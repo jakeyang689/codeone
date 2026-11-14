@@ -4,9 +4,10 @@
 
 **codeone 是一个自然语言编译器，必须配合 AI coding 使用**：让 LLM 直接从自然语言生成 SSA，再由编译器把 SSA 降级为 LLVM IR 并产出原生机器码，从而省掉「自然语言 → 高级语言 → 机器码」中间的高级语言层。
 
-<img src="assets/pipeline.zh-CN.svg" alt="自然语言 → LLM → SSA（.bx） → c1 → LLVM IR → LLVM → 机器码" width="860">
+<img src="assets/pipeline.zh-CN.svg" alt="自然语言 → LLM → SSA（.bx） → c1（直接降级或 MLIR 方言） → LLVM IR → LLVM → 机器码" width="860">
 
-- **SSA 编译器（`ssa/`）**：`c1` 把 `.bx` 编译为 `.o`，链接为可执行文件或静态库。
+- **SSA 编译器（`ssa/`）**：`c1` 把 `.bx` 编译为 `.o`，链接为可执行文件或静态库。39 条指令覆盖算术、位运算、内存、控制流、原子操作、目标平台内联汇编，以及 `tensor`（静态形状上的 f32 逐元素运算与矩阵乘）。
+- **两套后端**：默认直接把 AST 降级为 LLVM IR；`--backend=mlir` 则先经过 `ssa/hir/` 中手写的 MLIR 方言，它与每条 SSA 指令一一对应（见 [`hir.md`](hir.md)）。两条路径都在同一进程内产出 LLVM IR——MLIR 静态链接进 `c1`，无需辅助程序；`tensor` 指令在两种后端下都会生成 linalg 内核。
 - **标准库（`ssa/boxes/std/`）**：纯 SSA 编写的字符串、容器、JSON、时间、哈希与加解密、RSA/ECDSA、TLS 1.2/1.3、HTTP、WebSocket、线程等模块；非 ISO-C 系统 API 由 `ssa/platform/` 的 C 封装提供。
 
 ## 必须配合 AI Coding
