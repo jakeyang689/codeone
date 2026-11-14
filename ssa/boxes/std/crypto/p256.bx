@@ -1,0 +1,449 @@
+// NIST P-256 (secp256r1) ECDSA + ECDH
+// Big-endian byte I/O, little-endian i32 limb representation
+// 8 limbs for 256-bit curve, reuses RSA bn_* for big-number math
+//
+// Curve: secp256r1 (y^2 = x^3 - 3x + b over GF(p))
+//   p = 2^256 - 2^224 + 2^192 + 2^96 - 1
+
+// --- Extern: RSA big-number primitives ---
+extern @std_crypto_rsa_bn_zero(r: *i32, limbs: i32) -> void
+extern @std_crypto_rsa_bn_copy(r: *i32, a: *i32, limbs: i32) -> void
+extern @std_crypto_rsa_bn_is_zero(a: *i32, limbs: i32) -> i1
+extern @std_crypto_rsa_bn_cmp(a: *i32, b: *i32, limbs: i32) -> i32
+extern @std_crypto_rsa_bn_add(r: *i32, a: *i32, b: *i32, limbs: i32) -> i32
+extern @std_crypto_rsa_bn_sub(r: *i32, a: *i32, b: *i32, limbs: i32) -> i32
+extern @std_crypto_rsa_bn_mod_mul(r: *i32, a: *i32, b: *i32, m: *i32, limbs: i32) -> void
+extern @std_crypto_rsa_bn_mod_pow(r: *i32, base: *i32, exp: *i32, exp_limbs: i32, m: *i32, limbs: i32) -> void
+extern @std_crypto_rsa_bn_mod(r: *i32, a: *i32, a_limbs: i32, m: *i32, m_limbs: i32) -> void
+extern @std_crypto_rsa_bn_random(r: *i32, limbs: i32) -> void
+extern @std_crypto_rsa_bn_from_bytes(r: *i32, bytes: *i8, byte_len: i32, limbs: i32) -> void
+extern @std_crypto_rsa_bn_to_bytes(bytes: *i8, a: *i32, byte_len: i32, limbs: i32) -> void
+extern @std_crypto_rsa_bn_mul(r: *i32, a: *i32, b: *i32, limbs: i32) -> void
+extern @bn_mont_nprime(n0: i32) -> i32
+extern @bn_mont_mul(r: *i32, a: *i32, b: *i32, n: *i32, n_prime: i32,
+                    limbs: i32) -> void
+extern @std_crypto_rsa_bn_mod_pow_mont(r: *i32, base: *i32, exp: *i32,
+                                       exp_limbs: i32, n: *i32,
+                                       limbs: i32) -> void
+
+// --- P-256 curve constants (little-endian i32 limbs) ---
+
+// Prime p = 2^256 - 2^224 + 2^192 + 2^96 - 1
+// = 0xFFFFFFFF00000001000000000000000000000000FFFFFFFFFFFFFFFFFFFFFFFF
+const @_p: [i32, 8] = [ -1, -1, -1, 0, 0, 0, 1, -1 ]
+
+// p - 2 for Fermat inverse: a^(p-2) mod p
+const @_pm2: [i32, 8] = [ -3, -1, -1, 0, 0, 0, 1, -1 ]
+
+// R^2 mod p = 2^512 mod p, used to leave Montgomery form after one extra mul
+const @_r2: [i32, 8] = [ 0x3, 0, -1, -5, -2, -1, -3, 4 ]
+
+// Curve parameter a = p - 3
+const @_a: [i32, 8] = [ -4, -1, -1, 0, 0, 0, 1, -1 ]
+
+// Curve order n
+// n = 0xFFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551
+const @_n: [i32, 8] = [ 0xFC632551, 0xF3B9CAC2, 0xA7179E84, 0xBCE6FAAD,
+                         -1, -1, 0, -1 ]
+
+// n - 2 for Fermat inverse mod n
+const @_nm2: [i32, 8] = [ 0xFC63254F, 0xF3B9CAC2, 0xA7179E84, 0xBCE6FAAD,
+                           -1, -1, 0, -1 ]
+
+// Base point G.x
+const @_gx: [i32, 8] = [ 0xD898C296, 0xF4A13945, 0x2DEB33A0, 0x77037D81,
+                          0x63A440F2, 0xF8BCE6E5, 0xE12C4247, 0x6B17D1F2 ]
+
+// Base point G.y
+const @_gy: [i32, 8] = [ 0x37BF51F5, 0xCBB64068, 0x6B315ECE, 0x2BCE3357,
+                          0x7C0F9E16, 0x8EE7EB4A, 0xFE1A7F9B, 0x4FE342E2 ]
+
+
+// --- Helper: get bit of big number ---
+fun @p256_get_bit(val: *i32, bit: i32) -> i1 {
+  @entry:
+    %limb_idx = lshr i32 %bit, 5
+    %bit_in_limb = and i32 %bit, 31
+    %p = gep i32, *%val, %limb_idx
+    %v = load i32, *%p
+    %shifted = lshr i32 %v, %bit_in_limb
+    %r = and i32 %shifted, 1
+    %result = ne i32 %r, 0
+    ret i1 %result
+}
+
+
+// --- Field arithmetic (mod p) ---
+
+// fe_add: r = (a + b) mod p (using 9-limb temp with bn_mod)
+fun @p256_fe_add(r: *i32, a: *i32, b: *i32) -> void {
+  @entry:
+    %tmp9 = let [i32, 9]
+    %t9p = gep i32, *%tmp9, 0
+    call @std_crypto_rsa_bn_zero(%t9p, 9)
+    %carry = call @std_crypto_rsa_bn_add(%t9p, %a, %b, 8)
+    %c8 = gep i32, *%tmp9, 8
+    store i32 %carry, *%c8
+    %pp = gep i32, *@_p, 0
+    call @std_crypto_rsa_bn_mod(%r, %t9p, 9, %pp, 8)
+    ret void
+}
+
+// fe_sub: r = (a - b) mod p (using bn_cmp instead of borrow return)
+fun @p256_fe_sub(r: *i32, a: *i32, b: *i32) -> void {
+  @entry:
+    %cmp = call @std_crypto_rsa_bn_cmp(%a, %b, 8)
+    %lt = slt i32 %cmp, 0
+    br %lt, @sub_borrow, @sub_direct
+  @sub_direct:
+    call @std_crypto_rsa_bn_sub(%r, %a, %b, 8)
+    ret void
+  @sub_borrow:
+    %tmp = let [i32, 8]
+    %tp = gep i32, *%tmp, 0
+    call @std_crypto_rsa_bn_sub(%tp, %a, %b, 8)
+    %pp = gep i32, *@_p, 0
+    call @std_crypto_rsa_bn_add(%tp, %tp, %pp, 8)
+    call @std_crypto_rsa_bn_copy(%r, %tp, 8)
+    ret void
+}
+
+// fe_mul: r = (a * b) mod p.
+// Montgomery multiplication returns a*b*R^-1; a second multiplication by
+// R^2 brings the result back to the normal representation.
+fun @p256_fe_mul(r: *i32, a: *i32, b: *i32) -> void {
+  @entry:
+    %pp = gep i32, *@_p, 0
+    %n0 = load i32, *%pp
+    %npr = call @bn_mont_nprime(%n0)
+    %t = let [i32, 8]
+    %tp = gep i32, *%t, 0
+    call @bn_mont_mul(%tp, %a, %b, %pp, %npr, 8)
+    %r2p = gep i32, *@_r2, 0
+    call @bn_mont_mul(%r, %tp, %r2p, %pp, %npr, 8)
+    ret void
+}
+
+// fe_sq: r = a^2 mod p
+fun @p256_fe_sq(r: *i32, a: *i32) -> void {
+  @entry:
+    %pp = gep i32, *@_p, 0
+    %n0 = load i32, *%pp
+    %npr = call @bn_mont_nprime(%n0)
+    %t = let [i32, 8]
+    %tp = gep i32, *%t, 0
+    call @bn_mont_mul(%tp, %a, %a, %pp, %npr, 8)
+    %r2p = gep i32, *@_r2, 0
+    call @bn_mont_mul(%r, %tp, %r2p, %pp, %npr, 8)
+    ret void
+}
+
+// fe_inv: r = a^(-1) mod p using Fermat: a^(p-2) mod p
+fun @p256_fe_inv(r: *i32, a: *i32) -> void {
+  @entry:
+    %pp = gep i32, *@_p, 0
+    %pm2p = gep i32, *@_pm2, 0
+    call @std_crypto_rsa_bn_mod_pow_mont(%r, %a, %pm2p, 8, %pp, 8)
+    ret void
+}
+
+
+// --- Point operations (affine coordinates) ---
+// Order: point_double → point_add → point_mul → point_mul_base
+
+// point_double: r = 2*a on P-256 (λ = (3x² + a) / 2y)
+// Returns 0 if a is point at infinity (x=0,y=0)
+fun @p256_point_double(r_x: *i32, r_y: *i32, a_x: *i32, a_y: *i32) -> i1 {
+  @entry:
+    %z_x = call @std_crypto_rsa_bn_is_zero(%a_x, 8)
+    %z_y = call @std_crypto_rsa_bn_is_zero(%a_y, 8)
+    %is_zero = and i1 %z_x, %z_y
+    br %is_zero, @double_zero, @double_do
+  @double_zero:
+    call @std_crypto_rsa_bn_zero(%r_x, 8)
+    call @std_crypto_rsa_bn_zero(%r_y, 8)
+    ret i1 0
+  @double_do:
+    %three = let [i32, 8]
+    %threep = gep i32, *%three, 0
+    call @std_crypto_rsa_bn_zero(%threep, 8)
+    store i32 3, *%threep
+    %num = let [i32, 8]
+    %den = let [i32, 8]
+    %lam = let [i32, 8]
+    %nump = gep i32, *%num, 0
+    %denp = gep i32, *%den, 0
+    %lamp = gep i32, *%lam, 0
+    call @p256_fe_sq(%nump, %a_x)
+    call @p256_fe_mul(%nump, %nump, %threep)
+    %ap = gep i32, *@_a, 0
+    call @p256_fe_add(%nump, %nump, %ap)
+    call @p256_fe_add(%denp, %a_y, %a_y)
+    call @p256_fe_inv(%lamp, %denp)
+    call @p256_fe_mul(%lamp, %lamp, %nump)
+    call @p256_fe_sq(%r_x, %lamp)
+    call @p256_fe_sub(%r_x, %r_x, %a_x)
+    call @p256_fe_sub(%r_x, %r_x, %a_x)
+    call @p256_fe_sub(%r_y, %a_x, %r_x)
+    call @p256_fe_mul(%r_y, %lamp, %r_y)
+    call @p256_fe_sub(%r_y, %r_y, %a_y)
+    ret i1 1
+}
+
+// point_add: r = a + b on P-256 (affine)
+fun @p256_point_add(r_x: *i32, r_y: *i32, a_x: *i32, a_y: *i32, b_x: *i32, b_y: *i32) -> i1 {
+  @entry:
+    %az = call @std_crypto_rsa_bn_is_zero(%a_x, 8)
+    %az2 = call @std_crypto_rsa_bn_is_zero(%a_y, 8)
+    %a_is_zero = and i1 %az, %az2
+    br %a_is_zero, @ret_b, @check_b_zero
+  @ret_b:
+    call @std_crypto_rsa_bn_copy(%r_x, %b_x, 8)
+    call @std_crypto_rsa_bn_copy(%r_y, %b_y, 8)
+    ret i1 1
+  @check_b_zero:
+    %bz = call @std_crypto_rsa_bn_is_zero(%b_x, 8)
+    %bz2 = call @std_crypto_rsa_bn_is_zero(%b_y, 8)
+    %b_is_zero = and i1 %bz, %bz2
+    br %b_is_zero, @ret_a, @check_same
+  @ret_a:
+    call @std_crypto_rsa_bn_copy(%r_x, %a_x, 8)
+    call @std_crypto_rsa_bn_copy(%r_y, %a_y, 8)
+    ret i1 1
+  @check_same:
+    %cx = call @std_crypto_rsa_bn_cmp(%a_x, %b_x, 8)
+    %cy = call @std_crypto_rsa_bn_cmp(%a_y, %b_y, 8)
+    %x_eq = eq i32 %cx, 0
+    %y_eq = eq i32 %cy, 0
+    %same = and i1 %x_eq, %y_eq
+    br %same, @do_double, @do_add
+  @do_double:
+    %_dd = call @p256_point_double(%r_x, %r_y, %a_x, %a_y)
+    ret i1 1
+  @do_add:
+    %dx = let [i32, 8]
+    %dy = let [i32, 8]
+    %lam = let [i32, 8]
+    %dxp = gep i32, *%dx, 0
+    %dyp = gep i32, *%dy, 0
+    %lamp = gep i32, *%lam, 0
+    call @p256_fe_sub(%dyp, %b_y, %a_y)
+    call @p256_fe_sub(%dxp, %b_x, %a_x)
+    %dxz = call @std_crypto_rsa_bn_is_zero(%dxp, 8)
+    br %dxz, @zero, @add_cont
+  @add_cont:
+    call @p256_fe_inv(%lamp, %dxp)
+    call @p256_fe_mul(%lamp, %lamp, %dyp)
+    %x3 = let [i32, 8]
+    %x3p = gep i32, *%x3, 0
+    call @p256_fe_sq(%x3p, %lamp)
+    call @p256_fe_sub(%x3p, %x3p, %a_x)
+    call @p256_fe_sub(%x3p, %x3p, %b_x)
+    call @p256_fe_sub(%r_y, %a_x, %x3p)
+    call @p256_fe_mul(%r_y, %lamp, %r_y)
+    call @p256_fe_sub(%r_y, %r_y, %a_y)
+    call @std_crypto_rsa_bn_copy(%r_x, %x3p, 8)
+    ret i1 1
+  @zero:
+    call @std_crypto_rsa_bn_zero(%r_x, 8)
+    call @std_crypto_rsa_bn_zero(%r_y, 8)
+    ret i1 0
+}
+
+// point_mul: r = k * P (MSB-first double-and-add)
+// Scan bits from 255 down to 0, doubling result each step,
+// adding P when the bit is set.
+fun @p256_point_mul(r_x: *i32, r_y: *i32, p_x: *i32, p_y: *i32, k: *i32) -> void {
+  @entry:
+    %rx = let [i32, 8]
+    %ry = let [i32, 8]
+    %rxp = gep i32, *%rx, 0
+    %ryp = gep i32, *%ry, 0
+    call @std_crypto_rsa_bn_zero(%rxp, 8)
+    call @std_crypto_rsa_bn_zero(%ryp, 8)
+    %bit = let i32
+    store i32 255, *%bit
+    jmp @mul_cond
+  @mul_cond:
+    %biv = load i32, *%bit
+    %nneg = sge i32 %biv, 0
+    br %nneg, @mul_body, @mul_done
+  @mul_body:
+    %biv2 = load i32, *%bit
+    // result = double(result)
+    %tx = let [i32, 8]
+    %ty = let [i32, 8]
+    %txp = gep i32, *%tx, 0
+    %typ = gep i32, *%ty, 0
+    %_pd = call @p256_point_double(%txp, %typ, %rxp, %ryp)
+    call @std_crypto_rsa_bn_copy(%rxp, %txp, 8)
+    call @std_crypto_rsa_bn_copy(%ryp, %typ, 8)
+    // if bit is set: result = add(result, P)
+    %kb = call @p256_get_bit(%k, %biv2)
+    br %kb, @add_k, @skip_k
+  @add_k:
+    %tx2 = let [i32, 8]
+    %ty2 = let [i32, 8]
+    %tx2p = gep i32, *%tx2, 0
+    %ty2p = gep i32, *%ty2, 0
+    %_pa = call @p256_point_add(%tx2p, %ty2p, %rxp, %ryp, %p_x, %p_y)
+    call @std_crypto_rsa_bn_copy(%rxp, %tx2p, 8)
+    call @std_crypto_rsa_bn_copy(%ryp, %ty2p, 8)
+    jmp @skip_k
+  @skip_k:
+    %biv3 = sub i32 %biv2, 1
+    store i32 %biv3, *%bit
+    jmp @mul_cond
+  @mul_done:
+    call @std_crypto_rsa_bn_copy(%r_x, %rxp, 8)
+    call @std_crypto_rsa_bn_copy(%r_y, %ryp, 8)
+    ret void
+}
+
+// point_mul_base: r = k * G
+fun @p256_point_mul_base(r_x: *i32, r_y: *i32, k: *i32) -> void {
+  @entry:
+    %gxp = gep i32, *@_gx, 0
+    %gyp = gep i32, *@_gy, 0
+    call @p256_point_mul(%r_x, %r_y, %gxp, %gyp, %k)
+    ret void
+}
+
+// random_scalar: fill r with random scalar modulo n
+fun @p256_random_scalar(r: *i32) -> void {
+  @entry:
+    %np = gep i32, *@_n, 0
+    jmp @rs_loop
+  @rs_loop:
+    call @std_crypto_rsa_bn_random(%r, 8)
+    call @std_crypto_rsa_bn_mod(%r, %r, 8, %np, 8)
+    %z = call @std_crypto_rsa_bn_is_zero(%r, 8)
+    br %z, @rs_loop, @rs_done
+  @rs_done: ret void
+}
+
+// generate_keypair: generate P-256 key pair
+fun @std_crypto_p256_generate_keypair(priv: *i32, pub_x: *i32, pub_y: *i32) -> void {
+  @entry:
+    %np = gep i32, *@_n, 0
+    jmp @kg_loop
+  @kg_loop:
+    call @std_crypto_rsa_bn_random(%priv, 8)
+    call @std_crypto_rsa_bn_mod(%priv, %priv, 8, %np, 8)
+    %z = call @std_crypto_rsa_bn_is_zero(%priv, 8)
+    br %z, @kg_loop, @kg_ok
+  @kg_ok:
+    call @p256_point_mul_base(%pub_x, %pub_y, %priv)
+    ret void
+}
+
+// ecdh: shared secret = priv * peer_pub (x-coord)
+fun @std_crypto_p256_ecdh(priv: *i32, peer_x: *i32, peer_y: *i32, secret_x: *i32) -> void {
+  @entry:
+    %sx = let [i32, 8]
+    %sy = let [i32, 8]
+    %sxp = gep i32, *%sx, 0
+    %syp = gep i32, *%sy, 0
+    call @p256_point_mul(%sxp, %syp, %peer_x, %peer_y, %priv)
+    call @std_crypto_rsa_bn_copy(%secret_x, %sxp, 8)
+    ret void
+}
+
+// sign: ECDSA signature
+fun @std_crypto_p256_sign(priv: *i32, hash: *i8, r: *i32, s: *i32) -> void {
+  @entry:
+    %np = gep i32, *@_n, 0
+    %nm2p = gep i32, *@_nm2, 0
+    %z_bn = let [i32, 8]
+    %z_bnp = gep i32, *%z_bn, 0
+    call @std_crypto_rsa_bn_from_bytes(%z_bnp, %hash, 32, 8)
+    call @std_crypto_rsa_bn_mod(%z_bnp, %z_bnp, 8, %np, 8)
+    jmp @sign_loop
+  @sign_loop:
+    %k = let [i32, 8]
+    %kp = gep i32, *%k, 0
+    call @p256_random_scalar(%kp)
+    %rx = let [i32, 8]
+    %ry = let [i32, 8]
+    %rxp = gep i32, *%rx, 0
+    call @p256_point_mul_base(%rxp, %ry, %kp)
+    call @std_crypto_rsa_bn_copy(%r, %rxp, 8)
+    call @std_crypto_rsa_bn_mod(%r, %r, 8, %np, 8)
+    %rz = call @std_crypto_rsa_bn_is_zero(%r, 8)
+    br %rz, @sign_loop, @sign_cont
+  @sign_cont:
+    %tmp = let [i32, 8]
+    %tmpp = gep i32, *%tmp, 0
+    call @std_crypto_rsa_bn_mod_mul(%tmpp, %r, %priv, %np, 8)
+    // Add z mod n: use 9-limb temp for carry safety
+    %stmp9 = let [i32, 9]
+    %st9p = gep i32, *%stmp9, 0
+    call @std_crypto_rsa_bn_zero(%st9p, 9)
+    %scarry = call @std_crypto_rsa_bn_add(%st9p, %tmpp, %z_bnp, 8)
+    %s9 = gep i32, *%stmp9, 8
+    store i32 %scarry, *%s9
+    call @std_crypto_rsa_bn_mod(%tmpp, %st9p, 9, %np, 8)
+    %kinv = let [i32, 8]
+    %kinvp = gep i32, *%kinv, 0
+    call @std_crypto_rsa_bn_mod_pow(%kinvp, %kp, %nm2p, 8, %np, 8)
+    call @std_crypto_rsa_bn_mod_mul(%s, %kinvp, %tmpp, %np, 8)
+    %sz = call @std_crypto_rsa_bn_is_zero(%s, 8)
+    br %sz, @sign_loop, @sign_done
+  @sign_done: ret void
+}
+
+// verify: ECDSA signature verification
+fun @std_crypto_p256_verify(pub_x: *i32, pub_y: *i32, hash: *i8, r: *i32, s: *i32) -> i1 {
+  @entry:
+    %np = gep i32, *@_n, 0
+    %pp = gep i32, *@_p, 0
+    %rz = call @std_crypto_rsa_bn_is_zero(%r, 8)
+    br %rz, @invalid, @check_s_z
+  @check_s_z:
+    %sz = call @std_crypto_rsa_bn_is_zero(%s, 8)
+    br %sz, @invalid, @check_r_range
+  @check_r_range:
+    %rcmp = call @std_crypto_rsa_bn_cmp(%r, %np, 8)
+    %rlt = slt i32 %rcmp, 0
+    br %rlt, @check_s_range, @invalid
+  @check_s_range:
+    %scmp = call @std_crypto_rsa_bn_cmp(%s, %np, 8)
+    %slt = slt i32 %scmp, 0
+    br %slt, @verify_cont, @invalid
+  @verify_cont:
+    %z_bn = let [i32, 8]
+    %z_bnp = gep i32, *%z_bn, 0
+    call @std_crypto_rsa_bn_from_bytes(%z_bnp, %hash, 32, 8)
+    call @std_crypto_rsa_bn_mod(%z_bnp, %z_bnp, 8, %np, 8)
+    %nm2p = gep i32, *@_nm2, 0
+    %w_bn = let [i32, 8]
+    %w_bnp = gep i32, *%w_bn, 0
+    call @std_crypto_rsa_bn_mod_pow(%w_bnp, %s, %nm2p, 8, %np, 8)
+    %u1 = let [i32, 8]
+    %u1p = gep i32, *%u1, 0
+    call @std_crypto_rsa_bn_mod_mul(%u1p, %z_bnp, %w_bnp, %np, 8)
+    %u2 = let [i32, 8]
+    %u2p = gep i32, *%u2, 0
+    call @std_crypto_rsa_bn_mod_mul(%u2p, %r, %w_bnp, %np, 8)
+    %u1gx = let [i32, 8]
+    %u1gy = let [i32, 8]
+    %u1gxp = gep i32, *%u1gx, 0
+    %u1gyp = gep i32, *%u1gy, 0
+    call @p256_point_mul_base(%u1gxp, %u1gyp, %u1p)
+    %u2qx = let [i32, 8]
+    %u2qy = let [i32, 8]
+    %u2qxp = gep i32, *%u2qx, 0
+    %u2qyp = gep i32, *%u2qy, 0
+    call @p256_point_mul(%u2qxp, %u2qyp, %pub_x, %pub_y, %u2p)
+    %px = let [i32, 8]
+    %py = let [i32, 8]
+    %pxp = gep i32, *%px, 0
+    %pyp = gep i32, *%py, 0
+    call @p256_point_add(%pxp, %pyp, %u1gxp, %u1gyp, %u2qxp, %u2qyp)
+    call @std_crypto_rsa_bn_mod(%pxp, %pxp, 8, %np, 8)
+    %cmp = call @std_crypto_rsa_bn_cmp(%pxp, %r, 8)
+    %eq = eq i32 %cmp, 0
+    br %eq, @valid, @invalid
+  @valid: ret i1 1
+  @invalid: ret i1 0
+}

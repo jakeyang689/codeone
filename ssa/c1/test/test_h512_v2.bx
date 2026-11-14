@@ -1,0 +1,56 @@
+// Debug HMAC-SHA512 with varying data sizes
+extern @printf(fmt: *i8, ...) -> i32
+extern @std_crypto_hmac_sha512(key: *i8, key_len: i32, data: *i8, data_len: i32, mac: *i8) -> void
+extern @std_crypto_hmac_sha384(key: *i8, key_len: i32, data: *i8, data_len: i32, mac: *i8) -> void
+
+const @key: [i8, 4] = [0x4a, 0x65, 0x66, 0x65]
+const @msg: [i8, 28] = [
+  0x77, 0x68, 0x61, 0x74, 0x20, 0x64, 0x6f, 0x20, 0x79, 0x61,
+  0x20, 0x77, 0x61, 0x6e, 0x74, 0x20, 0x66, 0x6f, 0x72, 0x20,
+  0x6e, 0x6f, 0x74, 0x68, 0x69, 0x6e, 0x67, 0x3f
+]
+
+fun @print_hex(data: *i8, len: i32) -> void {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @loop_cond
+  @loop_cond:
+    %iv = load i32, *%i
+    %done = slt i32 %iv, %len
+    br %done, @loop_body, @loop_done
+  @loop_body:
+    %p = gep i8, *%data, %iv
+    %b = load i8, *%p
+    %bz = zext i8 %b to i32
+    call @printf("%02x", %bz)
+    %next = add i32 %iv, 1
+    store i32 %next, *%i
+    jmp @loop_cond
+  @loop_done:
+    ret void
+}
+
+fun @main() -> i32 {
+  @entry:
+    %kp = gep i8, *@key, 0
+    %mp = gep i8, *@msg, 0
+
+    // HMAC-SHA512 of 28-byte msg
+    %mac512 = let [i8, 64]
+    %mac512_p = gep i8, *%mac512, 0
+    call @std_crypto_hmac_sha512(%kp, 4, %mp, 28, %mac512_p)
+    call @printf("HMAC-SHA512: ")
+    call @print_hex(%mac512_p, 64)
+    call @printf("\n")
+
+    // HMAC-SHA384 of 28-byte msg (for comparison)
+    %mac384 = let [i8, 48]
+    %mac384_p = gep i8, *%mac384, 0
+    call @std_crypto_hmac_sha384(%kp, 4, %mp, 28, %mac384_p)
+    call @printf("HMAC-SHA384: ")
+    call @print_hex(%mac384_p, 48)
+    call @printf("\n")
+
+    ret i32 0
+}

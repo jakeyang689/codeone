@@ -1,0 +1,49 @@
+// Compare plain mod_pow against the Montgomery path, and check they agree.
+extern @printf(fmt: *i8, ...) -> i32
+extern @clock() -> i64
+extern @std_crypto_rsa_bn_zero(r: *i32, limbs: i32) -> void
+extern @std_crypto_rsa_bn_random(r: *i32, limbs: i32) -> void
+extern @std_crypto_rsa_bn_cmp(a: *i32, b: *i32, limbs: i32) -> i32
+extern @std_crypto_rsa_bn_mod_pow(r: *i32, base: *i32, exp: *i32, exp_limbs: i32, m: *i32, limbs: i32) -> void
+extern @std_crypto_rsa_bn_mod_pow_mont(r: *i32, base: *i32, exp: *i32, exp_limbs: i32, m: *i32, limbs: i32) -> void
+
+fun @main() -> i32 {
+  @entry:
+    %n = let [i32, 64]
+    %base = let [i32, 64]
+    %exp = let [i32, 64]
+    %r1 = let [i32, 64]
+    %r2 = let [i32, 64]
+    %np = gep i32, *%n, 0
+    %bp = gep i32, *%base, 0
+    %ep = gep i32, *%exp, 0
+    %r1p = gep i32, *%r1, 0
+    %r2p = gep i32, *%r2, 0
+
+    call @std_crypto_rsa_bn_random(%np, 64)
+    // Montgomery needs an odd modulus
+    %n0p = gep i32, *%np, 0
+    %n0 = load i32, *%n0p
+    %n0o = or i32 %n0, 1
+    store i32 %n0o, *%n0p
+
+    call @std_crypto_rsa_bn_zero(%bp, 64)
+    store i32 2, *%bp
+    call @std_crypto_rsa_bn_zero(%ep, 64)
+    store i32 65537, *%ep
+
+    %t0 = call @clock()
+    call @std_crypto_rsa_bn_mod_pow(%r1p, %bp, %ep, 64, %np, 64)
+    %t1 = call @clock()
+    %plain = sub i64 %t1, %t0
+
+    %t2 = call @clock()
+    call @std_crypto_rsa_bn_mod_pow_mont(%r2p, %bp, %ep, 64, %np, 64)
+    %t3 = call @clock()
+    %mont = sub i64 %t3, %t2
+
+    %cmp = call @std_crypto_rsa_bn_cmp(%r1p, %r2p, 64)
+    call @printf("equal: %d (0 = same)\n", %cmp)
+    call @printf("plain: %lld us | mont: %lld us\n", %plain, %mont)
+    ret i32 0
+}

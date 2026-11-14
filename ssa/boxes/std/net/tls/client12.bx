@@ -1,0 +1,677 @@
+// TLS 1.2 client handshake (public API)
+
+extern @putchar(c: i32) -> i32
+// Debug helper - prints step number
+fun @dbg(n: i32) -> void {
+  @e:
+    %c = add i32 %n, 48
+    call @putchar(%c)
+    ret void
+}
+extern @memcpy(dst: *i8, src: *i8, n: i64) -> *i8
+extern @memset(s: *i8, c: i32, n: i64) -> *i8
+extern @c1_random_buf(buf: *i8, len: i64) -> void
+
+extern @tls_write_record(fd: i32, typ: i8, ver: i16, data: *i8, len: i32) -> i32
+extern @tls12_record_encrypt(fd: i32, seq: *i64, k: *i8, iv: *i8, ks: i32, t: i8, d: *i8, l: i32) -> i32
+extern @tls12_record_decrypt(fd: i32, seq: *i64, k: *i8, iv: *i8, ks: i32, b: *i8, c: i32, ot: *i8, ol: *i32) -> i32
+
+extern @std_crypto_sha256_compute(data: *i8, len: i32, digest: *i8) -> void
+extern @std_crypto_tls12_prf_sha256(s: *i8, sl: i32, seed: *i8, sdl: i32, ol: i32, out: *i8) -> void
+extern @std_crypto_rsa_encrypt_pkcs1_v15(m: *i8, ml: i32, e: *i32, n: *i32, li: i32, ct: *i8) -> i32
+extern @x509_parse_rsa_pubkey(cert: *i8, cl: i32, no: *i32, eo: *i32, li: i32) -> i1
+extern @x509_check_hostname(cert_der: *i8, cert_len: i32,
+                            host: *i8, host_len: i32) -> i1
+extern @x509_verify_chain(leaf: *i8, leaf_len: i32,
+                          pool: *i8, offsets: *i32, lens: *i32, count: i32,
+                          roots: *i8, root_offsets: *i32, root_lens: *i32,
+                          root_count: i32, now_secs: i64, limbs: i32) -> i32
+extern @c1_time_now_ms() -> i64
+
+extern @ch12(ctx: *i8, buf: *i8, cap: i32, olen: *i32) -> i32
+extern @parse_sh(buf: *i8, blen: i32, sr: *i8, cs: *i16) -> i32
+extern @derive12(ctx: *i8) -> i32
+
+extern @put24(p: *i8, v: i32) -> void
+extern @send_hs(fd: i32, hst: i8, body: *i8, blen: i32) -> i32
+extern @read_hs(fd: i32, buf: *i8, cap: i32, hst: *i8, blen: *i32) -> i32
+
+// Record content types (RFC 5246 §6.2.1).
+enum @TlsContentType: i8 {
+  @ChangeCipherSpec = 20,
+  @Alert = 21,
+  @Handshake = 22,
+  @Application = 23
+}
+
+// Handshake message types (RFC 5246 §7.4).
+enum @TlsHandshakeType: i8 {
+  @ClientHello = 1,
+  @ServerHello = 2,
+  @Certificate = 11,
+  @ServerHelloDone = 14,
+  @ClientKeyExchange = 16,
+  @Finished = 20
+}
+
+// TLS Context struct definitions
+struct @TLS12Context {
+  @fd: i32,
+  @state: i32,
+  @version: i32,
+  @key_size: i32,
+  @limbs: i32,
+  @cipher_suite: i32,
+  @client_seq: i64,
+  @server_seq: i64,
+  @client_random: [i8, 32],
+  @server_random: [i8, 32],
+  @client_write_key: [i8, 32],
+  @server_write_key: [i8, 32],
+  @client_write_iv: [i8, 12],
+  @server_write_iv: [i8, 12],
+  @pre_master_secret: [i8, 48],
+  @master_secret: [i8, 48]
+}
+struct @TLS13Extension {
+  @init_client_seq: i64,
+  @_pad: [i8, 24],
+  @ecdhe_private: [i8, 32],
+  @ecdhe_public_x: [i8, 32],
+  @ecdhe_public_y: [i8, 32],
+  @server_ec_x: [i8, 32],
+  @server_ec_y: [i8, 32],
+  @handshake_traffic: [i8, 48],
+  @application_traffic: [i8, 48],
+  @sni_host: [i8, 256],
+  @sni_len: i32,
+  @role: i32,
+  @trust_pool: *i8,
+  @trust_offsets: *i32,
+  @trust_lens: *i32,
+  @trust_count: i32
+}
+struct @TLSContext {
+  @tls12: @TLS12Context,
+  @tls13: @TLS13Extension
+}
+
+const @_cf_label: [i8, 15] = [99, 108, 105, 101, 110, 116, 32, 102, 105, 110, 105, 115, 104, 101, 100]
+
+
+// Step 1: Send ClientHello, record in transcript
+fun @tls12_step_ch(ctx: *@TLSContext, fd: i32, tx: *i8, tx_off: *i32) -> i32 {
+  @e:
+    %ch_buf = let [i8, 512]
+    %ch_p = gep i8, *%ch_buf, 0
+    %ch_len = let i32
+    %ch_len_p = gep i32, *%ch_len, 0
+    %r1 = call @ch12(%ctx, %ch_p, 512, %ch_len_p)
+    %ok1 = eq i32 %r1, 0
+    br %ok1, @send, @fail
+  @send:
+    %body_len = load i32, *%ch_len_p
+    %r2 = call @send_hs(%fd, @TlsHandshakeType.ClientHello, %ch_p, %body_len)
+    %ok2 = eq i32 %r2, 0
+    br %ok2, @tx_rec, @fail
+  @tx_rec:
+    %off_v = load i32, *%tx_off
+    %tx_p = gep i8, *%tx, %off_v
+    store i8 @TlsHandshakeType.ClientHello, *%tx_p
+    %tx_len_p = gep i8, *%tx, %off_v
+    %tx_len_p2 = gep i8, *%tx, %off_v
+    %tx_len_p3 = add i32 %off_v, 1
+    %tx_len_p4 = gep i8, *%tx, %tx_len_p3
+    call @put24(%tx_len_p4, %body_len)
+    %tx_body_p2 = add i32 %off_v, 4
+    %tx_body_p3 = gep i8, *%tx, %tx_body_p2
+    %body_64 = sext i32 %body_len to i64
+    call @memcpy(%tx_body_p3, %ch_p, %body_64)
+    %new_off = add i32 %off_v, %body_len
+    %new_off2 = add i32 %new_off, 4
+    store i32 %new_off2, *%tx_off
+    ret i32 0
+  @fail:
+    ret i32 -1
+}
+
+// Step 2: Read and return ServerHello body
+fun @tls12_step_sh(fd: i32, buf: *i8, cap: i32, sr: *i8, cs: *i16, tx: *i8, tx_off: *i32) -> i32 {
+  @e:
+    %hst = let i8
+    %hstp = gep i8, *%hst, 0
+    %hsl = let i32
+    %hslp = gep i32, *%hsl, 0
+    %r = call @read_hs(%fd, %buf, %cap, %hstp, %hslp)
+    %ok = eq i32 %r, 0
+    br %ok, @check, @fail
+  @check:
+    %t = load i8, *%hstp
+    %is_sh = eq i8 %t, @TlsHandshakeType.ServerHello
+    br %is_sh, @parse, @fail
+  @parse:
+    %blen = load i32, *%hslp
+    %r2 = call @parse_sh(%buf, %blen, %sr, %cs)
+    %ok2 = eq i32 %r2, 0
+    br %ok2, @tx, @fail
+  @tx:
+    %off = load i32, *%tx_off
+    %txp = gep i8, *%tx, %off
+    store i8 @TlsHandshakeType.ServerHello, *%txp
+    %txp_len = gep i8, *%txp, 1
+    call @put24(%txp_len, %blen)
+    %b_off = add i32 %off, 4
+    %b_p = gep i8, *%tx, %b_off
+    %b64 = sext i32 %blen to i64
+    %buf_body = gep i8, *%buf, 4
+    call @memcpy(%b_p, %buf_body, %b64)
+    %new = add i32 %off, %blen
+    %new2 = add i32 %new, 4
+    store i32 %new2, *%tx_off
+    ret i32 0
+  @fail:
+    ret i32 -1
+}
+
+// Extract the leaf certificate's RSA public key from a Certificate body.
+// body = full handshake message (4-byte header + body), blen = body length
+fun @extract_rsa(body: *i8, blen: i32, no: *i32, eo: *i32, li: i32) -> i32 {
+  @e:
+    // Minimum: handshake hdr(4) + cert list len(3) + cert len(3) = 10
+    %ok = sge i32 %blen, 10
+    br %ok, @read, @fail
+  @read:
+    // buf[4-6] = cert list len, buf[7-9] = first cert len, buf[10..] = DER
+    %cert_p = gep i8, *%body, 7
+    %b0 = load i8, *%cert_p
+    %p2 = gep i8, *%body, 8
+    %b1 = load i8, *%p2
+    %p3 = gep i8, *%body, 9
+    %b2 = load i8, *%p3
+    %i0 = zext i8 %b0 to i32
+    %i1 = zext i8 %b1 to i32
+    %i2 = zext i8 %b2 to i32
+    %clen = shl i32 %i0, 16
+    %clen2 = or i32 %clen, %i1
+    %clen3 = shl i32 %clen2, 8
+    %clen4 = or i32 %clen3, %i2
+    %der_p = gep i8, *%body, 10
+    %found = call @x509_parse_rsa_pubkey(%der_p, %clen4, %no, %eo, %li)
+    br %found, @ok, @fail
+  @ok:
+    ret i32 0
+  @fail:
+    ret i32 -1
+}
+
+// Copy the intermediate certificates of a TLS 1.2 Certificate message into a
+// DER pool, skipping the leaf. body is the full handshake message: the cert
+// list length sits at body[4..6] and the first entry at body[7].
+fun @_t12_parse_intermediates(body: *i8, blen: i32, pool: *i8, pool_cap: i32,
+                              offsets: *i32, lens: *i32, max_count: i32) -> i32 {
+  @e:
+    %pos = let i32
+    store i32 7, *%pos
+    %cnt = let i32
+    store i32 0, *%cnt
+    %poff = let i32
+    store i32 0, *%poff
+    %idx = let i32
+    store i32 0, *%idx
+    // Positions are offsets into the full message; blen is the body length.
+    %mlen = add i32 %blen, 4
+    jmp @cond
+  @cond:
+    %pv = load i32, *%pos
+    %avail = sub i32 %mlen, %pv
+    %more = sge i32 %avail, 3
+    br %more, @entry, @done
+  @entry:
+    %pv2 = load i32, *%pos
+    %lp = gep i8, *%body, %pv2
+    %b0 = load i8, *%lp
+    %lp1 = gep i8, *%lp, 1
+    %b1 = load i8, *%lp1
+    %lp2 = gep i8, *%lp, 2
+    %b2 = load i8, *%lp2
+    %i0 = zext i8 %b0 to i32
+    %i1 = zext i8 %b1 to i32
+    %i2 = zext i8 %b2 to i32
+    %cl0 = shl i32 %i0, 16
+    %cl1 = or i32 %cl0, %i1
+    %cl2 = shl i32 %cl1, 8
+    %clen = or i32 %cl2, %i2
+    %need = add i32 %clen, 3
+    %avail2 = sub i32 %mlen, %pv2
+    %fits = sge i32 %avail2, %need
+    br %fits, @have, @bad
+  @have:
+    %ix = load i32, *%idx
+    %skip = eq i32 %ix, 0
+    br %skip, @adv, @copy
+  @copy:
+    %c = load i32, *%cnt
+    %room = slt i32 %c, %max_count
+    br %room, @copy_cap, @bad
+  @copy_cap:
+    %po = load i32, *%poff
+    %end = add i32 %po, %clen
+    %capok = sle i32 %end, %pool_cap
+    br %capok, @copy_do, @bad
+  @copy_do:
+    %c2 = load i32, *%cnt
+    %der0 = gep i8, *%body, %pv2
+    %der = gep i8, *%der0, 3
+    %dst = gep i8, *%pool, %po
+    %cl64 = sext i32 %clen to i64
+    call @memcpy(%dst, %der, %cl64)
+    %offp = gep i32, *%offsets, %c2
+    store i32 %po, *%offp
+    %lenp = gep i32, *%lens, %c2
+    store i32 %clen, *%lenp
+    %nc = add i32 %c2, 1
+    store i32 %nc, *%cnt
+    store i32 %end, *%poff
+    jmp @adv
+  @adv:
+    %pv3 = load i32, *%pos
+    %step = add i32 %clen, 3
+    %npos = add i32 %pv3, %step
+    store i32 %npos, *%pos
+    %ix2 = load i32, *%idx
+    %nix = add i32 %ix2, 1
+    store i32 %nix, *%idx
+    jmp @cond
+  @done:
+    %fc = load i32, *%cnt
+    ret i32 %fc
+  @bad:
+    ret i32 -1
+}
+
+// Validate the server certificate chain when a trust store is configured.
+// Without one the client keeps its previous accept-anything behaviour.
+fun @_t12_check_chain(ctx: *i8, body: *i8, blen: i32, limbs: i32) -> i32 {
+  @e:
+    %t13 = field @TLSContext, *%ctx, 1
+    %tcp = field @TLS13Extension, *%t13, 15
+    %tcv = load i32, *%tcp
+    %has = sgt i32 %tcv, 0
+    br %has, @leaf, @ok
+  @leaf:
+    %lp = gep i8, *%body, 7
+    %b0 = load i8, *%lp
+    %lp1 = gep i8, *%lp, 1
+    %b1 = load i8, *%lp1
+    %lp2 = gep i8, *%lp, 2
+    %b2 = load i8, *%lp2
+    %i0 = zext i8 %b0 to i32
+    %i1 = zext i8 %b1 to i32
+    %i2 = zext i8 %b2 to i32
+    %cl0 = shl i32 %i0, 16
+    %cl1 = or i32 %cl0, %i1
+    %cl2 = shl i32 %cl1, 8
+    %clen = or i32 %cl2, %i2
+    %leaf = gep i8, *%body, 10
+    %host_arr = field @TLS13Extension, *%t13, 9
+    %host = gep i8, *%host_arr, 0
+    %hlp = field @TLS13Extension, *%t13, 10
+    %hl = load i32, *%hlp
+    %hok = call @x509_check_hostname(%leaf, %clen, %host, %hl)
+    br %hok, @chain, @fail
+  @chain:
+    %ipool = let [i8, 8192]
+    %ioffs = let [i32, 8]
+    %ilens = let [i32, 8]
+    %ipoolp = gep i8, *%ipool, 0
+    %ioffsp = gep i32, *%ioffs, 0
+    %ilensp = gep i32, *%ilens, 0
+    %icnt = call @_t12_parse_intermediates(%body, %blen, %ipoolp, 8192,
+                                           %ioffsp, %ilensp, 8)
+    %icnt_ok = sge i32 %icnt, 0
+    br %icnt_ok, @verify, @fail
+  @verify:
+    %tpp = field @TLS13Extension, *%t13, 12
+    %tpool = load *i8, *%tpp
+    %top = field @TLS13Extension, *%t13, 13
+    %toffs = load *i32, *%top
+    %tlp = field @TLS13Extension, *%t13, 14
+    %tlens = load *i32, *%tlp
+    %ms = call @c1_time_now_ms()
+    %now = div i64 %ms, 1000
+    %cr = call @x509_verify_chain(%leaf, %clen, %ipoolp, %ioffsp, %ilensp,
+                                  %icnt, %tpool, %toffs, %tlens, %tcv,
+                                  %now, %limbs)
+    %crok = eq i32 %cr, 0
+    br %crok, @ok, @fail
+  @ok:
+    ret i32 0
+  @fail:
+    ret i32 -1
+}
+
+// Step 3: Read Certificate, extract RSA key, validate the chain
+fun @tls12_step_cert(ctx: *i8, fd: i32, buf: *i8, cap: i32, rsa_n: *i32, rsa_e: *i32, limbs: i32, tx: *i8, tx_off: *i32) -> i32 {
+  @e:
+    %hst = let i8
+    %hstp = gep i8, *%hst, 0
+    %hsl = let i32
+    %hslp = gep i32, *%hsl, 0
+    %r = call @read_hs(%fd, %buf, %cap, %hstp, %hslp)
+    %ok = eq i32 %r, 0
+    br %ok, @check, @fail
+  @check:
+    %t = load i8, *%hstp
+    %is_cert = eq i8 %t, @TlsHandshakeType.Certificate
+    br %is_cert, @extract, @fail
+  @extract:
+    %blen = load i32, *%hslp
+    %r2 = call @extract_rsa(%buf, %blen, %rsa_n, %rsa_e, %limbs)
+    %ok2 = eq i32 %r2, 0
+    br %ok2, @trust, @fail
+  @trust:
+    %rt = call @_t12_check_chain(%ctx, %buf, %blen, %limbs)
+    %rt_ok = eq i32 %rt, 0
+    br %rt_ok, @tx, @fail
+  @tx:
+    %off = load i32, *%tx_off
+    %txp = gep i8, *%tx, %off
+    store i8 @TlsHandshakeType.Certificate, *%txp
+    %txp_len = gep i8, *%txp, 1
+    call @put24(%txp_len, %blen)
+    %b_off = add i32 %off, 4
+    %b_p = gep i8, *%tx, %b_off
+    %b64 = sext i32 %blen to i64
+    %buf_body = gep i8, *%buf, 4
+    call @memcpy(%b_p, %buf_body, %b64)
+    %new = add i32 %off, %blen
+    %new2 = add i32 %new, 4
+    store i32 %new2, *%tx_off
+    ret i32 0
+  @fail:
+    ret i32 -1
+}
+
+// Step 4: Read ServerHelloDone
+fun @tls12_step_shd(fd: i32, buf: *i8, cap: i32, tx: *i8, tx_off: *i32) -> i32 {
+  @e:
+    %hst = let i8
+    %hstp = gep i8, *%hst, 0
+    %hsl = let i32
+    %hslp = gep i32, *%hsl, 0
+    %r = call @read_hs(%fd, %buf, %cap, %hstp, %hslp)
+    %ok = eq i32 %r, 0
+    br %ok, @check, @fail
+  @check:
+    %t = load i8, *%hstp
+    %is_shd = eq i8 %t, @TlsHandshakeType.ServerHelloDone
+    br %is_shd, @tx, @fail
+  @tx:
+    %blen = load i32, *%hslp
+    %off = load i32, *%tx_off
+    %txp = gep i8, *%tx, %off
+    store i8 @TlsHandshakeType.ServerHelloDone, *%txp
+    %txp_len = gep i8, *%txp, 1
+    call @put24(%txp_len, %blen)
+    %new = add i32 %off, %blen
+    %new2 = add i32 %new, 4
+    store i32 %new2, *%tx_off
+    ret i32 0
+  @fail:
+    ret i32 -1
+}
+
+// Step 5: Generate pre-master, RSA encrypt, send ClientKeyExchange
+fun @tls12_step_cke(ctx: *@TLSContext, fd: i32, rsa_n: *i32, rsa_e: *i32, limbs: i32, tx: *i8, tx_off: *i32) -> i32 {
+  @e:
+    %pms = let [i8, 48]
+    %pms_p = gep i8, *%pms, 0
+    store i8 3, *%pms_p
+    %p1 = gep i8, *%pms_p, 1
+    store i8 3, *%p1
+    %p_rand = gep i8, *%pms_p, 2
+    %n46 = let i64
+    store i64 46, *%n46
+    %n46v = load i64, *%n46
+    call @c1_random_buf(%p_rand, %n46v)
+    // Store pre-master in context (TLS12Context field 14)
+    %t12 = field @TLSContext, *%ctx, 0
+    %cpms_arr = field @TLS12Context, *%t12, 14
+    %cpms = gep i8, *%cpms_arr, 0
+    call @memcpy(%cpms, %pms_p, 48)
+    // RSA encrypt
+    %enc = let [i8, 512]
+    %enc_p = gep i8, *%enc, 0
+    %r = call @std_crypto_rsa_encrypt_pkcs1_v15(%pms_p, 48, %rsa_e, %rsa_n, %limbs, %enc_p)
+    %ok = eq i32 %r, 0
+    br %ok, @send, @fail
+  @send:
+    %rsa_bytes = mul i32 %limbs, 4
+    %cke = let [i8, 514]
+    %cke_p = gep i8, *%cke, 0
+    // Write 2-byte length
+    %len_hi = lshr i32 %rsa_bytes, 8
+    %len_hi_b = trunc i32 %len_hi to i8
+    %len_lo_b = trunc i32 %rsa_bytes to i8
+    store i8 %len_hi_b, *%cke_p
+    %cke_p2 = gep i8, *%cke_p, 1
+    store i8 %len_lo_b, *%cke_p2
+    // Copy encrypted pre-master
+    %enc_dst = gep i8, *%cke_p, 2
+    %rb64 = sext i32 %rsa_bytes to i64
+    call @memcpy(%enc_dst, %enc_p, %rb64)
+    %cke_total = add i32 %rsa_bytes, 2
+    %r2 = call @send_hs(%fd, @TlsHandshakeType.ClientKeyExchange, %cke_p, %cke_total)
+    %ok2 = eq i32 %r2, 0
+    br %ok2, @tx, @fail
+  @tx:
+    %off = load i32, *%tx_off
+    %txp = gep i8, *%tx, %off
+    store i8 @TlsHandshakeType.ClientKeyExchange, *%txp
+    %txp_len5 = gep i8, *%txp, 1
+    call @put24(%txp_len5, %cke_total)
+    %b_off = add i32 %off, 4
+    %b_p = gep i8, *%tx, %b_off
+    %cke_64 = sext i32 %cke_total to i64
+    call @memcpy(%b_p, %cke_p, %cke_64)
+    %new = add i32 %off, %cke_total
+    %new2 = add i32 %new, 4
+    store i32 %new2, *%tx_off
+    ret i32 0
+  @fail:
+    ret i32 -1
+}
+
+// Step 6: Send CCS, derive keys
+fun @tls12_step_ccs_derive(ctx: *@TLSContext, fd: i32) -> i32 {
+  @e:
+    %ccs = let [i8, 1]
+    %ccs_p = gep i8, *%ccs, 0
+    store i8 1, *%ccs_p
+    %r = call @tls_write_record(%fd, @TlsContentType.ChangeCipherSpec, 771, %ccs_p, 1)
+    %ok = eq i32 %r, 0
+    br %ok, @derive, @fail
+  @derive:
+    %r2 = call @derive12(%ctx)
+    %ok2 = eq i32 %r2, 0
+    br %ok2, @ok_ret, @fail
+  @ok_ret:
+    ret i32 0
+  @fail:
+    ret i32 -1
+}
+
+const @_client_finished_label: [i8, 15] = [99, 108, 105, 101, 110, 116, 32, 102, 105, 110, 105, 115, 104, 101, 100]
+
+// ... (functions above use this constant)
+fun @tls12_step_finished(ctx: *@TLSContext, fd: i32, tx: *i8, tx_len: i32) -> i32 {
+  @e:
+    %t12 = field @TLSContext, *%ctx, 0
+    %thash = let [i8, 32]
+    %thash_p = gep i8, *%thash, 0
+    call @std_crypto_sha256_compute(%tx, %tx_len, %thash_p)
+    // Build PRF seed: "client finished"(15) || thash(32) = 47 bytes
+    %seed = let [i8, 47]
+    %sp = gep i8, *%seed, 0
+    %cfp = gep i8, *@_cf_label, 0
+    call @memcpy(%sp, %cfp, 15)
+    %s_off = gep i8, *%sp, 15
+    %n32 = let i64
+    store i64 32, *%n32
+    %n32v = load i64, *%n32
+    call @memcpy(%s_off, %thash_p, %n32v)
+    // PRF -> 12 bytes verify_data (TLS12Context field 15 = master_secret)
+    %ms_arr = field @TLS12Context, *%t12, 15
+    %ms_p = gep i8, *%ms_arr, 0
+    %verify = let [i8, 12]
+    %verify_p = gep i8, *%verify, 0
+    call @std_crypto_tls12_prf_sha256(%ms_p, 48, %sp, 47, 12, %verify_p)
+    // Reset seq counters (field 6 = client_seq, field 7 = server_seq)
+    %cseq_p = field @TLS12Context, *%t12, 6
+    %sseq_p = field @TLS12Context, *%t12, 7
+    store i64 0, *%cseq_p
+    store i64 0, *%sseq_p
+    // Build Finished handshake message: type(1) || length(3) || verify_data(12) = 16 bytes
+    %fin_msg = let [i8, 16]
+    %fin_msg_p = gep i8, *%fin_msg, 0
+    store i8 @TlsHandshakeType.Finished, *%fin_msg_p
+    %fin_len_p = gep i8, *%fin_msg_p, 1
+    call @put24(%fin_len_p, 12)   // length = 12
+    %fin_vd = gep i8, *%fin_msg_p, 4
+    call @memcpy(%fin_vd, %verify_p, 12)
+    // Encrypt and send (field 10 = client_write_key, field 12 = client_write_iv)
+    %ckey_arr = field @TLS12Context, *%t12, 10
+    %ckey = gep i8, *%ckey_arr, 0
+    %civ_arr = field @TLS12Context, *%t12, 12
+    %civ = gep i8, *%civ_arr, 0
+    %r = call @tls12_record_encrypt(%fd, %cseq_p, %ckey, %civ, 16, @TlsContentType.Handshake, %fin_msg_p, 16)
+    %ok = eq i32 %r, 0
+    br %ok, @ok_ret, @fail
+  @ok_ret:
+    ret i32 0
+  @fail:
+    ret i32 -1
+}
+
+// Step 8: Read CCS + server Finished
+fun @tls12_step_verify(ctx: *@TLSContext, fd: i32, buf: *i8, cap: i32) -> i32 {
+  @e:
+    %t12 = field @TLSContext, *%ctx, 0
+    %hst = let i8
+    %hstp = gep i8, *%hst, 0
+    %hsl = let i32
+    %hslp = gep i32, *%hsl, 0
+    // Read CCS
+    %r = call @read_hs(%fd, %buf, %cap, %hstp, %hslp)
+    %ok = eq i32 %r, 0
+    br %ok, @check_ccs, @fail
+  @check_ccs:
+    %t = load i8, *%hstp
+    %is_ccs = eq i8 %t, @TlsContentType.ChangeCipherSpec
+    br %is_ccs, @read_fin, @fail
+  @read_fin:
+    %sseq_p = field @TLS12Context, *%t12, 7
+    %skey_arr = field @TLS12Context, *%t12, 11
+    %skey = gep i8, *%skey_arr, 0
+    %siv_arr = field @TLS12Context, *%t12, 13
+    %siv = gep i8, *%siv_arr, 0
+    %fin_ct = let i8
+    %fin_ctp = gep i8, *%fin_ct, 0
+    %fin_len = let i32
+    %fin_lenp = gep i32, *%fin_len, 0
+    %r2 = call @tls12_record_decrypt(%fd, %sseq_p, %skey, %siv, 16, %buf, %cap, %fin_ctp, %fin_lenp)
+    %ok2 = eq i32 %r2, 0
+    // TLS 1.2 AEAD: decryption success means it's the Finished (verified by AAD)
+    br %ok2, @ok_ret, @fail
+  @ok_ret:
+    ret i32 0
+  @fail:
+    ret i32 -1
+}
+
+// Full TLS 1.2 handshake (calls all steps)
+fun @tls12_hs(ctx: *@TLSContext, fd: i32, limbs: i32) -> i32 {
+  @e:
+    %t12 = field @TLSContext, *%ctx, 0
+    // Init TLS12Context fields
+    %fd_p = field @TLS12Context, *%t12, 0
+    store i32 %fd, *%fd_p
+    %ver_p = field @TLS12Context, *%t12, 2
+    store i32 771, *%ver_p
+    %ks_p = field @TLS12Context, *%t12, 3
+    store i32 16, *%ks_p
+    %lm_p = field @TLS12Context, *%t12, 4
+    store i32 %limbs, *%lm_p
+    %cseq_p = field @TLS12Context, *%t12, 6
+    store i64 0, *%cseq_p
+    %sseq_p = field @TLS12Context, *%t12, 7
+    store i64 0, *%sseq_p
+    %tx = let [i8, 16384]
+    %txp = gep i8, *%tx, 0
+    %tx_off = let i32
+    store i32 0, *%tx_off
+    // Step 1: Send CH
+    %r1 = call @tls12_step_ch(%ctx, %fd, %txp, %tx_off)
+    %ok1 = eq i32 %r1, 0
+    br %ok1, @s2, @fail1
+  @s2:
+    %buf = let [i8, 16384]
+    %bp = gep i8, *%buf, 0
+    // Server random (TLS12Context field 9)
+    %sr_arr = field @TLS12Context, *%t12, 9
+    %sr = gep i8, *%sr_arr, 0
+    %cs = let i16
+    %csp = gep i16, *%cs, 0
+    %r2 = call @tls12_step_sh(%fd, %bp, 16384, %sr, %csp, %txp, %tx_off)
+    %ok2 = eq i32 %r2, 0
+    br %ok2, @s3, @fail2
+  @s3:
+    %rsa_n = let [i32, 64]
+    %rsa_e = let [i32, 64]
+    %rn = gep i32, *%rsa_n, 0
+    %re = gep i32, *%rsa_e, 0
+    %r3 = call @tls12_step_cert(%ctx, %fd, %bp, 16384, %rn, %re, %limbs, %txp, %tx_off)
+    %ok3 = eq i32 %r3, 0
+    br %ok3, @s4, @fail3
+  @s4:
+    %r4 = call @tls12_step_shd(%fd, %bp, 16384, %txp, %tx_off)
+    %ok4 = eq i32 %r4, 0
+    br %ok4, @s5, @fail4
+  @s5:
+    %r5 = call @tls12_step_cke(%ctx, %fd, %rn, %re, %limbs, %txp, %tx_off)
+    %ok5 = eq i32 %r5, 0
+    br %ok5, @s6, @fail5
+  @s6:
+    %r6 = call @tls12_step_ccs_derive(%ctx, %fd)
+    %ok6 = eq i32 %r6, 0
+    br %ok6, @s7, @fail6
+  @s7:
+    %txlen = load i32, *%tx_off
+    %r7 = call @tls12_step_finished(%ctx, %fd, %txp, %txlen)
+    %ok7 = eq i32 %r7, 0
+    br %ok7, @s8, @fail7
+  @s8:
+    %r8 = call @tls12_step_verify(%ctx, %fd, %bp, 16384)
+    %ok8 = eq i32 %r8, 0
+    br %ok8, @done, @fail8
+  @done:
+    %st_p = field @TLS12Context, *%t12, 1
+    store i32 1, *%st_p
+    ret i32 0
+  @fail1:
+    ret i32 -1
+  @fail2:
+    ret i32 -2
+  @fail3:
+    ret i32 -3
+  @fail4:
+    ret i32 -4
+  @fail5:
+    ret i32 -5
+  @fail6:
+    ret i32 -6
+  @fail7:
+    ret i32 -7
+  @fail8:
+    ret i32 -8
+}

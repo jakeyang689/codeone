@@ -1,0 +1,128 @@
+// X.509 signature-algorithm and hostname tests.
+//
+// certs/rsa.der  — self-signed SHA-256 + RSA PKCS#1 v1.5
+// certs/pss.der  — self-signed RSASSA-PSS (SHA-256, salt 32)
+// certs/ec.der   — self-signed ECDSA P-256 + SHA-256
+// All three carry SAN: DNS:www.example.com, DNS:*.example.org
+
+extern @printf(fmt: *i8, ...) -> i32
+extern @memcpy(dst: *i8, src: *i8, n: i64) -> *i8
+
+extern @std_io_file_open_read(path: *i8) -> *i8
+extern @std_io_file_read(fp: *i8, buf: *i8, count: i32) -> i64
+extern @std_io_file_close(fp: *i8) -> i32
+
+extern @x509_verify_self_signed(cert_der: *i8, cert_len: i32,
+                                limbs: i32) -> i1
+extern @x509_check_hostname(cert_der: *i8, cert_len: i32, host: *i8,
+                            host_len: i32) -> i1
+
+fun @main() -> i32 {
+  @entry:
+    %buf = let [i8, 4096]
+    %bp = gep i8, *%buf, 0
+    %id = let i32
+    store i32 0, *%id
+
+    // --- RSA PKCS#1 v1.5 ---
+    %n1 = call @_read_cert("certs/rsa.der", %bp)
+    %ok1 = sgt i32 %n1, 0
+    br %ok1, @v1, @fail
+  @v1:
+    store i32 1, *%id
+    %r1 = call @x509_verify_self_signed(%bp, %n1, 64)
+    %r1i = zext i1 %r1 to i32
+    %r1ok = eq i32 %r1i, 1
+    br %r1ok, @v2, @fail
+
+  // --- RSASSA-PSS ---
+  @v2:
+    store i32 2, *%id
+    %n2 = call @_read_cert("certs/pss.der", %bp)
+    %ok2 = sgt i32 %n2, 0
+    br %ok2, @v2b, @fail
+  @v2b:
+    %r2 = call @x509_verify_self_signed(%bp, %n2, 64)
+    %r2i = zext i1 %r2 to i32
+    %r2ok = eq i32 %r2i, 1
+    br %r2ok, @v3, @fail
+
+  // --- ECDSA P-256 ---
+  @v3:
+    store i32 3, *%id
+    %n3 = call @_read_cert("certs/ec.der", %bp)
+    %ok3 = sgt i32 %n3, 0
+    br %ok3, @v3b, @fail
+  @v3b:
+    %r3 = call @x509_verify_self_signed(%bp, %n3, 64)
+    %r3i = zext i1 %r3 to i32
+    %r3ok = eq i32 %r3i, 1
+    br %r3ok, @host1, @fail
+
+  // --- SAN matching on the RSA certificate ---
+  @host1:
+    store i32 4, *%id
+    %n4 = call @_read_cert("certs/rsa.der", %bp)
+    %h1 = call @x509_check_hostname(%bp, %n4, "www.example.com", 15)
+    %h1i = zext i1 %h1 to i32
+    %h1ok = eq i32 %h1i, 1
+    br %h1ok, @host2, @fail
+  @host2:
+    store i32 5, *%id
+    %h2 = call @x509_check_hostname(%bp, %n4, "example.com", 11)
+    %h2i = zext i1 %h2 to i32
+    %h2ok = eq i32 %h2i, 0
+    br %h2ok, @host3, @fail
+  @host3:
+    store i32 6, *%id
+    %h3 = call @x509_check_hostname(%bp, %n4, "a.example.org", 13)
+    %h3i = zext i1 %h3 to i32
+    %h3ok = eq i32 %h3i, 1
+    br %h3ok, @host4, @fail
+  @host4:
+    store i32 7, *%id
+    %h4 = call @x509_check_hostname(%bp, %n4, "a.b.example.org", 15)
+    %h4i = zext i1 %h4 to i32
+    %h4ok = eq i32 %h4i, 0
+    br %h4ok, @bad, @fail
+
+  // --- Tampered TBS must not verify ---
+  @bad:
+    store i32 8, *%id
+    %tam = let [i8, 4096]
+    %tamp = gep i8, *%tam, 0
+    call @memcpy(%tamp, %bp, 900)
+    %flip = gep i8, *%tam, 100
+    %fv = load i8, *%flip
+    %fvz = zext i8 %fv to i32
+    %fv1 = add i32 %fvz, 1
+    %fvb = trunc i32 %fv1 to i8
+    store i8 %fvb, *%flip
+    %r8 = call @x509_verify_self_signed(%tamp, %n4, 64)
+    %r8i = zext i1 %r8 to i32
+    %r8ok = eq i32 %r8i, 0
+    br %r8ok, @pass, @fail
+
+  @pass:
+    call @printf("PASS x509_algs\n")
+    ret i32 0
+  @fail:
+    %cid = load i32, *%id
+    call @printf("FAIL x509_algs at case %d\n", %cid)
+    ret i32 1
+}
+
+// Read a whole file into buf; returns the byte count or -1.
+fun @_read_cert(path: *i8, buf: *i8) -> i32 {
+  @entry:
+    %fp = call @std_io_file_open_read(%path)
+    %null = eq *i8 %fp, null
+    br %null, @rc_fail, @rc_read
+  @rc_read:
+    %n64 = call @std_io_file_read(%fp, %buf, 4096)
+    call @std_io_file_close(%fp)
+    %n = trunc i64 %n64 to i32
+    ret i32 %n
+  @rc_fail:
+    ret i32 -1
+}

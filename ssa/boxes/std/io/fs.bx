@@ -1,0 +1,88 @@
+// Filesystem metadata and directory iteration.
+//
+// Backed by ssa/platform/fs.c (POSIX stat/opendir), so programs must link the
+// platform library. Paths are NUL-terminated. Boolean queries return 1 or 0;
+// size/mtime return -1 on error; mutations return 0 or -1.
+
+extern @c1_fs_exists(path: *i8) -> i32
+extern @c1_fs_is_file(path: *i8) -> i32
+extern @c1_fs_is_dir(path: *i8) -> i32
+extern @c1_fs_size(path: *i8) -> i64
+extern @c1_fs_mtime(path: *i8) -> i64
+extern @c1_fs_mkdir(path: *i8) -> i32
+extern @c1_fs_remove(path: *i8) -> i32
+extern @c1_fs_rename(src: *i8, dst: *i8) -> i32
+extern @c1_fs_opendir(path: *i8) -> *i8
+extern @c1_fs_readdir(dir: *i8, name: *i8, cap: i32) -> i32
+extern @c1_fs_closedir(dir: *i8) -> i32
+
+fun @std_io_fs_exists(path: *i8) -> i32 {
+  @entry:
+    %r = call @c1_fs_exists(%path)
+    ret i32 %r
+}
+
+fun @std_io_fs_is_file(path: *i8) -> i32 {
+  @entry:
+    %r = call @c1_fs_is_file(%path)
+    ret i32 %r
+}
+
+fun @std_io_fs_is_dir(path: *i8) -> i32 {
+  @entry:
+    %r = call @c1_fs_is_dir(%path)
+    ret i32 %r
+}
+
+fun @std_io_fs_size(path: *i8) -> i64 {
+  @entry:
+    %r = call @c1_fs_size(%path)
+    ret i64 %r
+}
+
+// Last modification time in Unix seconds.
+fun @std_io_fs_mtime(path: *i8) -> i64 {
+  @entry:
+    %r = call @c1_fs_mtime(%path)
+    ret i64 %r
+}
+
+fun @std_io_fs_mkdir(path: *i8) -> i32 {
+  @entry:
+    %r = call @c1_fs_mkdir(%path)
+    ret i32 %r
+}
+
+// Remove a file or an empty directory.
+fun @std_io_fs_remove(path: *i8) -> i32 {
+  @entry:
+    %r = call @c1_fs_remove(%path)
+    ret i32 %r
+}
+
+fun @std_io_fs_rename(src: *i8, dst: *i8) -> i32 {
+  @entry:
+    %r = call @c1_fs_rename(%src, %dst)
+    ret i32 %r
+}
+
+// Open a directory for iteration; returns null on failure.
+fun @std_io_fs_opendir(path: *i8) -> *i8 {
+  @entry:
+    %r = call @c1_fs_opendir(%path)
+    ret *i8 %r
+}
+
+// Read the next entry name into name. Returns 1 = entry, 0 = end,
+// -1 = error or the buffer is too small.
+fun @std_io_fs_readdir(dir: *i8, name: *i8, cap: i32) -> i32 {
+  @entry:
+    %r = call @c1_fs_readdir(%dir, %name, %cap)
+    ret i32 %r
+}
+
+fun @std_io_fs_closedir(dir: *i8) -> i32 {
+  @entry:
+    %r = call @c1_fs_closedir(%dir)
+    ret i32 %r
+}

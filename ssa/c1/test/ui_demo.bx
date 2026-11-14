@@ -1,0 +1,225 @@
+// Route-A UI demo: raylib does the pixels, this file does the widget tree.
+//
+//   tools/setup-thirdparty.sh      # once, unpacks and builds raylib
+//   c1 ui_demo.bx boxes/std/ui/widget.bx -L platform -l platform \
+//      -L thirdparty/raylib/build/raylib -l raylib \
+//      --link-flag "-framework Cocoa" --link-flag "-framework IOKit" \
+//      --link-flag "-framework OpenGL" --link-flag "-framework CoreVideo"
+//
+// Runs 30 frames, writes ui_demo.png and exits.
+
+extern @c1_ui_init(width: i32, height: i32, title: *i8) -> i32
+extern @c1_ui_close() -> void
+extern @c1_ui_begin_frame() -> i32
+extern @c1_ui_end_frame() -> void
+extern @c1_ui_clear(rgb: i32) -> void
+extern @c1_ui_load_font(path: *i8, size: i32) -> i32
+extern @c1_ui_screenshot(path: *i8) -> void
+extern @c1_ui_mouse_x() -> i32
+extern @c1_ui_mouse_y() -> i32
+extern @c1_ui_mouse_down() -> i32
+extern @c1_ui_mouse_pressed() -> i32
+extern @printf(fmt: *i8, ...) -> i32
+
+// Struct declarations are per-file in SSA; this must stay identical to the
+// one in boxes/std/ui/widget.bx.
+struct @UiNode {
+  @kind: i32,
+  @pad: i32,
+  @gap: i32,
+  @radius: i32,
+  @color: i32,
+  @text: *i8,
+  @font_size: i32,
+  @x: i32,
+  @y: i32,
+  @w: i32,
+  @h: i32,
+  @first_child: *@UiNode,
+  @last_child: *@UiNode,
+  @next_sibling: *@UiNode,
+  @text_color: i32,
+  @state: i32,
+  @value: i32,
+  @max: i32
+}
+
+// The widget runtime lives in boxes/std/ui/widget.bx; cross-file calls need
+// a declaration just like libc ones.
+extern @std_ui_box(n: *@UiNode, kind: i32, pad: i32, gap: i32) -> void
+extern @std_ui_rect(n: *@UiNode, w: i32, h: i32, color: i32, radius: i32) -> void
+extern @std_ui_text(n: *@UiNode, text: *i8, size: i32, color: i32) -> void
+extern @std_ui_fill(n: *@UiNode, color: i32, radius: i32) -> void
+extern @std_ui_append(parent: *@UiNode, child: *@UiNode) -> void
+extern @std_ui_layout(root: *@UiNode, x: i32, y: i32, w: i32) -> void
+extern @std_ui_paint(n: *@UiNode) -> void
+extern @std_ui_button(n: *@UiNode, text: *i8, size: i32, bg: i32, fg: i32, radius: i32) -> void
+extern @std_ui_button_update(n: *@UiNode, px: i32, py: i32, down: i32) -> void
+extern @std_ui_button_at(root: *@UiNode, px: i32, py: i32) -> *@UiNode
+extern @std_ui_checkbox(n: *@UiNode, text: *i8, size: i32, accent: i32, fg: i32) -> void
+extern @std_ui_slider(n: *@UiNode, value: i32, max: i32, accent: i32, track: i32) -> void
+extern @std_ui_progress(n: *@UiNode, value: i32, max: i32, accent: i32, track: i32) -> void
+extern @std_ui_input(n: *@UiNode, text: *i8, capacity: i32, size: i32, bg: i32, fg: i32) -> void
+extern @std_ui_pointer(n: *@UiNode, px: i32, py: i32, down: i32, clicked: i32) -> void
+extern @std_ui_keyboard(n: *@UiNode) -> i32
+
+// Must match boxes/std/ui/widget.bx.
+enum @UiKind: i32 {
+  @Column = 0,
+  @Row = 1,
+  @Rect = 2,
+  @Text = 3,
+  @Button = 4,
+  @Checkbox = 5,
+  @Slider = 6,
+  @Progress = 7,
+  @Input = 8
+}
+
+fun @main() -> i32 {
+@entry:
+  %ok = call @c1_ui_init(760, 720, "codeone - route A")
+  %bad = ne i32 %ok, 0
+  br %bad, @fail, @setup
+@setup:
+  %ign = call @c1_ui_load_font("/System/Library/Fonts/Supplemental/Arial.ttf", 48)
+  %nodes = let [@UiNode, 32]
+
+  // Text-field buffer. The widget writes into it while focused; capacity
+  // counts the terminating NUL.
+  %ibuf = let [i8, 64]
+  %ib0 = gep i8, *%ibuf, 0
+  store i8 0, *%ib0
+
+  // root column
+  %root = gep @UiNode, *%nodes, 0
+  call @std_ui_box(%root, @UiKind.Column, 0, 20)
+
+  // card 1
+  %card1 = gep @UiNode, *%nodes, 1
+  call @std_ui_box(%card1, @UiKind.Column, 24, 12)
+  call @std_ui_fill(%card1, 0x1E242C, 16)
+  call @std_ui_append(%root, %card1)
+
+  %title = gep @UiNode, *%nodes, 2
+  call @std_ui_text(%title, "Route A: raylib + SSA", 26, 0xE6EDF3)
+  call @std_ui_append(%card1, %title)
+
+  %sub = gep @UiNode, *%nodes, 3
+  call @std_ui_text(%sub, "widget tree, flex layout and painting are .bx code", 16, 0x9DA7B3)
+  call @std_ui_append(%card1, %sub)
+
+  %bar = gep @UiNode, *%nodes, 4
+  call @std_ui_rect(%bar, 200, 6, 0x3B82F6, 3)
+  call @std_ui_append(%card1, %bar)
+
+  %row = gep @UiNode, *%nodes, 5
+  call @std_ui_box(%row, @UiKind.Row, 0, 16)
+  call @std_ui_append(%card1, %row)
+
+  %tile = gep @UiNode, *%nodes, 6
+  call @std_ui_rect(%tile, 96, 96, 0x2563EB, 12)
+  call @std_ui_append(%row, %tile)
+
+  %lines = gep @UiNode, *%nodes, 7
+  call @std_ui_box(%lines, @UiKind.Column, 0, 6)
+  call @std_ui_append(%row, %lines)
+
+  %l1 = gep @UiNode, *%nodes, 8
+  call @std_ui_text(%l1, "layout    column / row", 15, 0x9DA7B3)
+  call @std_ui_append(%lines, %l1)
+
+  %l2 = gep @UiNode, *%nodes, 9
+  call @std_ui_text(%l2, "paint     pre-order", 15, 0x9DA7B3)
+  call @std_ui_append(%lines, %l2)
+
+  %l3 = gep @UiNode, *%nodes, 10
+  call @std_ui_text(%l3, "hit test  topmost node", 15, 0x9DA7B3)
+  call @std_ui_append(%lines, %l3)
+
+  // card 2
+  %card2 = gep @UiNode, *%nodes, 11
+  call @std_ui_box(%card2, @UiKind.Column, 20, 8)
+  call @std_ui_fill(%card2, 0x1E242C, 16)
+  call @std_ui_append(%root, %card2)
+
+  %c2t = gep @UiNode, *%nodes, 12
+  call @std_ui_text(%c2t, "measure -> arrange -> paint", 18, 0xE6EDF3)
+  call @std_ui_append(%card2, %c2t)
+
+  %c2s = gep @UiNode, *%nodes, 13
+  call @std_ui_text(%c2s, "3 recursive passes, no C above the platform wrappers", 15, 0x9DA7B3)
+  call @std_ui_append(%card2, %c2s)
+
+  %btn = gep @UiNode, *%nodes, 14
+  call @std_ui_button(%btn, "Click me", 16, 0x2563EB, 0xFFFFFF, 8)
+  call @std_ui_append(%card2, %btn)
+
+  // card 3: interactive widgets
+  %card3 = gep @UiNode, *%nodes, 15
+  call @std_ui_box(%card3, @UiKind.Column, 20, 10)
+  call @std_ui_fill(%card3, 0x1E242C, 16)
+  call @std_ui_append(%root, %card3)
+
+  %c3t = gep @UiNode, *%nodes, 16
+  call @std_ui_text(%c3t, "checkbox, slider, progress, text field", 18, 0xE6EDF3)
+  call @std_ui_append(%card3, %c3t)
+
+  %c3cb = gep @UiNode, *%nodes, 17
+  call @std_ui_checkbox(%c3cb, "Enable option", 16, 0x2563EB, 0xE6EDF3)
+  call @std_ui_append(%card3, %c3cb)
+
+  %c3sl = gep @UiNode, *%nodes, 18
+  call @std_ui_slider(%c3sl, 40, 100, 0x2563EB, 0x2D3540)
+  call @std_ui_append(%card3, %c3sl)
+
+  %c3pg = gep @UiNode, *%nodes, 19
+  call @std_ui_progress(%c3pg, 70, 100, 0x22C55E, 0x2D3540)
+  call @std_ui_append(%card3, %c3pg)
+
+  %c3in = gep @UiNode, *%nodes, 20
+  %ibp = gep i8, *%ibuf, 0
+  call @std_ui_input(%c3in, %ibp, 64, 16, 0x0E1116, 0xE6EDF3)
+  call @std_ui_append(%card3, %c3in)
+
+  %frames = let i32
+  store i32 0, *%frames
+  jmp @loop
+@loop:
+  %run = call @c1_ui_begin_frame()
+  %stop = eq i32 %run, 0
+  br %stop, @done, @draw
+@draw:
+  call @c1_ui_clear(0x12161C)
+  call @std_ui_layout(%root, 48, 40, 560)
+  %mx = call @c1_ui_mouse_x()
+  %my = call @c1_ui_mouse_y()
+  %down = call @c1_ui_mouse_down()
+  %pressed = call @c1_ui_mouse_pressed()
+  call @std_ui_pointer(%root, %mx, %my, %down, %pressed)
+  %ign2 = call @std_ui_keyboard(%root)
+  %p = ne i32 %pressed, 0
+  %b = call @std_ui_button_at(%root, %mx, %my)
+  %hasb = ne *@UiNode %b, null
+  %click = and i1 %p, %hasb
+  br %click, @on_click, @paint
+@on_click:
+  call @printf("button clicked\n")
+  jmp @paint
+@paint:
+  call @std_ui_paint(%root)
+  call @c1_ui_end_frame()
+  %f = load i32, *%frames
+  %f2 = add i32 %f, 1
+  store i32 %f2, *%frames
+  %enough = sge i32 %f2, 30
+  br %enough, @shot, @loop
+@shot:
+  call @c1_ui_screenshot("ui_demo.png")
+  jmp @done
+@done:
+  call @c1_ui_close()
+  ret i32 0
+@fail:
+  ret i32 1
+}

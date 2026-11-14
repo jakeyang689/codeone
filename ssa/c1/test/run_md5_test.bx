@@ -1,0 +1,69 @@
+// Standalone MD5 test runner
+// MD5("hello") = 5d41402abc4b2a76b9719d911017c592
+
+extern @std_crypto_md5_compute(data: *i8, len: i32, digest: *i8) -> void
+
+fun @main() -> i32 {
+  @entry:
+    // "hello" as byte array
+    %data = let [i8, 5]
+    %p0 = gep i8, *%data, 0
+    store i8 104, *%p0
+    %p1 = gep i8, *%data, 1
+    store i8 101, *%p1
+    %p2 = gep i8, *%data, 2
+    store i8 108, *%p2
+    %p3 = gep i8, *%data, 3
+    store i8 108, *%p3
+    %p4 = gep i8, *%data, 4
+    store i8 111, *%p4
+
+    %dp = gep i8, *%data, 0
+    %digest = let [i8, 16]
+    %dg = gep i8, *%digest, 0
+    call @std_crypto_md5_compute(%dp, 5, %dg)
+
+    // Check bytes of MD5("hello")
+    // Expected: 5d 41 40 2a bc 4b 2a 76 b9 71 9d 91 10 17 c5 92
+
+    // Byte 0 = 0x5d
+    %b0 = load i8, *%dg
+    %c0 = eq i8 %b0, 0x5d
+    br %c0, @c1, @fail
+
+  @c1:
+    %p1c = gep i8, *%digest, 1
+    %b1 = load i8, *%p1c
+    %c1v = eq i8 %b1, 0x41
+    br %c1v, @c2, @fail
+
+  @c2:
+    %p2c = gep i8, *%digest, 2
+    %b2 = load i8, *%p2c
+    %c2v = eq i8 %b2, 0x40
+    br %c2v, @c3, @fail
+
+  @c3:
+    %p3c = gep i8, *%digest, 3
+    %b3 = load i8, *%p3c
+    %c3v = eq i8 %b3, 0x2a
+    br %c3v, @c4, @fail
+
+  @c4:
+    %p4c = gep i8, *%digest, 4
+    %b4 = load i8, *%p4c
+    %c4v = eq i8 %b4, 0xbc
+    br %c4v, @c5, @fail
+
+  @c5:
+    // Byte 15 = 0x92
+    %p15 = gep i8, *%digest, 15
+    %b15 = load i8, *%p15
+    %c15v = eq i8 %b15, 0x92
+    br %c15v, @pass, @fail
+
+  @pass:
+    ret i32 0
+  @fail:
+    ret i32 1
+}

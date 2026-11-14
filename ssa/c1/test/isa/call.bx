@@ -1,0 +1,88 @@
+// call semantics: mixed parameter types, recursion, pointer arguments,
+// and calling a function defined later in the file.
+
+extern @printf(fmt: *i8, ...) -> i32
+
+fun @main() -> i32 {
+  @entry:
+    %id = let i32
+    store i32 0, *%id
+
+    // --- recursion ---
+    %f = call @fact(5)
+    %c1 = eq i32 %f, 120
+    br %c1, @t1, @fail
+
+  @t1:
+    store i32 1, *%id
+    // --- mixed parameter widths ---
+    %m = call @mix(1, 2, 3, 4)
+    %c2 = eq i64 %m, 10
+    br %c2, @t2, @fail
+
+  @t2:
+    store i32 2, *%id
+    // --- pointer argument ---
+    %buf = let [i32, 2]
+    %bp = gep i32, *%buf, 0
+    store i32 5, *%bp
+    %bp1 = gep i32, *%buf, 1
+    store i32 6, *%bp1
+    %s = call @sum2(%buf)
+    %c3 = eq i32 %s, 11
+    br %c3, @t3, @fail
+
+  @t3:
+    store i32 3, *%id
+    // --- call a function defined below main ---
+    %l = call @defined_later(4)
+    %c4 = eq i32 %l, 16
+    br %c4, @pass, @fail
+
+  @pass:
+    call @printf("PASS isa/call\n")
+    ret i32 0
+  @fail:
+    %n = load i32, *%id
+    call @printf("FAIL isa/call at case %d\n", %n)
+    ret i32 1
+}
+
+fun @fact(n: i32) -> i32 {
+  @entry:
+    %base = sle i32 %n, 1
+    br %base, @one, @rec
+  @one:
+    ret i32 1
+  @rec:
+    %m = sub i32 %n, 1
+    %f = call @fact(%m)
+    %r = mul i32 %n, %f
+    ret i32 %r
+}
+
+fun @mix(a: i8, b: i16, c: i32, d: i64) -> i64 {
+  @entry:
+    %az = sext i8 %a to i64
+    %bz = sext i16 %b to i64
+    %cz = sext i32 %c to i64
+    %s1 = add i64 %az, %bz
+    %s2 = add i64 %s1, %cz
+    %s3 = add i64 %s2, %d
+    ret i64 %s3
+}
+
+fun @sum2(p: *i32) -> i32 {
+  @entry:
+    %a = load i32, *%p
+    %p1 = gep i32, *%p, 1
+    %b = load i32, *%p1
+    %s = add i32 %a, %b
+    ret i32 %s
+}
+
+fun @defined_later(x: i32) -> i32 {
+  @entry:
+    %sq = mul i32 %x, %x
+    ret i32 %sq
+}

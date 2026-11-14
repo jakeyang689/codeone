@@ -1,0 +1,163 @@
+// net_url_parse tests.
+
+extern @printf(fmt: *i8, ...) -> i32
+extern @memcmp(a: *i8, b: *i8, n: i64) -> i32
+extern @net_url_parse(url: *i8, len: i32, out: *@HttpUrl) -> i32
+
+struct @HttpUrl {
+  @scheme: i32,
+  @host_off: i32,
+  @host_len: i32,
+  @port: i32,
+  @path_off: i32,
+  @path_len: i32,
+  @query_off: i32,
+  @query_len: i32
+}
+
+const @U1: [i8, 21] = "https://example.com/"
+const @U2: [i8, 32] = "http://example.com:8080/a/b?x=1"
+const @U3: [i8, 20] = "https://example.com"
+const @U4: [i8, 14] = "example.com/x"
+
+fun @main() -> i32 {
+  @entry:
+    %id = let i32
+    store i32 0, *%id
+    %u = let [i32, 8]
+    %up = gep i32, *%u, 0
+
+    // --- https with path ---
+    %p1 = gep i8, *@U1, 0
+    %r1 = call @net_url_parse(%p1, 20, %up)
+    %r1_ok = eq i32 %r1, 0
+    br %r1_ok, @t1, @fail
+  @t1:
+    store i32 1, *%id
+    %f0 = field @HttpUrl, *%up, 0
+    %scheme = load i32, *%f0
+    %f3 = field @HttpUrl, *%up, 3
+    %port = load i32, *%f3
+    %f1 = field @HttpUrl, *%up, 1
+    %hoff = load i32, *%f1
+    %f2 = field @HttpUrl, *%up, 2
+    %hlen = load i32, *%f2
+    %f4 = field @HttpUrl, *%up, 4
+    %poff = load i32, *%f4
+    %f5 = field @HttpUrl, *%up, 5
+    %plen = load i32, *%f5
+    %f7 = field @HttpUrl, *%up, 7
+    %qlen = load i32, *%f7
+    %c_s = eq i32 %scheme, 1
+    %c_p = eq i32 %port, 443
+    %c_ho = eq i32 %hoff, 8
+    %c_hl = eq i32 %hlen, 11
+    %c_po = eq i32 %poff, 19
+    %c_pl = eq i32 %plen, 1
+    %c_ql = eq i32 %qlen, 0
+    %x1 = and i1 %c_s, %c_p
+    %x2 = and i1 %c_ho, %c_hl
+    %x3 = and i1 %c_po, %c_pl
+    %x4 = and i1 %x1, %x2
+    %x5 = and i1 %x3, %c_ql
+    %all = and i1 %x4, %x5
+    br %all, @t1b, @fail
+  @t1b:
+    %hp = gep i8, *%p1, %hoff
+    %hd = call @memcmp(%hp, "example.com", 11)
+    %hd_ok = eq i32 %hd, 0
+    br %hd_ok, @t2, @fail
+
+  @t2:
+    store i32 2, *%id
+    // --- http with explicit port, path and query ---
+    %p2 = gep i8, *@U2, 0
+    %r2 = call @net_url_parse(%p2, 31, %up)
+    %r2_ok = eq i32 %r2, 0
+    br %r2_ok, @t2b, @fail
+  @t2b:
+    %g0 = field @HttpUrl, *%up, 0
+    %s2 = load i32, *%g0
+    %g3 = field @HttpUrl, *%up, 3
+    %pt2 = load i32, *%g3
+    %g1 = field @HttpUrl, *%up, 1
+    %ho2 = load i32, *%g1
+    %g4 = field @HttpUrl, *%up, 4
+    %po2 = load i32, *%g4
+    %g5 = field @HttpUrl, *%up, 5
+    %pl2 = load i32, *%g5
+    %g6 = field @HttpUrl, *%up, 6
+    %qo2 = load i32, *%g6
+    %g7 = field @HttpUrl, *%up, 7
+    %ql2 = load i32, *%g7
+    %d_s = eq i32 %s2, 0
+    %d_p = eq i32 %pt2, 8080
+    %d_ho = eq i32 %ho2, 7
+    %d_po = eq i32 %po2, 23
+    %d_pl = eq i32 %pl2, 4
+    %d_qo = eq i32 %qo2, 28
+    %d_ql = eq i32 %ql2, 3
+    %y1 = and i1 %d_s, %d_p
+    %y2 = and i1 %d_ho, %d_po
+    %y3 = and i1 %d_pl, %d_qo
+    %y4 = and i1 %d_ql, %y1
+    %y5 = and i1 %y2, %y3
+    %all2 = and i1 %y4, %y5
+    br %all2, @t2c, @fail
+  @t2c:
+    %pp2 = gep i8, *%p2, %po2
+    %pd = call @memcmp(%pp2, "/a/b", 4)
+    %pd_ok = eq i32 %pd, 0
+    br %pd_ok, @t2d, @fail
+  @t2d:
+    %qp2 = gep i8, *%p2, %qo2
+    %qd = call @memcmp(%qp2, "x=1", 3)
+    %qd_ok = eq i32 %qd, 0
+    br %qd_ok, @t3, @fail
+
+  @t3:
+    store i32 3, *%id
+    // --- no path ---
+    %p3 = gep i8, *@U3, 0
+    %r3 = call @net_url_parse(%p3, 19, %up)
+    %r3_ok = eq i32 %r3, 0
+    br %r3_ok, @t3b, @fail
+  @t3b:
+    %h4 = field @HttpUrl, *%up, 5
+    %pl3 = load i32, *%h4
+    %pl3_ok = eq i32 %pl3, 0
+    br %pl3_ok, @t4, @fail
+
+  @t4:
+    store i32 4, *%id
+    // --- no scheme ---
+    %p4 = gep i8, *@U4, 0
+    %r4 = call @net_url_parse(%p4, 13, %up)
+    %r4_ok = eq i32 %r4, 0
+    br %r4_ok, @t4b, @fail
+  @t4b:
+    %i0 = field @HttpUrl, *%up, 0
+    %s4 = load i32, *%i0
+    %i3 = field @HttpUrl, *%up, 3
+    %pt4 = load i32, *%i3
+    %i1 = field @HttpUrl, *%up, 1
+    %ho4 = load i32, *%i1
+    %i5 = field @HttpUrl, *%up, 5
+    %pl4 = load i32, *%i5
+    %e_s = eq i32 %s4, 0
+    %e_p = eq i32 %pt4, 80
+    %e_ho = eq i32 %ho4, 0
+    %e_pl = eq i32 %pl4, 2
+    %z1 = and i1 %e_s, %e_p
+    %z2 = and i1 %e_ho, %e_pl
+    %z3 = and i1 %z1, %z2
+    br %z3, @pass, @fail
+
+  @pass:
+    call @printf("PASS url_parse\n")
+    ret i32 0
+  @fail:
+    %n = load i32, *%id
+    call @printf("FAIL url_parse at case %d\n", %n)
+    ret i32 1
+}

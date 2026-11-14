@@ -1,0 +1,2785 @@
+// AES-128 encryption/decryption
+// 128-bit block, 128-bit key, 10 rounds
+// State: column-major 4x4 byte array
+
+// Platform dependencies (libc + hardware crypto)
+extern @memset(s: *i8, c: i32, n: i64) -> *i8
+extern @memcpy(dst: *i8, src: *i8, n: i64) -> *i8
+extern @c1_random_buf(buf: *i8, len: i64) -> void
+extern @c1_cpu_features() -> i64
+extern @c1_aes128_encrypt_block(in: *i8, key: *i8, out: *i8) -> void
+extern @c1_aes128_decrypt_block(in: *i8, key: *i8, out: *i8) -> void
+extern @c1_aes256_encrypt_block(in: *i8, key: *i8, out: *i8) -> void
+extern @c1_aes256_decrypt_block(in: *i8, key: *i8, out: *i8) -> void
+extern @c1_aes128_cbc_encrypt(in: *i8, len: i32, key: *i8, iv: *i8, out: *i8) -> void
+extern @c1_aes128_cbc_decrypt(in: *i8, len: i32, key: *i8, iv: *i8, out: *i8) -> void
+extern @c1_aes256_cbc_encrypt(in: *i8, len: i32, key: *i8, iv: *i8, out: *i8) -> void
+extern @c1_aes256_cbc_decrypt(in: *i8, len: i32, key: *i8, iv: *i8, out: *i8) -> void
+extern @c1_aes128_gcm_encrypt(pt: *i8, pt_len: i32, aad: *i8, aad_len: i32, key: *i8, iv: *i8, ct: *i8, tag: *i8) -> i32
+extern @c1_aes128_gcm_decrypt(ct: *i8, ct_len: i32, aad: *i8, aad_len: i32, key: *i8, iv: *i8, tag: *i8, pt: *i8) -> i32
+extern @c1_aes256_gcm_encrypt(pt: *i8, pt_len: i32, aad: *i8, aad_len: i32, key: *i8, iv: *i8, ct: *i8, tag: *i8) -> i32
+extern @c1_aes256_gcm_decrypt(ct: *i8, ct_len: i32, aad: *i8, aad_len: i32, key: *i8, iv: *i8, tag: *i8, pt: *i8) -> i32
+
+// ============================================================
+// Constants
+// ============================================================
+
+// AES S-box (row-major)
+const @_sbox: [i8, 256] = [
+  0x63, 0x7c, 0x77, 0x7b, 0xf2, 0x6b, 0x6f, 0xc5, 0x30, 0x01, 0x67, 0x2b, 0xfe, 0xd7, 0xab, 0x76,
+  0xca, 0x82, 0xc9, 0x7d, 0xfa, 0x59, 0x47, 0xf0, 0xad, 0xd4, 0xa2, 0xaf, 0x9c, 0xa4, 0x72, 0xc0,
+  0xb7, 0xfd, 0x93, 0x26, 0x36, 0x3f, 0xf7, 0xcc, 0x34, 0xa5, 0xe5, 0xf1, 0x71, 0xd8, 0x31, 0x15,
+  0x04, 0xc7, 0x23, 0xc3, 0x18, 0x96, 0x05, 0x9a, 0x07, 0x12, 0x80, 0xe2, 0xeb, 0x27, 0xb2, 0x75,
+  0x09, 0x83, 0x2c, 0x1a, 0x1b, 0x6e, 0x5a, 0xa0, 0x52, 0x3b, 0xd6, 0xb3, 0x29, 0xe3, 0x2f, 0x84,
+  0x53, 0xd1, 0x00, 0xed, 0x20, 0xfc, 0xb1, 0x5b, 0x6a, 0xcb, 0xbe, 0x39, 0x4a, 0x4c, 0x58, 0xcf,
+  0xd0, 0xef, 0xaa, 0xfb, 0x43, 0x4d, 0x33, 0x85, 0x45, 0xf9, 0x02, 0x7f, 0x50, 0x3c, 0x9f, 0xa8,
+  0x51, 0xa3, 0x40, 0x8f, 0x92, 0x9d, 0x38, 0xf5, 0xbc, 0xb6, 0xda, 0x21, 0x10, 0xff, 0xf3, 0xd2,
+  0xcd, 0x0c, 0x13, 0xec, 0x5f, 0x97, 0x44, 0x17, 0xc4, 0xa7, 0x7e, 0x3d, 0x64, 0x5d, 0x19, 0x73,
+  0x60, 0x81, 0x4f, 0xdc, 0x22, 0x2a, 0x90, 0x88, 0x46, 0xee, 0xb8, 0x14, 0xde, 0x5e, 0x0b, 0xdb,
+  0xe0, 0x32, 0x3a, 0x0a, 0x49, 0x06, 0x24, 0x5c, 0xc2, 0xd3, 0xac, 0x62, 0x91, 0x95, 0xe4, 0x79,
+  0xe7, 0xc8, 0x37, 0x6d, 0x8d, 0xd5, 0x4e, 0xa9, 0x6c, 0x56, 0xf4, 0xea, 0x65, 0x7a, 0xae, 0x08,
+  0xba, 0x78, 0x25, 0x2e, 0x1c, 0xa6, 0xb4, 0xc6, 0xe8, 0xdd, 0x74, 0x1f, 0x4b, 0xbd, 0x8b, 0x8a,
+  0x70, 0x3e, 0xb5, 0x66, 0x48, 0x03, 0xf6, 0x0e, 0x61, 0x35, 0x57, 0xb9, 0x86, 0xc1, 0x1d, 0x9e,
+  0xe1, 0xf8, 0x98, 0x11, 0x69, 0xd9, 0x8e, 0x94, 0x9b, 0x1e, 0x87, 0xe9, 0xce, 0x55, 0x28, 0xdf,
+  0x8c, 0xa1, 0x89, 0x0d, 0xbf, 0xe6, 0x42, 0x68, 0x41, 0x99, 0x2d, 0x0f, 0xb0, 0x54, 0xbb, 0x16
+]
+
+// Inverse S-box
+const @_inv_sbox: [i8, 256] = [
+  0x52, 0x09, 0x6a, 0xd5, 0x30, 0x36, 0xa5, 0x38, 0xbf, 0x40, 0xa3, 0x9e, 0x81, 0xf3, 0xd7, 0xfb,
+  0x7c, 0xe3, 0x39, 0x82, 0x9b, 0x2f, 0xff, 0x87, 0x34, 0x8e, 0x43, 0x44, 0xc4, 0xde, 0xe9, 0xcb,
+  0x54, 0x7b, 0x94, 0x32, 0xa6, 0xc2, 0x23, 0x3d, 0xee, 0x4c, 0x95, 0x0b, 0x42, 0xfa, 0xc3, 0x4e,
+  0x08, 0x2e, 0xa1, 0x66, 0x28, 0xd9, 0x24, 0xb2, 0x76, 0x5b, 0xa2, 0x49, 0x6d, 0x8b, 0xd1, 0x25,
+  0x72, 0xf8, 0xf6, 0x64, 0x86, 0x68, 0x98, 0x16, 0xd4, 0xa4, 0x5c, 0xcc, 0x5d, 0x65, 0xb6, 0x92,
+  0x6c, 0x70, 0x48, 0x50, 0xfd, 0xed, 0xb9, 0xda, 0x5e, 0x15, 0x46, 0x57, 0xa7, 0x8d, 0x9d, 0x84,
+  0x90, 0xd8, 0xab, 0x00, 0x8c, 0xbc, 0xd3, 0x0a, 0xf7, 0xe4, 0x58, 0x05, 0xb8, 0xb3, 0x45, 0x06,
+  0xd0, 0x2c, 0x1e, 0x8f, 0xca, 0x3f, 0x0f, 0x02, 0xc1, 0xaf, 0xbd, 0x03, 0x01, 0x13, 0x8a, 0x6b,
+  0x3a, 0x91, 0x11, 0x41, 0x4f, 0x67, 0xdc, 0xea, 0x97, 0xf2, 0xcf, 0xce, 0xf0, 0xb4, 0xe6, 0x73,
+  0x96, 0xac, 0x74, 0x22, 0xe7, 0xad, 0x35, 0x85, 0xe2, 0xf9, 0x37, 0xe8, 0x1c, 0x75, 0xdf, 0x6e,
+  0x47, 0xf1, 0x1a, 0x71, 0x1d, 0x29, 0xc5, 0x89, 0x6f, 0xb7, 0x62, 0x0e, 0xaa, 0x18, 0xbe, 0x1b,
+  0xfc, 0x56, 0x3e, 0x4b, 0xc6, 0xd2, 0x79, 0x20, 0x9a, 0xdb, 0xc0, 0xfe, 0x78, 0xcd, 0x5a, 0xf4,
+  0x1f, 0xdd, 0xa8, 0x33, 0x88, 0x07, 0xc7, 0x31, 0xb1, 0x12, 0x10, 0x59, 0x27, 0x80, 0xec, 0x5f,
+  0x60, 0x51, 0x7f, 0xa9, 0x19, 0xb5, 0x4a, 0x0d, 0x2d, 0xe5, 0x7a, 0x9f, 0x93, 0xc9, 0x9c, 0xef,
+  0xa0, 0xe0, 0x3b, 0x4d, 0xae, 0x2a, 0xf5, 0xb0, 0xc8, 0xeb, 0xbb, 0x3c, 0x83, 0x53, 0x99, 0x61,
+  0x17, 0x2b, 0x04, 0x7e, 0xba, 0x77, 0xd6, 0x26, 0xe1, 0x69, 0x14, 0x63, 0x55, 0x21, 0x0c, 0x7d
+]
+
+// Round constants: Rcon[1..10], index 0 unused (zero)
+const @_rcon: [i8, 11] = [ 0x00, 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1b, 0x36 ]
+
+
+// ============================================================
+// GF(2^8) helpers
+// ============================================================
+
+// gf_mul2: multiply by 2 in GF(2^8) (xtime)
+fun @_aes_gf_mul2(b: i8) -> i8 {
+  @entry:
+    // Branchless xtime: mask is 0x1b when the top bit is set, else 0.
+    %t = shl i8 %b, 1
+    %sign = ashr i8 %b, 7
+    %mask = and i8 %sign, 0x1b
+    %r = xor i8 %t, %mask
+    ret i8 %r
+}
+
+// gf_mul3: multiply by 3 in GF(2^8) = mul2(x) ^ x
+fun @_aes_gf_mul3(b: i8) -> i8 {
+  @entry:
+    %m2 = call @_aes_gf_mul2(%b)
+    %r = xor i8 %m2, %b
+    ret i8 %r
+}
+
+
+// ============================================================
+// State transformation helpers
+// All operate on *i8 pointing to [i8, 16] in column-major order
+// ============================================================
+
+// sub_bytes: apply S-box to all 16 bytes of state
+fun @_aes_sub_bytes(state: *i8) -> void {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @sb_cond
+
+  @sb_cond:
+    %iv = load i32, *%i
+    %more = slt i32 %iv, 16
+    br %more, @sb_body, @sb_done
+
+  @sb_body:
+    %iv2 = load i32, *%i
+    %ptr = gep i8, *%state, %iv2
+    %val = load i8, *%ptr
+    %idx = zext i8 %val to i32
+    %sbox_p = gep i8, *@_sbox, %idx
+    %sub = load i8, *%sbox_p
+    store i8 %sub, *%ptr
+    %next = add i32 %iv2, 1
+    store i32 %next, *%i
+    jmp @sb_cond
+
+  @sb_done: ret void
+}
+
+// inv_sub_bytes: apply inverse S-box to all 16 bytes of state
+fun @_aes_inv_sub_bytes(state: *i8) -> void {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @isb_cond
+
+  @isb_cond:
+    %iv = load i32, *%i
+    %more = slt i32 %iv, 16
+    br %more, @isb_body, @isb_done
+
+  @isb_body:
+    %iv2 = load i32, *%i
+    %ptr = gep i8, *%state, %iv2
+    %val = load i8, *%ptr
+    %idx = zext i8 %val to i32
+    %sbox_p = gep i8, *@_inv_sbox, %idx
+    %sub = load i8, *%sbox_p
+    store i8 %sub, *%ptr
+    %next = add i32 %iv2, 1
+    store i32 %next, *%i
+    jmp @isb_cond
+
+  @isb_done: ret void
+}
+
+// shift_rows: apply AES row shift (column-major state)
+fun @_aes_shift_rows(state: *i8) -> void {
+  @entry:
+    // Copy state to temp buffer
+    %tmp = let [i8, 16], 16
+    %tmp_p = gep i8, *%tmp, 0
+    %ci = let i32
+    store i32 0, *%ci
+    jmp @sr_copy_cond
+
+  @sr_copy_cond:
+    %civ = load i32, *%ci
+    %more = slt i32 %civ, 16
+    br %more, @sr_copy_body, @sr_shuffle
+
+  @sr_copy_body:
+    %civ2 = load i32, *%ci
+    %src_p = gep i8, *%state, %civ2
+    %v = load i8, *%src_p
+    %dst_p = gep i8, *%tmp_p, %civ2
+    store i8 %v, *%dst_p
+    %next = add i32 %civ2, 1
+    store i32 %next, *%ci
+    jmp @sr_copy_cond
+
+  @sr_shuffle:
+    // Row 0 (indices 0, 4, 8, 12): no shift
+    // Row 1 (indices 1, 5, 9, 13): shift left 1 → [5, 9, 13, 1]
+    // Row 2 (indices 2, 6, 10, 14): shift left 2 → [10, 14, 2, 6]
+    // Row 3 (indices 3, 7, 11, 15): shift left 3 → [15, 3, 7, 11]
+
+    %p0  = gep i8, *%tmp_p, 0
+    %p4  = gep i8, *%tmp_p, 4
+    %p8  = gep i8, *%tmp_p, 8
+    %p12 = gep i8, *%tmp_p, 12
+    %p1  = gep i8, *%tmp_p, 1
+    %p5  = gep i8, *%tmp_p, 5
+    %p9  = gep i8, *%tmp_p, 9
+    %p13 = gep i8, *%tmp_p, 13
+    %p2  = gep i8, *%tmp_p, 2
+    %p6  = gep i8, *%tmp_p, 6
+    %p10 = gep i8, *%tmp_p, 10
+    %p14 = gep i8, *%tmp_p, 14
+    %p3  = gep i8, *%tmp_p, 3
+    %p7  = gep i8, *%tmp_p, 7
+    %p11 = gep i8, *%tmp_p, 11
+    %p15 = gep i8, *%tmp_p, 15
+
+    %v0  = load i8, *%p0
+    %v1  = load i8, *%p5
+    %v2  = load i8, *%p10
+    %v3  = load i8, *%p15
+    %v4  = load i8, *%p4
+    %v5  = load i8, *%p9
+    %v6  = load i8, *%p14
+    %v7  = load i8, *%p3
+    %v8  = load i8, *%p8
+    %v9  = load i8, *%p13
+    %v10 = load i8, *%p2
+    %v11 = load i8, *%p7
+    %v12 = load i8, *%p12
+    %v13 = load i8, *%p1
+    %v14 = load i8, *%p6
+    %v15 = load i8, *%p11
+
+    %sp0  = gep i8, *%state, 0
+    %sp1  = gep i8, *%state, 1
+    %sp2  = gep i8, *%state, 2
+    %sp3  = gep i8, *%state, 3
+    %sp4  = gep i8, *%state, 4
+    %sp5  = gep i8, *%state, 5
+    %sp6  = gep i8, *%state, 6
+    %sp7  = gep i8, *%state, 7
+    %sp8  = gep i8, *%state, 8
+    %sp9  = gep i8, *%state, 9
+    %sp10 = gep i8, *%state, 10
+    %sp11 = gep i8, *%state, 11
+    %sp12 = gep i8, *%state, 12
+    %sp13 = gep i8, *%state, 13
+    %sp14 = gep i8, *%state, 14
+    %sp15 = gep i8, *%state, 15
+
+    store i8 %v0,  *%sp0
+    store i8 %v1,  *%sp1
+    store i8 %v2,  *%sp2
+    store i8 %v3,  *%sp3
+    store i8 %v4,  *%sp4
+    store i8 %v5,  *%sp5
+    store i8 %v6,  *%sp6
+    store i8 %v7,  *%sp7
+    store i8 %v8,  *%sp8
+    store i8 %v9,  *%sp9
+    store i8 %v10, *%sp10
+    store i8 %v11, *%sp11
+    store i8 %v12, *%sp12
+    store i8 %v13, *%sp13
+    store i8 %v14, *%sp14
+    store i8 %v15, *%sp15
+    ret void
+}
+
+// inv_shift_rows: undo AES row shift
+fun @_aes_inv_shift_rows(state: *i8) -> void {
+  @entry:
+    %tmp = let [i8, 16], 16
+    %tmp_p = gep i8, *%tmp, 0
+    %ci = let i32
+    store i32 0, *%ci
+    jmp @isr_copy_cond
+
+  @isr_copy_cond:
+    %civ = load i32, *%ci
+    %more = slt i32 %civ, 16
+    br %more, @isr_copy_body, @isr_shuffle
+
+  @isr_copy_body:
+    %civ2 = load i32, *%ci
+    %src_p = gep i8, *%state, %civ2
+    %v = load i8, *%src_p
+    %dst_p = gep i8, *%tmp_p, %civ2
+    store i8 %v, *%dst_p
+    %next = add i32 %civ2, 1
+    store i32 %next, *%ci
+    jmp @isr_copy_cond
+
+  @isr_shuffle:
+    // Inverse: shift right each row
+    // Row 0 → [0, 4, 8, 12] (no shift)
+    // Row 1 → [13, 1, 5, 9] (right shift 1)
+    // Row 2 → [10, 14, 2, 6] (right shift 2)
+    // Row 3 → [7, 11, 15, 3] (right shift 3)
+
+    %p0  = gep i8, *%tmp_p, 0
+    %p4  = gep i8, *%tmp_p, 4
+    %p8  = gep i8, *%tmp_p, 8
+    %p12 = gep i8, *%tmp_p, 12
+    %p1  = gep i8, *%tmp_p, 1
+    %p5  = gep i8, *%tmp_p, 5
+    %p9  = gep i8, *%tmp_p, 9
+    %p13 = gep i8, *%tmp_p, 13
+    %p2  = gep i8, *%tmp_p, 2
+    %p6  = gep i8, *%tmp_p, 6
+    %p10 = gep i8, *%tmp_p, 10
+    %p14 = gep i8, *%tmp_p, 14
+    %p3  = gep i8, *%tmp_p, 3
+    %p7  = gep i8, *%tmp_p, 7
+    %p11 = gep i8, *%tmp_p, 11
+    %p15 = gep i8, *%tmp_p, 15
+
+    %v0  = load i8, *%p0
+    %v1  = load i8, *%p13
+    %v2  = load i8, *%p10
+    %v3  = load i8, *%p7
+    %v4  = load i8, *%p4
+    %v5  = load i8, *%p1
+    %v6  = load i8, *%p14
+    %v7  = load i8, *%p11
+    %v8  = load i8, *%p8
+    %v9  = load i8, *%p5
+    %v10 = load i8, *%p2
+    %v11 = load i8, *%p15
+    %v12 = load i8, *%p12
+    %v13 = load i8, *%p9
+    %v14 = load i8, *%p6
+    %v15 = load i8, *%p3
+
+    %sp0  = gep i8, *%state, 0
+    %sp1  = gep i8, *%state, 1
+    %sp2  = gep i8, *%state, 2
+    %sp3  = gep i8, *%state, 3
+    %sp4  = gep i8, *%state, 4
+    %sp5  = gep i8, *%state, 5
+    %sp6  = gep i8, *%state, 6
+    %sp7  = gep i8, *%state, 7
+    %sp8  = gep i8, *%state, 8
+    %sp9  = gep i8, *%state, 9
+    %sp10 = gep i8, *%state, 10
+    %sp11 = gep i8, *%state, 11
+    %sp12 = gep i8, *%state, 12
+    %sp13 = gep i8, *%state, 13
+    %sp14 = gep i8, *%state, 14
+    %sp15 = gep i8, *%state, 15
+
+    store i8 %v0,  *%sp0
+    store i8 %v1,  *%sp1
+    store i8 %v2,  *%sp2
+    store i8 %v3,  *%sp3
+    store i8 %v4,  *%sp4
+    store i8 %v5,  *%sp5
+    store i8 %v6,  *%sp6
+    store i8 %v7,  *%sp7
+    store i8 %v8,  *%sp8
+    store i8 %v9,  *%sp9
+    store i8 %v10, *%sp10
+    store i8 %v11, *%sp11
+    store i8 %v12, *%sp12
+    store i8 %v13, *%sp13
+    store i8 %v14, *%sp14
+    store i8 %v15, *%sp15
+    ret void
+}
+
+// mix_columns: apply AES MixColumns to all 4 columns
+fun @_aes_mix_columns(state: *i8) -> void {
+  @entry:
+    %col = let i32
+    store i32 0, *%col
+    jmp @mc_cond
+
+  @mc_cond:
+    %cv = load i32, *%col
+    %more = slt i32 %cv, 4
+    br %more, @mc_body, @mc_done
+
+  @mc_body:
+    %cv2 = load i32, *%col
+    %off0 = mul i32 %cv2, 4
+    %off1 = add i32 %off0, 1
+    %off2 = add i32 %off0, 2
+    %off3 = add i32 %off0, 3
+
+    %p0 = gep i8, *%state, %off0
+    %p1 = gep i8, *%state, %off1
+    %p2 = gep i8, *%state, %off2
+    %p3 = gep i8, *%state, %off3
+
+    %b0 = load i8, *%p0
+    %b1 = load i8, *%p1
+    %b2 = load i8, *%p2
+    %b3 = load i8, *%p3
+
+    %t0 = call @_aes_gf_mul2(%b0)
+    %t1 = call @_aes_gf_mul3(%b1)
+    %t2 = xor i8 %t0, %t1
+    %t3 = xor i8 %t2, %b2
+    %r0 = xor i8 %t3, %b3
+
+    %u0 = call @_aes_gf_mul2(%b1)
+    %u1 = call @_aes_gf_mul3(%b2)
+    %u2 = xor i8 %b0, %u0
+    %u3 = xor i8 %u2, %u1
+    %r1 = xor i8 %u3, %b3
+
+    %v0 = call @_aes_gf_mul2(%b2)
+    %v1 = call @_aes_gf_mul3(%b3)
+    %v2 = xor i8 %b0, %b1
+    %v3 = xor i8 %v2, %v0
+    %r2 = xor i8 %v3, %v1
+
+    %w0 = call @_aes_gf_mul3(%b0)
+    %w1 = call @_aes_gf_mul2(%b3)
+    %w2 = xor i8 %w0, %b1
+    %w3 = xor i8 %w2, %b2
+    %r3 = xor i8 %w3, %w1
+
+    store i8 %r0, *%p0
+    store i8 %r1, *%p1
+    store i8 %r2, *%p2
+    store i8 %r3, *%p3
+
+    %next = add i32 %cv2, 1
+    store i32 %next, *%col
+    jmp @mc_cond
+
+  @mc_done: ret void
+}
+
+// inv_mix_columns: undo MixColumns
+// Matrix: [14, 11, 13, 9; 9, 14, 11, 13; 13, 9, 14, 11; 11, 13, 9, 14]
+fun @_aes_inv_mix_columns(state: *i8) -> void {
+  @entry:
+    %col = let i32
+    store i32 0, *%col
+    jmp @imc_cond
+
+  @imc_cond:
+    %cv = load i32, *%col
+    %more = slt i32 %cv, 4
+    br %more, @imc_body, @imc_done
+
+  @imc_body:
+    %cv2 = load i32, *%col
+    %off0 = mul i32 %cv2, 4
+    %off1 = add i32 %off0, 1
+    %off2 = add i32 %off0, 2
+    %off3 = add i32 %off0, 3
+
+    %p0 = gep i8, *%state, %off0
+    %p1 = gep i8, *%state, %off1
+    %p2 = gep i8, *%state, %off2
+    %p3 = gep i8, *%state, %off3
+
+    %b0 = load i8, *%p0
+    %b1 = load i8, *%p1
+    %b2 = load i8, *%p2
+    %b3 = load i8, *%p3
+
+    // 14 = mul2(mul2(mul2(b))) XOR mul2(mul2(b)) XOR mul2(b) = mul8 ^ mul4 ^ mul2
+    // 11 = mul8 ^ mul2 ^ b
+    // 13 = mul8 ^ mul4 ^ b
+    // 9  = mul8 ^ b
+
+    // Precompute: mul2, mul4 = mul2(mul2), mul8 = mul2(mul4)
+    %t0 = call @_aes_gf_mul2(%b0)
+    %t1 = call @_aes_gf_mul2(%t0)
+    %t2 = call @_aes_gf_mul2(%t1)   // t2 = mul8(b0)
+
+    %u0 = call @_aes_gf_mul2(%b1)
+    %u1 = call @_aes_gf_mul2(%u0)
+    %u2 = call @_aes_gf_mul2(%u1)   // u2 = mul8(b1)
+
+    %v0 = call @_aes_gf_mul2(%b2)
+    %v1 = call @_aes_gf_mul2(%v0)
+    %v2 = call @_aes_gf_mul2(%v1)   // v2 = mul8(b2)
+
+    %w0 = call @_aes_gf_mul2(%b3)
+    %w1 = call @_aes_gf_mul2(%w0)
+    %w2 = call @_aes_gf_mul2(%w1)   // w2 = mul8(b3)
+
+    // r0 = 14*b0 ^ 11*b1 ^ 13*b2 ^ 9*b3
+    // 14*b0 = mul8 ^ mul4 ^ mul2 = t2 ^ t1 ^ t0
+    // 11*b1 = mul8 ^ mul2 ^ b1  = u2 ^ u0 ^ b1
+    // 13*b2 = mul8 ^ mul4 ^ b2  = v2 ^ v1 ^ b2
+    // 9*b3  = mul8 ^ b3         = w2 ^ b3
+
+    %m14_0 = xor i8 %t2, %t1
+    %m14_1 = xor i8 %m14_0, %t0
+    %m11_0 = xor i8 %u2, %u0
+    %m11_1 = xor i8 %m11_0, %b1
+    %m13_0 = xor i8 %v2, %v1
+    %m13_1 = xor i8 %m13_0, %b2
+    %m9_0  = xor i8 %w2, %b3
+
+    %x0 = xor i8 %m14_1, %m11_1
+    %x1 = xor i8 %x0, %m13_1
+    %r0 = xor i8 %x1, %m9_0
+
+    // r1 = 9*b0 ^ 14*b1 ^ 11*b2 ^ 13*b3
+    %m9_b0  = xor i8 %t2, %b0
+    %m14_b1 = xor i8 %u2, %u1
+    %m14_b2 = xor i8 %m14_b1, %u0
+    %m11_b2 = xor i8 %v2, %v0
+    %m11_b3 = xor i8 %m11_b2, %b2
+    %m13_b3 = xor i8 %w2, %w1
+    %m13_b4 = xor i8 %m13_b3, %b3
+
+    %y0 = xor i8 %m9_b0, %m14_b2
+    %y1 = xor i8 %y0, %m11_b3
+    %r1 = xor i8 %y1, %m13_b4
+
+    // r2 = 13*b0 ^ 9*b1 ^ 14*b2 ^ 11*b3
+    %m13_b0 = xor i8 %t2, %t1
+    %m13_b1 = xor i8 %m13_b0, %b0
+    %m9_b1  = xor i8 %u2, %b1
+    %m14_b2a = xor i8 %v2, %v1
+    %m14_b2b = xor i8 %m14_b2a, %v0
+    %m11_b3a = xor i8 %w2, %w0
+    %m11_b3b = xor i8 %m11_b3a, %b3
+
+    %z0 = xor i8 %m13_b1, %m9_b1
+    %z1 = xor i8 %z0, %m14_b2b
+    %r2 = xor i8 %z1, %m11_b3b
+
+    // r3 = 11*b0 ^ 13*b1 ^ 9*b2 ^ 14*b3
+    %m11_b0a = xor i8 %t2, %t0
+    %m11_b0b = xor i8 %m11_b0a, %b0
+    %m13_b1a = xor i8 %u2, %u1
+    %m13_b1b = xor i8 %m13_b1a, %b1
+    %m9_b2   = xor i8 %v2, %b2
+    %m14_b3a = xor i8 %w2, %w1
+    %m14_b3b = xor i8 %m14_b3a, %w0
+
+    %wz0 = xor i8 %m11_b0b, %m13_b1b
+    %wz1 = xor i8 %wz0, %m9_b2
+    %r3  = xor i8 %wz1, %m14_b3b
+
+    store i8 %r0, *%p0
+    store i8 %r1, *%p1
+    store i8 %r2, *%p2
+    store i8 %r3, *%p3
+
+    %next = add i32 %cv2, 1
+    store i32 %next, *%col
+    jmp @imc_cond
+
+  @imc_done: ret void
+}
+
+
+// ============================================================
+// Key operations
+// ============================================================
+
+// xor_round_key: state[i] ^= rk[i] for all 16 bytes
+fun @_aes_xor_rk(state: *i8, rk: *i8) -> void {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @xor_cond
+
+  @xor_cond:
+    %iv = load i32, *%i
+    %more = slt i32 %iv, 16
+    br %more, @xor_body, @xor_done
+
+  @xor_body:
+    %iv2 = load i32, *%i
+    %sp = gep i8, *%state, %iv2
+    %sv = load i8, *%sp
+    %kp = gep i8, *%rk, %iv2
+    %kv = load i8, *%kp
+    %xv = xor i8 %sv, %kv
+    store i8 %xv, *%sp
+    %next = add i32 %iv2, 1
+    store i32 %next, *%i
+    jmp @xor_cond
+
+  @xor_done: ret void
+}
+
+// key_expansion: expand 16-byte key to 176 bytes (11 round keys)
+fun @_copy16(dst: *i8, src: *i8) -> void {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @cp16_cond
+  @cp16_cond:
+    %iv = load i32, *%i
+    %more = slt i32 %iv, 16
+    br %more, @cp16_body, @cp16_done
+  @cp16_body:
+    %iv2 = load i32, *%i
+    %sp = gep i8, *%src, %iv2
+    %sv = load i8, *%sp
+    %dp = gep i8, *%dst, %iv2
+    store i8 %sv, *%dp
+    %next = add i32 %iv2, 1
+    store i32 %next, *%i
+    jmp @cp16_cond
+  @cp16_done: ret void
+}
+
+fun @_xor16(r: *i8, a: *i8, b: *i8) -> void {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @x16_cond
+  @x16_cond:
+    %iv = load i32, *%i
+    %more = slt i32 %iv, 16
+    br %more, @x16_body, @x16_done
+  @x16_body:
+    %iv2 = load i32, *%i
+    %ap = gep i8, *%a, %iv2
+    %av = load i8, *%ap
+    %bp = gep i8, *%b, %iv2
+    %bv = load i8, *%bp
+    %xv = xor i8 %av, %bv
+    %rp = gep i8, *%r, %iv2
+    store i8 %xv, *%rp
+    %next = add i32 %iv2, 1
+    store i32 %next, *%i
+    jmp @x16_cond
+  @x16_done: ret void
+}
+
+fun @_zero16(buf: *i8) -> void {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @z16_cond
+  @z16_cond:
+    %iv = load i32, *%i
+    %more = slt i32 %iv, 16
+    br %more, @z16_body, @z16_done
+  @z16_body:
+    %iv2 = load i32, *%i
+    %p = gep i8, *%buf, %iv2
+    store i8 0, *%p
+    %next = add i32 %iv2, 1
+    store i32 %next, *%i
+    jmp @z16_cond
+  @z16_done: ret void
+}
+
+
+fun @_aes_key_expansion(key: *i8, exp: *i8) -> void {
+  @entry:
+    // Copy first 16 bytes
+    %i = let i32
+    store i32 0, *%i
+    jmp @ke_copy_cond
+
+  @ke_copy_cond:
+    %iv = load i32, *%i
+    %more = slt i32 %iv, 16
+    br %more, @ke_copy_body, @ke_loop
+
+  @ke_copy_body:
+    %iv2 = load i32, *%i
+    %kp = gep i8, *%key, %iv2
+    %kv = load i8, *%kp
+    %ep = gep i8, *%exp, %iv2
+    store i8 %kv, *%ep
+    %next = add i32 %iv2, 1
+    store i32 %next, *%i
+    jmp @ke_copy_cond
+
+  @ke_loop:
+    %wi = let i32
+    store i32 4, *%wi
+    jmp @ke_cond
+
+  @ke_cond:
+    %wiv = load i32, *%wi
+    %more_w = slt i32 %wiv, 44
+    br %more_w, @ke_body, @ke_done
+
+  @ke_body:
+    %wiv2 = load i32, *%wi
+    %off = mul i32 %wiv2, 4
+    %prev_off = sub i32 %off, 4
+    %prev4_off = sub i32 %off, 16
+
+    %mod4 = and i32 %wiv2, 3
+    %is_rcon = eq i32 %mod4, 0
+    br %is_rcon, @ke_rcon, @ke_xor_prev
+
+  @ke_rcon:
+    // temp = SubWord(RotWord(exp[i-1])) XOR Rcon
+    // RotWord: [b0,b1,b2,b3] at prev_off → [b1,b2,b3,b0]
+    %pr0p = gep i8, *%exp, %prev_off
+    %pr1p = gep i8, *%exp, %prev4_off
+
+    %b0p = gep i8, *%exp, %prev_off
+    %b1p = gep i8, *%exp, 1
+    %b1_abs = add i32 %prev_off, 1
+    %b1p_abs = gep i8, *%exp, %b1_abs
+    %b2_abs = add i32 %prev_off, 2
+    %b2p_abs = gep i8, *%exp, %b2_abs
+    %b3_abs = add i32 %prev_off, 3
+    %b3p_abs = gep i8, *%exp, %b3_abs
+
+    %b1v = load i8, *%b1p_abs
+    %b2v = load i8, *%b2p_abs
+    %b3v = load i8, *%b3p_abs
+    %b0v = load i8, *%b0p
+
+    // SubWord: apply S-box
+    %i_b1 = zext i8 %b1v to i32
+    %i_b2 = zext i8 %b2v to i32
+    %i_b3 = zext i8 %b3v to i32
+    %i_b0 = zext i8 %b0v to i32
+
+    %sb1_p = gep i8, *@_sbox, %i_b1
+    %sb2_p = gep i8, *@_sbox, %i_b2
+    %sb3_p = gep i8, *@_sbox, %i_b3
+    %sb0_p = gep i8, *@_sbox, %i_b0
+
+    %sb1 = load i8, *%sb1_p
+    %sb2 = load i8, *%sb2_p
+    %sb3 = load i8, *%sb3_p
+    %sb0 = load i8, *%sb0_p
+
+    // Rcon index = i / 4
+    %rcon_idx = lshr i32 %wiv2, 2
+    %rcon_p = gep i8, *@_rcon, %rcon_idx
+    %rc = load i8, *%rcon_p
+
+    // b0 ^= Rcon
+    %tb0 = xor i8 %sb1, %rc
+
+    // XOR with exp[i-4]
+    %pp0 = gep i8, *%exp, %prev4_off
+    %p1_abs = add i32 %prev4_off, 1
+    %pp1_abs = gep i8, *%exp, %p1_abs
+    %p2_abs = add i32 %prev4_off, 2
+    %pp2_abs = gep i8, *%exp, %p2_abs
+    %p3_abs = add i32 %prev4_off, 3
+    %pp3_abs = gep i8, *%exp, %p3_abs
+
+    %p0v = load i8, *%pp0
+    %p1v = load i8, *%pp1_abs
+    %p2v = load i8, *%pp2_abs
+    %p3v = load i8, *%pp3_abs
+
+    %r0 = xor i8 %tb0, %p0v
+    %r1 = xor i8 %sb2, %p1v
+    %r2 = xor i8 %sb3, %p2v
+    %r3 = xor i8 %sb0, %p3v
+
+    %op0 = gep i8, *%exp, %off
+    %o1_abs = add i32 %off, 1
+    %op1_abs = gep i8, *%exp, %o1_abs
+    %o2_abs = add i32 %off, 2
+    %op2_abs = gep i8, *%exp, %o2_abs
+    %o3_abs = add i32 %off, 3
+    %op3_abs = gep i8, *%exp, %o3_abs
+
+    store i8 %r0, *%op0
+    store i8 %r1, *%op1_abs
+    store i8 %r2, *%op2_abs
+    store i8 %r3, *%op3_abs
+
+    %next_w = add i32 %wiv2, 1
+    store i32 %next_w, *%wi
+    jmp @ke_cond
+
+  @ke_xor_prev:
+    // exp[i] = exp[i-1] XOR exp[i-4]
+    %x0_abs = add i32 %prev_off, 0
+    %x1_abs = add i32 %prev_off, 1
+    %x2_abs = add i32 %prev_off, 2
+    %x3_abs = add i32 %prev_off, 3
+
+    %x0p = gep i8, *%exp, %x0_abs
+    %x1p = gep i8, *%exp, %x1_abs
+    %x2p = gep i8, *%exp, %x2_abs
+    %x3p = gep i8, *%exp, %x3_abs
+
+    %xp0 = gep i8, *%exp, %prev4_off
+    %xp1 = gep i8, *%exp, %prev4_off
+    %x1p_abs = add i32 %prev4_off, 1
+    %xp1_abs = gep i8, *%exp, %x1p_abs
+    %x2p_abs = add i32 %prev4_off, 2
+    %xp2_abs = gep i8, *%exp, %x2p_abs
+    %x3p_abs = add i32 %prev4_off, 3
+    %xp3_abs = gep i8, *%exp, %x3p_abs
+
+    %xv0 = load i8, *%x0p
+    %xv1 = load i8, *%x1p
+    %xv2 = load i8, *%x2p
+    %xv3 = load i8, *%x3p
+
+    %pv0 = load i8, *%xp0
+    %pv1 = load i8, *%xp1_abs
+    %pv2 = load i8, *%xp2_abs
+    %pv3 = load i8, *%xp3_abs
+
+    %rx0 = xor i8 %xv0, %pv0
+    %rx1 = xor i8 %xv1, %pv1
+    %rx2 = xor i8 %xv2, %pv2
+    %rx3 = xor i8 %xv3, %pv3
+
+    %ox0 = gep i8, *%exp, %off
+    %ox1 = gep i8, *%exp, %off
+    %ox1_abs = add i32 %off, 1
+    %ox1_abs_p = gep i8, *%exp, %ox1_abs
+    %ox2_abs = add i32 %off, 2
+    %ox2_abs_p = gep i8, *%exp, %ox2_abs
+    %ox3_abs = add i32 %off, 3
+    %ox3_abs_p = gep i8, *%exp, %ox3_abs
+
+    store i8 %rx0, *%ox0
+    store i8 %rx1, *%ox1_abs_p
+    store i8 %rx2, *%ox2_abs_p
+    store i8 %rx3, *%ox3_abs_p
+
+    %next_w2 = add i32 %wiv2, 1
+    store i32 %next_w2, *%wi
+    jmp @ke_cond
+
+  @ke_done: ret void
+}
+
+
+
+
+
+
+// ============================================================
+// AES-128 block encrypt
+// ============================================================
+
+// AES-128 encryption of one block with an already expanded key (176 bytes).
+fun @_sw_aes_encrypt_exp(plaintext: *i8, exp_p: *i8, ciphertext: *i8) -> void {
+  @entry:
+    %state = let [i8, 16], 16
+    %state_p = gep i8, *%state, 0
+
+    // Copy plaintext to state
+    %ci = let i32
+    store i32 0, *%ci
+    jmp @enc_cp_cond
+
+  @enc_cp_cond:
+    %civ = load i32, *%ci
+    %more = slt i32 %civ, 16
+    br %more, @enc_cp_body, @enc_rk
+
+  @enc_cp_body:
+    %civ2 = load i32, *%ci
+    %pp = gep i8, *%plaintext, %civ2
+    %pv = load i8, *%pp
+    %sp = gep i8, *%state_p, %civ2
+    store i8 %pv, *%sp
+    %next = add i32 %civ2, 1
+    store i32 %next, *%ci
+    jmp @enc_cp_cond
+
+  @enc_rk:
+    // AddRoundKey: state XOR key[0..15]
+    call @_aes_xor_rk(%state_p, %exp_p)
+
+    // Rounds 1..9
+    %ri = let i32
+    store i32 1, *%ri
+    jmp @enc_round_cond
+
+  @enc_round_cond:
+    %riv = load i32, *%ri
+    %more_r = slt i32 %riv, 10
+    br %more_r, @enc_round_body, @enc_final
+
+  @enc_round_body:
+    call @_aes_sub_bytes(%state_p)
+    call @_aes_shift_rows(%state_p)
+    call @_aes_mix_columns(%state_p)
+
+    // AddRoundKey with expanded[round * 16]
+    %riv2 = load i32, *%ri
+    %rk_off = mul i32 %riv2, 16
+    %rk_p = gep i8, *%exp_p, %rk_off
+    call @_aes_xor_rk(%state_p, %rk_p)
+
+    %next_r = add i32 %riv2, 1
+    store i32 %next_r, *%ri
+    jmp @enc_round_cond
+
+  @enc_final:
+    // Final round (no MixColumns)
+    call @_aes_sub_bytes(%state_p)
+    call @_aes_shift_rows(%state_p)
+
+    // AddRoundKey with expanded[10*16 = 160]
+    %last_off = add i32 0, 160
+    %last_rk = gep i8, *%exp_p, %last_off
+    call @_aes_xor_rk(%state_p, %last_rk)
+
+    // Copy state to ciphertext
+    %oi = let i32
+    store i32 0, *%oi
+    jmp @enc_out_cond
+
+  @enc_out_cond:
+    %oiv = load i32, *%oi
+    %more_o = slt i32 %oiv, 16
+    br %more_o, @enc_out_body, @enc_done
+
+  @enc_out_body:
+    %oiv2 = load i32, *%oi
+    %sp2 = gep i8, *%state_p, %oiv2
+    %sv2 = load i8, *%sp2
+    %cp = gep i8, *%ciphertext, %oiv2
+    store i8 %sv2, *%cp
+    %next_o = add i32 %oiv2, 1
+    store i32 %next_o, *%oi
+    jmp @enc_out_cond
+
+  @enc_done: ret void
+}
+
+// AES-128 encryption of one block; expands the key first.
+fun @_sw_aes_encrypt(plaintext: *i8, key: *i8, ciphertext: *i8) -> void {
+  @entry:
+    %exp = let [i8, 176], 16
+    %exp_p = gep i8, *%exp, 0
+    call @_aes_key_expansion(%key, %exp_p)
+    call @_sw_aes_encrypt_exp(%plaintext, %exp_p, %ciphertext)
+    ret void
+}
+
+
+// ============================================================
+// AES-128 block decrypt
+// ============================================================
+
+// AES-128 decryption of one block with an already expanded key (176 bytes).
+fun @_sw_aes_decrypt_exp(ciphertext: *i8, exp_p: *i8, plaintext: *i8) -> void {
+  @entry:
+    %state = let [i8, 16], 16
+    %state_p = gep i8, *%state, 0
+
+    // Copy ciphertext to state
+    %ci = let i32
+    store i32 0, *%ci
+    jmp @dec_cp_cond
+
+  @dec_cp_cond:
+    %civ = load i32, *%ci
+    %more = slt i32 %civ, 16
+    br %more, @dec_cp_body, @dec_rk
+
+  @dec_cp_body:
+    %civ2 = load i32, *%ci
+    %cp = gep i8, *%ciphertext, %civ2
+    %cv = load i8, *%cp
+    %sp = gep i8, *%state_p, %civ2
+    store i8 %cv, *%sp
+    %next = add i32 %civ2, 1
+    store i32 %next, *%ci
+    jmp @dec_cp_cond
+
+  @dec_rk:
+    // Start with last round key (expanded[160..175])
+    %first_rk_off = add i32 0, 160
+    %first_rk = gep i8, *%exp_p, %first_rk_off
+    call @_aes_xor_rk(%state_p, %first_rk)
+
+    // Rounds 9 down to 1
+    %ri = let i32
+    store i32 9, *%ri
+    jmp @dec_round_cond
+
+  @dec_round_cond:
+    %riv = load i32, *%ri
+    %more_r = sgt i32 %riv, 0
+    br %more_r, @dec_round_body, @dec_final
+
+  @dec_round_body:
+    call @_aes_inv_sub_bytes(%state_p)
+    call @_aes_inv_shift_rows(%state_p)
+
+    // AddRoundKey with expanded[round * 16]
+    %riv2 = load i32, *%ri
+    %rk_off = mul i32 %riv2, 16
+    %rk_p = gep i8, *%exp_p, %rk_off
+    call @_aes_xor_rk(%state_p, %rk_p)
+
+    call @_aes_inv_mix_columns(%state_p)
+
+    %next_r = sub i32 %riv2, 1
+    store i32 %next_r, *%ri
+    jmp @dec_round_cond
+
+  @dec_final:
+    // Last round: InvSubBytes, InvShiftRows, AddRoundKey (key[0..15])
+    call @_aes_inv_sub_bytes(%state_p)
+    call @_aes_inv_shift_rows(%state_p)
+    call @_aes_xor_rk(%state_p, %exp_p)
+
+    // Copy state to plaintext
+    %oi = let i32
+    store i32 0, *%oi
+    jmp @dec_out_cond
+
+  @dec_out_cond:
+    %oiv = load i32, *%oi
+    %more_o = slt i32 %oiv, 16
+    br %more_o, @dec_out_body, @dec_done
+
+  @dec_out_body:
+    %oiv2 = load i32, *%oi
+    %sp2 = gep i8, *%state_p, %oiv2
+    %sv2 = load i8, *%sp2
+    %pp = gep i8, *%plaintext, %oiv2
+    store i8 %sv2, *%pp
+    %next_o = add i32 %oiv2, 1
+    store i32 %next_o, *%oi
+    jmp @dec_out_cond
+
+  @dec_done: ret void
+}
+
+// AES-128 decryption of one block; expands the key first.
+fun @_sw_aes_decrypt(ciphertext: *i8, key: *i8, plaintext: *i8) -> void {
+  @entry:
+    %exp = let [i8, 176], 16
+    %exp_p = gep i8, *%exp, 0
+    call @_aes_key_expansion(%key, %exp_p)
+    call @_sw_aes_decrypt_exp(%ciphertext, %exp_p, %plaintext)
+    ret void
+}
+
+fun @std_crypto_aes_encrypt(plaintext: *i8, key: *i8, ciphertext: *i8) -> void {
+  @entry:
+    %f = call @c1_cpu_features()
+    %b = and i64 %f, 1
+    %hw = ne i64 %b, 0
+    br %hw, @hw_path, @sw_path
+  @hw_path:
+    call @c1_aes128_encrypt_block(%plaintext, %key, %ciphertext)
+    ret void
+  @sw_path:
+    call @_sw_aes_encrypt(%plaintext, %key, %ciphertext)
+    ret void
+}
+
+fun @std_crypto_aes_decrypt(ciphertext: *i8, key: *i8, plaintext: *i8) -> void {
+  @entry:
+    %f = call @c1_cpu_features()
+    %b = and i64 %f, 1
+    %hw = ne i64 %b, 0
+    br %hw, @hw_path, @sw_path
+  @hw_path:
+    call @c1_aes128_decrypt_block(%ciphertext, %key, %plaintext)
+    ret void
+  @sw_path:
+    call @_sw_aes_decrypt(%ciphertext, %key, %plaintext)
+    ret void
+}
+
+// ============================================================
+// GCM (Galois/Counter Mode) — NIST SP 800-38D
+// ============================================================
+// GHASH: GF(2^128) / (x^128 + x^7 + x^2 + x + 1)
+// R = 0xE1 || 0^15
+
+
+
+
+
+// copy16: copy 16 bytes from src to dst
+
+// xor16: r[i] = a[i] ^ b[i] for all 16 bytes
+
+// zero16: zero all 16 bytes
+
+// shr128: right-shift 128-bit big-endian value by 1 bit (in-place)
+fun @_shr128(v: *i8) -> void {
+  @entry:
+    %carry = let i32
+    store i32 0, *%carry
+    %i = let i32
+    store i32 0, *%i
+    jmp @shr_cond
+  @shr_cond:
+    %iv = load i32, *%i
+    %more = slt i32 %iv, 16
+    br %more, @shr_body, @shr_done
+  @shr_body:
+    %iv2 = load i32, *%i
+    %p = gep i8, *%v, %iv2
+    %val = load i8, *%p
+    %val_i = zext i8 %val to i32
+    %carry_v = load i32, *%carry
+    %carry_shift = shl i32 %carry_v, 7
+    %val_shift = lshr i32 %val_i, 1
+    %new_val_i = or i32 %carry_shift, %val_shift
+    %new_val = trunc i32 %new_val_i to i8
+    store i8 %new_val, *%p
+    %new_carry = and i32 %val_i, 1
+    store i32 %new_carry, *%carry
+    %next = add i32 %iv2, 1
+    store i32 %next, *%i
+    jmp @shr_cond
+  @shr_done: ret void
+}
+
+// get_bit128: get bit i (0=MSB, 127=LSB) of 128-bit big-endian value
+fun @_get_bit128(v: *i8, bit: i32) -> i1 {
+  @entry:
+    %byte_idx = lshr i32 %bit, 3
+    %bit_in = and i32 %bit, 7
+    %shift = sub i32 7, %bit_in
+    %bp = gep i8, *%v, %byte_idx
+    %bv = load i8, *%bp
+    %bvi = zext i8 %bv to i32
+    %shifted = lshr i32 %bvi, %shift
+    %r = and i32 %shifted, 1
+    %result = ne i32 %r, 0
+    ret i1 %result
+}
+
+// ghash_mul: result = X * Y in GF(2^128)
+fun @_ghash_mul(result: *i8, x: *i8, y: *i8) -> void {
+  @entry:
+    %Z = let [i8, 16], 16
+    %Z_p = gep i8, *%Z, 0
+    %V = let [i8, 16], 16
+    %V_p = gep i8, *%V, 0
+    call @_zero16(%Z_p)
+    call @_copy16(%V_p, %y)
+
+    %i = let i32
+    store i32 0, *%i
+    jmp @gm_cond
+
+  @gm_cond:
+    %iv = load i32, *%i
+    %more = slt i32 %iv, 128
+    br %more, @gm_body, @gm_done
+
+  @gm_body:
+    %iv2 = load i32, *%i
+    %xbit = call @_get_bit128(%x, %iv2)
+    br %xbit, @gm_zxor, @gm_chklsb
+
+  @gm_zxor:
+    call @_xor16(%Z_p, %Z_p, %V_p)
+    jmp @gm_chklsb
+
+  @gm_chklsb:
+    %v15p = gep i8, *%V_p, 15
+    %v15 = load i8, *%v15p
+    %lsb = and i8 %v15, 1
+    %need_reduce = ne i8 %lsb, 0
+
+    call @_shr128(%V_p)
+
+    br %need_reduce, @gm_xor_r, @gm_next
+
+  @gm_xor_r:
+    %v0p = gep i8, *%V_p, 0
+    %v0 = load i8, *%v0p
+    %v0_new = xor i8 %v0, 0xE1
+    store i8 %v0_new, *%v0p
+    jmp @gm_next
+
+  @gm_next:
+    %iv3 = load i32, *%i
+    %next_i = add i32 %iv3, 1
+    store i32 %next_i, *%i
+    jmp @gm_cond
+
+  @gm_done:
+    call @_copy16(%result, %Z_p)
+    ret void
+}
+
+// hw_ghash_mul: multiply two GCM field elements with the hardware
+// carry-less multiplier (one gfmul lowers to pmull/pclmul plus reduction).
+
+// ghash_mul: dispatch on hardware support.
+
+// ghash_block: Y = (Y XOR block) * H
+fun @_ghash_block(Y: *i8, H: *i8, block: *i8) -> void {
+  @entry:
+    call @_xor16(%Y, %Y, %block)
+    call @_ghash_mul(%Y, %Y, %H)
+    ret void
+}
+
+// gcm_incr: increment the rightmost 32 bits (big-endian) of counter block
+fun @_gcm_incr(cb: *i8) -> void {
+  @entry:
+    %i = let i32
+    store i32 15, *%i
+    jmp @inc_cond
+  @inc_cond:
+    %iv = load i32, *%i
+    %below12 = slt i32 %iv, 12
+    br %below12, @inc_done, @inc_body
+  @inc_body:
+    %iv2 = load i32, *%i
+    %p = gep i8, *%cb, %iv2
+    %v = load i8, *%p
+    %v_inc = add i8 %v, 1
+    store i8 %v_inc, *%p
+    %wrapped = eq i8 %v_inc, 0
+    br %wrapped, @inc_next, @inc_done
+  @inc_next:
+    %iv3 = load i32, *%i
+    %next = sub i32 %iv3, 1
+    store i32 %next, *%i
+    jmp @inc_cond
+  @inc_done: ret void
+}
+
+// ghash_process: run GHASH over data (any length, zero-padded)
+fun @_ghash_process(Y: *i8, H: *i8, data: *i8, len: i32) -> void {
+  @entry:
+    %nfull = lshr i32 %len, 4
+    %fi = let i32
+    store i32 0, *%fi
+    jmp @gp_full_cond
+
+  @gp_full_cond:
+    %fiv = load i32, *%fi
+    %more_f = slt i32 %fiv, %nfull
+    br %more_f, @gp_full_body, @gp_full_done
+
+  @gp_full_body:
+    %fiv2 = load i32, *%fi
+    %off = mul i32 %fiv2, 16
+    %bp = gep i8, *%data, %off
+    call @_ghash_block(%Y, %H, %bp)
+    %next_f = add i32 %fiv2, 1
+    store i32 %next_f, *%fi
+    jmp @gp_full_cond
+
+  @gp_full_done:
+    %rem = and i32 %len, 15
+    %has_rem = ne i32 %rem, 0
+    br %has_rem, @gp_pad, @gp_done
+
+  @gp_pad:
+    %buf = let [i8, 16], 16
+    %buf_p = gep i8, *%buf, 0
+    call @_zero16(%buf_p)
+    %rci = let i32
+    store i32 0, *%rci
+    jmp @gp_pad_copy_cond
+  @gp_pad_copy_cond:
+    %rciv = load i32, *%rci
+    %more_c = slt i32 %rciv, %rem
+    br %more_c, @gp_pad_copy_body, @gp_pad_done
+  @gp_pad_copy_body:
+    %rciv2 = load i32, *%rci
+    %full_off = mul i32 %nfull, 16
+    %src_off = add i32 %full_off, %rciv2
+    %sp = gep i8, *%data, %src_off
+    %sv = load i8, *%sp
+    %dp = gep i8, *%buf_p, %rciv2
+    store i8 %sv, *%dp
+    %next_c = add i32 %rciv2, 1
+    store i32 %next_c, *%rci
+    jmp @gp_pad_copy_cond
+  @gp_pad_done:
+    call @_ghash_block(%Y, %H, %buf_p)
+    jmp @gp_done
+
+  @gp_done: ret void
+}
+
+// gcm_compute_tag: S = GHASH(H, AAD, CT); T = S XOR AES(K, J0)
+fun @_gcm_compute_tag(H: *i8, J0: *i8, aad: *i8, aad_len: i32, ct: *i8, ct_len: i32, key: *i8, tag: *i8) -> void {
+  @entry:
+    %Y = let [i8, 16], 16
+    %Y_p = gep i8, *%Y, 0
+    call @_zero16(%Y_p)
+
+    call @_ghash_process(%Y_p, %H, %aad, %aad_len)
+    call @_ghash_process(%Y_p, %H, %ct, %ct_len)
+
+    // Length block: 8 bytes AAD bit-length || 8 bytes CT bit-length
+    %len_blk = let [i8, 16], 16
+    %len_blk_p = gep i8, *%len_blk, 0
+    call @_zero16(%len_blk_p)
+
+    %aad_bits = shl i32 %aad_len, 3
+    %aab3 = trunc i32 %aad_bits to i8
+    %aas8 = lshr i32 %aad_bits, 8
+    %aab2 = trunc i32 %aas8 to i8
+    %aas16 = lshr i32 %aad_bits, 16
+    %aab1 = trunc i32 %aas16 to i8
+    %aas24 = lshr i32 %aad_bits, 24
+    %aab0 = trunc i32 %aas24 to i8
+
+    %lb4 = gep i8, *%len_blk_p, 4
+    store i8 %aab0, *%lb4
+    %lb5 = gep i8, *%len_blk_p, 5
+    store i8 %aab1, *%lb5
+    %lb6 = gep i8, *%len_blk_p, 6
+    store i8 %aab2, *%lb6
+    %lb7 = gep i8, *%len_blk_p, 7
+    store i8 %aab3, *%lb7
+
+    %ct_bits = shl i32 %ct_len, 3
+    %ctb3 = trunc i32 %ct_bits to i8
+    %cts8 = lshr i32 %ct_bits, 8
+    %ctb2 = trunc i32 %cts8 to i8
+    %cts16 = lshr i32 %ct_bits, 16
+    %ctb1 = trunc i32 %cts16 to i8
+    %cts24 = lshr i32 %ct_bits, 24
+    %ctb0 = trunc i32 %cts24 to i8
+
+    %lb12 = gep i8, *%len_blk_p, 12
+    store i8 %ctb0, *%lb12
+    %lb13 = gep i8, *%len_blk_p, 13
+    store i8 %ctb1, *%lb13
+    %lb14 = gep i8, *%len_blk_p, 14
+    store i8 %ctb2, *%lb14
+    %lb15 = gep i8, *%len_blk_p, 15
+    store i8 %ctb3, *%lb15
+
+    call @_xor16(%Y_p, %Y_p, %len_blk_p)
+    call @_ghash_mul(%Y_p, %Y_p, %H)
+
+    %ek = let [i8, 16], 16
+    %ek_p = gep i8, *%ek, 0
+    call @_sw_aes_encrypt(%J0, %key, %ek_p)
+    call @_xor16(%tag, %Y_p, %ek_p)
+    ret void
+}
+
+
+// ============================================================
+// AES-128-CBC
+// ============================================================
+
+// std_crypto_aes128_cbc_encrypt: AES-128-CBC encrypt
+// plaintext_len must be multiple of 16 (caller responsible for padding)
+// IV is 16 bytes
+fun @_sw_aes128_cbc_encrypt(plaintext: *i8, plaintext_len: i32, key: *i8, iv: *i8, ciphertext: *i8) -> void {
+  @entry:
+    %xor_block = let [i8, 16], 16
+    %xor_p = gep i8, *%xor_block, 0
+    %prev = let [i8, 16], 16
+    %prev_p = gep i8, *%prev, 0
+    %exp = let [i8, 176], 16
+    %exp_p = gep i8, *%exp, 0
+    call @_aes_key_expansion(%key, %exp_p)
+    call @_copy16(%prev_p, %iv)
+
+    %i = let i32
+    store i32 0, *%i
+    jmp @cbc_enc_cond
+
+  @cbc_enc_cond:
+    %iv_loop = load i32, *%i
+    %more = slt i32 %iv_loop, %plaintext_len
+    br %more, @cbc_enc_body, @cbc_enc_done
+
+  @cbc_enc_body:
+    %iv_loop2 = load i32, *%i
+    %pt_block = gep i8, *%plaintext, %iv_loop2
+
+    // XOR plaintext block with prev (IV or previous ciphertext)
+    call @_xor16(%xor_p, %pt_block, %prev_p)
+
+    // Encrypt
+    %ct_block = gep i8, *%ciphertext, %iv_loop2
+    call @_sw_aes_encrypt_exp(%xor_p, %exp_p, %ct_block)
+
+    // prev = ciphertext block for next iteration
+    call @_copy16(%prev_p, %ct_block)
+
+    %next = add i32 %iv_loop2, 16
+    store i32 %next, *%i
+    jmp @cbc_enc_cond
+
+  @cbc_enc_done: ret void
+}
+
+// std_crypto_aes128_cbc_decrypt: AES-128-CBC decrypt
+// ciphertext_len must be multiple of 16
+// IV is 16 bytes
+fun @_sw_aes128_cbc_decrypt(ciphertext: *i8, ciphertext_len: i32, key: *i8, iv: *i8, plaintext: *i8) -> void {
+  @entry:
+    %dec_block = let [i8, 16], 16
+    %dec_p = gep i8, *%dec_block, 0
+    %prev = let [i8, 16], 16
+    %prev_p = gep i8, *%prev, 0
+    %exp = let [i8, 176], 16
+    %exp_p = gep i8, *%exp, 0
+    call @_aes_key_expansion(%key, %exp_p)
+    call @_copy16(%prev_p, %iv)
+
+    %i = let i32
+    store i32 0, *%i
+    jmp @cbc_dec_cond
+
+  @cbc_dec_cond:
+    %iv_loop = load i32, *%i
+    %more = slt i32 %iv_loop, %ciphertext_len
+    br %more, @cbc_dec_body, @cbc_dec_done
+
+  @cbc_dec_body:
+    %iv_loop2 = load i32, *%i
+    %ct_block = gep i8, *%ciphertext, %iv_loop2
+
+    // Decrypt block
+    call @_sw_aes_decrypt_exp(%ct_block, %exp_p, %dec_p)
+
+    // XOR with prev (IV or previous ciphertext) to get plaintext
+    %pt_block = gep i8, *%plaintext, %iv_loop2
+    call @_xor16(%pt_block, %dec_p, %prev_p)
+
+    // prev = ciphertext block (for next iteration)
+    call @_copy16(%prev_p, %ct_block)
+
+    %next = add i32 %iv_loop2, 16
+    store i32 %next, *%i
+    jmp @cbc_dec_cond
+
+  @cbc_dec_done: ret void
+}
+
+
+// ============================================================
+// Public GCM API
+// ============================================================
+
+// std_crypto_aes_gcm_encrypt: AES-128-GCM encrypt (96-bit IV)
+// Returns 0 on success
+fun @_sw_aes_gcm_encrypt(plaintext: *i8, pt_len: i32, aad: *i8, aad_len: i32,
+                                 key: *i8, iv: *i8, ciphertext: *i8, tag: *i8) -> i32 {
+  @entry:
+    %kbi = let i32
+    %ks = let [i8, 16], 16
+    %ks_p = gep i8, *%ks, 0
+    %H = let [i8, 16], 16
+    %H_p = gep i8, *%H, 0
+    %zero = let [i8, 16], 16
+    %zero_p = gep i8, *%zero, 0
+    %exp = let [i8, 176], 16
+    %exp_p = gep i8, *%exp, 0
+    call @_aes_key_expansion(%key, %exp_p)
+    call @_zero16(%zero_p)
+    call @_sw_aes_encrypt_exp(%zero_p, %exp_p, %H_p)
+
+    // J0 = IV[0..11] || 0x00000001
+    %J0 = let [i8, 16], 16
+    %J0_p = gep i8, *%J0, 0
+    %jci = let i32
+    store i32 0, *%jci
+    jmp @enc_j0_copy_cond
+  @enc_j0_copy_cond:
+    %jciv = load i32, *%jci
+    %more = slt i32 %jciv, 12
+    br %more, @enc_j0_copy_body, @enc_j0_done
+  @enc_j0_copy_body:
+    %jciv2 = load i32, *%jci
+    %ivp = gep i8, *%iv, %jciv2
+    %ivv = load i8, *%ivp
+    %j0p = gep i8, *%J0_p, %jciv2
+    store i8 %ivv, *%j0p
+    %next_j = add i32 %jciv2, 1
+    store i32 %next_j, *%jci
+    jmp @enc_j0_copy_cond
+  @enc_j0_done:
+    %j12 = gep i8, *%J0_p, 12
+    store i8 0, *%j12
+    %j13 = gep i8, *%J0_p, 13
+    store i8 0, *%j13
+    %j14 = gep i8, *%J0_p, 14
+    store i8 0, *%j14
+    %j15 = gep i8, *%J0_p, 15
+    store i8 1, *%j15
+
+    // Encrypt: keystream = AES(K, incr(J0)), AES(K, incr^2(J0)), ...
+    %cb = let [i8, 16], 16
+    %cb_p = gep i8, *%cb, 0
+    call @_copy16(%cb_p, %J0_p)
+
+    %en_i = let i32
+    store i32 0, *%en_i
+    jmp @enc_ks_cond
+
+  @enc_ks_cond:
+    %en_iv = load i32, *%en_i
+    %en_more = slt i32 %en_iv, %pt_len
+    br %en_more, @enc_ks_body, @enc_mac
+
+  @enc_ks_body:
+    %en_iv2 = load i32, *%en_i
+    call @_gcm_incr(%cb_p)
+
+    call @_sw_aes_encrypt_exp(%cb_p, %exp_p, %ks_p)
+
+    store i32 0, *%kbi
+    jmp @enc_ks_xor_cond
+  @enc_ks_xor_cond:
+    %kbiv = load i32, *%kbi
+    %under16 = slt i32 %kbiv, 16
+    %enc_remaining = sub i32 %pt_len, %en_iv2
+    %enc_block_rem = sub i32 %enc_remaining, %kbiv
+    %still_has_pt = sgt i32 %enc_block_rem, 0
+    %still_in = and i1 %under16, %still_has_pt
+    br %still_in, @enc_ks_xor_body, @enc_ks_next
+  @enc_ks_xor_body:
+    %kbiv2 = load i32, *%kbi
+    %pt_off = add i32 %en_iv2, %kbiv2
+    %pt_p = gep i8, *%plaintext, %pt_off
+    %pt_v = load i8, *%pt_p
+    %ks_ptr = gep i8, *%ks_p, %kbiv2
+    %ks_v = load i8, *%ks_ptr
+    %ct_v = xor i8 %pt_v, %ks_v
+    %ct_p = gep i8, *%ciphertext, %pt_off
+    store i8 %ct_v, *%ct_p
+    %kb_next = add i32 %kbiv2, 1
+    store i32 %kb_next, *%kbi
+    jmp @enc_ks_xor_cond
+  @enc_ks_next:
+    %kb_done_v = load i32, *%kbi
+    %en_next = add i32 %en_iv2, %kb_done_v
+    store i32 %en_next, *%en_i
+    jmp @enc_ks_cond
+
+  @enc_mac:
+    call @_gcm_compute_tag(%H_p, %J0_p, %aad, %aad_len, %ciphertext, %pt_len, %key, %tag)
+    ret i32 0
+}
+
+// std_crypto_aes_gcm_decrypt: AES-128-GCM decrypt (96-bit IV)
+// Returns 0 if tag matches, -1 if mismatch
+fun @_sw_aes_gcm_decrypt(ciphertext: *i8, ct_len: i32, aad: *i8, aad_len: i32,
+                                 key: *i8, iv: *i8, tag: *i8, plaintext: *i8) -> i32 {
+  @entry:
+    %kbi = let i32
+    %ks = let [i8, 16], 16
+    %ks_p = gep i8, *%ks, 0
+    %H = let [i8, 16], 16
+    %H_p = gep i8, *%H, 0
+    %zero = let [i8, 16], 16
+    %zero_p = gep i8, *%zero, 0
+    %exp = let [i8, 176], 16
+    %exp_p = gep i8, *%exp, 0
+    call @_aes_key_expansion(%key, %exp_p)
+    call @_zero16(%zero_p)
+    call @_sw_aes_encrypt_exp(%zero_p, %exp_p, %H_p)
+
+    // J0 = IV[0..11] || 0x00000001
+    %J0 = let [i8, 16], 16
+    %J0_p = gep i8, *%J0, 0
+    %jci = let i32
+    store i32 0, *%jci
+    jmp @dec_j0_copy_cond
+  @dec_j0_copy_cond:
+    %jciv = load i32, *%jci
+    %more = slt i32 %jciv, 12
+    br %more, @dec_j0_copy_body, @dec_j0_done
+  @dec_j0_copy_body:
+    %jciv2 = load i32, *%jci
+    %ivp = gep i8, *%iv, %jciv2
+    %ivv = load i8, *%ivp
+    %j0p = gep i8, *%J0_p, %jciv2
+    store i8 %ivv, *%j0p
+    %next_j = add i32 %jciv2, 1
+    store i32 %next_j, *%jci
+    jmp @dec_j0_copy_cond
+  @dec_j0_done:
+    %j12 = gep i8, *%J0_p, 12
+    store i8 0, *%j12
+    %j13 = gep i8, *%J0_p, 13
+    store i8 0, *%j13
+    %j14 = gep i8, *%J0_p, 14
+    store i8 0, *%j14
+    %j15 = gep i8, *%J0_p, 15
+    store i8 1, *%j15
+
+    // Verify tag first (constant-time compare)
+    %computed_tag = let [i8, 16], 16
+    %computed_tag_p = gep i8, *%computed_tag, 0
+    call @_gcm_compute_tag(%H_p, %J0_p, %aad, %aad_len, %ciphertext, %ct_len, %key, %computed_tag_p)
+
+    %tci = let i32
+    store i32 0, *%tci
+    %tc_bad = let i32
+    store i32 0, *%tc_bad
+    jmp @dec_tag_cmp_cond
+  @dec_tag_cmp_cond:
+    %tciv = load i32, *%tci
+    %more_t = slt i32 %tciv, 16
+    br %more_t, @dec_tag_cmp_body, @dec_tag_done
+  @dec_tag_cmp_body:
+    %tciv2 = load i32, *%tci
+    %ctag_p = gep i8, *%computed_tag_p, %tciv2
+    %ctag_v = load i8, *%ctag_p
+    %tagg_p = gep i8, *%tag, %tciv2
+    %tagg_v = load i8, *%tagg_p
+    %tag_x = xor i8 %ctag_v, %tagg_v
+    %tag_xi = zext i8 %tag_x to i32
+    %tag_bad = load i32, *%tc_bad
+    %tag_bad2 = or i32 %tag_bad, %tag_xi
+    store i32 %tag_bad2, *%tc_bad
+    jmp @dec_tag_next
+  @dec_tag_next:
+    %tciv3 = load i32, *%tci
+    %tci_next = add i32 %tciv3, 1
+    store i32 %tci_next, *%tci
+    jmp @dec_tag_cmp_cond
+  @dec_tag_done:
+    %tb = load i32, *%tc_bad
+    %tag_mismatch = ne i32 %tb, 0
+    br %tag_mismatch, @dec_fail, @dec_ok
+
+  @dec_ok:
+    %cb = let [i8, 16], 16
+    %cb_p = gep i8, *%cb, 0
+    call @_copy16(%cb_p, %J0_p)
+
+    %dc_i = let i32
+    store i32 0, *%dc_i
+    jmp @dec_ks_cond
+
+  @dec_ks_cond:
+    %dc_iv = load i32, *%dc_i
+    %dc_more = slt i32 %dc_iv, %ct_len
+    br %dc_more, @dec_ks_body, @dec_success
+
+  @dec_ks_body:
+    %dc_iv2 = load i32, *%dc_i
+    call @_gcm_incr(%cb_p)
+
+    call @_sw_aes_encrypt_exp(%cb_p, %exp_p, %ks_p)
+
+    store i32 0, *%kbi
+    jmp @dec_ks_xor_cond
+  @dec_ks_xor_cond:
+    %kbiv = load i32, *%kbi
+    %under16 = slt i32 %kbiv, 16
+    %dec_remaining = sub i32 %ct_len, %dc_iv2
+    %dec_block_rem = sub i32 %dec_remaining, %kbiv
+    %still_has_ct = sgt i32 %dec_block_rem, 0
+    %still_in = and i1 %under16, %still_has_ct
+    br %still_in, @dec_ks_xor_body, @dec_ks_next
+  @dec_ks_xor_body:
+    %kbiv2 = load i32, *%kbi
+    %ct_off = add i32 %dc_iv2, %kbiv2
+    %ct_p = gep i8, *%ciphertext, %ct_off
+    %ct_v = load i8, *%ct_p
+    %ks_ptr = gep i8, *%ks_p, %kbiv2
+    %ks_v = load i8, *%ks_ptr
+    %pt_v = xor i8 %ct_v, %ks_v
+    %pt_p = gep i8, *%plaintext, %ct_off
+    store i8 %pt_v, *%pt_p
+    %kb_next = add i32 %kbiv2, 1
+    store i32 %kb_next, *%kbi
+    jmp @dec_ks_xor_cond
+  @dec_ks_next:
+    %kb_done_v = load i32, *%kbi
+    %dc_next = add i32 %dc_iv2, %kb_done_v
+    store i32 %dc_next, *%dc_i
+    jmp @dec_ks_cond
+
+  @dec_fail:
+    ret i32 -1
+
+  @dec_success:
+    ret i32 0
+}
+
+// ============================================================
+// AES-256 key expansion (32-byte key → 240 bytes, 15 round keys)
+// ============================================================
+
+// key_expansion_256: expand 32-byte key to 240 bytes (15 round keys)
+// AES-256 uses 14 rounds → 15 round keys → 60 words → 240 bytes
+fun @_aes_key_expansion_256(key: *i8, exp: *i8) -> void {
+  @entry:
+    // Copy first 32 bytes
+    %i = let i32
+    store i32 0, *%i
+    jmp @ke256_copy_cond
+
+  @ke256_copy_cond:
+    %iv = load i32, *%i
+    %more = slt i32 %iv, 32
+    br %more, @ke256_copy_body, @ke256_loop
+
+  @ke256_copy_body:
+    %iv2 = load i32, *%i
+    %kp = gep i8, *%key, %iv2
+    %kv = load i8, *%kp
+    %ep = gep i8, *%exp, %iv2
+    store i8 %kv, *%ep
+    %next = add i32 %iv2, 1
+    store i32 %next, *%i
+    jmp @ke256_copy_cond
+
+  @ke256_loop:
+    %wi = let i32
+    store i32 8, *%wi
+    jmp @ke256_cond
+
+  @ke256_cond:
+    %wiv = load i32, *%wi
+    %more_w = slt i32 %wiv, 60
+    br %more_w, @ke256_body, @ke256_done
+
+  @ke256_body:
+    %wiv2 = load i32, *%wi
+    %off = mul i32 %wiv2, 4
+    %prev_off = sub i32 %off, 4
+    %prev8_off = sub i32 %off, 32
+
+    %mod8 = and i32 %wiv2, 7
+    %is_rcon = eq i32 %mod8, 0
+    br %is_rcon, @ke256_rcon, @ke256_check_subword
+
+  @ke256_check_subword:
+    %mod8_4 = eq i32 %mod8, 4
+    br %mod8_4, @ke256_subword, @ke256_xor_prev
+
+  @ke256_rcon:
+    // temp = SubWord(RotWord(exp[i-1])) XOR Rcon
+    %b1_abs = add i32 %prev_off, 1
+    %b1p_abs = gep i8, *%exp, %b1_abs
+    %b2_abs = add i32 %prev_off, 2
+    %b2p_abs = gep i8, *%exp, %b2_abs
+    %b3_abs = add i32 %prev_off, 3
+    %b3p_abs = gep i8, *%exp, %b3_abs
+    %b0p = gep i8, *%exp, %prev_off
+
+    %b1v = load i8, *%b1p_abs
+    %b2v = load i8, *%b2p_abs
+    %b3v = load i8, *%b3p_abs
+    %b0v = load i8, *%b0p
+
+    %i_b1 = zext i8 %b1v to i32
+    %i_b2 = zext i8 %b2v to i32
+    %i_b3 = zext i8 %b3v to i32
+    %i_b0 = zext i8 %b0v to i32
+
+    %sb1_p = gep i8, *@_sbox, %i_b1
+    %sb2_p = gep i8, *@_sbox, %i_b2
+    %sb3_p = gep i8, *@_sbox, %i_b3
+    %sb0_p = gep i8, *@_sbox, %i_b0
+
+    %sb1 = load i8, *%sb1_p
+    %sb2 = load i8, *%sb2_p
+    %sb3 = load i8, *%sb3_p
+    %sb0 = load i8, *%sb0_p
+
+    // Rcon index = i / 8
+    %rcon_idx = lshr i32 %wiv2, 3
+    %rcon_p = gep i8, *@_rcon, %rcon_idx
+    %rc = load i8, *%rcon_p
+
+    %tb0 = xor i8 %sb1, %rc
+
+    // XOR with exp[i-8]
+    %pp0 = gep i8, *%exp, %prev8_off
+    %p1_abs = add i32 %prev8_off, 1
+    %pp1_abs = gep i8, *%exp, %p1_abs
+    %p2_abs = add i32 %prev8_off, 2
+    %pp2_abs = gep i8, *%exp, %p2_abs
+    %p3_abs = add i32 %prev8_off, 3
+    %pp3_abs = gep i8, *%exp, %p3_abs
+
+    %p0v = load i8, *%pp0
+    %p1v = load i8, *%pp1_abs
+    %p2v = load i8, *%pp2_abs
+    %p3v = load i8, *%pp3_abs
+
+    %r0 = xor i8 %tb0, %p0v
+    %r1 = xor i8 %sb2, %p1v
+    %r2 = xor i8 %sb3, %p2v
+    %r3 = xor i8 %sb0, %p3v
+
+    %op0 = gep i8, *%exp, %off
+    %o1_abs = add i32 %off, 1
+    %op1_abs = gep i8, *%exp, %o1_abs
+    %o2_abs = add i32 %off, 2
+    %op2_abs = gep i8, *%exp, %o2_abs
+    %o3_abs = add i32 %off, 3
+    %op3_abs = gep i8, *%exp, %o3_abs
+
+    store i8 %r0, *%op0
+    store i8 %r1, *%op1_abs
+    store i8 %r2, *%op2_abs
+    store i8 %r3, *%op3_abs
+
+    %next_w = add i32 %wiv2, 1
+    store i32 %next_w, *%wi
+    jmp @ke256_cond
+
+  @ke256_subword:
+    // SubWord(prev) XOR exp[i-8] (extra SubWord on all 4 bytes for AES-256)
+    %s0p = gep i8, *%exp, %prev_off
+    %s1_abs = add i32 %prev_off, 1
+    %s1p_abs = gep i8, *%exp, %s1_abs
+    %s2_abs = add i32 %prev_off, 2
+    %s2p_abs = gep i8, *%exp, %s2_abs
+    %s3_abs = add i32 %prev_off, 3
+    %s3p_abs = gep i8, *%exp, %s3_abs
+
+    %sv0 = load i8, *%s0p
+    %sv1 = load i8, *%s1p_abs
+    %sv2 = load i8, *%s2p_abs
+    %sv3 = load i8, *%s3p_abs
+
+    %si_b0 = zext i8 %sv0 to i32
+    %si_b1 = zext i8 %sv1 to i32
+    %si_b2 = zext i8 %sv2 to i32
+    %si_b3 = zext i8 %sv3 to i32
+
+    %ss0_p = gep i8, *@_sbox, %si_b0
+    %ss1_p = gep i8, *@_sbox, %si_b1
+    %ss2_p = gep i8, *@_sbox, %si_b2
+    %ss3_p = gep i8, *@_sbox, %si_b3
+
+    %ss0 = load i8, *%ss0_p
+    %ss1 = load i8, *%ss1_p
+    %ss2 = load i8, *%ss2_p
+    %ss3 = load i8, *%ss3_p
+
+    // XOR with exp[i-8]
+    %xpp0 = gep i8, *%exp, %prev8_off
+    %x1_abs = add i32 %prev8_off, 1
+    %xpp1_abs = gep i8, *%exp, %x1_abs
+    %x2_abs = add i32 %prev8_off, 2
+    %xpp2_abs = gep i8, *%exp, %x2_abs
+    %x3_abs = add i32 %prev8_off, 3
+    %xpp3_abs = gep i8, *%exp, %x3_abs
+
+    %xpv0 = load i8, *%xpp0
+    %xpv1 = load i8, *%xpp1_abs
+    %xpv2 = load i8, *%xpp2_abs
+    %xpv3 = load i8, *%xpp3_abs
+
+    %rr0 = xor i8 %ss0, %xpv0
+    %rr1 = xor i8 %ss1, %xpv1
+    %rr2 = xor i8 %ss2, %xpv2
+    %rr3 = xor i8 %ss3, %xpv3
+
+    %ox0 = gep i8, *%exp, %off
+    %ox1_abs = add i32 %off, 1
+    %ox1p_abs = gep i8, *%exp, %ox1_abs
+    %ox2_abs = add i32 %off, 2
+    %ox2p_abs = gep i8, *%exp, %ox2_abs
+    %ox3_abs = add i32 %off, 3
+    %ox3p_abs = gep i8, *%exp, %ox3_abs
+
+    store i8 %rr0, *%ox0
+    store i8 %rr1, *%ox1p_abs
+    store i8 %rr2, *%ox2p_abs
+    store i8 %rr3, *%ox3p_abs
+
+    %nw = add i32 %wiv2, 1
+    store i32 %nw, *%wi
+    jmp @ke256_cond
+
+  @ke256_xor_prev:
+    // exp[i] = exp[i-1] XOR exp[i-8]
+    %xx0p = gep i8, *%exp, %prev_off
+    %xx1_abs = add i32 %prev_off, 1
+    %xx1p_abs = gep i8, *%exp, %xx1_abs
+    %xx2_abs = add i32 %prev_off, 2
+    %xx2p_abs = gep i8, *%exp, %xx2_abs
+    %xx3_abs = add i32 %prev_off, 3
+    %xx3p_abs = gep i8, *%exp, %xx3_abs
+
+    %xxv0 = load i8, *%xx0p
+    %xxv1 = load i8, *%xx1p_abs
+    %xxv2 = load i8, *%xx2p_abs
+    %xxv3 = load i8, *%xx3p_abs
+
+    %xppp0 = gep i8, *%exp, %prev8_off
+    %xp1_abs = add i32 %prev8_off, 1
+    %xppp1_abs = gep i8, *%exp, %xp1_abs
+    %xp2_abs = add i32 %prev8_off, 2
+    %xppp2_abs = gep i8, *%exp, %xp2_abs
+    %xp3_abs = add i32 %prev8_off, 3
+    %xppp3_abs = gep i8, *%exp, %xp3_abs
+
+    %xppv0 = load i8, *%xppp0
+    %xppv1 = load i8, *%xppp1_abs
+    %xppv2 = load i8, *%xppp2_abs
+    %xppv3 = load i8, *%xppp3_abs
+
+    %rx0 = xor i8 %xxv0, %xppv0
+    %rx1 = xor i8 %xxv1, %xppv1
+    %rx2 = xor i8 %xxv2, %xppv2
+    %rx3 = xor i8 %xxv3, %xppv3
+
+    %oox0 = gep i8, *%exp, %off
+    %oox1_abs = add i32 %off, 1
+    %oox1p_abs = gep i8, *%exp, %oox1_abs
+    %oox2_abs = add i32 %off, 2
+    %oox2p_abs = gep i8, *%exp, %oox2_abs
+    %oox3_abs = add i32 %off, 3
+    %oox3p_abs = gep i8, *%exp, %oox3_abs
+
+    store i8 %rx0, *%oox0
+    store i8 %rx1, *%oox1p_abs
+    store i8 %rx2, *%oox2p_abs
+    store i8 %rx3, *%oox3p_abs
+
+    %nw2 = add i32 %wiv2, 1
+    store i32 %nw2, *%wi
+    jmp @ke256_cond
+
+  @ke256_done: ret void
+}
+
+
+
+
+
+
+// ============================================================
+// AES-256 block encrypt (14 rounds)
+// ============================================================
+
+// AES-256 encryption of one block with an already expanded key (240 bytes).
+fun @_sw_aes256_encrypt_exp(plaintext: *i8, exp_p: *i8, ciphertext: *i8) -> void {
+  @entry:
+    %state = let [i8, 16], 16
+    %state_p = gep i8, *%state, 0
+
+    // Copy plaintext to state
+    %ci = let i32
+    store i32 0, *%ci
+    jmp @a256_ec_cond
+
+  @a256_ec_cond:
+    %civ = load i32, *%ci
+    %more = slt i32 %civ, 16
+    br %more, @a256_ec_body, @a256_rk
+  @a256_ec_body:
+    %civ2 = load i32, *%ci
+    %pp = gep i8, *%plaintext, %civ2
+    %pv = load i8, *%pp
+    %sp = gep i8, *%state_p, %civ2
+    store i8 %pv, *%sp
+    %next = add i32 %civ2, 1
+    store i32 %next, *%ci
+    jmp @a256_ec_cond
+
+  @a256_rk:
+    call @_aes_xor_rk(%state_p, %exp_p)
+
+    %ri = let i32
+    store i32 1, *%ri
+    jmp @a256_er_cond
+
+  @a256_er_cond:
+    %riv = load i32, *%ri
+    %more_r = slt i32 %riv, 14
+    br %more_r, @a256_er_body, @a256_final
+  @a256_er_body:
+    call @_aes_sub_bytes(%state_p)
+    call @_aes_shift_rows(%state_p)
+    call @_aes_mix_columns(%state_p)
+    %riv2 = load i32, *%ri
+    %rk_off = mul i32 %riv2, 16
+    %rk_p = gep i8, *%exp_p, %rk_off
+    call @_aes_xor_rk(%state_p, %rk_p)
+    %next_r = add i32 %riv2, 1
+    store i32 %next_r, *%ri
+    jmp @a256_er_cond
+
+  @a256_final:
+    call @_aes_sub_bytes(%state_p)
+    call @_aes_shift_rows(%state_p)
+    %last_off = mul i32 14, 16
+    %last_rk = gep i8, *%exp_p, %last_off
+    call @_aes_xor_rk(%state_p, %last_rk)
+
+    %oi = let i32
+    store i32 0, *%oi
+    jmp @a256_eo_cond
+  @a256_eo_cond:
+    %oiv = load i32, *%oi
+    %more_o = slt i32 %oiv, 16
+    br %more_o, @a256_eo_body, @a256_done
+  @a256_eo_body:
+    %oiv2 = load i32, *%oi
+    %sp2 = gep i8, *%state_p, %oiv2
+    %sv2 = load i8, *%sp2
+    %cp = gep i8, *%ciphertext, %oiv2
+    store i8 %sv2, *%cp
+    %next_o = add i32 %oiv2, 1
+    store i32 %next_o, *%oi
+    jmp @a256_eo_cond
+  @a256_done: ret void
+}
+
+// AES-256 encryption of one block; expands the key first.
+fun @_sw_aes256_encrypt(plaintext: *i8, key: *i8, ciphertext: *i8) -> void {
+  @entry:
+    %exp = let [i8, 240], 16
+    %exp_p = gep i8, *%exp, 0
+    call @_aes_key_expansion_256(%key, %exp_p)
+    call @_sw_aes256_encrypt_exp(%plaintext, %exp_p, %ciphertext)
+    ret void
+}
+
+
+// ============================================================
+// AES-256 block decrypt (14 rounds)
+// ============================================================
+
+fun @_sw_aes256_decrypt_exp(ciphertext: *i8, exp_p: *i8, plaintext: *i8) -> void {
+  @entry:
+    %state = let [i8, 16], 16
+    %state_p = gep i8, *%state, 0
+
+    %ci = let i32
+    store i32 0, *%ci
+    jmp @a256_dc_cond
+  @a256_dc_cond:
+    %civ = load i32, *%ci
+    %more = slt i32 %civ, 16
+    br %more, @a256_dc_body, @a256_drk
+  @a256_dc_body:
+    %civ2 = load i32, *%ci
+    %cp = gep i8, *%ciphertext, %civ2
+    %cv = load i8, *%cp
+    %sp = gep i8, *%state_p, %civ2
+    store i8 %cv, *%sp
+    %next = add i32 %civ2, 1
+    store i32 %next, *%ci
+    jmp @a256_dc_cond
+
+  @a256_drk:
+    %last_rk_off = mul i32 14, 16
+    %first_rk = gep i8, *%exp_p, %last_rk_off
+    call @_aes_xor_rk(%state_p, %first_rk)
+
+    %ri = let i32
+    store i32 13, *%ri
+    jmp @a256_dr_cond
+  @a256_dr_cond:
+    %riv = load i32, *%ri
+    %more_r = sgt i32 %riv, 0
+    br %more_r, @a256_dr_body, @a256_dfinal
+  @a256_dr_body:
+    call @_aes_inv_sub_bytes(%state_p)
+    call @_aes_inv_shift_rows(%state_p)
+    %riv2 = load i32, *%ri
+    %rk_off = mul i32 %riv2, 16
+    %rk_p = gep i8, *%exp_p, %rk_off
+    call @_aes_xor_rk(%state_p, %rk_p)
+    call @_aes_inv_mix_columns(%state_p)
+    %next_r = sub i32 %riv2, 1
+    store i32 %next_r, *%ri
+    jmp @a256_dr_cond
+
+  @a256_dfinal:
+    call @_aes_inv_sub_bytes(%state_p)
+    call @_aes_inv_shift_rows(%state_p)
+    call @_aes_xor_rk(%state_p, %exp_p)
+
+    %oi = let i32
+    store i32 0, *%oi
+    jmp @a256_do_cond
+  @a256_do_cond:
+    %oiv = load i32, *%oi
+    %more_o = slt i32 %oiv, 16
+    br %more_o, @a256_do_body, @a256_done
+  @a256_do_body:
+    %oiv2 = load i32, *%oi
+    %sp2 = gep i8, *%state_p, %oiv2
+    %sv2 = load i8, *%sp2
+    %pp = gep i8, *%plaintext, %oiv2
+    store i8 %sv2, *%pp
+    %next_o = add i32 %oiv2, 1
+    store i32 %next_o, *%oi
+    jmp @a256_do_cond
+  @a256_done: ret void
+}
+
+// AES-256 decryption of one block; expands the key first.
+fun @_sw_aes256_decrypt(ciphertext: *i8, key: *i8, plaintext: *i8) -> void {
+  @entry:
+    %exp = let [i8, 240], 16
+    %exp_p = gep i8, *%exp, 0
+    call @_aes_key_expansion_256(%key, %exp_p)
+    call @_sw_aes256_decrypt_exp(%ciphertext, %exp_p, %plaintext)
+    ret void
+}
+
+fun @std_crypto_aes256_encrypt(plaintext: *i8, key: *i8, ciphertext: *i8) -> void {
+  @entry:
+    %f = call @c1_cpu_features()
+    %b = and i64 %f, 1
+    %hw = ne i64 %b, 0
+    br %hw, @hw_path, @sw_path
+  @hw_path:
+    call @c1_aes256_encrypt_block(%plaintext, %key, %ciphertext)
+    ret void
+  @sw_path:
+    call @_sw_aes256_encrypt(%plaintext, %key, %ciphertext)
+    ret void
+}
+
+fun @std_crypto_aes256_decrypt(ciphertext: *i8, key: *i8, plaintext: *i8) -> void {
+  @entry:
+    %f = call @c1_cpu_features()
+    %b = and i64 %f, 1
+    %hw = ne i64 %b, 0
+    br %hw, @hw_path, @sw_path
+  @hw_path:
+    call @c1_aes256_decrypt_block(%ciphertext, %key, %plaintext)
+    ret void
+  @sw_path:
+    call @_sw_aes256_decrypt(%ciphertext, %key, %plaintext)
+    ret void
+}
+
+
+// ============================================================
+// AES-256-CBC
+// ============================================================
+
+fun @_sw_aes256_cbc_encrypt(plaintext: *i8, plaintext_len: i32, key: *i8, iv: *i8, ciphertext: *i8) -> void {
+  @entry:
+    %xor_block = let [i8, 16], 16
+    %xor_p = gep i8, *%xor_block, 0
+    %prev = let [i8, 16], 16
+    %prev_p = gep i8, *%prev, 0
+    %exp = let [i8, 240], 16
+    %exp_p = gep i8, *%exp, 0
+    call @_aes_key_expansion_256(%key, %exp_p)
+    call @_copy16(%prev_p, %iv)
+
+    %i = let i32
+    store i32 0, *%i
+    jmp @cbc256_enc_cond
+  @cbc256_enc_cond:
+    %iv_loop = load i32, *%i
+    %more = slt i32 %iv_loop, %plaintext_len
+    br %more, @cbc256_enc_body, @cbc256_enc_done
+  @cbc256_enc_body:
+    %iv_loop2 = load i32, *%i
+    %pt_block = gep i8, *%plaintext, %iv_loop2
+    call @_xor16(%xor_p, %pt_block, %prev_p)
+    %ct_block = gep i8, *%ciphertext, %iv_loop2
+    call @_sw_aes256_encrypt_exp(%xor_p, %exp_p, %ct_block)
+    call @_copy16(%prev_p, %ct_block)
+    %next = add i32 %iv_loop2, 16
+    store i32 %next, *%i
+    jmp @cbc256_enc_cond
+  @cbc256_enc_done: ret void
+}
+
+fun @_sw_aes256_cbc_decrypt(ciphertext: *i8, ciphertext_len: i32, key: *i8, iv: *i8, plaintext: *i8) -> void {
+  @entry:
+    %dec_block = let [i8, 16], 16
+    %dec_p = gep i8, *%dec_block, 0
+    %prev = let [i8, 16], 16
+    %prev_p = gep i8, *%prev, 0
+    %exp = let [i8, 240], 16
+    %exp_p = gep i8, *%exp, 0
+    call @_aes_key_expansion_256(%key, %exp_p)
+    call @_copy16(%prev_p, %iv)
+
+    %i = let i32
+    store i32 0, *%i
+    jmp @cbc256_dec_cond
+  @cbc256_dec_cond:
+    %iv_loop = load i32, *%i
+    %more = slt i32 %iv_loop, %ciphertext_len
+    br %more, @cbc256_dec_body, @cbc256_dec_done
+  @cbc256_dec_body:
+    %iv_loop2 = load i32, *%i
+    %ct_block = gep i8, *%ciphertext, %iv_loop2
+    call @_sw_aes256_decrypt_exp(%ct_block, %exp_p, %dec_p)
+    %pt_block = gep i8, *%plaintext, %iv_loop2
+    call @_xor16(%pt_block, %dec_p, %prev_p)
+    call @_copy16(%prev_p, %ct_block)
+    %next = add i32 %iv_loop2, 16
+    store i32 %next, *%i
+    jmp @cbc256_dec_cond
+  @cbc256_dec_done: ret void
+}
+
+
+// ============================================================
+// AES-256-GCM
+// ============================================================
+
+// gcm_compute_tag_aes256: same as _gcm_compute_tag but uses AES-256
+fun @_gcm_compute_tag_aes256(H: *i8, J0: *i8, aad: *i8, aad_len: i32, ct: *i8, ct_len: i32, key: *i8, tag: *i8) -> void {
+  @entry:
+    %Y = let [i8, 16], 16
+    %Y_p = gep i8, *%Y, 0
+    call @_zero16(%Y_p)
+    call @_ghash_process(%Y_p, %H, %aad, %aad_len)
+    call @_ghash_process(%Y_p, %H, %ct, %ct_len)
+
+    %len_blk = let [i8, 16], 16
+    %len_blk_p = gep i8, *%len_blk, 0
+    call @_zero16(%len_blk_p)
+
+    %aad_bits = shl i32 %aad_len, 3
+    %aab3 = trunc i32 %aad_bits to i8
+    %aas8 = lshr i32 %aad_bits, 8
+    %aab2 = trunc i32 %aas8 to i8
+    %aas16 = lshr i32 %aad_bits, 16
+    %aab1 = trunc i32 %aas16 to i8
+    %aas24 = lshr i32 %aad_bits, 24
+    %aab0 = trunc i32 %aas24 to i8
+    %lb4 = gep i8, *%len_blk_p, 4
+    store i8 %aab0, *%lb4
+    %lb5 = gep i8, *%len_blk_p, 5
+    store i8 %aab1, *%lb5
+    %lb6 = gep i8, *%len_blk_p, 6
+    store i8 %aab2, *%lb6
+    %lb7 = gep i8, *%len_blk_p, 7
+    store i8 %aab3, *%lb7
+
+    %ct_bits = shl i32 %ct_len, 3
+    %ctb3 = trunc i32 %ct_bits to i8
+    %cts8 = lshr i32 %ct_bits, 8
+    %ctb2 = trunc i32 %cts8 to i8
+    %cts16 = lshr i32 %ct_bits, 16
+    %ctb1 = trunc i32 %cts16 to i8
+    %cts24 = lshr i32 %ct_bits, 24
+    %ctb0 = trunc i32 %cts24 to i8
+    %lb12 = gep i8, *%len_blk_p, 12
+    store i8 %ctb0, *%lb12
+    %lb13 = gep i8, *%len_blk_p, 13
+    store i8 %ctb1, *%lb13
+    %lb14 = gep i8, *%len_blk_p, 14
+    store i8 %ctb2, *%lb14
+    %lb15 = gep i8, *%len_blk_p, 15
+    store i8 %ctb3, *%lb15
+
+    call @_xor16(%Y_p, %Y_p, %len_blk_p)
+    call @_ghash_mul(%Y_p, %Y_p, %H)
+
+    %ek = let [i8, 16], 16
+    %ek_p = gep i8, *%ek, 0
+    call @_sw_aes256_encrypt(%J0, %key, %ek_p)
+    call @_xor16(%tag, %Y_p, %ek_p)
+    ret void
+}
+
+fun @_sw_aes256_gcm_encrypt(plaintext: *i8, pt_len: i32, aad: *i8, aad_len: i32,
+                                    key: *i8, iv: *i8, ciphertext: *i8, tag: *i8) -> i32 {
+  @entry:
+    %kbi = let i32
+    %ks = let [i8, 16], 16
+    %ks_p = gep i8, *%ks, 0
+    %H = let [i8, 16], 16
+    %H_p = gep i8, *%H, 0
+    %zero = let [i8, 16], 16
+    %zero_p = gep i8, *%zero, 0
+    %exp = let [i8, 240], 16
+    %exp_p = gep i8, *%exp, 0
+    call @_aes_key_expansion_256(%key, %exp_p)
+    call @_zero16(%zero_p)
+    call @_sw_aes256_encrypt_exp(%zero_p, %exp_p, %H_p)
+
+    %J0 = let [i8, 16], 16
+    %J0_p = gep i8, *%J0, 0
+    %jci = let i32
+    store i32 0, *%jci
+    jmp @a256_ge_j0_cond
+  @a256_ge_j0_cond:
+    %jciv = load i32, *%jci
+    %more = slt i32 %jciv, 12
+    br %more, @a256_ge_j0_body, @a256_ge_j0_done
+  @a256_ge_j0_body:
+    %jciv2 = load i32, *%jci
+    %ivp = gep i8, *%iv, %jciv2
+    %ivv = load i8, *%ivp
+    %j0p = gep i8, *%J0_p, %jciv2
+    store i8 %ivv, *%j0p
+    %next_j = add i32 %jciv2, 1
+    store i32 %next_j, *%jci
+    jmp @a256_ge_j0_cond
+  @a256_ge_j0_done:
+    %j12 = gep i8, *%J0_p, 12
+    store i8 0, *%j12
+    %j13 = gep i8, *%J0_p, 13
+    store i8 0, *%j13
+    %j14 = gep i8, *%J0_p, 14
+    store i8 0, *%j14
+    %j15 = gep i8, *%J0_p, 15
+    store i8 1, *%j15
+
+    %cb = let [i8, 16], 16
+    %cb_p = gep i8, *%cb, 0
+    call @_copy16(%cb_p, %J0_p)
+
+    %en_i = let i32
+    store i32 0, *%en_i
+    jmp @a256_ge_ks_cond
+  @a256_ge_ks_cond:
+    %en_iv = load i32, *%en_i
+    %en_more = slt i32 %en_iv, %pt_len
+    br %en_more, @a256_ge_ks_body, @a256_ge_mac
+  @a256_ge_ks_body:
+    %en_iv2 = load i32, *%en_i
+    call @_gcm_incr(%cb_p)
+    call @_sw_aes256_encrypt_exp(%cb_p, %exp_p, %ks_p)
+    store i32 0, *%kbi
+    jmp @a256_ge_xor_cond
+  @a256_ge_xor_cond:
+    %kbiv = load i32, *%kbi
+    %u16ge = slt i32 %kbiv, 16
+    %enc_remaining = sub i32 %pt_len, %en_iv2
+    %enc_block_rem = sub i32 %enc_remaining, %kbiv
+    %still_has_pt = sgt i32 %enc_block_rem, 0
+    %still_in = and i1 %u16ge, %still_has_pt
+    br %still_in, @a256_ge_xor_body, @a256_ge_next
+  @a256_ge_xor_body:
+    %kbiv2 = load i32, *%kbi
+    %pt_off = add i32 %en_iv2, %kbiv2
+    %pt_p = gep i8, *%plaintext, %pt_off
+    %pt_v = load i8, *%pt_p
+    %ks_ptr = gep i8, *%ks_p, %kbiv2
+    %ks_v = load i8, *%ks_ptr
+    %ct_v = xor i8 %pt_v, %ks_v
+    %ct_p = gep i8, *%ciphertext, %pt_off
+    store i8 %ct_v, *%ct_p
+    %kb_next = add i32 %kbiv2, 1
+    store i32 %kb_next, *%kbi
+    jmp @a256_ge_xor_cond
+  @a256_ge_next:
+    %kb_done_v = load i32, *%kbi
+    %en_next = add i32 %en_iv2, %kb_done_v
+    store i32 %en_next, *%en_i
+    jmp @a256_ge_ks_cond
+  @a256_ge_mac:
+    call @_gcm_compute_tag_aes256(%H_p, %J0_p, %aad, %aad_len, %ciphertext, %pt_len, %key, %tag)
+    ret i32 0
+}
+
+fun @_sw_aes256_gcm_decrypt(ciphertext: *i8, ct_len: i32, aad: *i8, aad_len: i32,
+                                    key: *i8, iv: *i8, tag: *i8, plaintext: *i8) -> i32 {
+  @entry:
+    %kbi = let i32
+    %ks = let [i8, 16], 16
+    %ks_p = gep i8, *%ks, 0
+    %H = let [i8, 16], 16
+    %H_p = gep i8, *%H, 0
+    %zero = let [i8, 16], 16
+    %zero_p = gep i8, *%zero, 0
+    %exp = let [i8, 240], 16
+    %exp_p = gep i8, *%exp, 0
+    call @_aes_key_expansion_256(%key, %exp_p)
+    call @_zero16(%zero_p)
+    call @_sw_aes256_encrypt_exp(%zero_p, %exp_p, %H_p)
+
+    %J0 = let [i8, 16], 16
+    %J0_p = gep i8, *%J0, 0
+    %jci = let i32
+    store i32 0, *%jci
+    jmp @a256_gd_j0_cond
+  @a256_gd_j0_cond:
+    %jciv = load i32, *%jci
+    %more = slt i32 %jciv, 12
+    br %more, @a256_gd_j0_body, @a256_gd_j0_done
+  @a256_gd_j0_body:
+    %jciv2 = load i32, *%jci
+    %ivp = gep i8, *%iv, %jciv2
+    %ivv = load i8, *%ivp
+    %j0p = gep i8, *%J0_p, %jciv2
+    store i8 %ivv, *%j0p
+    %next_j = add i32 %jciv2, 1
+    store i32 %next_j, *%jci
+    jmp @a256_gd_j0_cond
+  @a256_gd_j0_done:
+    %j12 = gep i8, *%J0_p, 12
+    store i8 0, *%j12
+    %j13 = gep i8, *%J0_p, 13
+    store i8 0, *%j13
+    %j14 = gep i8, *%J0_p, 14
+    store i8 0, *%j14
+    %j15 = gep i8, *%J0_p, 15
+    store i8 1, *%j15
+
+    %computed_tag = let [i8, 16], 16
+    %computed_tag_p = gep i8, *%computed_tag, 0
+    call @_gcm_compute_tag_aes256(%H_p, %J0_p, %aad, %aad_len, %ciphertext, %ct_len, %key, %computed_tag_p)
+
+    %tci = let i32
+    store i32 0, *%tci
+    %tc_bad = let i32
+    store i32 0, *%tc_bad
+    jmp @a256_gd_tc_cond
+  @a256_gd_tc_cond:
+    %tciv = load i32, *%tci
+    %more_t = slt i32 %tciv, 16
+    br %more_t, @a256_gd_tc_body, @a256_gd_tc_done
+  @a256_gd_tc_body:
+    %tciv2 = load i32, *%tci
+    %ctag_p = gep i8, *%computed_tag_p, %tciv2
+    %ctag_v = load i8, *%ctag_p
+    %tagg_p = gep i8, *%tag, %tciv2
+    %tagg_v = load i8, *%tagg_p
+    %tag_x = xor i8 %ctag_v, %tagg_v
+    %tag_xi = zext i8 %tag_x to i32
+    %tag_bad = load i32, *%tc_bad
+    %tag_bad2 = or i32 %tag_bad, %tag_xi
+    store i32 %tag_bad2, *%tc_bad
+    jmp @a256_gd_tc_next
+  @a256_gd_tc_next:
+    %tciv3 = load i32, *%tci
+    %tci_next = add i32 %tciv3, 1
+    store i32 %tci_next, *%tci
+    jmp @a256_gd_tc_cond
+  @a256_gd_tc_done:
+    %tb = load i32, *%tc_bad
+    %tag_mismatch = ne i32 %tb, 0
+    br %tag_mismatch, @a256_gd_fail, @a256_gd_ok
+
+  @a256_gd_ok:
+    %cb = let [i8, 16], 16
+    %cb_p = gep i8, *%cb, 0
+    call @_copy16(%cb_p, %J0_p)
+    %dc_i = let i32
+    store i32 0, *%dc_i
+    jmp @a256_gd_ks_cond
+  @a256_gd_ks_cond:
+    %dc_iv = load i32, *%dc_i
+    %dc_more = slt i32 %dc_iv, %ct_len
+    br %dc_more, @a256_gd_ks_body, @a256_gd_success
+  @a256_gd_ks_body:
+    %dc_iv2 = load i32, *%dc_i
+    call @_gcm_incr(%cb_p)
+    call @_sw_aes256_encrypt_exp(%cb_p, %exp_p, %ks_p)
+    store i32 0, *%kbi
+    jmp @a256_gd_xor_cond
+  @a256_gd_xor_cond:
+    %kbiv = load i32, *%kbi
+    %ugd16 = slt i32 %kbiv, 16
+    %dec_remaining = sub i32 %ct_len, %dc_iv2
+    %dec_block_rem = sub i32 %dec_remaining, %kbiv
+    %still_has_ct = sgt i32 %dec_block_rem, 0
+    %still_in = and i1 %ugd16, %still_has_ct
+    br %still_in, @a256_gd_xor_body, @a256_gd_next
+  @a256_gd_xor_body:
+    %kbiv2 = load i32, *%kbi
+    %ct_off = add i32 %dc_iv2, %kbiv2
+    %ct_p = gep i8, *%ciphertext, %ct_off
+    %ct_v = load i8, *%ct_p
+    %ks_ptr = gep i8, *%ks_p, %kbiv2
+    %ks_v = load i8, *%ks_ptr
+    %pt_v = xor i8 %ct_v, %ks_v
+    %pt_p = gep i8, *%plaintext, %ct_off
+    store i8 %pt_v, *%pt_p
+    %kb_next = add i32 %kbiv2, 1
+    store i32 %kb_next, *%kbi
+    jmp @a256_gd_xor_cond
+  @a256_gd_next:
+    %kb_done_v = load i32, *%kbi
+    %dc_next = add i32 %dc_iv2, %kb_done_v
+    store i32 %dc_next, *%dc_i
+    jmp @a256_gd_ks_cond
+
+  @a256_gd_fail:
+    ret i32 -1
+  @a256_gd_success:
+    ret i32 0
+}
+
+
+
+
+
+
+// ============================================================
+// AES-128-GCM seal/open (auto-generated random IV)
+// ============================================================
+// seal: generates random 12-byte IV, encrypts.
+//   out must be pt_len + 28 bytes: [IV(12)][ciphertext(pt_len)][tag(16)]
+//   Returns 0 on success.
+// ============================================================
+// Hardware AES implemented in SSA
+// Uses aesenc/aesdec/aesimc/aesenclast/aesdeclast, which lower to
+// AES-NI or ARMv8 Crypto depending on the target.
+// ============================================================
+
+
+// Round keys go through aesimc because SSA aesdec follows the AES-NI
+// convention (AddRoundKey applied after InvMixColumns).
+
+
+// Round keys go through aesimc because SSA aesdec follows the AES-NI
+// convention (AddRoundKey applied after InvMixColumns).
+
+
+
+
+
+
+
+
+
+// ============================================================
+// Hardware dispatch (GCM needs both AES and PMULL: feature bits 0 and 2)
+// Every public entry point probes the CPU once (the platform layer
+// caches the result) and takes the accelerated path when available.
+// ============================================================
+
+
+
+
+
+fun @std_crypto_aes128_cbc_encrypt(plaintext: *i8, plaintext_len: i32, key: *i8, iv: *i8, ciphertext: *i8) -> void {
+  @entry:
+    %f = call @c1_cpu_features()
+    %b = and i64 %f, 1
+    %hw = ne i64 %b, 0
+    br %hw, @hw_path, @sw_path
+  @hw_path:
+    call @c1_aes128_cbc_encrypt(%plaintext, %plaintext_len, %key, %iv, %ciphertext)
+    ret void
+  @sw_path:
+    call @_sw_aes128_cbc_encrypt(%plaintext, %plaintext_len, %key, %iv, %ciphertext)
+    ret void
+}
+
+fun @std_crypto_aes128_cbc_decrypt(ciphertext: *i8, ciphertext_len: i32, key: *i8, iv: *i8, plaintext: *i8) -> void {
+  @entry:
+    %f = call @c1_cpu_features()
+    %b = and i64 %f, 1
+    %hw = ne i64 %b, 0
+    br %hw, @hw_path, @sw_path
+  @hw_path:
+    call @c1_aes128_cbc_decrypt(%ciphertext, %ciphertext_len, %key, %iv, %plaintext)
+    ret void
+  @sw_path:
+    call @_sw_aes128_cbc_decrypt(%ciphertext, %ciphertext_len, %key, %iv, %plaintext)
+    ret void
+}
+
+fun @std_crypto_aes256_cbc_encrypt(plaintext: *i8, plaintext_len: i32, key: *i8, iv: *i8, ciphertext: *i8) -> void {
+  @entry:
+    %f = call @c1_cpu_features()
+    %b = and i64 %f, 1
+    %hw = ne i64 %b, 0
+    br %hw, @hw_path, @sw_path
+  @hw_path:
+    call @c1_aes256_cbc_encrypt(%plaintext, %plaintext_len, %key, %iv, %ciphertext)
+    ret void
+  @sw_path:
+    call @_sw_aes256_cbc_encrypt(%plaintext, %plaintext_len, %key, %iv, %ciphertext)
+    ret void
+}
+
+fun @std_crypto_aes256_cbc_decrypt(ciphertext: *i8, ciphertext_len: i32, key: *i8, iv: *i8, plaintext: *i8) -> void {
+  @entry:
+    %f = call @c1_cpu_features()
+    %b = and i64 %f, 1
+    %hw = ne i64 %b, 0
+    br %hw, @hw_path, @sw_path
+  @hw_path:
+    call @c1_aes256_cbc_decrypt(%ciphertext, %ciphertext_len, %key, %iv, %plaintext)
+    ret void
+  @sw_path:
+    call @_sw_aes256_cbc_decrypt(%ciphertext, %ciphertext_len, %key, %iv, %plaintext)
+    ret void
+}
+
+
+
+
+
+
+
+
+
+fun @std_crypto_aes_gcm_encrypt(plaintext: *i8, pt_len: i32, aad: *i8, aad_len: i32,
+                                 key: *i8, iv: *i8, ciphertext: *i8, tag: *i8) -> i32 {
+  @entry:
+    %f = call @c1_cpu_features()
+    %b = and i64 %f, 5
+    %hw = eq i64 %b, 5
+    br %hw, @hw_path, @sw_path
+  @hw_path:
+    %r = call @c1_aes128_gcm_encrypt(%plaintext, %pt_len, %aad, %aad_len, %key, %iv, %ciphertext, %tag)
+    ret i32 %r
+  @sw_path:
+    %r2 = call @_sw_aes_gcm_encrypt(%plaintext, %pt_len, %aad, %aad_len, %key, %iv, %ciphertext, %tag)
+    ret i32 %r2
+}
+
+fun @std_crypto_aes_gcm_decrypt(ciphertext: *i8, ct_len: i32, aad: *i8, aad_len: i32,
+                                 key: *i8, iv: *i8, tag: *i8, plaintext: *i8) -> i32 {
+  @entry:
+    %f = call @c1_cpu_features()
+    %b = and i64 %f, 5
+    %hw = eq i64 %b, 5
+    br %hw, @hw_path, @sw_path
+  @hw_path:
+    %r = call @c1_aes128_gcm_decrypt(%ciphertext, %ct_len, %aad, %aad_len, %key, %iv, %tag, %plaintext)
+    ret i32 %r
+  @sw_path:
+    %r2 = call @_sw_aes_gcm_decrypt(%ciphertext, %ct_len, %aad, %aad_len, %key, %iv, %tag, %plaintext)
+    ret i32 %r2
+}
+
+fun @std_crypto_aes256_gcm_encrypt(plaintext: *i8, pt_len: i32, aad: *i8, aad_len: i32,
+                                 key: *i8, iv: *i8, ciphertext: *i8, tag: *i8) -> i32 {
+  @entry:
+    %f = call @c1_cpu_features()
+    %b = and i64 %f, 5
+    %hw = eq i64 %b, 5
+    br %hw, @hw_path, @sw_path
+  @hw_path:
+    %r = call @c1_aes256_gcm_encrypt(%plaintext, %pt_len, %aad, %aad_len, %key, %iv, %ciphertext, %tag)
+    ret i32 %r
+  @sw_path:
+    %r2 = call @_sw_aes256_gcm_encrypt(%plaintext, %pt_len, %aad, %aad_len, %key, %iv, %ciphertext, %tag)
+    ret i32 %r2
+}
+
+fun @std_crypto_aes256_gcm_decrypt(ciphertext: *i8, ct_len: i32, aad: *i8, aad_len: i32,
+                                 key: *i8, iv: *i8, tag: *i8, plaintext: *i8) -> i32 {
+  @entry:
+    %f = call @c1_cpu_features()
+    %b = and i64 %f, 5
+    %hw = eq i64 %b, 5
+    br %hw, @hw_path, @sw_path
+  @hw_path:
+    %r = call @c1_aes256_gcm_decrypt(%ciphertext, %ct_len, %aad, %aad_len, %key, %iv, %tag, %plaintext)
+    ret i32 %r
+  @sw_path:
+    %r2 = call @_sw_aes256_gcm_decrypt(%ciphertext, %ct_len, %aad, %aad_len, %key, %iv, %tag, %plaintext)
+    ret i32 %r2
+}
+
+fun @std_crypto_aes_gcm_seal(plaintext: *i8, pt_len: i32, aad: *i8, aad_len: i32,
+                              key: *i8, out: *i8) -> i32 {
+  @entry:
+    %iv = let [i8, 12]
+    %iv_p = gep i8, *%iv, 0
+    %iv_64 = sext i32 12 to i64
+    call @c1_random_buf(%iv_p, %iv_64)
+    %ct_off = add i32 0, 12
+    %ct_out = gep i8, *%out, %ct_off
+    %tag_off = add i32 %ct_off, %pt_len
+    %tag_buf = let [i8, 16], 16
+    %tag_buf_p = gep i8, *%tag_buf, 0
+    call @std_crypto_aes_gcm_encrypt(%plaintext, %pt_len, %aad, %aad_len,
+                                      %key, %iv_p, %ct_out, %tag_buf_p)
+    // Copy IV to out[0..11]
+    %ici = let i32
+    store i32 0, *%ici
+    jmp @seal_iv_cond
+  @seal_iv_cond:
+    %iciv = load i32, *%ici
+    %more = slt i32 %iciv, 12
+    br %more, @seal_iv_body, @seal_iv_done
+  @seal_iv_body:
+    %iciv2 = load i32, *%ici
+    %ivp = gep i8, *%iv_p, %iciv2
+    %ivv = load i8, *%ivp
+    %outp = gep i8, *%out, %iciv2
+    store i8 %ivv, *%outp
+    %next = add i32 %iciv2, 1
+    store i32 %next, *%ici
+    jmp @seal_iv_cond
+  @seal_iv_done:
+    // Copy tag to out[tag_off..tag_off+15]
+    %tci = let i32
+    store i32 0, *%tci
+    jmp @seal_tag_cond
+  @seal_tag_cond:
+    %tciv = load i32, *%tci
+    %more_t = slt i32 %tciv, 16
+    br %more_t, @seal_tag_body, @seal_tag_done
+  @seal_tag_body:
+    %tciv2 = load i32, *%tci
+    %tp = gep i8, *%tag_buf_p, %tciv2
+    %tv = load i8, *%tp
+    %off = add i32 %tag_off, %tciv2
+    %top = gep i8, *%out, %off
+    store i8 %tv, *%top
+    %next_t = add i32 %tciv2, 1
+    store i32 %next_t, *%tci
+    jmp @seal_tag_cond
+  @seal_tag_done:
+    ret i32 0
+}
+
+// open: extract IV + tag from sealed data, decrypt.
+//   sealed layout: [IV(12)][ciphertext][tag(16)]
+//   total_len = 12 + ct_len + 16, ct_len = total_len - 28
+//   Returns 0 on success, -1 on tag mismatch.
+fun @std_crypto_aes_gcm_open(sealed: *i8, total_len: i32, aad: *i8, aad_len: i32,
+                               key: *i8, plaintext: *i8) -> i32 {
+  @entry:
+    %too_small = slt i32 %total_len, 29
+    br %too_small, @open_fail, @open_ok
+  @open_ok:
+    %iv_p = gep i8, *%sealed, 0
+    %ct_len = sub i32 %total_len, 28
+    %ct_p = gep i8, *%sealed, 12
+    %tag_p2 = gep i8, *%sealed, 12
+    %tag_p3 = gep i8, *%tag_p2, %ct_len
+    call @std_crypto_aes_gcm_decrypt(%ct_p, %ct_len, %aad, %aad_len,
+                                      %key, %iv_p, %tag_p3, %plaintext)
+    ret i32 0
+  @open_fail:
+    ret i32 -1
+}
+
+
+// ============================================================
+// AES-256-GCM seal/open (auto-generated random IV)
+// ============================================================
+
+fun @std_crypto_aes256_gcm_seal(plaintext: *i8, pt_len: i32, aad: *i8, aad_len: i32,
+                                 key: *i8, out: *i8) -> i32 {
+  @entry:
+    %iv = let [i8, 12]
+    %iv_p = gep i8, *%iv, 0
+    %iv_64 = sext i32 12 to i64
+    call @c1_random_buf(%iv_p, %iv_64)
+    %ct_off = add i32 0, 12
+    %ct_out = gep i8, *%out, %ct_off
+    %tag_off = add i32 %ct_off, %pt_len
+    %tag_buf = let [i8, 16], 16
+    %tag_buf_p = gep i8, *%tag_buf, 0
+    call @std_crypto_aes256_gcm_encrypt(%plaintext, %pt_len, %aad, %aad_len,
+                                         %key, %iv_p, %ct_out, %tag_buf_p)
+    %ici = let i32
+    store i32 0, *%ici
+    jmp @a256s_iv_cond
+  @a256s_iv_cond:
+    %iciv = load i32, *%ici
+    %more = slt i32 %iciv, 12
+    br %more, @a256s_iv_body, @a256s_iv_done
+  @a256s_iv_body:
+    %iciv2 = load i32, *%ici
+    %ivp = gep i8, *%iv_p, %iciv2
+    %ivv = load i8, *%ivp
+    %outp = gep i8, *%out, %iciv2
+    store i8 %ivv, *%outp
+    %next = add i32 %iciv2, 1
+    store i32 %next, *%ici
+    jmp @a256s_iv_cond
+  @a256s_iv_done:
+    %tci = let i32
+    store i32 0, *%tci
+    jmp @a256s_tag_cond
+  @a256s_tag_cond:
+    %tciv = load i32, *%tci
+    %more_t = slt i32 %tciv, 16
+    br %more_t, @a256s_tag_body, @a256s_tag_done
+  @a256s_tag_body:
+    %tciv2 = load i32, *%tci
+    %tp = gep i8, *%tag_buf_p, %tciv2
+    %tv = load i8, *%tp
+    %off = add i32 %tag_off, %tciv2
+    %top = gep i8, *%out, %off
+    store i8 %tv, *%top
+    %next_t = add i32 %tciv2, 1
+    store i32 %next_t, *%tci
+    jmp @a256s_tag_cond
+  @a256s_tag_done:
+    ret i32 0
+}
+
+fun @std_crypto_aes256_gcm_open(sealed: *i8, total_len: i32, aad: *i8, aad_len: i32,
+                                  key: *i8, plaintext: *i8) -> i32 {
+  @entry:
+    %too_small = slt i32 %total_len, 29
+    br %too_small, @a256o_fail, @a256o_ok
+  @a256o_ok:
+    %iv_p = gep i8, *%sealed, 0
+    %ct_len = sub i32 %total_len, 28
+    %ct_p = gep i8, *%sealed, 12
+    %tag_p2 = gep i8, *%sealed, 12
+    %tag_p3 = gep i8, *%tag_p2, %ct_len
+    call @std_crypto_aes256_gcm_decrypt(%ct_p, %ct_len, %aad, %aad_len,
+                                         %key, %iv_p, %tag_p3, %plaintext)
+    ret i32 0
+  @a256o_fail:
+    ret i32 -1
+}
+

@@ -1,0 +1,85 @@
+// Base64 encode/decode tests. Prints "PASS base64" on success.
+
+extern @printf(fmt: *i8, ...) -> i32
+extern @strcmp(a: *i8, b: *i8) -> i32
+extern @std_crypto_b64_encode(out: *i8, data: *i8, in_len: i32) -> void
+extern @std_crypto_b64_decode(src: *i8, src_len: i32, out: *i8,
+                               out_cap: i32, out_len: *i32) -> i32
+
+fun @main() -> i32 {
+  @entry:
+    %id = let i32
+    %enc = let [i8, 64]
+    %dec = let [i8, 64]
+    %len = let i32
+    %ep = gep i8, *%enc, 0
+    %dp = gep i8, *%dec, 0
+    %lp = gep i32, *%len, 0
+    store i32 0, *%id
+    jmp @c1
+
+  @c1:
+    store i32 1, *%id
+    call @std_crypto_b64_encode(%ep, "hello", 5)
+    %c1v = call @strcmp(%ep, "aGVsbG8=")
+    %c1ok = eq i32 %c1v, 0
+    br %c1ok, @c2, @fail
+  @c2:
+    store i32 2, *%id
+    %r2 = call @std_crypto_b64_decode(%ep, 8, %dp, 64, %lp)
+    %l2 = load i32, *%lp
+    %z2 = gep i8, *%dp, %l2
+    store i8 0, *%z2
+    %c2v = call @strcmp(%dp, "hello")
+    %r2ok = eq i32 %r2, 0
+    %l2ok = eq i32 %l2, 5
+    %c2ok = eq i32 %c2v, 0
+    %a2 = and i1 %r2ok, %l2ok
+    %b2 = and i1 %a2, %c2ok
+    br %b2, @c3, @fail
+  @c3:
+    store i32 3, *%id
+    %r3 = call @std_crypto_b64_decode("aGVs\nbG8=", 9, %dp, 64, %lp)
+    %l3 = load i32, *%lp
+    %z3 = gep i8, *%dp, %l3
+    store i8 0, *%z3
+    %c3v = call @strcmp(%dp, "hello")
+    %r3ok = eq i32 %r3, 0
+    %l3ok = eq i32 %l3, 5
+    %c3ok = eq i32 %c3v, 0
+    %a3 = and i1 %r3ok, %l3ok
+    %b3 = and i1 %a3, %c3ok
+    br %b3, @c4, @fail
+  @c4:
+    store i32 4, *%id
+    %r4 = call @std_crypto_b64_decode("aGVs*bG8=", 9, %dp, 64, %lp)
+    %r4ok = eq i32 %r4, -1
+    br %r4ok, @c5, @fail
+  @c5:
+    store i32 5, *%id
+    %r5 = call @std_crypto_b64_decode("aGVsbG8=", 8, %dp, 4, %lp)
+    %r5ok = eq i32 %r5, -1
+    br %r5ok, @c6, @fail
+  @c6:
+    store i32 6, *%id
+    call @std_crypto_b64_encode(%ep, "", 0)
+    %c6v = call @strcmp(%ep, "")
+    %c6ok = eq i32 %c6v, 0
+    br %c6ok, @c7, @fail
+  @c7:
+    store i32 7, *%id
+    %r7 = call @std_crypto_b64_decode("", 0, %dp, 64, %lp)
+    %l7 = load i32, *%lp
+    %r7ok = eq i32 %r7, 0
+    %l7ok = eq i32 %l7, 0
+    %c7ok = and i1 %r7ok, %l7ok
+    br %c7ok, @pass, @fail
+
+  @pass:
+    call @printf("PASS base64\n")
+    ret i32 0
+  @fail:
+    %fid = load i32, *%id
+    call @printf("FAIL base64 at case %d\n", %fid)
+    ret i32 1
+}

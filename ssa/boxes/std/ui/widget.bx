@@ -1,0 +1,1313 @@
+// Widget tree, flex layout and painting.
+//
+// The platform layer (platform/ui.c) only knows how to draw a rectangle and a
+// string; everything above that lives here so UI code is plain SSA.
+//
+// Build a tree, then lay it out and paint it every frame:
+//
+//   %root = gep @UiNode, *%nodes, 0
+//   call @std_ui_box(%root, @UiKind.Column, 24, 16)   // pad 24, gap 16
+//   call @std_ui_text(%child, "Hello", 20, 0xF0F4F8)
+//   call @std_ui_append(%root, %child)
+//   call @std_ui_layout(%root, 40, 40, 480)
+//   call @std_ui_paint(%root)
+//
+// A color of -1 means "no fill"; the others are 0xRRGGBB.
+// A child index or pointer of null marks the end of a sibling list.
+
+// Node kinds. Column and row are containers; the others are leaves set by
+// their own builder, listed here so kind comparisons read as names.
+enum @UiKind: i32 {
+  @Column = 0,
+  @Row = 1,
+  @Rect = 2,
+  @Text = 3,
+  @Button = 4,
+  @Checkbox = 5,
+  @Slider = 6,
+  @Progress = 7,
+  @Input = 8
+}
+
+// Widget state: buttons and sliders are Pressed while held, a text field is
+// Focused after a click.
+enum @UiState: i32 {
+  @Normal = 0,
+  @Pressed = 1,
+  @Focused = 2
+}
+
+// Key ids understood by @c1_ui_key_pressed.
+enum @UiKey: i32 {
+  @Backspace = 1,
+  @Enter = 2,
+  @Left = 3,
+  @Right = 4,
+  @Tab = 5
+}
+
+extern @c1_ui_rect(x: i32, y: i32, w: i32, h: i32, rgb: i32) -> void
+extern @c1_ui_rect_rounded(x: i32, y: i32, w: i32, h: i32, radius: i32, rgb: i32) -> void
+extern @c1_ui_text(text: *i8, x: i32, y: i32, size: i32, rgb: i32) -> void
+extern @c1_ui_text_width(text: *i8, size: i32) -> i32
+extern @c1_ui_char_pressed() -> i32
+extern @c1_ui_key_pressed(key: i32) -> i32
+extern @strlen(s: *i8) -> i64
+
+struct @UiNode {
+  @kind: i32,
+  @pad: i32,
+  @gap: i32,
+  @radius: i32,
+  @color: i32,
+  @text: *i8,
+  @font_size: i32,
+  @x: i32,
+  @y: i32,
+  @w: i32,
+  @h: i32,
+  @first_child: *@UiNode,
+  @last_child: *@UiNode,
+  @next_sibling: *@UiNode,
+  @text_color: i32,
+  @state: i32,
+  // Checkbox checked flag, slider/progress position, or nothing.
+  @value: i32,
+  // Slider/progress upper bound, or text field capacity.
+  @max: i32
+}
+
+// Reset all fields and set the node kind.
+fun @std_ui_node(n: *@UiNode, kind: i32) -> void {
+@entry:
+  %kp = field @UiNode, *%n, 0
+  store i32 %kind, *%kp
+  %pp = field @UiNode, *%n, 1
+  store i32 0, *%pp
+  %gp = field @UiNode, *%n, 2
+  store i32 0, *%gp
+  %rp = field @UiNode, *%n, 3
+  store i32 0, *%rp
+  %cp = field @UiNode, *%n, 4
+  store i32 -1, *%cp
+  %tp = field @UiNode, *%n, 5
+  store *i8 null, *%tp
+  %fp = field @UiNode, *%n, 6
+  store i32 16, *%fp
+  %xp = field @UiNode, *%n, 7
+  store i32 0, *%xp
+  %yp = field @UiNode, *%n, 8
+  store i32 0, *%yp
+  %wp = field @UiNode, *%n, 9
+  store i32 0, *%wp
+  %hp = field @UiNode, *%n, 10
+  store i32 0, *%hp
+  %fcp = field @UiNode, *%n, 11
+  store *@UiNode null, *%fcp
+  %lcp = field @UiNode, *%n, 12
+  store *@UiNode null, *%lcp
+  %nsp = field @UiNode, *%n, 13
+  store *@UiNode null, *%nsp
+  %tcp = field @UiNode, *%n, 14
+  store i32 -1, *%tcp
+  %stp = field @UiNode, *%n, 15
+  store i32 0, *%stp
+  %vp = field @UiNode, *%n, 16
+  store i32 0, *%vp
+  %mp = field @UiNode, *%n, 17
+  store i32 0, *%mp
+  ret void
+}
+
+// Container: kind @UiKind.Column or @UiKind.Row, with padding and child gap.
+fun @std_ui_box(n: *@UiNode, kind: i32, pad: i32, gap: i32) -> void {
+@entry:
+  call @std_ui_node(%n, %kind)
+  %pp = field @UiNode, *%n, 1
+  store i32 %pad, *%pp
+  %gp = field @UiNode, *%n, 2
+  store i32 %gap, *%gp
+  ret void
+}
+
+// Fixed-size rectangle. radius 0 draws square corners.
+fun @std_ui_rect(n: *@UiNode, w: i32, h: i32, color: i32, radius: i32) -> void {
+@entry:
+  call @std_ui_node(%n, @UiKind.Rect)
+  %wp = field @UiNode, *%n, 9
+  store i32 %w, *%wp
+  %hp = field @UiNode, *%n, 10
+  store i32 %h, *%hp
+  %cp = field @UiNode, *%n, 4
+  store i32 %color, *%cp
+  %rp = field @UiNode, *%n, 3
+  store i32 %radius, *%rp
+  ret void
+}
+
+// Single line of text; its measured width becomes the node width.
+fun @std_ui_text(n: *@UiNode, text: *i8, size: i32, color: i32) -> void {
+@entry:
+  call @std_ui_node(%n, @UiKind.Text)
+  %tp = field @UiNode, *%n, 5
+  store *i8 %text, *%tp
+  %fp = field @UiNode, *%n, 6
+  store i32 %size, *%fp
+  %cp = field @UiNode, *%n, 4
+  store i32 %color, *%cp
+  ret void
+}
+
+// Button: label plus background, size and colors are explicit. The label is
+// centered; @std_ui_button_update flips it to a darker shade while held.
+fun @std_ui_button(n: *@UiNode, text: *i8, size: i32, bg: i32, fg: i32, radius: i32) -> void {
+@entry:
+  call @std_ui_node(%n, @UiKind.Button)
+  %tp = field @UiNode, *%n, 5
+  store *i8 %text, *%tp
+  %fp = field @UiNode, *%n, 6
+  store i32 %size, *%fp
+  %cp = field @UiNode, *%n, 4
+  store i32 %bg, *%cp
+  %tcp = field @UiNode, *%n, 14
+  store i32 %fg, *%tcp
+  %rp = field @UiNode, *%n, 3
+  store i32 %radius, *%rp
+  ret void
+}
+
+// Fill in the background color of a container (or of any node).
+fun @std_ui_fill(n: *@UiNode, color: i32, radius: i32) -> void {
+@entry:
+  %cp = field @UiNode, *%n, 4
+  store i32 %color, *%cp
+  %rp = field @UiNode, *%n, 3
+  store i32 %radius, *%rp
+  ret void
+}
+
+// Checkbox plus label. value 0 is unchecked, 1 is checked; a click inside the
+// node toggles it (see @std_ui_pointer).
+fun @std_ui_checkbox(n: *@UiNode, text: *i8, size: i32, accent: i32, fg: i32) -> void {
+@entry:
+  call @std_ui_node(%n, @UiKind.Checkbox)
+  %tp = field @UiNode, *%n, 5
+  store *i8 %text, *%tp
+  %fp = field @UiNode, *%n, 6
+  store i32 %size, *%fp
+  %cp = field @UiNode, *%n, 4
+  store i32 %accent, *%cp
+  %tcp = field @UiNode, *%n, 14
+  store i32 %fg, *%tcp
+  ret void
+}
+
+// Slider over [0, max]; value is the knob position. Dragging inside the track
+// updates it (see @std_ui_pointer).
+fun @std_ui_slider(n: *@UiNode, value: i32, max: i32, accent: i32, track: i32) -> void {
+@entry:
+  call @std_ui_node(%n, @UiKind.Slider)
+  %vp = field @UiNode, *%n, 16
+  store i32 %value, *%vp
+  %mp = field @UiNode, *%n, 17
+  store i32 %max, *%mp
+  %cp = field @UiNode, *%n, 4
+  store i32 %accent, *%cp
+  %tcp = field @UiNode, *%n, 14
+  store i32 %track, *%tcp
+  ret void
+}
+
+// Progress bar over [0, max]. Same value model as the slider, not interactive.
+fun @std_ui_progress(n: *@UiNode, value: i32, max: i32, accent: i32, track: i32) -> void {
+@entry:
+  call @std_ui_node(%n, @UiKind.Progress)
+  %vp = field @UiNode, *%n, 16
+  store i32 %value, *%vp
+  %mp = field @UiNode, *%n, 17
+  store i32 %max, *%mp
+  %cp = field @UiNode, *%n, 4
+  store i32 %accent, *%cp
+  %tcp = field @UiNode, *%n, 14
+  store i32 %track, *%tcp
+  ret void
+}
+
+// Single-line text field. The buffer belongs to the caller and holds
+// `capacity` bytes, NUL-terminated; @std_ui_keyboard edits it while focused.
+fun @std_ui_input(n: *@UiNode, text: *i8, capacity: i32, size: i32, bg: i32, fg: i32) -> void {
+@entry:
+  call @std_ui_node(%n, @UiKind.Input)
+  %tp = field @UiNode, *%n, 5
+  store *i8 %text, *%tp
+  %mp = field @UiNode, *%n, 17
+  store i32 %capacity, *%mp
+  %fp = field @UiNode, *%n, 6
+  store i32 %size, *%fp
+  %cp = field @UiNode, *%n, 4
+  store i32 %bg, *%cp
+  %tcp = field @UiNode, *%n, 14
+  store i32 %fg, *%tcp
+  ret void
+}
+
+// Append child to parent's child list.
+fun @std_ui_append(parent: *@UiNode, child: *@UiNode) -> void {
+@entry:
+  %lp = field @UiNode, *%parent, 12
+  %last = load *@UiNode, *%lp
+  %none = eq *@UiNode %last, null
+  br %none, @set_first, @set_next
+@set_first:
+  %fp = field @UiNode, *%parent, 11
+  store *@UiNode %child, *%fp
+  jmp @set_last
+@set_next:
+  %np = field @UiNode, *%last, 13
+  store *@UiNode %child, *%np
+  jmp @set_last
+@set_last:
+  store *@UiNode %child, *%lp
+  ret void
+}
+
+// ---- layout: measure intrinsic size, then assign positions ----
+
+fun @std_ui_measure(n: *@UiNode) -> void {
+@entry:
+  %kp = field @UiNode, *%n, 0
+  %kind = load i32, *%kp
+  %is_rect = eq i32 %kind, @UiKind.Rect
+  br %is_rect, @done, @check_text
+@check_text:
+  %is_text = eq i32 %kind, @UiKind.Text
+  br %is_text, @text, @check_button
+@check_button:
+  %is_button = eq i32 %kind, @UiKind.Button
+  br %is_button, @button, @check_checkbox
+@check_checkbox:
+  %is_cb = eq i32 %kind, @UiKind.Checkbox
+  br %is_cb, @checkbox, @check_slider
+@check_slider:
+  %is_sl = eq i32 %kind, @UiKind.Slider
+  br %is_sl, @slider, @check_progress
+@check_progress:
+  %is_pg = eq i32 %kind, @UiKind.Progress
+  br %is_pg, @progress, @check_input
+@check_input:
+  %is_in = eq i32 %kind, @UiKind.Input
+  br %is_in, @input, @container
+@checkbox:
+  %cbtp = field @UiNode, *%n, 5
+  %cbt = load *i8, *%cbtp
+  %cbsp = field @UiNode, *%n, 6
+  %cbsz = load i32, *%cbsp
+  %cbtw = call @c1_ui_text_width(%cbt, %cbsz)
+  // 20 px box plus an 8 px gap before the label.
+  %cbw = add i32 %cbtw, 28
+  %cbwp = field @UiNode, *%n, 9
+  store i32 %cbw, *%cbwp
+  %cbq = div i32 %cbsz, 4
+  %cblh = add i32 %cbsz, %cbq
+  %taller = sgt i32 %cblh, 20
+  br %taller, @cb_line, @cb_box
+@cb_line:
+  %cbhp = field @UiNode, *%n, 10
+  store i32 %cblh, *%cbhp
+  ret void
+@cb_box:
+  %cbhp2 = field @UiNode, *%n, 10
+  store i32 20, *%cbhp2
+  ret void
+@slider:
+  %slwp = field @UiNode, *%n, 9
+  store i32 200, *%slwp
+  %slhp = field @UiNode, *%n, 10
+  store i32 20, *%slhp
+  ret void
+@progress:
+  %pgwp = field @UiNode, *%n, 9
+  store i32 200, *%pgwp
+  %pghp = field @UiNode, *%n, 10
+  store i32 8, *%pghp
+  ret void
+@input:
+  %inwp = field @UiNode, *%n, 9
+  store i32 200, *%inwp
+  %insp = field @UiNode, *%n, 6
+  %insz = load i32, *%insp
+  %inq = div i32 %insz, 4
+  %inlh = add i32 %insz, %inq
+  %inh = add i32 %inlh, 16
+  %inhp = field @UiNode, *%n, 10
+  store i32 %inh, *%inhp
+  ret void
+@button:
+  %btp = field @UiNode, *%n, 5
+  %bt = load *i8, *%btp
+  %bsp = field @UiNode, *%n, 6
+  %bsz = load i32, *%bsp
+  %btw = call @c1_ui_text_width(%bt, %bsz)
+  // 16 px horizontal and 8 px vertical padding around the label.
+  %bw = add i32 %btw, 32
+  %bh = add i32 %bsz, 16
+  %bwp = field @UiNode, *%n, 9
+  store i32 %bw, *%bwp
+  %bhp = field @UiNode, *%n, 10
+  store i32 %bh, *%bhp
+  ret void
+@text:
+  %tp = field @UiNode, *%n, 5
+  %t = load *i8, *%tp
+  %sp = field @UiNode, *%n, 6
+  %sz = load i32, *%sp
+  %tw = call @c1_ui_text_width(%t, %sz)
+  %wp = field @UiNode, *%n, 9
+  store i32 %tw, *%wp
+  %q = div i32 %sz, 4
+  %lh = add i32 %sz, %q
+  %hp = field @UiNode, *%n, 10
+  store i32 %lh, *%hp
+  ret void
+@container:
+  %max_w = let i32
+  %max_h = let i32
+  %sum_w = let i32
+  %sum_h = let i32
+  %count = let i32
+  store i32 0, *%max_w
+  store i32 0, *%max_h
+  store i32 0, *%sum_w
+  store i32 0, *%sum_h
+  store i32 0, *%count
+  %fp = field @UiNode, *%n, 11
+  %first = load *@UiNode, *%fp
+  %cur = let *@UiNode
+  store *@UiNode %first, *%cur
+  jmp @loop_test
+@loop_test:
+  %c = load *@UiNode, *%cur
+  %none = eq *@UiNode %c, null
+  br %none, @loop_done, @loop_body
+@loop_body:
+  call @std_ui_measure(%c)
+  %cwp = field @UiNode, *%c, 9
+  %cw = load i32, *%cwp
+  %chp = field @UiNode, *%c, 10
+  %ch = load i32, *%chp
+  %mwv = load i32, *%max_w
+  %bigger_w = sgt i32 %cw, %mwv
+  br %bigger_w, @set_mw, @check_mh
+@set_mw:
+  store i32 %cw, *%max_w
+  jmp @check_mh
+@check_mh:
+  %mhv = load i32, *%max_h
+  %bigger_h = sgt i32 %ch, %mhv
+  br %bigger_h, @set_mh, @accumulate
+@set_mh:
+  store i32 %ch, *%max_h
+  jmp @accumulate
+@accumulate:
+  %swv = load i32, *%sum_w
+  %sw2 = add i32 %swv, %cw
+  store i32 %sw2, *%sum_w
+  %shv = load i32, *%sum_h
+  %sh2 = add i32 %shv, %ch
+  store i32 %sh2, *%sum_h
+  %cnt = load i32, *%count
+  %cnt2 = add i32 %cnt, 1
+  store i32 %cnt2, *%count
+  %nsp = field @UiNode, *%c, 13
+  %nxt = load *@UiNode, *%nsp
+  store *@UiNode %nxt, *%cur
+  jmp @loop_test
+@loop_done:
+  %cnt0 = load i32, *%count
+  %has = sgt i32 %cnt0, 0
+  br %has, @gaps, @pick
+@gaps:
+  %n1 = sub i32 %cnt0, 1
+  %gp = field @UiNode, *%n, 2
+  %gap = load i32, *%gp
+  %gtot = mul i32 %gap, %n1
+  %sw0 = load i32, *%sum_w
+  %sw1 = add i32 %sw0, %gtot
+  store i32 %sw1, *%sum_w
+  %sh0 = load i32, *%sum_h
+  %sh1 = add i32 %sh0, %gtot
+  store i32 %sh1, *%sum_h
+  jmp @pick
+@pick:
+  %kkp = field @UiNode, *%n, 0
+  %kk = load i32, *%kkp
+  %is_row = eq i32 %kk, 1
+  br %is_row, @row_size, @col_size
+@row_size:
+  %rw = load i32, *%sum_w
+  %rh = load i32, *%max_h
+  %padp = field @UiNode, *%n, 1
+  %pad = load i32, *%padp
+  %pad2 = mul i32 %pad, 2
+  %rw2 = add i32 %rw, %pad2
+  %rh2 = add i32 %rh, %pad2
+  %owp = field @UiNode, *%n, 9
+  store i32 %rw2, *%owp
+  %ohp = field @UiNode, *%n, 10
+  store i32 %rh2, *%ohp
+  ret void
+@col_size:
+  %cw0 = load i32, *%max_w
+  %ch0 = load i32, *%sum_h
+  %padp2 = field @UiNode, *%n, 1
+  %pad3 = load i32, *%padp2
+  %pad4 = mul i32 %pad3, 2
+  %cw1 = add i32 %cw0, %pad4
+  %ch1 = add i32 %ch0, %pad4
+  %owp2 = field @UiNode, *%n, 9
+  store i32 %cw1, *%owp2
+  %ohp2 = field @UiNode, *%n, 10
+  store i32 %ch1, *%ohp2
+  ret void
+@done:
+  ret void
+}
+
+// Place n at (x, y). w/h of 0 keep the measured size.
+fun @std_ui_arrange(n: *@UiNode, x: i32, y: i32, w: i32, h: i32) -> void {
+@entry:
+  %xp = field @UiNode, *%n, 7
+  store i32 %x, *%xp
+  %yp = field @UiNode, *%n, 8
+  store i32 %y, *%yp
+  %wpos = sgt i32 %w, 0
+  br %wpos, @set_w, @check_h
+@set_w:
+  %wp = field @UiNode, *%n, 9
+  store i32 %w, *%wp
+  jmp @check_h
+@check_h:
+  %hpos = sgt i32 %h, 0
+  br %hpos, @set_h, @children
+@set_h:
+  %hp = field @UiNode, *%n, 10
+  store i32 %h, *%hp
+  jmp @children
+@children:
+  %kp = field @UiNode, *%n, 0
+  %kind = load i32, *%kp
+  %is_col = eq i32 %kind, @UiKind.Column
+  %is_row = eq i32 %kind, @UiKind.Row
+  %is_box = or i1 %is_col, %is_row
+  br %is_box, @start, @done
+@start:
+  %padp = field @UiNode, *%n, 1
+  %pad = load i32, *%padp
+  %gapp = field @UiNode, *%n, 2
+  %gap = load i32, *%gapp
+  %wp2 = field @UiNode, *%n, 9
+  %nw = load i32, *%wp2
+  %hp2 = field @UiNode, *%n, 10
+  %nh = load i32, *%hp2
+  %ix = add i32 %x, %pad
+  %iy = add i32 %y, %pad
+  %pad2 = mul i32 %pad, 2
+  %inner_w = sub i32 %nw, %pad2
+  %inner_h = sub i32 %nh, %pad2
+  %cx = let i32
+  %cy = let i32
+  store i32 %ix, *%cx
+  store i32 %iy, *%cy
+  %fp = field @UiNode, *%n, 11
+  %first = load *@UiNode, *%fp
+  %cur = let *@UiNode
+  store *@UiNode %first, *%cur
+  jmp @loop_test
+@loop_test:
+  %c = load *@UiNode, *%cur
+  %none = eq *@UiNode %c, null
+  br %none, @done, @loop_body
+@loop_body:
+  %is_row2 = eq i32 %kind, @UiKind.Row
+  br %is_row2, @row_child, @col_child
+@row_child:
+  %cxv = load i32, *%cx
+  %iyv = load i32, *%cy
+  call @std_ui_arrange(%c, %cxv, %iyv, 0, %inner_h)
+  %cwp = field @UiNode, *%c, 9
+  %cw = load i32, *%cwp
+  %adv = add i32 %cw, %gap
+  %cxn = add i32 %cxv, %adv
+  store i32 %cxn, *%cx
+  jmp @loop_next
+@col_child:
+  %cxv2 = load i32, *%cx
+  %iyv2 = load i32, *%cy
+  call @std_ui_arrange(%c, %cxv2, %iyv2, %inner_w, 0)
+  %chp = field @UiNode, *%c, 10
+  %chv = load i32, *%chp
+  %adv2 = add i32 %chv, %gap
+  %cyn = add i32 %iyv2, %adv2
+  store i32 %cyn, *%cy
+  jmp @loop_next
+@loop_next:
+  %nsp = field @UiNode, *%c, 13
+  %nxt = load *@UiNode, *%nsp
+  store *@UiNode %nxt, *%cur
+  jmp @loop_test
+@done:
+  ret void
+}
+
+// Measure, then place at (x, y) with the given width.
+fun @std_ui_layout(root: *@UiNode, x: i32, y: i32, w: i32) -> void {
+@entry:
+  call @std_ui_measure(%root)
+  %hp = field @UiNode, *%root, 10
+  %h = load i32, *%hp
+  call @std_ui_arrange(%root, %x, %y, %w, %h)
+  ret void
+}
+
+// Pre-order paint: containers fill their background first, then children.
+fun @std_ui_paint(n: *@UiNode) -> void {
+@entry:
+  %kp = field @UiNode, *%n, 0
+  %kind = load i32, *%kp
+  %is_col = eq i32 %kind, @UiKind.Column
+  %is_row = eq i32 %kind, @UiKind.Row
+  %is_box = or i1 %is_col, %is_row
+  br %is_box, @box, @leaf
+@box:
+  %cp = field @UiNode, *%n, 4
+  %color = load i32, *%cp
+  %paint = sge i32 %color, 0
+  br %paint, @fill, @kids
+@fill:
+  %xp = field @UiNode, *%n, 7
+  %x = load i32, *%xp
+  %yp = field @UiNode, *%n, 8
+  %y = load i32, *%yp
+  %wp = field @UiNode, *%n, 9
+  %w = load i32, *%wp
+  %hp = field @UiNode, *%n, 10
+  %h = load i32, *%hp
+  %rp = field @UiNode, *%n, 3
+  %r = load i32, *%rp
+  call @c1_ui_rect_rounded(%x, %y, %w, %h, %r, %color)
+  jmp @kids
+@kids:
+  %fp = field @UiNode, *%n, 11
+  %first = load *@UiNode, *%fp
+  %cur = let *@UiNode
+  store *@UiNode %first, *%cur
+  jmp @loop_test
+@loop_test:
+  %c = load *@UiNode, *%cur
+  %none = eq *@UiNode %c, null
+  br %none, @done, @loop_body
+@loop_body:
+  call @std_ui_paint(%c)
+  %nsp = field @UiNode, *%c, 13
+  %nxt = load *@UiNode, *%nsp
+  store *@UiNode %nxt, *%cur
+  jmp @loop_test
+@done:
+  ret void
+@leaf:
+  %is_text = eq i32 %kind, @UiKind.Text
+  br %is_text, @text, @check_button
+@check_button:
+  %is_button = eq i32 %kind, @UiKind.Button
+  br %is_button, @button, @check_checkbox
+@check_checkbox:
+  %is_cb = eq i32 %kind, @UiKind.Checkbox
+  br %is_cb, @checkbox, @check_slider
+@check_slider:
+  %is_sl = eq i32 %kind, @UiKind.Slider
+  br %is_sl, @slider, @check_progress
+@check_progress:
+  %is_pg = eq i32 %kind, @UiKind.Progress
+  br %is_pg, @progress, @check_input
+@check_input:
+  %is_in = eq i32 %kind, @UiKind.Input
+  br %is_in, @input, @rect
+@checkbox:
+  %cbxp = field @UiNode, *%n, 7
+  %cbx = load i32, *%cbxp
+  %cbyp = field @UiNode, *%n, 8
+  %cby = load i32, *%cbyp
+  %cbhp = field @UiNode, *%n, 10
+  %cbh = load i32, *%cbhp
+  %cbacp = field @UiNode, *%n, 4
+  %cbaccent = load i32, *%cbacp
+  %cbfgp = field @UiNode, *%n, 14
+  %cbfg = load i32, *%cbfgp
+  %cbvp = field @UiNode, *%n, 16
+  %cbval = load i32, *%cbvp
+  %cbdyp = sub i32 %cbh, 20
+  %cbdy = div i32 %cbdyp, 2
+  %cbby = add i32 %cby, %cbdy
+  %cbchecked = ne i32 %cbval, 0
+  br %cbchecked, @cb_checked, @cb_hollow
+@cb_hollow:
+  call @c1_ui_rect(%cbx, %cbby, 20, 2, %cbaccent)
+  %cbhy = add i32 %cbby, 18
+  call @c1_ui_rect(%cbx, %cbhy, 20, 2, %cbaccent)
+  call @c1_ui_rect(%cbx, %cbby, 2, 20, %cbaccent)
+  %cbhx = add i32 %cbx, 18
+  call @c1_ui_rect(%cbhx, %cbby, 2, 20, %cbaccent)
+  jmp @cb_label
+@cb_checked:
+  call @c1_ui_rect_rounded(%cbx, %cbby, 20, 20, 4, %cbaccent)
+  %cbmx = add i32 %cbx, 6
+  %cbmy = add i32 %cbby, 6
+  call @c1_ui_rect_rounded(%cbmx, %cbmy, 8, 8, 2, %cbfg)
+  jmp @cb_label
+@cb_label:
+  %cblx = add i32 %cbx, 28
+  %cbtp = field @UiNode, *%n, 5
+  %cbt = load *i8, *%cbtp
+  %cbsp = field @UiNode, *%n, 6
+  %cbsz = load i32, *%cbsp
+  %cbq = div i32 %cbsz, 4
+  %cblh = add i32 %cbsz, %cbq
+  %cblyp = sub i32 %cbh, %cblh
+  %cblyo = div i32 %cblyp, 2
+  %cbly = add i32 %cby, %cblyo
+  call @c1_ui_text(%cbt, %cblx, %cbly, %cbsz, %cbfg)
+  ret void
+@slider:
+  %slxp = field @UiNode, *%n, 7
+  %slx = load i32, *%slxp
+  %slyp = field @UiNode, *%n, 8
+  %sly = load i32, *%slyp
+  %slwp = field @UiNode, *%n, 9
+  %slw = load i32, *%slwp
+  %slhp = field @UiNode, *%n, 10
+  %slh = load i32, *%slhp
+  %slacp = field @UiNode, *%n, 4
+  %slaccent = load i32, *%slacp
+  %sltcp = field @UiNode, *%n, 14
+  %sltrack = load i32, *%sltcp
+  %sldyp = sub i32 %slh, 6
+  %sldy = div i32 %sldyp, 2
+  %slty = add i32 %sly, %sldy
+  call @c1_ui_rect_rounded(%slx, %slty, %slw, 6, 3, %sltrack)
+  %slmp = field @UiNode, *%n, 17
+  %slmax = load i32, *%slmp
+  %slvp = field @UiNode, *%n, 16
+  %slval = load i32, *%slvp
+  %slfill = let i32
+  store i32 0, *%slfill
+  %slmok = sgt i32 %slmax, 0
+  br %slmok, @sl_calc, @sl_knob
+@sl_calc:
+  %slnum = mul i32 %slw, %slval
+  %slfw = div i32 %slnum, %slmax
+  %slneg = slt i32 %slfw, 0
+  br %slneg, @sl_knob, @sl_hi
+@sl_hi:
+  %slover = sgt i32 %slfw, %slw
+  br %slover, @sl_full, @sl_part
+@sl_full:
+  store i32 %slw, *%slfill
+  jmp @sl_knob
+@sl_part:
+  store i32 %slfw, *%slfill
+  jmp @sl_knob
+@sl_knob:
+  %slfv = load i32, *%slfill
+  call @c1_ui_rect_rounded(%slx, %slty, %slfv, 6, 3, %slaccent)
+  // Knob centre follows the fill; clamp it inside the track.
+  %slkx = let i32
+  store i32 %slx, *%slkx
+  %slkhi = let i32
+  store i32 0, *%slkhi
+  %slroom = sub i32 %slw, 16
+  %slroomok = sgt i32 %slroom, 0
+  br %slroomok, @sl_room, @sl_rel
+@sl_room:
+  store i32 %slroom, *%slkhi
+  jmp @sl_rel
+@sl_rel:
+  %slraw = add i32 %slx, %slfv
+  %slraw2 = sub i32 %slraw, 8
+  %slrel = sub i32 %slraw2, %slx
+  %slrelpos = sgt i32 %slrel, 0
+  br %slrelpos, @sl_rel_hi, @sl_draw_knob
+@sl_rel_hi:
+  %slhimax = load i32, *%slkhi
+  %slrelover = sgt i32 %slrel, %slhimax
+  br %slrelover, @sl_rel_max, @sl_rel_set
+@sl_rel_max:
+  %slrelmax = add i32 %slx, %slhimax
+  store i32 %slrelmax, *%slkx
+  jmp @sl_draw_knob
+@sl_rel_set:
+  %slrelv = add i32 %slx, %slrel
+  store i32 %slrelv, *%slkx
+  jmp @sl_draw_knob
+@sl_draw_knob:
+  %slkxv = load i32, *%slkx
+  %slkyd = sub i32 %slh, 16
+  %slkyo = div i32 %slkyd, 2
+  %slky = add i32 %sly, %slkyo
+  call @c1_ui_rect_rounded(%slkxv, %slky, 16, 16, 8, %slaccent)
+  ret void
+@progress:
+  %pgxp = field @UiNode, *%n, 7
+  %pgx = load i32, *%pgxp
+  %pgyp = field @UiNode, *%n, 8
+  %pgy = load i32, *%pgyp
+  %pgwp = field @UiNode, *%n, 9
+  %pgw = load i32, *%pgwp
+  %pghp = field @UiNode, *%n, 10
+  %pgh = load i32, *%pghp
+  %pgacp = field @UiNode, *%n, 4
+  %pgaccent = load i32, *%pgacp
+  %pgtcp = field @UiNode, *%n, 14
+  %pgtrack = load i32, *%pgtcp
+  call @c1_ui_rect_rounded(%pgx, %pgy, %pgw, %pgh, 4, %pgtrack)
+  %pgmp = field @UiNode, *%n, 17
+  %pgmax = load i32, *%pgmp
+  %pgvp = field @UiNode, *%n, 16
+  %pgval = load i32, *%pgvp
+  %pgok = sgt i32 %pgmax, 0
+  br %pgok, @pg_calc, @pg_done
+@pg_calc:
+  %pgnum = mul i32 %pgw, %pgval
+  %pgfw = div i32 %pgnum, %pgmax
+  %pgneg = slt i32 %pgfw, 0
+  br %pgneg, @pg_done, @pg_hi
+@pg_hi:
+  %pgover = sgt i32 %pgfw, %pgw
+  br %pgover, @pg_full, @pg_part
+@pg_full:
+  call @c1_ui_rect_rounded(%pgx, %pgy, %pgw, %pgh, 4, %pgaccent)
+  ret void
+@pg_part:
+  call @c1_ui_rect_rounded(%pgx, %pgy, %pgfw, %pgh, 4, %pgaccent)
+  ret void
+@pg_done:
+  ret void
+@input:
+  %inx = field @UiNode, *%n, 7
+  %inxv = load i32, *%inx
+  %iny = field @UiNode, *%n, 8
+  %inyv = load i32, *%iny
+  %inw = field @UiNode, *%n, 9
+  %inwv = load i32, *%inw
+  %inh = field @UiNode, *%n, 10
+  %inhv = load i32, *%inh
+  %inrp = field @UiNode, *%n, 3
+  %inr = load i32, *%inrp
+  %inbgp = field @UiNode, *%n, 4
+  %inbg = load i32, *%inbgp
+  %infgp = field @UiNode, *%n, 14
+  %infg = load i32, *%infgp
+  %intp = field @UiNode, *%n, 5
+  %int = load *i8, *%intp
+  %insp = field @UiNode, *%n, 6
+  %insz = load i32, *%insp
+  call @c1_ui_rect_rounded(%inxv, %inyv, %inwv, %inhv, %inr, %inbg)
+  %inq = div i32 %insz, 4
+  %inlh = add i32 %insz, %inq
+  %inyp = sub i32 %inhv, %inlh
+  %inyo = div i32 %inyp, 2
+  %inty = add i32 %inyv, %inyo
+  %intx = add i32 %inxv, 8
+  call @c1_ui_text(%int, %intx, %inty, %insz, %infg)
+  %instp = field @UiNode, *%n, 15
+  %inst = load i32, *%instp
+  %infoc = eq i32 %inst, @UiState.Focused
+  br %infoc, @in_caret, @in_done
+@in_caret:
+  %intw = call @c1_ui_text_width(%int, %insz)
+  %incx = add i32 %intx, %intw
+  call @c1_ui_rect(%incx, %inty, 2, %inlh, %infg)
+  ret void
+@in_done:
+  ret void
+@rect:
+  %rxp = field @UiNode, *%n, 7
+  %rx = load i32, *%rxp
+  %ryp = field @UiNode, *%n, 8
+  %ry = load i32, *%ryp
+  %rwp = field @UiNode, *%n, 9
+  %rw = load i32, *%rwp
+  %rhp = field @UiNode, *%n, 10
+  %rh = load i32, *%rhp
+  %rcp = field @UiNode, *%n, 4
+  %rcolor = load i32, *%rcp
+  %rrp = field @UiNode, *%n, 3
+  %rr = load i32, *%rrp
+  call @c1_ui_rect_rounded(%rx, %ry, %rw, %rh, %rr, %rcolor)
+  ret void
+@text:
+  %tp = field @UiNode, *%n, 5
+  %t = load *i8, *%tp
+  %txp = field @UiNode, *%n, 7
+  %tx = load i32, *%txp
+  %typ = field @UiNode, *%n, 8
+  %ty = load i32, *%typ
+  %tsp = field @UiNode, *%n, 6
+  %tsz = load i32, *%tsp
+  %tcp = field @UiNode, *%n, 4
+  %tcolor = load i32, *%tcp
+  call @c1_ui_text(%t, %tx, %ty, %tsz, %tcolor)
+  ret void
+@button:
+  %bxp = field @UiNode, *%n, 7
+  %bx = load i32, *%bxp
+  %byp = field @UiNode, *%n, 8
+  %by = load i32, *%byp
+  %bwp2 = field @UiNode, *%n, 9
+  %bw = load i32, *%bwp2
+  %bhp2 = field @UiNode, *%n, 10
+  %bh = load i32, *%bhp2
+  %brp = field @UiNode, *%n, 3
+  %br = load i32, *%brp
+  %bcp = field @UiNode, *%n, 4
+  %bg = load i32, *%bcp
+  %bstp = field @UiNode, *%n, 15
+  %bstate = load i32, *%bstp
+  %btp = field @UiNode, *%n, 5
+  %bt = load *i8, *%btp
+  %bsp = field @UiNode, *%n, 6
+  %bsz = load i32, *%bsp
+  %btc = field @UiNode, *%n, 14
+  %bfg = load i32, *%btc
+  %bfill = let i32
+  store i32 %bg, *%bfill
+  %bdown = eq i32 %bstate, @UiState.Pressed
+  br %bdown, @btn_dark, @btn_draw
+@btn_dark:
+  // Held: shade the background to 75% so the press is visible.
+  %dr = lshr i32 %bg, 16
+  %dr0 = and i32 %dr, 255
+  %dg = lshr i32 %bg, 8
+  %dg0 = and i32 %dg, 255
+  %db0 = and i32 %bg, 255
+  %dr1 = mul i32 %dr0, 3
+  %dr2 = div i32 %dr1, 4
+  %dg1 = mul i32 %dg0, 3
+  %dg2 = div i32 %dg1, 4
+  %db1 = mul i32 %db0, 3
+  %db2 = div i32 %db1, 4
+  %dr3 = shl i32 %dr2, 16
+  %dg3 = shl i32 %dg2, 8
+  %dc1 = or i32 %dr3, %dg3
+  %dc2 = or i32 %dc1, %db2
+  store i32 %dc2, *%bfill
+  jmp @btn_draw
+@btn_draw:
+  %bfc = load i32, *%bfill
+  call @c1_ui_rect_rounded(%bx, %by, %bw, %bh, %br, %bfc)
+  %btw = call @c1_ui_text_width(%bt, %bsz)
+  %bq = div i32 %bsz, 4
+  %blh = add i32 %bsz, %bq
+  %bdw = sub i32 %bw, %btw
+  %bdx = div i32 %bdw, 2
+  %btx = add i32 %bx, %bdx
+  %bdh = sub i32 %bh, %blh
+  %bdy = div i32 %bdh, 2
+  %bty = add i32 %by, %bdy
+  call @c1_ui_text(%bt, %btx, %bty, %bsz, %bfg)
+  ret void
+}
+
+// Topmost node containing (px, py), or null.
+fun @std_ui_hit(n: *@UiNode, px: i32, py: i32) -> *@UiNode {
+@entry:
+  %fp = field @UiNode, *%n, 11
+  %first = load *@UiNode, *%fp
+  %cur = let *@UiNode
+  store *@UiNode %first, *%cur
+  jmp @test
+@test:
+  %c = load *@UiNode, *%cur
+  %none = eq *@UiNode %c, null
+  br %none, @self, @recurse
+@recurse:
+  %hit = call @std_ui_hit(%c, %px, %py)
+  %got = ne *@UiNode %hit, null
+  br %got, @found, @next
+@found:
+  ret *@UiNode %hit
+@next:
+  %nsp = field @UiNode, *%c, 13
+  %nxt = load *@UiNode, *%nsp
+  store *@UiNode %nxt, *%cur
+  jmp @test
+@self:
+  %xp = field @UiNode, *%n, 7
+  %x = load i32, *%xp
+  %yp = field @UiNode, *%n, 8
+  %y = load i32, *%yp
+  %wp = field @UiNode, *%n, 9
+  %w = load i32, *%wp
+  %hp = field @UiNode, *%n, 10
+  %h = load i32, *%hp
+  %x2 = add i32 %x, %w
+  %y2 = add i32 %y, %h
+  %okx1 = sge i32 %px, %x
+  %okx2 = slt i32 %px, %x2
+  %oky1 = sge i32 %py, %y
+  %oky2 = slt i32 %py, %y2
+  %bx = and i1 %okx1, %okx2
+  %by = and i1 %oky1, %oky2
+  %inside = and i1 %bx, %by
+  br %inside, @yes, @no
+@yes:
+  ret *@UiNode %n
+@no:
+  ret *@UiNode null
+}
+
+// Refresh the pressed state of every button. Call once per frame after layout.
+fun @std_ui_button_update(n: *@UiNode, px: i32, py: i32, down: i32) -> void {
+@entry:
+  %kp = field @UiNode, *%n, 0
+  %kind = load i32, *%kp
+  %is_btn = eq i32 %kind, @UiKind.Button
+  br %is_btn, @button, @kids
+@button:
+  %xp = field @UiNode, *%n, 7
+  %x = load i32, *%xp
+  %yp = field @UiNode, *%n, 8
+  %y = load i32, *%yp
+  %wp = field @UiNode, *%n, 9
+  %w = load i32, *%wp
+  %hp = field @UiNode, *%n, 10
+  %h = load i32, *%hp
+  %x2 = add i32 %x, %w
+  %y2 = add i32 %y, %h
+  %okx1 = sge i32 %px, %x
+  %okx2 = slt i32 %px, %x2
+  %oky1 = sge i32 %py, %y
+  %oky2 = slt i32 %py, %y2
+  %bx = and i1 %okx1, %okx2
+  %by = and i1 %oky1, %oky2
+  %inside = and i1 %bx, %by
+  %downb = ne i32 %down, 0
+  %pressed = and i1 %inside, %downb
+  %state = zext i1 %pressed to i32
+  %stp = field @UiNode, *%n, 15
+  store i32 %state, *%stp
+  jmp @kids
+@kids:
+  %fp = field @UiNode, *%n, 11
+  %first = load *@UiNode, *%fp
+  %cur = let *@UiNode
+  store *@UiNode %first, *%cur
+  jmp @test
+@test:
+  %c = load *@UiNode, *%cur
+  %none = eq *@UiNode %c, null
+  br %none, @done, @body
+@body:
+  call @std_ui_button_update(%c, %px, %py, %down)
+  %nsp = field @UiNode, *%c, 13
+  %nxt = load *@UiNode, *%nsp
+  store *@UiNode %nxt, *%cur
+  jmp @test
+@done:
+  ret void
+}
+
+// Button under (px, py), or null. Pair with c1_ui_mouse_pressed() for clicks.
+fun @std_ui_button_at(root: *@UiNode, px: i32, py: i32) -> *@UiNode {
+@entry:
+  %n = call @std_ui_hit(%root, %px, %py)
+  %none = eq *@UiNode %n, null
+  br %none, @miss, @check
+@check:
+  %kp = field @UiNode, *%n, 0
+  %kind = load i32, *%kp
+  %is_btn = eq i32 %kind, @UiKind.Button
+  br %is_btn, @hit, @miss
+@hit:
+  ret *@UiNode %n
+@miss:
+  ret *@UiNode null
+}
+
+// Whether (px, py) lies inside the node's box.
+fun @std_ui_inside(n: *@UiNode, px: i32, py: i32) -> i1 {
+@entry:
+  %xp = field @UiNode, *%n, 7
+  %x = load i32, *%xp
+  %yp = field @UiNode, *%n, 8
+  %y = load i32, *%yp
+  %wp = field @UiNode, *%n, 9
+  %w = load i32, *%wp
+  %hp = field @UiNode, *%n, 10
+  %h = load i32, *%hp
+  %x2 = add i32 %x, %w
+  %y2 = add i32 %y, %h
+  %okx1 = sge i32 %px, %x
+  %okx2 = slt i32 %px, %x2
+  %oky1 = sge i32 %py, %y
+  %oky2 = slt i32 %py, %y2
+  %inside_x = and i1 %okx1, %okx2
+  %inside_y = and i1 %oky1, %oky2
+  %inside = and i1 %inside_x, %inside_y
+  ret i1 %inside
+}
+
+// Drop the focus flag on every text input except `keep` (pass null to blur all).
+fun @std_ui_clear_focus(n: *@UiNode, keep: *@UiNode) -> void {
+@entry:
+  %kp = field @UiNode, *%n, 0
+  %kind = load i32, *%kp
+  %is_input = eq i32 %kind, @UiKind.Input
+  %same = eq *@UiNode %n, %keep
+  br %same, @kids, @maybe
+@maybe:
+  br %is_input, @blur, @kids
+@blur:
+  %stp = field @UiNode, *%n, 15
+  store i32 @UiState.Normal, *%stp
+  jmp @kids
+@kids:
+  %fp = field @UiNode, *%n, 11
+  %first = load *@UiNode, *%fp
+  %cur = let *@UiNode
+  store *@UiNode %first, *%cur
+  jmp @test
+@test:
+  %c = load *@UiNode, *%cur
+  %none = eq *@UiNode %c, null
+  br %none, @done, @body
+@body:
+  call @std_ui_clear_focus(%c, %keep)
+  %nsp = field @UiNode, *%c, 13
+  %nxt = load *@UiNode, *%nsp
+  store *@UiNode %nxt, *%cur
+  jmp @test
+@done:
+  ret void
+}
+
+// First focused text input in the tree, or null.
+fun @std_ui_focus(n: *@UiNode) -> *@UiNode {
+@entry:
+  %kp = field @UiNode, *%n, 0
+  %kind = load i32, *%kp
+  %is_input = eq i32 %kind, @UiKind.Input
+  br %is_input, @check, @kids
+@check:
+  %stp = field @UiNode, *%n, 15
+  %st = load i32, *%stp
+  %focused = eq i32 %st, @UiState.Focused
+  br %focused, @found, @kids
+@found:
+  ret *@UiNode %n
+@kids:
+  %fp = field @UiNode, *%n, 11
+  %first = load *@UiNode, *%fp
+  %cur = let *@UiNode
+  store *@UiNode %first, *%cur
+  jmp @test
+@test:
+  %c = load *@UiNode, *%cur
+  %none = eq *@UiNode %c, null
+  br %none, @miss, @body
+@body:
+  %r = call @std_ui_focus(%c)
+  %got = ne *@UiNode %r, null
+  br %got, @found_child, @next
+@found_child:
+  ret *@UiNode %r
+@next:
+  %nsp = field @UiNode, *%c, 13
+  %nxt = load *@UiNode, *%nsp
+  store *@UiNode %nxt, *%cur
+  jmp @test
+@miss:
+  ret *@UiNode null
+}
+
+// Move a slider's value to the pointer position, clamped to [0, max].
+fun @std_ui_slider_set(n: *@UiNode, px: i32) -> void {
+@entry:
+  %xp = field @UiNode, *%n, 7
+  %x = load i32, *%xp
+  %wp = field @UiNode, *%n, 9
+  %w = load i32, *%wp
+  %mp = field @UiNode, *%n, 17
+  %max = load i32, *%mp
+  %v = let i32
+  store i32 0, *%v
+  %okmax = sgt i32 %max, 0
+  %okw = sgt i32 %w, 0
+  %ok = and i1 %okmax, %okw
+  br %ok, @calc, @store
+@calc:
+  %rel = sub i32 %px, %x
+  %relpos = sgt i32 %rel, 0
+  br %relpos, @rel_ok, @store
+@rel_ok:
+  %num = mul i32 %rel, %max
+  %val = div i32 %num, %w
+  %over = sgt i32 %val, %max
+  br %over, @full, @part
+@full:
+  store i32 %max, *%v
+  jmp @store
+@part:
+  store i32 %val, *%v
+  jmp @store
+@store:
+  %vp = field @UiNode, *%n, 16
+  %vv = load i32, *%v
+  store i32 %vv, *%vp
+  ret void
+}
+
+// Update every interactive widget for one pointer frame. `down` is the held
+// state, `clicked` the one-frame press edge; @std_ui_button_update handles the
+// button visuals, this adds toggling, dragging and text-input focus.
+fun @std_ui_pointer(n: *@UiNode, px: i32, py: i32, down: i32, clicked: i32) -> void {
+@entry:
+  call @std_ui_button_update(%n, %px, %py, %down)
+  %clickedb = ne i32 %clicked, 0
+  br %clickedb, @hit, @drag
+@hit:
+  %target = call @std_ui_hit(%n, %px, %py)
+  %none = eq *@UiNode %target, null
+  br %none, @blur, @kind
+@kind:
+  %kp = field @UiNode, *%target, 0
+  %kind = load i32, *%kp
+  %is_cb = eq i32 %kind, @UiKind.Checkbox
+  br %is_cb, @toggle, @check_slider
+@toggle:
+  %vp = field @UiNode, *%target, 16
+  %v = load i32, *%vp
+  %on = ne i32 %v, 0
+  %on32 = zext i1 %on to i32
+  %nv = xor i32 %on32, 1
+  store i32 %nv, *%vp
+  jmp @blur
+@check_slider:
+  %is_sl = eq i32 %kind, @UiKind.Slider
+  br %is_sl, @slide, @check_input
+@slide:
+  call @std_ui_slider_set(%target, %px)
+  jmp @blur
+@check_input:
+  %is_in = eq i32 %kind, @UiKind.Input
+  br %is_in, @focus, @blur
+@focus:
+  call @std_ui_clear_focus(%n, %target)
+  %fstp = field @UiNode, *%target, 15
+  store i32 @UiState.Focused, *%fstp
+  jmp @drag
+@blur:
+  call @std_ui_clear_focus(%n, null)
+  jmp @drag
+@drag:
+  %downb = ne i32 %down, 0
+  br %downb, @drag_hit, @done
+@drag_hit:
+  %dt = call @std_ui_hit(%n, %px, %py)
+  %dnone = eq *@UiNode %dt, null
+  br %dnone, @done, @drag_kind
+@drag_kind:
+  %dkp = field @UiNode, *%dt, 0
+  %dkind = load i32, *%dkp
+  %dsl = eq i32 %dkind, @UiKind.Slider
+  br %dsl, @drag_set, @done
+@drag_set:
+  call @std_ui_slider_set(%dt, %px)
+  jmp @done
+@done:
+  ret void
+}
+
+// Append one character to the focused input, within its capacity (the buffer
+// size including the terminating NUL). Returns 1 when a character was added.
+fun @std_ui_input_type(n: *@UiNode, ch: i32) -> i32 {
+@entry:
+  %in = call @std_ui_focus(%n)
+  %none = eq *@UiNode %in, null
+  br %none, @no, @len
+@len:
+  %tp = field @UiNode, *%in, 5
+  %t = load *i8, *%tp
+  %l = call @strlen(%t)
+  %cp = field @UiNode, *%in, 17
+  %cap = load i32, *%cp
+  %cap1 = sub i32 %cap, 1
+  %cap64 = sext i32 %cap1 to i64
+  %full = sge i64 %l, %cap64
+  br %full, @no, @put
+@put:
+  %dst = gep i8, *%t, %l
+  %ch8 = trunc i32 %ch to i8
+  store i8 %ch8, *%dst
+  %l1 = add i64 %l, 1
+  %end = gep i8, *%t, %l1
+  store i8 0, *%end
+  ret i32 1
+@no:
+  ret i32 0
+}
+
+// Remove the last character of the focused input. Returns 1 when one was removed.
+fun @std_ui_input_backspace(n: *@UiNode) -> i32 {
+@entry:
+  %in = call @std_ui_focus(%n)
+  %none = eq *@UiNode %in, null
+  br %none, @no, @len
+@len:
+  %tp = field @UiNode, *%in, 5
+  %t = load *i8, *%tp
+  %l = call @strlen(%t)
+  %empty = eq i64 %l, 0
+  br %empty, @no, @del
+@del:
+  %l1 = sub i64 %l, 1
+  %end = gep i8, *%t, %l1
+  store i8 0, *%end
+  ret i32 1
+@no:
+  ret i32 0
+}
+
+// Feed this frame's keyboard into the focused input. Returns 1 when Enter was
+// pressed, which blurs the input; 0 otherwise.
+fun @std_ui_keyboard(n: *@UiNode) -> i32 {
+@entry:
+  %in = call @std_ui_focus(%n)
+  %none = eq *@UiNode %in, null
+  br %none, @none, @char_loop
+@char_loop:
+  %ch = call @c1_ui_char_pressed()
+  %nochar = eq i32 %ch, 0
+  br %nochar, @keys, @char_add
+@char_add:
+  %added = call @std_ui_input_type(%n, %ch)
+  jmp @char_loop
+@keys:
+  %bs = call @c1_ui_key_pressed(@UiKey.Backspace)
+  %bsb = ne i32 %bs, 0
+  br %bsb, @back, @enter
+@back:
+  %removed = call @std_ui_input_backspace(%n)
+  jmp @enter
+@enter:
+  %ek = call @c1_ui_key_pressed(@UiKey.Enter)
+  %ekb = ne i32 %ek, 0
+  br %ekb, @blur, @ret
+@blur:
+  %stp = field @UiNode, *%in, 15
+  store i32 @UiState.Normal, *%stp
+  ret i32 1
+@ret:
+  ret i32 0
+@none:
+  ret i32 0
+}

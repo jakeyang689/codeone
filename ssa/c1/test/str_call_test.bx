@@ -1,0 +1,41 @@
+// Test: string literal in call arguments
+extern @putchar(c: i32) -> i32
+
+// A function that takes a byte pointer and prints it
+fun @print_str(s: *i8) -> i32 {
+  @entry:
+    %iptr = let i32
+    store i32 0, *%iptr
+    jmp @loop
+  @loop:
+    %i = load i32, *%iptr
+    %p = gep i8, *%s, %i
+    %ch = load i8, *%p
+    %nul = eq i8 %ch, 0
+    br %nul, @done, @body
+  @body:
+    %civ = load i32, *%iptr
+    %pp = gep i8, *%s, %civ
+    %cv = load i8, *%pp
+    %cvi = zext i8 %cv to i32
+    call @putchar(%cvi)
+    %civ2 = add i32 %civ, 1
+    store i32 %civ2, *%iptr
+    jmp @loop
+  @done:
+    ret i32 0
+}
+
+fun @main() -> i32 {
+  @entry:
+    // Direct string literal in call — AST should auto-generate const
+    call @print_str("Hello")
+    call @putchar('\n')
+    // Multiple string calls with different content
+    call @print_str("World")
+    call @putchar('\n')
+    // Mixed: int param after string
+    call @putchar(33)  // '!'
+    call @putchar('\n')
+    ret i32 0
+}

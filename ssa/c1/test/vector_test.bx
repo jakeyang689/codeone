@@ -1,0 +1,116 @@
+// Growable vector tests. Prints "PASS vector" on success.
+
+extern @printf(fmt: *i8, ...) -> i32
+extern @std_data_vector_init(v: *i8, elem_size: i32, initial_cap: i32) -> i32
+extern @std_data_vector_push(v: *i8, val: *i8) -> i32
+extern @std_data_vector_get(v: *i8, idx: i32, out: *i8) -> i32
+extern @std_data_vector_set(v: *i8, idx: i32, val: *i8) -> i32
+extern @std_data_vector_ptr(v: *i8, idx: i32) -> *i8
+extern @std_data_vector_count(v: *i8) -> i32
+extern @std_data_vector_capacity(v: *i8) -> i32
+extern @std_data_vector_elem_size(v: *i8) -> i32
+extern @std_data_vector_clear(v: *i8) -> void
+extern @std_data_vector_free(v: *i8) -> void
+
+fun @main() -> i32 {
+  @entry:
+    %id = let i32
+    %v = let [i8, 32]
+    %val = let i32
+    %out = let i32
+    %vp = gep i32, *%val, 0
+    %op = gep i32, *%out, 0
+    store i32 0, *%id
+    jmp @c1
+
+  @c1:
+    store i32 1, *%id
+    %r = call @std_data_vector_init(%v, 4, 2)
+    %rok = eq i32 %r, 0
+    br %rok, @c2, @fail
+  @c2:
+    store i32 2, *%id
+    store i32 10, *%vp
+    %p1 = call @std_data_vector_push(%v, %vp)
+    store i32 20, *%vp
+    %p2 = call @std_data_vector_push(%v, %vp)
+    store i32 30, *%vp
+    %p3 = call @std_data_vector_push(%v, %vp)
+    %s1 = add i32 %p1, %p2
+    %s2 = add i32 %s1, %p3
+    %pok = eq i32 %s2, 0
+    br %pok, @c3, @fail
+  @c3:
+    store i32 3, *%id
+    %n = call @std_data_vector_count(%v)
+    %cap = call @std_data_vector_capacity(%v)
+    %es = call @std_data_vector_elem_size(%v)
+    %nok = eq i32 %n, 3
+    %capok = sge i32 %cap, 4
+    %esok = eq i32 %es, 4
+    %a = and i1 %nok, %capok
+    %b = and i1 %a, %esok
+    br %b, @c4, @fail
+  @c4:
+    store i32 4, *%id
+    %g = call @std_data_vector_get(%v, 1, %op)
+    %gv = load i32, *%op
+    %gok = eq i32 %g, 0
+    %gvok = eq i32 %gv, 20
+    %c1 = and i1 %gok, %gvok
+    br %c1, @c5, @fail
+  @c5:
+    store i32 5, *%id
+    store i32 99, *%vp
+    %s = call @std_data_vector_set(%v, 2, %vp)
+    %g2 = call @std_data_vector_get(%v, 2, %op)
+    %g2v = load i32, *%op
+    %sok = eq i32 %s, 0
+    %g2ok = eq i32 %g2v, 99
+    %c2 = and i1 %sok, %g2ok
+    br %c2, @c6, @fail
+  @c6:
+    store i32 6, *%id
+    %pp = call @std_data_vector_ptr(%v, 0)
+    %ppn = eq *i8 %pp, null
+    br %ppn, @fail, @ld
+  @ld:
+    %pv = load i32, *%pp
+    %pvok = eq i32 %pv, 10
+    br %pvok, @c7, @fail
+  @c7:
+    store i32 7, *%id
+    %oob = call @std_data_vector_ptr(%v, 3)
+    %oobn = eq *i8 %oob, null
+    br %oobn, @c8, @fail
+  @c8:
+    store i32 8, *%id
+    call @std_data_vector_clear(%v)
+    %n2 = call @std_data_vector_count(%v)
+    %o2 = call @std_data_vector_ptr(%v, 0)
+    %n2ok = eq i32 %n2, 0
+    %o2ok = eq *i8 %o2, null
+    %d1 = and i1 %n2ok, %o2ok
+    br %d1, @c9, @fail
+  @c9:
+    store i32 9, *%id
+    store i32 7, *%vp
+    %p4 = call @std_data_vector_push(%v, %vp)
+    call @std_data_vector_free(%v)
+    %n3 = call @std_data_vector_count(%v)
+    %o3 = call @std_data_vector_ptr(%v, 0)
+    %p4ok = eq i32 %p4, 0
+    %n3ok = eq i32 %n3, 0
+    %o3ok = eq *i8 %o3, null
+    %e1 = and i1 %p4ok, %n3ok
+    %e2 = and i1 %e1, %o3ok
+    br %e2, @pass, @fail
+
+  @pass:
+    call @printf("PASS vector\n")
+    ret i32 0
+  @fail:
+    %fid = load i32, *%id
+    call @printf("FAIL vector at case %d\n", %fid)
+    ret i32 1
+}

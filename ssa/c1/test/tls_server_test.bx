@@ -1,0 +1,121 @@
+// TLS 1.2 server interop test.
+//
+// Listens on 127.0.0.1:9443, accepts one connection, performs the TLS 1.2
+// handshake with certs/tls13.pem + certs/tls13.key, reads one request, and
+// replies "tls-ok\n". Prints "PASS tls_server" on success.
+
+extern @printf(fmt: *i8, ...) -> i32
+extern @std_io_file_open_read(path: *i8) -> *i8
+extern @std_io_file_read(fp: *i8, buf: *i8, count: i32) -> i64
+extern @std_io_file_close(fp: *i8) -> i32
+extern @net_socket_tcp() -> i32
+extern @net_socket_bind(fd: i32, port: i32) -> i32
+extern @net_socket_listen(fd: i32) -> i32
+extern @net_socket_accept(fd: i32) -> i32
+extern @net_socket_close(fd: i32) -> i32
+extern @net_tls_server_accept(ctx: *i8, fd: i32, cert: *i8, cert_len: i32,
+                              key: *i8, key_len: i32, limbs: i32) -> i32
+extern @net_tls_recv(ctx: *i8, buf: *i8, cap: i32, out_len: *i32) -> i32
+extern @net_tls_send(ctx: *i8, data: *i8, len: i32) -> i32
+extern @net_tls_close(ctx: *i8) -> i32
+
+const @CERT_PATH = "certs/tls13.pem"
+const @KEY_PATH = "certs/tls13.key"
+const @REPLY: [i8, 8] = "tls-ok\n"
+
+fun @main() -> i32 {
+  @entry:
+    %ctx = let [i8, 1024]
+    %cert = let [i8, 8192]
+    %key = let [i8, 4096]
+    %req = let [i8, 1024]
+    %req_len = let i32
+
+    // ---- load the certificate ----
+    %cp = gep i8, *@CERT_PATH, 0
+    %cfp = call @std_io_file_open_read(%cp)
+    %cnull = eq *i8 %cfp, null
+    br %cnull, @fail_load, @read_cert
+  @read_cert:
+    %certp = gep i8, *%cert, 0
+    %cn64 = call @std_io_file_read(%cfp, %certp, 8191)
+    call @std_io_file_close(%cfp)
+    %cert_len = trunc i64 %cn64 to i32
+    %cpos = sgt i32 %cert_len, 0
+    br %cpos, @load_key, @fail_load
+
+  // ---- load the private key ----
+  @load_key:
+    %kp = gep i8, *@KEY_PATH, 0
+    %kfp = call @std_io_file_open_read(%kp)
+    %knull = eq *i8 %kfp, null
+    br %knull, @fail_load, @read_key
+  @read_key:
+    %keyp = gep i8, *%key, 0
+    %kn64 = call @std_io_file_read(%kfp, %keyp, 4095)
+    call @std_io_file_close(%kfp)
+    %key_len = trunc i64 %kn64 to i32
+    %kpos = sgt i32 %key_len, 0
+    br %kpos, @listen, @fail_load
+
+  // ---- listen ----
+  @listen:
+    %lfd = call @net_socket_tcp()
+    %lneg = slt i32 %lfd, 0
+    br %lneg, @fail_sock, @do_bind
+  @do_bind:
+    %br1 = call @net_socket_bind(%lfd, 9443)
+    %bneg = slt i32 %br1, 0
+    br %bneg, @fail_sock, @do_listen
+  @do_listen:
+    %lr = call @net_socket_listen(%lfd)
+    %lrneg = slt i32 %lr, 0
+    br %lrneg, @fail_sock, @do_accept
+  @do_accept:
+    %cfd = call @net_socket_accept(%lfd)
+    %aneg = slt i32 %cfd, 0
+    br %aneg, @fail_sock, @handshake
+
+  // ---- TLS handshake ----
+  @handshake:
+    %ctxp = gep i8, *%ctx, 0
+    %hr = call @net_tls_server_accept(%ctxp, %cfd, %certp, %cert_len,
+                                      %keyp, %key_len, 64)
+    %hok = eq i32 %hr, 0
+    br %hok, @recv, @fail_hs
+
+  // ---- application data ----
+  @recv:
+    %reqp = gep i8, *%req, 0
+    %reqp2 = gep i32, *%req_len, 0
+    %rr = call @net_tls_recv(%ctxp, %reqp, 1024, %reqp2)
+    %rok = eq i32 %rr, 0
+    br %rok, @send, @fail_recv
+  @send:
+    %replyp = gep i8, *@REPLY, 0
+    %sr = call @net_tls_send(%ctxp, %replyp, 7)
+    %sok = eq i32 %sr, 0
+    br %sok, @close, @fail_send
+  @close:
+    call @net_tls_close(%ctxp)
+    call @net_socket_close(%cfd)
+    call @net_socket_close(%lfd)
+    call @printf("PASS tls_server\n")
+    ret i32 0
+
+  @fail_load:
+    call @printf("FAIL tls_server load\n")
+    ret i32 1
+  @fail_sock:
+    call @printf("FAIL tls_server sock\n")
+    ret i32 1
+  @fail_hs:
+    call @printf("FAIL tls_server hs=%d\n", %hr)
+    ret i32 1
+  @fail_recv:
+    call @printf("FAIL tls_server recv=%d\n", %rr)
+    ret i32 1
+  @fail_send:
+    call @printf("FAIL tls_server send=%d\n", %sr)
+    ret i32 1
+}

@@ -1,0 +1,407 @@
+// WebSocket frame codec and handshake accept tests (no network).
+//
+// Covers the RFC 6455 accept vector, masked/unmasked round trips, all three
+// length encodings, control-frame validation, and close codes.
+
+extern @printf(fmt: *i8, ...) -> i32
+extern @memcmp(a: *i8, b: *i8, n: i64) -> i32
+
+extern @net_ws_accept(key: *i8, key_len: i32, out: *i8) -> i32
+extern @net_ws_build_frame(buf: *i8, cap: i32, opcode: i32, payload: *i8,
+                           len: i32, fin: i32, masked: i32, key: *i8) -> i32
+extern @net_ws_parse_frame(buf: *i8, len: i32, f: *@WsFrame,
+                           out_need: *i32) -> i32
+extern @net_ws_unmask_frame(buf: *i8, f: *@WsFrame) -> void
+extern @net_ws_close_code(payload: *i8, len: i32) -> i32
+extern @net_ws_put_close_code(buf: *i8, code: i32) -> void
+extern @net_http_parse_request(buf: *i8, len: i32, req: *@HttpRequest) -> i32
+extern @net_ws_build_handshake(buf: *i8, cap: i32, host: *i8, path: *i8,
+                               key_b64: *i8) -> i32
+extern @net_ws_check_handshake(buf: *i8, len: i32, key_b64: *i8) -> i32
+extern @net_ws_build_accept_response(buf: *i8, cap: i32, key: *i8,
+                                     key_len: i32) -> i32
+extern @std_text_str_find_ci(buf: *i8, start: i32, end: i32, needle: *i8) -> i32
+
+struct @WsFrame {
+  @fin: i32,
+  @opcode: i32,
+  @masked: i32,
+  @payload_off: i32,
+  @payload_len: i32,
+  @header_len: i32
+}
+
+// Layout must match http/request.bx.
+struct @HttpRequest {
+  @method_off: i32,
+  @method_len: i32,
+  @path_off: i32,
+  @path_len: i32,
+  @version: i32,
+  @headers_off: i32,
+  @headers_len: i32
+}
+
+const @KEY: [i8, 25] = "dGhlIHNhbXBsZSBub25jZQ=="
+const @KEY2: [i8, 25] = "XXXXXXXXXXXXXXXXXXXXXXXX"
+const @HOST: [i8, 12] = "example.com"
+const @PATH: [i8, 6] = "/chat"
+const @EXPECT: [i8, 29] = "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+const @REQ: [i8, 43] = "GET /chat HTTP/1.1\r\nUpgrade: websocket\r\n\r\n"
+const @REQ_EMPTY: [i8, 19] = "GET / HTTP/1.1\r\n\r\n"
+const @REQ_BAD: [i8, 14] = "GET /chat\r\n\r\n"
+const @OK_MSG: [i8, 6] = "PASS\n"
+const @FAIL_ACCEPT: [i8, 23] = "FAIL: accept mismatch\n"
+const @FAIL_FRAME: [i8, 19] = "FAIL: frame codec\n"
+const @FAIL_REQ: [i8, 23] = "FAIL: request parsing\n"
+const @FAIL_HS: [i8, 17] = "FAIL: handshake\n"
+const @FAIL_LEN: [i8, 21] = "FAIL: 64-bit length\n"
+
+fun @main() -> i32 {
+  @entry:
+    // --- RFC 6455 §1.3 accept vector ---
+    %acc = let [i8, 32]
+    %accp = gep i8, *%acc, 0
+    %keyp = gep i8, *@KEY, 0
+    %ar = call @net_ws_accept(%keyp, 24, %accp)
+    %ar_bad = slt i32 %ar, 0
+    br %ar_bad, @fail_accept, @cmp_accept
+  @cmp_accept:
+    %expp = gep i8, *@EXPECT, 0
+    %ad = call @memcmp(%accp, %expp, 28)
+    %a_ok = eq i32 %ad, 0
+    br %a_ok, @unmasked, @fail_accept
+
+  // --- unmasked text frame round trip ---
+  @unmasked:
+    %fbuf = let [i8, 256]
+    %fbp = gep i8, *%fbuf, 0
+    %msg = let [i8, 16]
+    %msgp = gep i8, *%msg, 0
+    store i8 72, *%msgp
+    %m1 = gep i8, *%msg, 1
+    store i8 105, *%m1
+    %n1 = call @net_ws_build_frame(%fbp, 256, 1, %msgp, 2, 1, 0, null)
+    %n1_ok = eq i32 %n1, 4
+    br %n1_ok, @u_parse, @fail_frame
+  @u_parse:
+    %f1 = let @WsFrame
+    %need1 = let i32
+    %need1p = gep i32, *%need1, 0
+    %pr1 = call @net_ws_parse_frame(%fbp, %n1, %f1, %need1p)
+    %pr1_ok = eq i32 %pr1, 0
+    br %pr1_ok, @u_fields, @fail_frame
+  @u_fields:
+    %op1p = field @WsFrame, *%f1, 1
+    %op1 = load i32, *%op1p
+    %op1_ok = eq i32 %op1, 1
+    %fin1p = field @WsFrame, *%f1, 0
+    %fin1 = load i32, *%fin1p
+    %fin1_ok = eq i32 %fin1, 1
+    %mk1p = field @WsFrame, *%f1, 2
+    %mk1 = load i32, *%mk1p
+    %mk1_ok = eq i32 %mk1, 0
+    %pl1p = field @WsFrame, *%f1, 4
+    %pl1 = load i32, *%pl1p
+    %pl1_ok = eq i32 %pl1, 2
+    %c1 = and i1 %op1_ok, %fin1_ok
+    %c2 = and i1 %c1, %mk1_ok
+    %c3 = and i1 %c2, %pl1_ok
+    br %c3, @u_bytes, @fail_frame
+  @u_bytes:
+    %po1p = field @WsFrame, *%f1, 3
+    %po1 = load i32, *%po1p
+    %pay1 = gep i8, *%fbuf, %po1
+    %bd1 = call @memcmp(%pay1, %msgp, 2)
+    %bd1_ok = eq i32 %bd1, 0
+    br %bd1_ok, @masked, @fail_frame
+
+  // --- masked binary frame round trip ---
+  @masked:
+    %mask = let [i8, 4]
+    %mkp = gep i8, *%mask, 0
+    store i8 1, *%mkp
+    %mk1p2 = gep i8, *%mask, 1
+    store i8 2, *%mk1p2
+    %mk2p = gep i8, *%mask, 2
+    store i8 3, *%mk2p
+    %mk3p = gep i8, *%mask, 3
+    store i8 4, *%mk3p
+    %n2 = call @net_ws_build_frame(%fbp, 256, 2, %msgp, 2, 1, 1, %mkp)
+    %n2_ok = eq i32 %n2, 8
+    br %n2_ok, @m_parse, @fail_frame
+  @m_parse:
+    %f2 = let @WsFrame
+    %need2 = let i32
+    %need2p = gep i32, *%need2, 0
+    %pr2 = call @net_ws_parse_frame(%fbp, %n2, %f2, %need2p)
+    %pr2_ok = eq i32 %pr2, 0
+    br %pr2_ok, @m_fields, @fail_frame
+  @m_fields:
+    %mkp2 = field @WsFrame, *%f2, 2
+    %mkv = load i32, *%mkp2
+    %mkv_ok = eq i32 %mkv, 1
+    br %mkv_ok, @m_unmask, @fail_frame
+  @m_unmask:
+    call @net_ws_unmask_frame(%fbp, %f2)
+    %po2p = field @WsFrame, *%f2, 3
+    %po2 = load i32, *%po2p
+    %pay2 = gep i8, *%fbuf, %po2
+    %bd2 = call @memcmp(%pay2, %msgp, 2)
+    %bd2_ok = eq i32 %bd2, 0
+    br %bd2_ok, @long16, @fail_frame
+
+  // --- 16-bit length ---
+  @long16:
+    %big = let [i8, 256]
+    %bigp = gep i8, *%big, 0
+    %i = let i32
+    store i32 0, *%i
+    jmp @fill_cond
+  @fill_cond:
+    %iv = load i32, *%i
+    %more = slt i32 %iv, 200
+    br %more, @fill, @fill_done
+  @fill:
+    %iv2 = load i32, *%i
+    %fp = gep i8, *%big, %iv2
+    %bv = and i32 %iv2, 255
+    %bc = trunc i32 %bv to i8
+    store i8 %bc, *%fp
+    %nx = add i32 %iv2, 1
+    store i32 %nx, *%i
+    jmp @fill_cond
+  @fill_done:
+    %n3 = call @net_ws_build_frame(%fbp, 256, 2, %bigp, 200, 1, 0, null)
+    %n3_ok = eq i32 %n3, 204
+    br %n3_ok, @long16_parse, @fail_frame
+  @long16_parse:
+    %f3 = let @WsFrame
+    %need3 = let i32
+    %need3p = gep i32, *%need3, 0
+    %pr3 = call @net_ws_parse_frame(%fbp, %n3, %f3, %need3p)
+    %pr3_ok = eq i32 %pr3, 0
+    br %pr3_ok, @partial, @fail_frame
+  @partial:
+    // A truncated payload reports -1 and the required total.
+    %pr4 = call @net_ws_parse_frame(%fbp, 100, %f3, %need3p)
+    %pr4_ok = eq i32 %pr4, -1
+    %nv = load i32, *%need3
+    %nv_ok = eq i32 %nv, 204
+    %p_ok = and i1 %pr4_ok, %nv_ok
+    br %p_ok, @ctrl_build, @fail_frame
+  @ctrl_build:
+    // Control frames may not carry more than 125 bytes.
+    %n4 = call @net_ws_build_frame(%fbp, 256, 9, %bigp, 200, 1, 0, null)
+    %n4_ok = eq i32 %n4, -1
+    br %n4_ok, @ctrl_parse, @fail_frame
+  @ctrl_parse:
+    // Hand-crafted ping with a 126-byte payload must be rejected.
+    store i8 0x89, *%fbp
+    %c1p = gep i8, *%fbuf, 1
+    store i8 0x7E, *%c1p
+    %c2p = gep i8, *%fbuf, 2
+    store i8 0, *%c2p
+    %c3p = gep i8, *%fbuf, 3
+    store i8 126, *%c3p
+    %f4 = let @WsFrame
+    %need4 = let i32
+    %need4p = gep i32, *%need4, 0
+    %pr5 = call @net_ws_parse_frame(%fbp, 130, %f4, %need4p)
+    %pr5_ok = eq i32 %pr5, -2
+    br %pr5_ok, @rsv, @fail_frame
+  @rsv:
+    // Reserved bits without a negotiated extension are a protocol error.
+    store i8 0xC1, *%fbp
+    %c5p = gep i8, *%fbuf, 1
+    store i8 0, *%c5p
+    %pr6 = call @net_ws_parse_frame(%fbp, 2, %f4, %need4p)
+    %pr6_ok = eq i32 %pr6, -2
+    br %pr6_ok, @close_code, @fail_frame
+  @close_code:
+    %cc = let [i8, 2]
+    %ccp = gep i8, *%cc, 0
+    call @net_ws_put_close_code(%ccp, 1000)
+    %ccv = call @net_ws_close_code(%ccp, 2)
+    %cc_ok = eq i32 %ccv, 1000
+    %ccz = call @net_ws_close_code(%ccp, 0)
+    %ccz_ok = eq i32 %ccz, 0
+    %cc_all = and i1 %cc_ok, %ccz_ok
+    br %cc_all, @parse_req, @fail_frame
+
+  // --- request parsing (server side of the handshake) ---
+  @parse_req:
+    %rq = let @HttpRequest
+    %rqp = gep i8, *@REQ, 0
+    %rr1 = call @net_http_parse_request(%rqp, 42, %rq)
+    %rr1_ok = eq i32 %rr1, 0
+    br %rr1_ok, @req_fields, @fail_req
+  @req_fields:
+    %mo_p = field @HttpRequest, *%rq, 0
+    %mo = load i32, *%mo_p
+    %ml_p = field @HttpRequest, *%rq, 1
+    %ml = load i32, *%ml_p
+    %po_p = field @HttpRequest, *%rq, 2
+    %po = load i32, *%po_p
+    %pl_p = field @HttpRequest, *%rq, 3
+    %pl = load i32, *%pl_p
+    %ver_p = field @HttpRequest, *%rq, 4
+    %ver = load i32, *%ver_p
+    %ho_p = field @HttpRequest, *%rq, 5
+    %ho = load i32, *%ho_p
+    %hl_p = field @HttpRequest, *%rq, 6
+    %hl = load i32, *%hl_p
+    %a1 = eq i32 %mo, 0
+    %a2 = eq i32 %ml, 3
+    %a3 = eq i32 %po, 4
+    %a4 = eq i32 %pl, 5
+    %a5 = eq i32 %ver, 11
+    %a6 = eq i32 %ho, 20
+    %a7 = eq i32 %hl, 18
+    %b1 = and i1 %a1, %a2
+    %b2 = and i1 %b1, %a3
+    %b3 = and i1 %b2, %a4
+    %b4 = and i1 %b3, %a5
+    %b5 = and i1 %b4, %a6
+    %b6 = and i1 %b5, %a7
+    br %b6, @req_empty, @fail_req
+  @req_empty:
+    %rq2 = let @HttpRequest
+    %eqp = gep i8, *@REQ_EMPTY, 0
+    %rr2 = call @net_http_parse_request(%eqp, 18, %rq2)
+    %rr2_ok = eq i32 %rr2, 0
+    br %rr2_ok, @req_empty_chk, @fail_req
+  @req_empty_chk:
+    %ho3_p = field @HttpRequest, *%rq2, 5
+    %ho3 = load i32, *%ho3_p
+    %hl3_p = field @HttpRequest, *%rq2, 6
+    %hl3 = load i32, *%hl3_p
+    %e1 = eq i32 %ho3, 16
+    %e2 = eq i32 %hl3, 0
+    %e_ok = and i1 %e1, %e2
+    br %e_ok, @req_bad, @fail_req
+  @req_bad:
+    %badp = gep i8, *@REQ_BAD, 0
+    %rr3 = call @net_http_parse_request(%badp, 13, %rq2)
+    %rr3_ok = eq i32 %rr3, -1
+    br %rr3_ok, @hs_server, @fail_req
+
+  // --- server 101 response, validated by the client check ---
+  @hs_server:
+    %hsbuf = let [i8, 256]
+    %hsp = gep i8, *%hsbuf, 0
+    %keyp2 = gep i8, *@KEY, 0
+    %hn = call @net_ws_build_accept_response(%hsp, 256, %keyp2, 24)
+    %hn_ok = sgt i32 %hn, 0
+    br %hn_ok, @hs_check, @fail_hs
+  @hs_check:
+    %hc = call @net_ws_check_handshake(%hsp, %hn, %keyp2)
+    %hc_ok = eq i32 %hc, 0
+    br %hc_ok, @hs_reject, @fail_hs
+  @hs_reject:
+    // A different key must not validate against this response.
+    %key2p = gep i8, *@KEY2, 0
+    %hc_bad = call @net_ws_check_handshake(%hsp, %hn, %key2p)
+    %hc_bad_ok = eq i32 %hc_bad, -1
+    br %hc_bad_ok, @hs_client, @fail_hs
+
+  // --- client handshake request headers ---
+  @hs_client:
+    %reqb = let [i8, 512]
+    %reqp = gep i8, *%reqb, 0
+    %hostp = gep i8, *@HOST, 0
+    %pathp2 = gep i8, *@PATH, 0
+    %rn = call @net_ws_build_handshake(%reqp, 512, %hostp, %pathp2, %keyp2)
+    %rn_ok = sgt i32 %rn, 0
+    br %rn_ok, @hs_client_chk, @fail_hs
+  @hs_client_chk:
+    %hq1 = call @std_text_str_find_ci(%reqp, 0, %rn, "upgrade: websocket")
+    %hq2 = call @std_text_str_find_ci(%reqp, 0, %rn, "connection: upgrade")
+    %hq3 = call @std_text_str_find_ci(%reqp, 0, %rn, "connection: close")
+    %hq1_ok = sge i32 %hq1, 0
+    %hq2_ok = sge i32 %hq2, 0
+    %hq3_ok = slt i32 %hq3, 0
+    %h1 = and i1 %hq1_ok, %hq2_ok
+    %h2 = and i1 %h1, %hq3_ok
+    br %h2, @long64, @fail_hs
+
+  // --- 64-bit length encoding ---
+  @long64:
+    %big64 = let [i8, 70000]
+    %big64p = gep i8, *%big64, 0
+    %i64 = let i32
+    store i32 0, *%i64
+    jmp @l64_cond
+  @l64_cond:
+    %iv64 = load i32, *%i64
+    %more64 = slt i32 %iv64, 70000
+    br %more64, @l64_fill, @l64_build
+  @l64_fill:
+    %iv64b = load i32, *%i64
+    %fp64 = gep i8, *%big64, %iv64b
+    %bv64 = and i32 %iv64b, 255
+    %bc64 = trunc i32 %bv64 to i8
+    store i8 %bc64, *%fp64
+    %n64 = add i32 %iv64b, 1
+    store i32 %n64, *%i64
+    jmp @l64_cond
+  @l64_build:
+    %fb64 = let [i8, 70016]
+    %fb64p = gep i8, *%fb64, 0
+    %nf = call @net_ws_build_frame(%fb64p, 70016, 2, %big64p, 70000, 1, 0, null)
+    %nf_ok = eq i32 %nf, 70010
+    br %nf_ok, @l64_b1, @fail_len
+  @l64_b1:
+    %b1p = gep i8, *%fb64, 1
+    %b1v64 = load i8, *%b1p
+    %b1_ok = eq i8 %b1v64, 127
+    br %b1_ok, @l64_parse, @fail_len
+  @l64_parse:
+    %f64 = let @WsFrame
+    %need64 = let i32
+    %need64p = gep i32, *%need64, 0
+    %pr64 = call @net_ws_parse_frame(%fb64p, %nf, %f64, %need64p)
+    %pr64_ok = eq i32 %pr64, 0
+    br %pr64_ok, @l64_fields, @fail_len
+  @l64_fields:
+    %hl64p = field @WsFrame, *%f64, 5
+    %hl64 = load i32, *%hl64p
+    %pl64p = field @WsFrame, *%f64, 4
+    %pl64 = load i32, *%pl64p
+    %hl64_ok = eq i32 %hl64, 10
+    %pl64_ok = eq i32 %pl64, 70000
+    %c64 = and i1 %hl64_ok, %pl64_ok
+    br %c64, @l64_cmp, @fail_len
+  @l64_cmp:
+    %po64p = field @WsFrame, *%f64, 3
+    %po64 = load i32, *%po64p
+    %pay64 = gep i8, *%fb64, %po64
+    %d64 = call @memcmp(%pay64, %big64p, 70000)
+    %d64_ok = eq i32 %d64, 0
+    br %d64_ok, @pass, @fail_len
+
+  @pass:
+    %okmsg = gep i8, *@OK_MSG, 0
+    call @printf(%okmsg)
+    ret i32 0
+  @fail_accept:
+    %amsg = gep i8, *@FAIL_ACCEPT, 0
+    call @printf(%amsg)
+    ret i32 1
+  @fail_frame:
+    %fmsg = gep i8, *@FAIL_FRAME, 0
+    call @printf(%fmsg)
+    ret i32 1
+  @fail_req:
+    %rmsg = gep i8, *@FAIL_REQ, 0
+    call @printf(%rmsg)
+    ret i32 1
+  @fail_hs:
+    %hmsg = gep i8, *@FAIL_HS, 0
+    call @printf(%hmsg)
+    ret i32 1
+  @fail_len:
+    %lmsg = gep i8, *@FAIL_LEN, 0
+    call @printf(%lmsg)
+    ret i32 1
+}

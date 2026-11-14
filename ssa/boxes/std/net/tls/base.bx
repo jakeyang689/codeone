@@ -1,0 +1,640 @@
+// TLS 1.2 Client — RSA key exchange + AES-128-GCM + SHA-256
+// TLS 1.3 Client — ECDHE (P-256) + AES-128-GCM + SHA-256
+extern @putchar(c: i32) -> i32
+extern @memcpy(dst: *i8, src: *i8, n: i64) -> *i8
+extern @memset(s: *i8, c: i32, n: i64) -> *i8
+extern @c1_random_buf(buf: *i8, len: i64) -> void
+// Record layer
+extern @tls_recv_all(fd: i32, buf: *i8, n: i32) -> i32
+extern @tls_send_all(fd: i32, buf: *i8, n: i32) -> i32
+extern @tls_read_plain(fd: i32, buf: *i8, cap: i32, ot: *i8, ol: *i32) -> i32
+extern @tls_write_record(fd: i32, typ: i8, ver: i16, data: *i8, len: i32) -> i32
+extern @tls12_record_encrypt(fd: i32, seq: *i64, k: *i8, iv: *i8, ks: i32, t: i8, d: *i8, l: i32) -> i32
+extern @tls12_record_decrypt(fd: i32, seq: *i64, k: *i8, iv: *i8, ks: i32, b: *i8, c: i32, ot: *i8, ol: *i32) -> i32
+extern @tls13_record_encrypt(fd: i32, seq: *i64, k: *i8, iv: *i8, ks: i32, t: i8, d: *i8, l: i32) -> i32
+extern @tls13_record_decrypt(fd: i32, seq: *i64, k: *i8, iv: *i8, ks: i32, b: *i8, c: i32, ot: *i8, ol: *i32) -> i32
+// Crypto
+extern @std_crypto_sha256_compute(data: *i8, len: i32, digest: *i8) -> void
+extern @std_crypto_hmac_sha256(k: *i8, kl: i32, d: *i8, dl: i32, mac: *i8) -> void
+extern @std_crypto_tls12_prf_sha256(s: *i8, sl: i32, seed: *i8, sdl: i32, ol: i32, out: *i8) -> void
+extern @std_crypto_rsa_encrypt_pkcs1_v15(m: *i8, ml: i32, e: *i32, n: *i32, li: i32, ct: *i8) -> i32
+extern @x509_parse_rsa_pubkey(cert: *i8, cl: i32, no: *i32, eo: *i32, li: i32) -> i1
+// TLS 1.3 key schedule
+extern @std_crypto_hkdf_extract_sha256(s: *i8, sl: i32, ikm: *i8, il: i32, prk: *i8) -> void
+extern @std_crypto_hkdf_expand_label_sha256(s: *i8, lbl: *i8, ll: i32, cx: *i8, cl: i32, ol: i32, out: *i8) -> void
+extern @std_crypto_tls13_early_secret_sha256(psk: *i8, pl: i32, out: *i8) -> void
+extern @std_crypto_tls13_handshake_secret_sha256(early: *i8, ecdhe: *i8, el: i32, out: *i8) -> void
+extern @std_crypto_tls13_master_secret_sha256(hs: *i8, out: *i8) -> void
+extern @std_crypto_tls13_traffic_key_sha256(sec: *i8, out: *i8) -> void
+extern @std_crypto_tls13_traffic_iv_sha256(sec: *i8, out: *i8) -> void
+extern @std_crypto_tls13_finished_key_sha256(sec: *i8, out: *i8) -> void
+// P-256
+extern @std_crypto_p256_generate_keypair(priv: *i32, px: *i32, py: *i32) -> void
+extern @std_crypto_p256_ecdh(priv: *i32, px: *i32, py: *i32, sx: *i32) -> void
+extern @std_crypto_rsa_bn_to_bytes(by: *i8, a: *i32, bl: i32, li: i32) -> void
+extern @std_crypto_rsa_bn_from_bytes(r: *i32, b: *i8, bl: i32, li: i32) -> void
+extern @x509_parse_p256_pubkey(cert: *i8, cl: i32, px: *i32, py: *i32) -> i1
+// Record content types (RFC 5246 §6.2.1).
+enum @TlsContentType: i8 {
+  @ChangeCipherSpec = 20,
+  @Alert = 21,
+  @Handshake = 22,
+  @Application = 23
+}
+
+const @VER_12: i16 = 771
+const @CSUITE_RSA_GCM: i16 = 156     // 0x009C
+const @CSUITE_TLS13: i16 = 4865      // 0x1301
+// ===== TLS Context Struct =====
+// Field indices are accessed via `field @TLS12Context, *%p, N` (literal N)
+// @TLS12Context fields (indices 0-15, 288 bytes):
+//   0: fd, 1: state, 2: version, 3: key_size, 4: limbs, 5: cipher_suite,
+//   6: client_seq, 7: server_seq,
+//   8: client_random[32], 9: server_random[32],
+//  10: client_write_key[32], 11: server_write_key[32],
+//  12: client_write_iv[12], 13: server_write_iv[12],
+//  14: pre_master_secret[48], 15: master_secret[48]
+struct @TLS12Context {
+  @fd: i32,
+  @state: i32,
+  @version: i32,
+  @key_size: i32,
+  @limbs: i32,
+  @cipher_suite: i32,
+  @client_seq: i64,
+  @server_seq: i64,
+  @client_random: [i8, 32],
+  @server_random: [i8, 32],
+  @client_write_key: [i8, 32],
+  @server_write_key: [i8, 32],
+  @client_write_iv: [i8, 12],
+  @server_write_iv: [i8, 12],
+  @pre_master_secret: [i8, 48],
+  @master_secret: [i8, 48]
+}
+// @TLS13Extension fields (indices 0-11, offset 288 in @TLSContext)
+//  11: role (0 = client, 1 = server)
+struct @TLS13Extension {
+  @init_client_seq: i64,
+  @_pad: [i8, 24],
+  @ecdhe_private: [i8, 32],
+  @ecdhe_public_x: [i8, 32],
+  @ecdhe_public_y: [i8, 32],
+  @server_ec_x: [i8, 32],
+  @server_ec_y: [i8, 32],
+  @handshake_traffic: [i8, 48],
+  @application_traffic: [i8, 48],
+  @sni_host: [i8, 256],
+  @sni_len: i32,
+  @role: i32,
+  @trust_pool: *i8,
+  @trust_offsets: *i32,
+  @trust_lens: *i32,
+  @trust_count: i32
+}
+// Top-level context: TLS 1.2 base + TLS 1.3 extension (576 bytes)
+struct @TLSContext {
+  @tls12: @TLS12Context,
+  @tls13: @TLS13Extension
+}
+// Context size for manual allocation (backward compat)
+const @CTX_SZ: i32 = 1024
+// Store i16 big-endian
+fun @put16(p: *i8, v: i16) -> void {
+  @e:
+    %v_hi = ashr i16 %v, 8
+    %b_hi = trunc i16 %v_hi to i8
+    %b_lo = trunc i16 %v to i8
+    store i8 %b_hi, *%p
+    %p1 = gep i8, *%p, 1
+    store i8 %b_lo, *%p1
+    ret void
+}
+// Store i24 big-endian
+fun @put24(p: *i8, v: i32) -> void {
+  @e:
+    %b2 = trunc i32 %v to i8
+    %s1 = lshr i32 %v, 8
+    %b1 = trunc i32 %s1 to i8
+    %s0 = lshr i32 %v, 16
+    %b0 = trunc i32 %s0 to i8
+    store i8 %b0, *%p
+    %p1 = gep i8, *%p, 1
+    store i8 %b1, *%p1
+    %p2 = gep i8, *%p, 2
+    store i8 %b2, *%p2
+    ret void
+}
+// Read i16 big-endian
+fun @get16(p: *i8) -> i16 {
+  @e:
+    %b0 = load i8, *%p
+    %p1 = gep i8, *%p, 1
+    %b1 = load i8, *%p1
+    %i0 = zext i8 %b0 to i16
+    %i1 = zext i8 %b1 to i16
+    %s = shl i16 %i0, 8
+    %r = or i16 %s, %i1
+    ret i16 %r
+}
+// Send handshake message: record(type=22) with 4-byte header + body
+fun @send_hs(fd: i32, hst: i8, body: *i8, blen: i32) -> i32 {
+  @e:
+    %buf = let [i8, 16640]
+    %bp = gep i8, *%buf, 0
+    store i8 %hst, *%bp
+    %lenp = gep i8, *%bp, 1
+    call @put24(%lenp, %blen)
+    %bodyp = gep i8, *%bp, 4
+    %blen64 = sext i32 %blen to i64
+    call @memcpy(%bodyp, %body, %blen64)
+    %total = add i32 %blen, 4
+    %r = call @tls_write_record(%fd, @TlsContentType.Handshake, 771, %bp, %total)
+    ret i32 %r
+}
+// Read handshake message: returns type and body in buf
+fun @read_hs(fd: i32, buf: *i8, cap: i32, hst: *i8, blen: *i32) -> i32 {
+  @e:
+    %ct = let i8
+    %ctp = gep i8, *%ct, 0
+    %rlen = let i32
+    %rlp = gep i32, *%rlen, 0
+    %r = call @tls_read_plain(%fd, %buf, %cap, %ctp, %rlp)
+    %r_err = slt i32 %r, 0
+    br %r_err, @err, @check
+  @check:
+    %ct_v = load i8, *%ctp
+    %is_hs = eq i8 %ct_v, @TlsContentType.Handshake
+    br %is_hs, @parse, @not_hs
+  @not_hs:
+    // Return CCS or Alert as-is
+    store i8 %ct_v, *%hst
+    %rl_v = load i32, *%rlp
+    store i32 %rl_v, *%blen
+    ret i32 0
+  @parse:
+    %t = load i8, *%buf
+    store i8 %t, *%hst
+    // Read 3-byte length at buf+1
+    %lp = gep i8, *%buf, 1
+    %b0 = load i8, *%lp
+    %p2 = gep i8, *%buf, 2
+    %b1 = load i8, *%p2
+    %p3 = gep i8, *%buf, 3
+    %b2 = load i8, *%p3
+    %i0 = zext i8 %b0 to i32
+    %i1 = zext i8 %b1 to i32
+    %i2 = zext i8 %b2 to i32
+    %s0 = shl i32 %i0, 16
+    %s1 = or i32 %s0, %i1
+    %s2 = shl i32 %s1, 8
+    %lenv = or i32 %s2, %i2
+    store i32 %lenv, *%blen
+    // Shift body to buf start (overwrite header)
+    // (caller handles offset)
+    ret i32 0
+  @err:
+    ret i32 -1
+}
+// ===== Build TLS 1.2 ClientHello =====
+// Includes signature_algorithms + extended_master_secret extensions
+fun @ch12(ctx: *@TLSContext, buf: *i8, cap: i32, olen: *i32) -> i32 {
+  @e:
+    // Legacy version: 0x0303
+    %bp = gep i8, *%buf, 0
+    store i8 3, *%bp
+    %p2 = gep i8, *%buf, 1
+    store i8 3, *%p2
+    // Client random (TLS12Context field 8 = client_random)
+    %t12 = field @TLSContext, *%ctx, 0
+    %cr_arr = field @TLS12Context, *%t12, 8
+    %cr = gep i8, *%cr_arr, 0
+    %n32 = let i64
+    store i64 32, *%n32
+    %n32v = load i64, *%n32
+    call @c1_random_buf(%cr, %n32v)
+    %cr_dst = gep i8, *%buf, 2
+    call @memcpy(%cr_dst, %cr, %n32v)
+    // Session ID length = 0
+    %sid_p = gep i8, *%buf, 34
+    store i8 0, *%sid_p
+    // Cipher suites length = 2 bytes, one suite
+    %cs_len_p = gep i8, *%buf, 35
+    store i8 0, *%cs_len_p
+    %cs_len_p2 = gep i8, *%buf, 36
+    store i8 2, *%cs_len_p2
+    // TLS_RSA_WITH_AES_128_GCM_SHA256 = 0x009C
+    %cs_p = gep i8, *%buf, 37
+    store i8 0, *%cs_p
+    %cs_p2 = gep i8, *%buf, 38
+    store i8 0x9C, *%cs_p2
+    // Compression methods: 1 byte length + null
+    %comp_len_p = gep i8, *%buf, 39
+    store i8 1, *%comp_len_p
+    %comp_p = gep i8, *%buf, 40
+    store i8 0, *%comp_p
+    // Extension 1: signature_algorithms (0x000D), 8 bytes at offset 43
+    %sig_type_h = gep i8, *%buf, 43
+    store i8 0, *%sig_type_h
+    %sig_type_l = gep i8, *%buf, 44
+    store i8 0x0D, *%sig_type_l
+    %sig_len_h = gep i8, *%buf, 45
+    store i8 0, *%sig_len_h
+    %sig_len_l = gep i8, *%buf, 46
+    store i8 4, *%sig_len_l
+    %sig_list_h = gep i8, *%buf, 47
+    store i8 0, *%sig_list_h
+    %sig_list_l = gep i8, *%buf, 48
+    store i8 2, *%sig_list_l
+    %sig_algo_h = gep i8, *%buf, 49
+    store i8 0x04, *%sig_algo_h
+    %sig_algo_l = gep i8, *%buf, 50
+    store i8 0x01, *%sig_algo_l
+
+    // SNI, when the caller supplied a host name
+    %t13 = field @TLSContext, *%ctx, 1
+    %host_arr = field @TLS13Extension, *%t13, 9
+    %host_p = gep i8, *%host_arr, 0
+    %hlen_p = field @TLS13Extension, *%t13, 10
+    %hlen = load i32, *%hlen_p
+    %has_host = sgt i32 %hlen, 0
+    br %has_host, @with_sni, @no_sni
+
+  @no_sni:
+    %el_p = gep i8, *%buf, 41
+    store i8 0, *%el_p
+    %el_p2 = gep i8, *%buf, 42
+    store i8 8, *%el_p2
+    store i32 51, *%olen
+    ret i32 0
+
+  @with_sni:
+    // extensions length = 8 (sig_algs) + 9 (SNI header) + hlen
+    %el = add i32 17, %hlen
+    %el_hi = lshr i32 %el, 8
+    %el_hi8 = trunc i32 %el_hi to i8
+    %elp = gep i8, *%buf, 41
+    store i8 %el_hi8, *%elp
+    %el_lo = and i32 %el, 255
+    %el_lo8 = trunc i32 %el_lo to i8
+    %elp2 = gep i8, *%buf, 42
+    store i8 %el_lo8, *%elp2
+    // server_name extension, type 0x0000
+    %s1 = gep i8, *%buf, 51
+    store i8 0, *%s1
+    %s2 = gep i8, *%buf, 52
+    store i8 0, *%s2
+    // extension data length = 5 + hlen
+    %dl = add i32 5, %hlen
+    %dl_hi = lshr i32 %dl, 8
+    %dl_hi8 = trunc i32 %dl_hi to i8
+    %s3 = gep i8, *%buf, 53
+    store i8 %dl_hi8, *%s3
+    %dl_lo = and i32 %dl, 255
+    %dl_lo8 = trunc i32 %dl_lo to i8
+    %s4 = gep i8, *%buf, 54
+    store i8 %dl_lo8, *%s4
+    // server_name_list length = 3 + hlen
+    %ll = add i32 3, %hlen
+    %ll_hi = lshr i32 %ll, 8
+    %ll_hi8 = trunc i32 %ll_hi to i8
+    %s5 = gep i8, *%buf, 55
+    store i8 %ll_hi8, *%s5
+    %ll_lo = and i32 %ll, 255
+    %ll_lo8 = trunc i32 %ll_lo to i8
+    %s6 = gep i8, *%buf, 56
+    store i8 %ll_lo8, *%s6
+    // name type = 0 (host_name)
+    %s7 = gep i8, *%buf, 57
+    store i8 0, *%s7
+    // name length = hlen
+    %nl_hi = lshr i32 %hlen, 8
+    %nl_hi8 = trunc i32 %nl_hi to i8
+    %s8 = gep i8, *%buf, 58
+    store i8 %nl_hi8, *%s8
+    %nl_lo = and i32 %hlen, 255
+    %nl_lo8 = trunc i32 %nl_lo to i8
+    %s9 = gep i8, *%buf, 59
+    store i8 %nl_lo8, *%s9
+    // host bytes at offset 60
+    %hd = gep i8, *%buf, 60
+    %h64 = sext i32 %hlen to i64
+    call @memcpy(%hd, %host_p, %h64)
+    %tot = add i32 60, %hlen
+    store i32 %tot, *%olen
+    ret i32 0
+}
+// ===== Parse ServerHello (TLS 1.2 & 1.3) =====
+// buf = full record body (handshake header + body), blen = handshake body length
+fun @parse_sh(buf: *i8, blen: i32, sr: *i8, cs: *i16) -> i32 {
+  @e:
+    // Minimum body: version(2) + random(32) + sid_len(1) = 35
+    %min_body = slt i32 %blen, 35
+    br %min_body, @fail, @go
+  @go:
+    // In the handshake body (starting at buf+4):
+    // body[0..1] = version, body[2..33] = random (32), body[34] = sid_len
+    %rp = gep i8, *%buf, 6     // buf[6] = body[2] = random start
+    %n32 = let i64
+    store i64 32, *%n32
+    %n32v = load i64, *%n32
+    call @memcpy(%sr, %rp, %n32v)
+    %sid_len_b = gep i8, *%buf, 38    // buf[38] = body[34] = sid_len
+    %sid_len = load i8, *%sid_len_b
+    %sid_i = zext i8 %sid_len to i32
+    // In the body: cs is at body[35 + sid_len], which is buf[39 + sid_len]
+    %cs_body_off = add i32 35, %sid_i    // offset in body (not including 4-byte handshake header)
+    %too_big = slt i32 %blen, %cs_body_off
+    br %too_big, @fail, @read_cs
+  @read_cs:
+    %cs_buf_off = add i32 %cs_body_off, 4   // +4 for handshake header
+    %csp = gep i8, *%buf, %cs_buf_off
+    %csv = call @get16(%csp)
+    store i16 %csv, *%cs
+    ret i32 0
+  @fail:
+    ret i32 -1
+}
+// ===== TLS 1.2 key derivation =====
+const @_ms_label: [i8, 13] = [109,97,115,116,101,114,32,115,101,99,114,101,116]
+const @_ke_label: [i8, 13] = [107,101,121,32,101,120,112,97,110,115,105,111,110]
+// key_block = PRF(master_secret, "key expansion", sr || cr)
+// Works for client and server: the block always lays out the client keys
+// first, then the server keys.
+fun @derive12_key_block(ctx: *@TLSContext) -> i32 {
+  @e:
+    %t12 = field @TLSContext, *%ctx, 0
+    %cr_arr = field @TLS12Context, *%t12, 8
+    %cr = gep i8, *%cr_arr, 0
+    %sr_arr = field @TLS12Context, *%t12, 9
+    %sr = gep i8, *%sr_arr, 0
+    %ms_arr = field @TLS12Context, *%t12, 15
+    %ms = gep i8, *%ms_arr, 0
+    %klbl = gep i8, *@_ke_label, 0
+    %kb_seed = let [i8, 77]
+    %ksp = gep i8, *%kb_seed, 0
+    %n13 = let i64
+    store i64 13, *%n13
+    %n13v = load i64, *%n13
+    call @memcpy(%ksp, %klbl, %n13v)
+    %n32 = let i64
+    store i64 32, *%n32
+    %n32v = load i64, *%n32
+    %ke_sr = gep i8, *%ksp, 13
+    call @memcpy(%ke_sr, %sr, %n32v)
+    %ke_cr = gep i8, *%ksp, 45
+    call @memcpy(%ke_cr, %cr, %n32v)
+    %kb = let [i8, 40]
+    %kbp = gep i8, *%kb, 0
+    call @std_crypto_tls12_prf_sha256(%ms, 48, %ksp, 77, 40, %kbp)
+    // Distribute to TLS12Context fields
+    %cwk_arr = field @TLS12Context, *%t12, 10
+    %cwk = gep i8, *%cwk_arr, 0
+    %swk_arr = field @TLS12Context, *%t12, 11
+    %swk = gep i8, *%swk_arr, 0
+    %cwi_arr = field @TLS12Context, *%t12, 12
+    %cwi = gep i8, *%cwi_arr, 0
+    %swi_arr = field @TLS12Context, *%t12, 13
+    %swi = gep i8, *%swi_arr, 0
+    %n16 = let i64
+    store i64 16, *%n16
+    %n16v = load i64, *%n16
+    call @memcpy(%cwk, %kbp, %n16v)
+    %k_so = gep i8, *%kbp, 16
+    call @memcpy(%swk, %k_so, %n16v)
+    %n4 = let i64
+    store i64 4, *%n4
+    %n4v = load i64, *%n4
+    %iv_cs = gep i8, *%kbp, 32
+    call @memcpy(%cwi, %iv_cs, %n4v)
+    %iv_ss = gep i8, *%kbp, 36
+    call @memcpy(%swi, %iv_ss, %n4v)
+    ret i32 0
+}
+
+// Legacy master secret + key block (no extended_master_secret).
+fun @derive12(ctx: *@TLSContext) -> i32 {
+  @e:
+    %t12 = field @TLSContext, *%ctx, 0
+    %cr_arr = field @TLS12Context, *%t12, 8
+    %cr = gep i8, *%cr_arr, 0
+    %sr_arr = field @TLS12Context, *%t12, 9
+    %sr = gep i8, *%sr_arr, 0
+    %pms_arr = field @TLS12Context, *%t12, 14
+    %pms = gep i8, *%pms_arr, 0
+    %ms_arr = field @TLS12Context, *%t12, 15
+    %ms = gep i8, *%ms_arr, 0
+    // master_secret = PRF(pms, "master secret", cr || sr)
+    %mlbl = gep i8, *@_ms_label, 0
+    %ms_seed = let [i8, 77]
+    %msp = gep i8, *%ms_seed, 0
+    %n13 = let i64
+    store i64 13, *%n13
+    %n13v = load i64, *%n13
+    call @memcpy(%msp, %mlbl, %n13v)
+    %n32 = let i64
+    store i64 32, *%n32
+    %n32v = load i64, *%n32
+    %ms_cr = gep i8, *%msp, 13
+    call @memcpy(%ms_cr, %cr, %n32v)
+    %ms_sr = gep i8, *%msp, 45
+    call @memcpy(%ms_sr, %sr, %n32v)
+    call @std_crypto_tls12_prf_sha256(%pms, 48, %msp, 77, 48, %ms)
+    %r = call @derive12_key_block(%ctx)
+    ret i32 %r
+}
+// ============================================================
+// Application data — shared by client and server
+// ============================================================
+
+fun @net_tls_send(ctx: *i8, data: *i8, len: i32) -> i32 {
+  @e:
+    %t12 = field @TLSContext, *%ctx, 0
+    %t13 = field @TLSContext, *%ctx, 1
+    %fd_p = field @TLS12Context, *%t12, 0
+    %fd = load i32, *%fd_p
+    %role_p = field @TLS13Extension, *%t13, 11
+    %role = load i32, *%role_p
+    %keyp = let *i8
+    %ivp = let *i8
+    %seqp = let *i64
+    %is_srv = eq i32 %role, 1
+    br %is_srv, @pick_srv, @pick_cli
+  @pick_srv:
+    %sk_arr = field @TLS12Context, *%t12, 11
+    %sk = gep i8, *%sk_arr, 0
+    store *i8 %sk, *%keyp
+    %siv_arr = field @TLS12Context, *%t12, 13
+    %siv = gep i8, *%siv_arr, 0
+    store *i8 %siv, *%ivp
+    %sseq_p = field @TLS12Context, *%t12, 7
+    store *i64 %sseq_p, *%seqp
+    jmp @picked
+  @pick_cli:
+    %ck_arr = field @TLS12Context, *%t12, 10
+    %ck = gep i8, *%ck_arr, 0
+    store *i8 %ck, *%keyp
+    %civ_arr = field @TLS12Context, *%t12, 12
+    %civ0 = gep i8, *%civ_arr, 0
+    store *i8 %civ0, *%ivp
+    %cseq_p = field @TLS12Context, *%t12, 6
+    store *i64 %cseq_p, *%seqp
+    jmp @picked
+  @picked:
+    %cseq = load *i64, *%seqp
+    %ckey = load *i8, *%keyp
+    %civ = load *i8, *%ivp
+    %ver_p = field @TLS12Context, *%t12, 2
+    %ver = load i32, *%ver_p
+    %is13 = eq i32 %ver, 13
+    %v13 = let i32
+    br %is13, @set13, @set12
+  @set13:
+    store i32 1, *%v13
+    jmp @init
+  @set12:
+    store i32 0, *%v13
+    jmp @init
+  @init:
+    %off = let i32
+    store i32 0, *%off
+    %neg = slt i32 %len, 0
+    br %neg, @fail, @loop
+  @loop:
+    %ov = load i32, *%off
+    %rem = sub i32 %len, %ov
+    %done = sle i32 %rem, 0
+    br %done, @ok, @chunk
+  @chunk:
+    // TLS 1.2 plaintext max is 16384; TLS 1.3 also carries the inner type.
+    %v = load i32, *%v13
+    %v13b = ne i32 %v, 0
+    br %v13b, @max13, @max12
+  @max13:
+    jmp @have_max
+  @max12:
+    jmp @have_max
+  @have_max:
+    %cap = phi i32 [ 16383, @max13 ], [ 16384, @max12 ]
+    %big = sgt i32 %rem, %cap
+    br %big, @sz_cap, @sz_rem
+  @sz_cap:
+    jmp @have_sz
+  @sz_rem:
+    jmp @have_sz
+  @have_sz:
+    %sz = phi i32 [ %cap, @sz_cap ], [ %rem, @sz_rem ]
+    %ov2 = load i32, *%off
+    %dp = gep i8, *%data, %ov2
+    %v2 = load i32, *%v13
+    %v13c = ne i32 %v2, 0
+    br %v13c, @enc13, @enc12
+  @enc13:
+    %r = call @tls13_record_encrypt(%fd, %cseq, %ckey, %civ, 16, @TlsContentType.Application, %dp, %sz)
+    jmp @enc_done
+  @enc12:
+    %r2 = call @tls12_record_encrypt(%fd, %cseq, %ckey, %civ, 16, @TlsContentType.Application, %dp, %sz)
+    jmp @enc_done
+  @enc_done:
+    %rr = phi i32 [ %r, @enc13 ], [ %r2, @enc12 ]
+    %bad = slt i32 %rr, 0
+    br %bad, @fail, @adv
+  @adv:
+    %ov3 = load i32, *%off
+    %no = add i32 %ov3, %sz
+    store i32 %no, *%off
+    jmp @loop
+  @ok:
+    ret i32 0
+  @fail:
+    ret i32 -1
+}
+
+fun @net_tls_recv(ctx: *i8, buf: *i8, cap: i32, out_len: *i32) -> i32 {
+  @e:
+    %t12 = field @TLSContext, *%ctx, 0
+    %t13 = field @TLSContext, *%ctx, 1
+    %fd_p = field @TLS12Context, *%t12, 0
+    %fd = load i32, *%fd_p
+    %role_p = field @TLS13Extension, *%t13, 11
+    %role = load i32, *%role_p
+    %keyp = let *i8
+    %ivp = let *i8
+    %seqp = let *i64
+    %is_srv = eq i32 %role, 1
+    br %is_srv, @rx_srv, @rx_cli
+  @rx_srv:
+    // server receives with the client's keys and sequence
+    %rck_arr = field @TLS12Context, *%t12, 10
+    %rck = gep i8, *%rck_arr, 0
+    store *i8 %rck, *%keyp
+    %rciv_arr = field @TLS12Context, *%t12, 12
+    %rciv = gep i8, *%rciv_arr, 0
+    store *i8 %rciv, *%ivp
+    %rcseq_p = field @TLS12Context, *%t12, 6
+    store *i64 %rcseq_p, *%seqp
+    jmp @rx_picked
+  @rx_cli:
+    // client receives with the server's keys and sequence
+    %rsk_arr = field @TLS12Context, *%t12, 11
+    %rsk = gep i8, *%rsk_arr, 0
+    store *i8 %rsk, *%keyp
+    %rsiv_arr = field @TLS12Context, *%t12, 13
+    %rsiv = gep i8, *%rsiv_arr, 0
+    store *i8 %rsiv, *%ivp
+    %rsseq_p = field @TLS12Context, *%t12, 7
+    store *i64 %rsseq_p, *%seqp
+    jmp @rx_picked
+  @rx_picked:
+    %ct = let i8
+    %ctp = gep i8, *%ct, 0
+    %sseq = load *i64, *%seqp
+    %skey = load *i8, *%keyp
+    %siv = load *i8, *%ivp
+    %ver_p = field @TLS12Context, *%t12, 2
+    %ver = load i32, *%ver_p
+    %is13 = eq i32 %ver, 13
+    br %is13, @recv13, @recv12
+  @recv13:
+    // Skip post-handshake messages (e.g. NewSessionTicket) until application
+    // data arrives.
+    %r = call @tls13_record_decrypt(%fd, %sseq, %skey, %siv, 16, %buf, %cap, %ctp, %out_len)
+    %r_err = slt i32 %r, 0
+    br %r_err, @recv13_fail, @recv13_type
+  @recv13_type:
+    %ot = load i8, *%ctp
+    %is_app = eq i8 %ot, @TlsContentType.Application
+    br %is_app, @recv13_ok, @recv13_chk_hs
+  @recv13_chk_hs:
+    %is_hs = eq i8 %ot, @TlsContentType.Handshake
+    br %is_hs, @recv13, @recv13_fail
+  @recv13_ok:
+    ret i32 0
+  @recv13_fail:
+    ret i32 -1
+  @recv12:
+    %r2 = call @tls12_record_decrypt(%fd, %sseq, %skey, %siv, 16, %buf, %cap, %ctp, %out_len)
+    ret i32 %r2
+}
+
+fun @net_tls_close(ctx: *i8) -> i32 {
+  @e:
+    %t12 = field @TLSContext, *%ctx, 0
+    %fd_p = field @TLS12Context, *%t12, 0
+    %fd = load i32, *%fd_p
+    %ver_p = field @TLS12Context, *%t12, 2
+    %ver = load i32, *%ver_p
+    %is13 = eq i32 %ver, 13
+    br %is13, @close13, @close12
+  @close13:
+    // close_notify is not sent; the caller closes the socket.
+    ret i32 0
+  @close12:
+    %alert = let [i8, 2]
+    %ap = gep i8, *%alert, 0
+    store i8 1, *%ap
+    %ap2 = gep i8, *%ap, 1
+    store i8 0, *%ap2
+    %r = call @tls_write_record(%fd, @TlsContentType.Alert, 771, %ap, 2)
+    ret i32 %r
+}

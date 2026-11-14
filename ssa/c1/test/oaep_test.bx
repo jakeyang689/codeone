@@ -1,0 +1,117 @@
+// RSAES-OAEP tests, including an OpenSSL-produced ciphertext.
+// Prints "PASS oaep" on success.
+
+extern @printf(fmt: *i8, ...) -> i32
+extern @strcmp(a: *i8, b: *i8) -> i32
+extern @std_io_file_open_read(path: *i8) -> *i8
+extern @std_io_file_read_all(fp: *i8, buf: *i8, cap: i32) -> i32
+extern @std_io_file_close(fp: *i8) -> i32
+extern @std_crypto_pem_read_rsa_private(pem: *i8, pem_len: i32,
+                                        n: *i32, e: *i32, d: *i32,
+                                        limbs: i32) -> i32
+extern @std_crypto_rsa_encrypt_oaep_sha256(msg: *i8, msg_len: i32,
+                                           e: *i32, e_limbs: i32,
+                                           n: *i32, limbs: i32, ct: *i8) -> i32
+extern @std_crypto_rsa_decrypt_oaep_sha256(ct: *i8, d: *i32, n: *i32,
+                                           limbs: i32, out: *i8,
+                                           out_cap: i32) -> i32
+
+const @KEY_PATH = "certs/tls13.key"
+const @PLAIN = "OAEP interop"
+// openssl pkeyutl -encrypt -pkeyopt rsa_padding_mode:oaep
+//   -pkeyopt rsa_oaep_md:sha256 -pkeyopt rsa_mgf1_md:sha256
+const @OAEP_CT: [i8, 256] = [24, 102, 8, 223, 117, 17, 196, 22, 211, 182, 81, 60, 101, 24, 152, 168, 150, 38, 40, 93, 27, 78, 230, 228, 15, 101, 76, 218, 198, 110, 59, 227, 210, 227, 154, 86, 74, 23, 141, 16, 245, 38, 251, 88, 83, 87, 132, 247, 240, 29, 132, 253, 67, 70, 87, 81, 194, 122, 243, 125, 142, 45, 172, 200, 249, 10, 52, 4, 217, 146, 137, 230, 217, 155, 150, 4, 243, 204, 188, 229, 119, 58, 29, 22, 232, 29, 31, 110, 203, 120, 164, 129, 0, 161, 32, 145, 243, 182, 239, 54, 33, 19, 42, 154, 60, 184, 194, 241, 76, 89, 109, 146, 199, 177, 64, 168, 105, 122, 227, 120, 68, 234, 132, 16, 235, 66, 59, 31, 31, 188, 26, 213, 116, 239, 201, 26, 5, 39, 154, 31, 54, 252, 197, 82, 71, 121, 186, 172, 164, 227, 19, 189, 63, 132, 0, 208, 224, 187, 231, 35, 77, 26, 19, 160, 75, 195, 50, 95, 13, 116, 77, 79, 149, 6, 152, 181, 111, 206, 129, 2, 40, 200, 197, 86, 66, 188, 54, 150, 32, 98, 134, 202, 29, 155, 163, 7, 169, 202, 232, 108, 141, 177, 42, 96, 205, 233, 46, 232, 211, 239, 62, 160, 30, 183, 111, 106, 130, 239, 203, 108, 182, 33, 163, 36, 62, 230, 184, 181, 47, 246, 172, 72, 55, 224, 208, 157, 165, 178, 249, 186, 91, 244, 244, 103, 186, 13, 164, 185, 153, 130, 117, 233, 222, 200, 194, 103]
+
+fun @main() -> i32 {
+  @entry:
+    %id = let i32
+    %pem = let [i8, 8192]
+    %n = let [i32, 64]
+    %e = let [i32, 64]
+    %d = let [i32, 64]
+    %ct = let [i8, 256]
+    %out = let [i8, 256]
+    %big = let [i8, 256]
+    %pp = gep i8, *%pem, 0
+    %np = gep i32, *%n, 0
+    %ep = gep i32, *%e, 0
+    %dp = gep i32, *%d, 0
+    %ctp = gep i8, *%ct, 0
+    %op = gep i8, *%out, 0
+    %bgp = gep i8, *%big, 0
+    store i32 0, *%id
+    jmp @c1
+
+  @c1:
+    store i32 1, *%id
+    %kp = gep i8, *@KEY_PATH, 0
+    %fp = call @std_io_file_open_read(%kp)
+    %fn = eq *i8 %fp, null
+    br %fn, @fail, @read
+  @read:
+    %n8 = call @std_io_file_read_all(%fp, %pp, 8191)
+    call @std_io_file_close(%fp)
+    %nok = sgt i32 %n8, 0
+    br %nok, @c2, @fail
+  @c2:
+    store i32 2, *%id
+    %r2 = call @std_crypto_pem_read_rsa_private(%pp, %n8, %np, %ep, %dp, 64)
+    %ok2 = eq i32 %r2, 0
+    br %ok2, @c3, @fail
+
+    // round trip
+  @c3:
+    store i32 3, *%id
+    %r3 = call @std_crypto_rsa_encrypt_oaep_sha256("OAEP roundtrip", 14,
+                                                   %ep, 64, %np, 64, %ctp)
+    %ok3 = eq i32 %r3, 0
+    br %ok3, @c4, @fail
+  @c4:
+    store i32 4, *%id
+    %d4 = call @std_crypto_rsa_decrypt_oaep_sha256(%ctp, %dp, %np, 64, %op, 256)
+    %z4 = gep i8, *%op, %d4
+    store i8 0, *%z4
+    %d4ok = eq i32 %d4, 14
+    %c4 = call @strcmp(%op, "OAEP roundtrip")
+    %c4ok = eq i32 %c4, 0
+    %a4 = and i1 %d4ok, %c4ok
+    br %a4, @c5, @fail
+
+    // tampered ciphertext
+  @c5:
+    store i32 5, *%id
+    %b0 = load i8, *%ctp
+    %xb = xor i8 %b0, 1
+    store i8 %xb, *%ctp
+    %d5 = call @std_crypto_rsa_decrypt_oaep_sha256(%ctp, %dp, %np, 64, %op, 256)
+    %ok5 = eq i32 %d5, -1
+    br %ok5, @c6, @fail
+
+    // message too long for k=256 (max 190)
+  @c6:
+    store i32 6, *%id
+    %r6 = call @std_crypto_rsa_encrypt_oaep_sha256(%bgp, 191, %ep, 64, %np, 64, %ctp)
+    %ok6 = eq i32 %r6, -1
+    br %ok6, @c7, @fail
+
+    // OpenSSL-generated ciphertext
+  @c7:
+    store i32 7, *%id
+    %ccp = gep i8, *@OAEP_CT, 0
+    %d7 = call @std_crypto_rsa_decrypt_oaep_sha256(%ccp, %dp, %np, 64, %op, 256)
+    %z7 = gep i8, *%op, %d7
+    store i8 0, *%z7
+    %d7ok = eq i32 %d7, 12
+    %c7 = call @strcmp(%op, @PLAIN)
+    %c7ok = eq i32 %c7, 0
+    %a7 = and i1 %d7ok, %c7ok
+    br %a7, @pass, @fail
+
+  @pass:
+    call @printf("PASS oaep\n")
+    ret i32 0
+  @fail:
+    %fid = load i32, *%id
+    call @printf("FAIL oaep at case %d\n", %fid)
+    ret i32 1
+}

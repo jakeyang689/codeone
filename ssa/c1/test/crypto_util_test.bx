@@ -1,0 +1,101 @@
+// Constant-time comparison and secure zero tests.
+// Prints "PASS crypto_util" on success.
+
+extern @printf(fmt: *i8, ...) -> i32
+extern @std_crypto_util_ct_eq(a: *i8, b: *i8, len: i32) -> i32
+extern @std_crypto_util_zero(buf: *i8, len: i32) -> void
+
+fun @main() -> i32 {
+  @entry:
+    %id = let i32
+    %buf = let [i8, 8]
+    %i = let i32
+    %bp = gep i8, *%buf, 0
+    store i32 0, *%id
+    jmp @c1
+
+  @c1:
+    store i32 1, *%id
+    %r1 = call @std_crypto_util_ct_eq("abc", "abc", 3)
+    %ok1 = eq i32 %r1, 1
+    br %ok1, @c2, @fail
+  @c2:
+    store i32 2, *%id
+    %r2 = call @std_crypto_util_ct_eq("abc", "abd", 3)
+    %ok2 = eq i32 %r2, 0
+    br %ok2, @c3, @fail
+  @c3:
+    store i32 3, *%id
+    %r3 = call @std_crypto_util_ct_eq("abc", "abd", 2)
+    %ok3 = eq i32 %r3, 1
+    br %ok3, @c4, @fail
+  @c4:
+    store i32 4, *%id
+    %r4 = call @std_crypto_util_ct_eq(%bp, %bp, 0)
+    %ok4 = eq i32 %r4, 1
+    br %ok4, @c5, @fail
+  @c5:
+    store i32 5, *%id
+    %r5 = call @std_crypto_util_ct_eq("a", "b", -1)
+    %ok5 = eq i32 %r5, 0
+    br %ok5, @c6, @fail
+
+    // fill with 0xFF, zero it, verify
+  @c6:
+    store i32 6, *%id
+    store i32 0, *%i
+    jmp @fill_cond
+  @fill_cond:
+    %iv = load i32, *%i
+    %more = slt i32 %iv, 8
+    br %more, @fill_body, @zero_call
+  @fill_body:
+    %iv2 = load i32, *%i
+    %p = gep i8, *%bp, %iv2
+    store i8 -1, *%p
+    %n = add i32 %iv2, 1
+    store i32 %n, *%i
+    jmp @fill_cond
+  @zero_call:
+    call @std_crypto_util_zero(%bp, 8)
+    store i32 0, *%i
+    jmp @chk_cond
+  @chk_cond:
+    %cv = load i32, *%i
+    %cmore = slt i32 %cv, 8
+    br %cmore, @chk_body, @c7
+  @chk_body:
+    %cv2 = load i32, *%i
+    %cp = gep i8, *%bp, %cv2
+    %c = load i8, *%cp
+    %z = eq i8 %c, 0
+    br %z, @chk_next, @fail
+  @chk_next:
+    %cv3 = load i32, *%i
+    %cn = add i32 %cv3, 1
+    store i32 %cn, *%i
+    jmp @chk_cond
+
+  @c7:
+    store i32 7, *%id
+    store i8 7, *%bp
+    call @std_crypto_util_zero(%bp, 0)
+    %v7 = load i8, *%bp
+    %ok7 = eq i8 %v7, 7
+    br %ok7, @c8, @fail
+  @c8:
+    store i32 8, *%id
+    store i8 9, *%bp
+    call @std_crypto_util_zero(%bp, -1)
+    %v8 = load i8, *%bp
+    %ok8 = eq i8 %v8, 9
+    br %ok8, @pass, @fail
+
+  @pass:
+    call @printf("PASS crypto_util\n")
+    ret i32 0
+  @fail:
+    %fid = load i32, *%id
+    call @printf("FAIL crypto_util at case %d\n", %fid)
+    ret i32 1
+}

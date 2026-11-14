@@ -1,0 +1,62 @@
+// Fixed-size bitset using i32 array
+// Each i32 holds 32 bits. Count = number of i32 words.
+
+fun @std_data_bitset_init(set: *i32, words: i32) -> void {
+  @entry:
+    %iptr = let i32
+    store i32 0, *%iptr
+    jmp @bi_cond
+
+  @bi_cond:
+    %i = load i32, *%iptr
+    %c = slt i32 %i, %words
+    br %c, @bi_body, @bi_done
+
+  @bi_body:
+    %iv = load i32, *%iptr
+    %p = gep i32, *%set, %iv
+    store i32 0, *%p
+    %iv2 = add i32 %iv, 1
+    store i32 %iv2, *%iptr
+    jmp @bi_cond
+
+  @bi_done:
+    ret void
+}
+
+fun @std_data_bitset_set_bit(set: *i32, bit: i32) -> void {
+  @entry:
+    %word = lshr i32 %bit, 5
+    %bit_in_word = and i32 %bit, 31
+    %p = gep i32, *%set, %word
+    %val = load i32, *%p
+    %one = shl i32 1, %bit_in_word
+    %new = or i32 %val, %one
+    store i32 %new, *%p
+    ret void
+}
+
+fun @std_data_bitset_clear_bit(set: *i32, bit: i32) -> void {
+  @entry:
+    %word = lshr i32 %bit, 5
+    %bit_in_word = and i32 %bit, 31
+    %p = gep i32, *%set, %word
+    %val = load i32, *%p
+    %one = shl i32 1, %bit_in_word
+    %not_one = xor i32 %one, -1
+    %new = and i32 %val, %not_one
+    store i32 %new, *%p
+    ret void
+}
+
+fun @std_data_bitset_test(set: *i32, bit: i32) -> i1 {
+  @entry:
+    %word = lshr i32 %bit, 5
+    %bit_in_word = and i32 %bit, 31
+    %p = gep i32, *%set, %word
+    %val = load i32, *%p
+    %one = shl i32 1, %bit_in_word
+    %masked = and i32 %val, %one
+    %nonzero = ne i32 %masked, 0
+    ret i1 %nonzero
+}

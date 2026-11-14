@@ -1,0 +1,72 @@
+// Comparison instruction semantics (results are i1).
+
+extern @printf(fmt: *i8, ...) -> i32
+
+fun @main() -> i32 {
+  @entry:
+    %id = let i32
+    store i32 0, *%id
+
+    %c1 = eq i32 5, 5
+    br %c1, @t1, @fail
+  @t1:
+    store i32 1, *%id
+    %c2 = ne i32 5, 4
+    br %c2, @t2, @fail
+
+  @t2:
+    store i32 2, *%id
+    %c3 = eq i8 -1, 255          // same bit pattern
+    br %c3, @t3, @fail
+
+  @t3:
+    store i32 3, *%id
+    // --- signed ordering: -1 < 0 ---
+    %c4 = slt i32 -1, 0
+    br %c4, @t4, @fail
+
+  @t4:
+    store i32 4, *%id
+    %c5 = sle i32 -1, -1
+    br %c5, @t5, @fail
+
+  @t5:
+    store i32 5, *%id
+    %c6 = sgt i32 0, -1
+    br %c6, @t6, @fail
+
+  @t6:
+    store i32 6, *%id
+    %c7 = sge i32 3, 4
+    %no7 = xor i1 %c7, true
+    br %no7, @t7, @fail
+
+  @t7:
+    store i32 7, *%id
+    // --- 64-bit boundary ---
+    %c8 = slt i64 -9223372036854775807, 0
+    br %c8, @t8, @fail
+
+  @t8:
+    store i32 8, *%id
+    %c9 = eq i64 0, 0
+    br %c9, @t9, @fail
+
+  @t9:
+    store i32 9, *%id
+    // i1 can be combined with bitwise ops
+    %c10 = eq i32 1, 1
+    %c11 = eq i32 2, 2
+    %c12 = and i1 %c10, %c11
+    %c13 = or i1 %c12, false
+    %c14 = xor i1 %c13, false
+    br %c14, @pass, @fail
+
+  @pass:
+    call @printf("PASS isa/compare\n")
+    ret i32 0
+  @fail:
+    %n = load i32, *%id
+    call @printf("FAIL isa/compare at case %d\n", %n)
+    ret i32 1
+}

@@ -1,0 +1,476 @@
+// URL encoding and decoding — pure SSA (no extern calls)
+
+const @net_url_hex: [i8, 17] = "0123456789ABCDEF"
+
+// URL-encode len bytes from input into output. Returns bytes written.
+fun @net_url_encode(input: *i8, len: i32, output: *i8) -> i32 {
+  @entry:
+    %ip = let i32
+    store i32 0, *%ip
+    %op = let i32
+    store i32 0, *%op
+    jmp @ec
+  @ec:
+    %i = load i32, *%ip
+    %more = slt i32 %i, %len
+    br %more, @er, @ed
+  @er:
+    %ci = load i32, *%ip
+    %pi = gep i8, *%input, %ci
+    %c = load i8, *%pi
+    %v = zext i8 %c to i32
+    // a-z
+    %ga = sge i32 %v, 97
+    %lz = sle i32 %v, 122
+    %az = and i1 %ga, %lz
+    br %az, @cp, @chk_AZ
+  @chk_AZ:
+    %gA = sge i32 %v, 65
+    %lZ = sle i32 %v, 90
+    %AZ = and i1 %gA, %lZ
+    br %AZ, @cp, @chk_09
+  @chk_09:
+    %g0 = sge i32 %v, 48
+    %l9 = sle i32 %v, 57
+    %_09 = and i1 %g0, %l9
+    br %_09, @cp, @chk_sym
+  @chk_sym:
+    %dot = eq i32 %v, 46
+    br %dot, @cp, @chk_min
+  @chk_min:
+    %min = eq i32 %v, 45
+    br %min, @cp, @chk_und
+  @chk_und:
+    %und = eq i32 %v, 95
+    br %und, @cp, @chk_til
+  @chk_til:
+    %til = eq i32 %v, 126
+    br %til, @cp, @chk_spc
+  @chk_spc:
+    %spc = eq i32 %v, 32
+    br %spc, @sp, @pct
+  @cp:
+    %oi1 = load i32, *%op
+    %po1 = gep i8, *%output, %oi1
+    store i8 %c, *%po1
+    %n1 = add i32 %oi1, 1
+    store i32 %n1, *%op
+    jmp @nx
+  @sp:
+    %oi2 = load i32, *%op
+    %po2 = gep i8, *%output, %oi2
+    store i8 '+', *%po2
+    %n2 = add i32 %oi2, 1
+    store i32 %n2, *%op
+    jmp @nx
+  @pct:
+    %oi3 = load i32, *%op
+    %po3 = gep i8, *%output, %oi3
+    store i8 '%', *%po3
+    %hi = lshr i32 %v, 4
+    %ph = gep i8, *@net_url_hex, %hi
+    %hc = load i8, *%ph
+    %oc1 = add i32 %oi3, 1
+    %po4 = gep i8, *%output, %oc1
+    store i8 %hc, *%po4
+    %lo = and i32 %v, 15
+    %pl = gep i8, *@net_url_hex, %lo
+    %lc = load i8, *%pl
+    %oc2 = add i32 %oi3, 2
+    %po5 = gep i8, *%output, %oc2
+    store i8 %lc, *%po5
+    %n3 = add i32 %oi3, 3
+    store i32 %n3, *%op
+    jmp @nx
+  @nx:
+    %ci2 = load i32, *%ip
+    %ni = add i32 %ci2, 1
+    store i32 %ni, *%ip
+    jmp @ec
+  @ed:
+    %r = load i32, *%op
+    ret i32 %r
+}
+
+// URL-decode len bytes from input into output. Returns bytes written.
+fun @net_url_decode(input: *i8, len: i32, output: *i8) -> i32 {
+  @entry:
+    %ip = let i32
+    store i32 0, *%ip
+    %op = let i32
+    store i32 0, *%op
+    jmp @dc
+  @dc:
+    %i = load i32, *%ip
+    %more = slt i32 %i, %len
+    br %more, @dr, @dd
+  @dr:
+    %ci = load i32, *%ip
+    %pi = gep i8, *%input, %ci
+    %c = load i8, *%pi
+    %v = zext i8 %c to i32
+    %is_p = eq i32 %v, 43
+    br %is_p, @dp, @pct_c
+  @dp:
+    %oi1 = load i32, *%op
+    %po1 = gep i8, *%output, %oi1
+    store i8 ' ', *%po1
+    %n1 = add i32 %oi1, 1
+    store i32 %n1, *%op
+    jmp @nx2
+  @pct_c:
+    %is_pp = eq i32 %v, 37
+    br %is_pp, @try_hex, @cp2
+  @try_hex:
+    %ci2 = load i32, *%ip
+    %rem = sub i32 %len, %ci2
+    %has2 = sge i32 %rem, 3
+    br %has2, @dh1, @cp2
+  @dh1:
+    %ci3 = load i32, *%ip
+    %ci3p1 = add i32 %ci3, 1
+    %ci3p2 = add i32 %ci3, 2
+    %ph1 = gep i8, *%input, %ci3p1
+    %ch1 = load i8, *%ph1
+    %ph2 = gep i8, *%input, %ci3p2
+    %ch2 = load i8, *%ph2
+    %h1v = zext i8 %ch1 to i32
+    %h2v = zext i8 %ch2 to i32
+    %h1m = let i32
+    %h2m = let i32
+    // Convert h1
+    %h1g0 = sge i32 %h1v, 48
+    %h1l9 = sle i32 %h1v, 57
+    %h109 = and i1 %h1g0, %h1l9
+    br %h109, @sh1_09, @sh1_A
+  @sh1_09:
+    %h1v9 = sub i32 %h1v, 48
+    store i32 %h1v9, *%h1m
+    jmp @dh2
+  @sh1_A:
+    %h1gA = sge i32 %h1v, 65
+    %h1lF = sle i32 %h1v, 70
+    %h1AF = and i1 %h1gA, %h1lF
+    br %h1AF, @sh1_AF, @sh1_a
+  @sh1_AF:
+    %h1vAF = sub i32 %h1v, 55
+    store i32 %h1vAF, *%h1m
+    jmp @dh2
+  @sh1_a:
+    %h1ga = sge i32 %h1v, 97
+    %h1lf = sle i32 %h1v, 102
+    %h1af = and i1 %h1ga, %h1lf
+    br %h1af, @sh1_af, @cp2
+  @sh1_af:
+    %h1vaf = sub i32 %h1v, 87
+    store i32 %h1vaf, *%h1m
+    jmp @dh2
+  @dh2:
+    %h2g0 = sge i32 %h2v, 48
+    %h2l9 = sle i32 %h2v, 57
+    %h209 = and i1 %h2g0, %h2l9
+    br %h209, @sh2_09, @sh2_A
+  @sh2_09:
+    %h2v9 = sub i32 %h2v, 48
+    store i32 %h2v9, *%h2m
+    jmp @emit
+  @sh2_A:
+    %h2gA = sge i32 %h2v, 65
+    %h2lF = sle i32 %h2v, 70
+    %h2AF = and i1 %h2gA, %h2lF
+    br %h2AF, @sh2_AF, @sh2_a
+  @sh2_AF:
+    %h2vAF = sub i32 %h2v, 55
+    store i32 %h2vAF, *%h2m
+    jmp @emit
+  @sh2_a:
+    %h2ga = sge i32 %h2v, 97
+    %h2lf = sle i32 %h2v, 102
+    %h2af = and i1 %h2ga, %h2lf
+    br %h2af, @sh2_af, @cp2
+  @sh2_af:
+    %h2vaf = sub i32 %h2v, 87
+    store i32 %h2vaf, *%h2m
+    jmp @emit
+  @emit:
+    %h1f = load i32, *%h1m
+    %h2f = load i32, *%h2m
+    %h1s = shl i32 %h1f, 4
+    %dec = add i32 %h1s, %h2f
+    %oi2 = load i32, *%op
+    %po2 = gep i8, *%output, %oi2
+    %dec8 = trunc i32 %dec to i8
+    store i8 %dec8, *%po2
+    %n2 = add i32 %oi2, 1
+    store i32 %n2, *%op
+    %ci4 = load i32, *%ip
+    %sk = add i32 %ci4, 3  // skip past %XX (3 bytes)
+    store i32 %sk, *%ip
+    jmp @dc
+  @cp2:
+    %oi3 = load i32, *%op
+    %po3 = gep i8, *%output, %oi3
+    store i8 %c, *%po3
+    %n3 = add i32 %oi3, 1
+    store i32 %n3, *%op
+    jmp @nx2
+  @nx2:
+    %ci5 = load i32, *%ip
+    %ni = add i32 %ci5, 1
+    store i32 %ni, *%ip
+    jmp @dc
+  @dd:
+    %r = load i32, *%op
+    ret i32 %r
+}
+
+// ============================================================
+// URL parsing
+// ============================================================
+
+// Components of an absolute URL. Offsets index into the input string.
+struct @HttpUrl {
+  @scheme: i32,     // 0 = http, 1 = https
+  @host_off: i32,
+  @host_len: i32,
+  @port: i32,
+  @path_off: i32,
+  @path_len: i32,
+  @query_off: i32,
+  @query_len: i32
+}
+
+// Parse "http[s]://host[:port][/path][?query]". A missing scheme means http.
+// Returns 0 on success, -1 on a malformed input.
+fun @net_url_parse(url: *i8, len: i32, out: *@HttpUrl) -> i32 {
+  @entry:
+    %sp = field @HttpUrl, *%out, 0
+    store i32 0, *%sp
+    %pp = field @HttpUrl, *%out, 3
+    store i32 80, *%pp
+    %qo = field @HttpUrl, *%out, 6
+    store i32 0, *%qo
+    %ql = field @HttpUrl, *%out, 7
+    store i32 0, *%ql
+    %len_ok = sgt i32 %len, 0
+    br %len_ok, @c0, @fail
+
+  @c0:
+    %p0 = gep i8, *%url, 0
+    %c0 = load i8, *%p0
+    %is_h = eq i8 %c0, 104
+    br %is_h, @c1, @no_scheme
+  @c1:
+    %len5 = sge i32 %len, 5
+    br %len5, @c1b, @no_scheme
+  @c1b:
+    %p1 = gep i8, *%url, 1
+    %c1 = load i8, *%p1
+    %is_t1 = eq i8 %c1, 116
+    br %is_t1, @c2, @no_scheme
+  @c2:
+    %p2 = gep i8, *%url, 2
+    %c2 = load i8, *%p2
+    %is_t2 = eq i8 %c2, 116
+    br %is_t2, @c3, @no_scheme
+  @c3:
+    %p3 = gep i8, *%url, 3
+    %c3 = load i8, *%p3
+    %is_p = eq i8 %c3, 112
+    br %is_p, @c4, @no_scheme
+  @c4:
+    %p4 = gep i8, *%url, 4
+    %c4 = load i8, *%p4
+    %is_colon = eq i8 %c4, 58
+    br %is_colon, @http_start, @https_chk
+  @http_start:
+    %len7 = sge i32 %len, 7
+    br %len7, @http_slashes, @fail
+  @http_slashes:
+    %p5 = gep i8, *%url, 5
+    %c5 = load i8, *%p5
+    %p6 = gep i8, *%url, 6
+    %c6 = load i8, *%p6
+    %s5 = eq i8 %c5, 47
+    %s6 = eq i8 %c6, 47
+    %both = and i1 %s5, %s6
+    br %both, @auth_http, @fail
+  @auth_http:
+    %a_http = add i32 0, 7
+    jmp @auth
+  @https_chk:
+    %is_s = eq i8 %c4, 115
+    br %is_s, @https_body, @no_scheme
+  @https_body:
+    %len8 = sge i32 %len, 8
+    br %len8, @https_slashes, @fail
+  @https_slashes:
+    %q5 = gep i8, *%url, 5
+    %d5 = load i8, *%q5
+    %q6 = gep i8, *%url, 6
+    %d6 = load i8, *%q6
+    %q7 = gep i8, *%url, 7
+    %d7 = load i8, *%q7
+    %e5 = eq i8 %d5, 58
+    %e6 = eq i8 %d6, 47
+    %e7 = eq i8 %d7, 47
+    %e56 = and i1 %e5, %e6
+    %eall = and i1 %e56, %e7
+    br %eall, @auth_https, @fail
+  @auth_https:
+    store i32 1, *%sp
+    store i32 443, *%pp
+    %a_https = add i32 0, 8
+    jmp @auth
+  @no_scheme:
+    %a_plain = add i32 0, 0
+    jmp @auth
+
+  @auth:
+    %a0 = phi i32 [ %a_http, @auth_http ], [ %a_https, @auth_https ], [ %a_plain, @no_scheme ]
+    %i = let i32
+    store i32 %a0, *%i
+    jmp @scan
+  @scan:
+    %iv = load i32, *%i
+    %more = slt i32 %iv, %len
+    br %more, @scan_ch, @auth_done
+  @scan_ch:
+    %iv2 = load i32, *%i
+    %cp = gep i8, *%url, %iv2
+    %ch = load i8, *%cp
+    %is_slash = eq i8 %ch, 47
+    %is_q = eq i8 %ch, 63
+    %stop = or i1 %is_slash, %is_q
+    br %stop, @auth_done, @scan_next
+  @scan_next:
+    %iv3 = load i32, *%i
+    %nx = add i32 %iv3, 1
+    store i32 %nx, *%i
+    jmp @scan
+  @auth_done:
+    %aend = load i32, *%i
+    %empty_host = eq i32 %aend, %a0
+    br %empty_host, @fail, @colon_scan_init
+
+  @colon_scan_init:
+    %j = let i32
+    store i32 %a0, *%j
+    jmp @colon_scan
+  @colon_scan:
+    %jv = load i32, *%j
+    %more2 = slt i32 %jv, %aend
+    br %more2, @colon_ch, @no_port
+  @colon_ch:
+    %jv2 = load i32, *%j
+    %jp = gep i8, *%url, %jv2
+    %jc = load i8, *%jp
+    %is_c = eq i8 %jc, 58
+    br %is_c, @have_colon, @colon_next
+  @colon_next:
+    %jv3 = load i32, *%j
+    %jn = add i32 %jv3, 1
+    store i32 %jn, *%j
+    jmp @colon_scan
+  @no_port:
+    %ho_p = field @HttpUrl, *%out, 1
+    store i32 %a0, *%ho_p
+    %hl_p = field @HttpUrl, *%out, 2
+    %hl = sub i32 %aend, %a0
+    store i32 %hl, *%hl_p
+    jmp @path_scan_init
+  @have_colon:
+    %cv = load i32, *%j
+    %ho2_p = field @HttpUrl, *%out, 1
+    store i32 %a0, *%ho2_p
+    %hl2_p = field @HttpUrl, *%out, 2
+    %hl2 = sub i32 %cv, %a0
+    %host_ok = sgt i32 %hl2, 0
+    br %host_ok, @port_parse, @fail
+  @port_parse:
+    store i32 %hl2, *%hl2_p
+    %ps = add i32 %cv, 1
+    %pn = let i32
+    store i32 0, *%pn
+    %pi = let i32
+    store i32 %ps, *%pi
+    jmp @port_cond
+  @port_cond:
+    %piv = load i32, *%pi
+    %pm = slt i32 %piv, %aend
+    br %pm, @port_ch, @port_done
+  @port_ch:
+    %piv2 = load i32, *%pi
+    %pp2 = gep i8, *%url, %piv2
+    %pc = load i8, *%pp2
+    %pv = zext i8 %pc to i32
+    %p_ge = sge i32 %pv, 48
+    %p_le = sle i32 %pv, 57
+    %is_digit = and i1 %p_ge, %p_le
+    br %is_digit, @port_acc, @fail
+  @port_acc:
+    %cur = load i32, *%pn
+    %times10 = mul i32 %cur, 10
+    %piv3 = load i32, *%pi
+    %pp3 = gep i8, *%url, %piv3
+    %pc3 = load i8, *%pp3
+    %pv3 = zext i8 %pc3 to i32
+    %dv = sub i32 %pv3, 48
+    %sum = add i32 %times10, %dv
+    store i32 %sum, *%pn
+    %piv4 = load i32, *%pi
+    %pnext = add i32 %piv4, 1
+    store i32 %pnext, *%pi
+    jmp @port_cond
+  @port_done:
+    %port_v = load i32, *%pn
+    %port_zero = eq i32 %port_v, 0
+    br %port_zero, @fail, @port_store
+  @port_store:
+    store i32 %port_v, *%pp
+    jmp @path_scan_init
+
+  @path_scan_init:
+    %k = let i32
+    store i32 %aend, *%k
+    jmp @q_scan
+  @q_scan:
+    %kv = load i32, *%k
+    %more3 = slt i32 %kv, %len
+    br %more3, @q_ch, @no_query
+  @q_ch:
+    %kv2 = load i32, *%k
+    %kp = gep i8, *%url, %kv2
+    %kc = load i8, *%kp
+    %is_qm = eq i8 %kc, 63
+    br %is_qm, @have_query, @q_next
+  @q_next:
+    %kv3 = load i32, *%k
+    %kn = add i32 %kv3, 1
+    store i32 %kn, *%k
+    jmp @q_scan
+  @have_query:
+    %qv = load i32, *%k
+    %po_p = field @HttpUrl, *%out, 4
+    store i32 %aend, *%po_p
+    %pl_p = field @HttpUrl, *%out, 5
+    %pl = sub i32 %qv, %aend
+    store i32 %pl, *%pl_p
+    %qo2_p = field @HttpUrl, *%out, 6
+    %qstart = add i32 %qv, 1
+    store i32 %qstart, *%qo2_p
+    %ql2_p = field @HttpUrl, *%out, 7
+    %ql2 = sub i32 %len, %qstart
+    store i32 %ql2, *%ql2_p
+    ret i32 0
+  @no_query:
+    %po2_p = field @HttpUrl, *%out, 4
+    store i32 %aend, *%po2_p
+    %pl2_p = field @HttpUrl, *%out, 5
+    %pl2 = sub i32 %len, %aend
+    store i32 %pl2, *%pl2_p
+    ret i32 0
+
+  @fail:
+    ret i32 -1
+}

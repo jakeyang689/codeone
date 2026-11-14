@@ -1,0 +1,63 @@
+// Test file I/O using standard C interfaces
+
+extern @putchar(c: i32) -> i32
+
+extern @fopen(path: *i8, mode: *i8) -> *i8
+extern @fread(buf: *i8, size: i64, count: i64, fp: *i8) -> i64
+extern @fwrite(buf: *i8, size: i64, count: i64, fp: *i8) -> i64
+extern @fclose(fp: *i8) -> i32
+extern @remove(path: *i8) -> i32
+
+const @fpath: [i8, 14] = "file_test.txt"
+const @mode_w: [i8, 2] = "w"
+const @mode_r: [i8, 2] = "r"
+const @test_data: [i8, 9] = [72, 101, 108, 108, 111, 70, 105, 108, 101]
+
+fun @main() -> i32 {
+  @entry:
+    %pp = gep i8, *@fpath, 0
+    %mw = gep i8, *@mode_w, 0
+    %fp = call @fopen(%pp, %mw)
+    %dp = gep i8, *@test_data, 0
+    %written = call @fwrite(%dp, 1, 9, %fp)
+    call @fclose(%fp)
+
+    %pp2 = gep i8, *@fpath, 0
+    %mr = gep i8, *@mode_r, 0
+    %fp2 = call @fopen(%pp2, %mr)
+    %buf = let [i8, 32]
+    %bp = gep i8, *%buf, 0
+    %n = call @fread(%bp, 1, 32, %fp2)
+    call @fclose(%fp2)
+
+    call @remove(%pp2)
+
+    %len_ok = eq i64 %n, 9
+    br %len_ok, @v_h, @fail
+  @v_h:
+    %p0 = gep i8, *%buf, 0
+    %c0 = load i8, *%p0
+    %c0i = zext i8 %c0 to i32
+    %is_H = eq i32 %c0i, 'H'
+    br %is_H, @v_e, @fail
+  @v_e:
+    %p8 = gep i8, *%buf, 8
+    %c8 = load i8, *%p8
+    %c8i = zext i8 %c8 to i32
+    %is_e = eq i32 %c8i, 'e'
+    br %is_e, @pass, @fail
+
+  @pass:
+    call @putchar('O')
+    call @putchar('K')
+    call @putchar('\n')
+    ret i32 0
+
+  @fail:
+    call @putchar('F')
+    call @putchar('A')
+    call @putchar('I')
+    call @putchar('L')
+    call @putchar('\n')
+    ret i32 1
+}

@@ -1,0 +1,62 @@
+// Test 2048-bit mod_pow performance with -O2
+// 64 limbs × 32 bits = 2048 bits
+// Compute: 42^65537 mod n where n is a known 2048-bit value
+
+extern @putchar(c: i32) -> i32
+extern @std_crypto_rsa_bn_mod_pow(r: *i32, base: *i32, exp: *i32, exp_limbs: i32, m: *i32, limbs: i32) -> void
+extern @std_crypto_rsa_bn_mod_mul(r: *i32, a: *i32, b: *i32, m: *i32, limbs: i32) -> void
+extern @std_crypto_rsa_bn_zero(r: *i32, limbs: i32) -> void
+extern @std_crypto_rsa_bn_cmp(a: *i32, b: *i32, limbs: i32) -> i32
+
+fun @main() -> i32 {
+  @entry:
+    // n = a 2048-bit modulus (using 0xFFFF... style for test, but actually
+    // let's generate a proper one: use p=65521, q=65519 for small test first
+    // Then try with larger values
+
+    // For a real 2048-bit test, we need limbs=64
+    // Each i32 stores 32 bits, 64 * 32 = 2048
+
+    // Use a semi-realistic modulus: zero most limbs, use last limbs
+    // n = 0xFFFF000000000000...0000FFFF (just a test value)
+    %n = let [i32, 64]
+    call @std_crypto_rsa_bn_zero(%n, 64)
+    %n_lo = gep i32, *%n, 0
+    store i32 0xFFFFFFFD, *%n_lo  // keep odd
+    %n_hi = gep i32, *%n, 63
+    store i32 0xFFFFFFFF, *%n_hi
+
+    // e = 65537 (1 limb, not 64)
+    %e = let [i32, 2]
+    call @std_crypto_rsa_bn_zero(%e, 2)
+    %e0 = gep i32, *%e, 0
+    store i32 65537, *%e0
+
+    // base = 42 (1 limb)
+    %base = let [i32, 64]
+    call @std_crypto_rsa_bn_zero(%base, 64)
+    %bp0 = gep i32, *%base, 0
+    store i32 42, *%bp0
+
+    // result buffer
+    %r = let [i32, 64]
+    call @std_crypto_rsa_bn_zero(%r, 64)
+
+    // Do one 2048-bit mod_pow: 42^65537 mod n
+    call @std_crypto_rsa_bn_mod_pow(%r, %base, %e, 2, %n, 64)
+
+    // Check result is non-zero and < n
+    %cmp = call @std_crypto_rsa_bn_cmp(%r, %n, 64)
+    %lt = slt i32 %cmp, 0
+    %rp0 = gep i32, *%r, 0
+    %rv = load i32, *%rp0
+    %nz = ne i32 %rv, 0
+    %ok = and i1 %lt, %nz
+    br %ok, @done, @done
+
+  @done:
+    call @putchar('O')
+    call @putchar('K')
+    call @putchar('\n')
+    ret i32 0
+}

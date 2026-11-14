@@ -1,0 +1,22 @@
+# {{PROJECT_NAME}} — codeone static library
+
+C1       ?= {{CODEONE_HOME}}/bin/c1
+BOXES    ?= {{CODEONE_HOME}}/boxes/std
+OPT      ?= -O2
+
+APP  := {{ARTIFACT}}
+# All .bx files in this directory are compiled together. Add a module by
+# creating <module>.bx here; no Makefile change is needed.
+SRCS := $(wildcard *.bx)
+# Standard-library boxes used by the library, e.g.: LIBS += $(BOXES)/core/math.bx
+LIBS :=
+
+.PHONY: all clean
+
+all: $(APP)
+
+$(APP): $(SRCS)
+	$(C1) $(SRCS) $(LIBS) --static $(OPT) -o $(APP)
+
+clean:
+	rm -f $(APP) *.o

@@ -1,0 +1,30 @@
+// mulhi / udiv / urem test
+extern @printf(fmt: *i8, ...) -> i32
+
+fun @main() -> i32 {
+  @entry:
+    // (2^32)^2 = 2^64 -> high half is 1
+    %h1 = mulhi i64 0x100000000, 0x100000000
+    %c1 = eq i64 %h1, 1
+    // 0xFFFFFFFF * 0xFFFFFFFF = 0xFFFFFFFE00000001 -> high half is 0
+    %h2 = mulhi i64 0xFFFFFFFF, 0xFFFFFFFF
+    %c2 = eq i64 %h2, 0
+    // (2^62)*(2^2) = 2^64 -> high half 1
+    %h3 = mulhi i64 0x4000000000000000, 4
+    %c3 = eq i64 %h3, 1
+    %q = udiv i64 100, 7
+    %cq = eq i64 %q, 14
+    %rr = urem i64 100, 7
+    %cr = eq i64 %rr, 2
+    %x1 = and i1 %c1, %c2
+    %x2 = and i1 %c3, %cq
+    %x3 = and i1 %x1, %x2
+    %all = and i1 %x3, %cr
+    br %all, @pass, @fail
+  @pass:
+    call @printf("PASS mulhi/udiv/urem\n")
+    ret i32 0
+  @fail:
+    call @printf("FAIL %lld %lld %lld %lld %lld\n", %h1, %h2, %h3, %q, %rr)
+    ret i32 1
+}

@@ -1,0 +1,35 @@
+// Formatting utilities
+// Convert i32 to hex string, buf must be [i8, 9] minimum
+
+const @hex: [i8, 17] = "0123456789ABCDEF"
+
+fun @std_text_fmt_hex(val: i32, buf: *i8) -> void {
+  @entry:
+    %iptr = let i32
+    store i32 0, *%iptr
+    jmp @hcond
+
+  @hcond:
+    %i = load i32, *%iptr
+    %c = slt i32 %i, 8
+    br %c, @hbody, @hdone
+
+  @hbody:
+    %iv = load i32, *%iptr
+    %sh = mul i32 %iv, 4
+    %sh2 = sub i32 28, %sh
+    %bits = lshr i32 %val, %sh2
+    %nib = and i32 %bits, 15
+    %ph = gep i8, *@hex, %nib
+    %ch = load i8, *%ph
+    %pb = gep i8, *%buf, %iv
+    store i8 %ch, *%pb
+    %iv2 = add i32 %iv, 1
+    store i32 %iv2, *%iptr
+    jmp @hcond
+
+  @hdone:
+    %np = gep i8, *%buf, 8
+    store i8 0, *%np
+    ret void
+}

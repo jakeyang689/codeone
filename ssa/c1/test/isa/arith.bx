@@ -1,0 +1,126 @@
+// Arithmetic and bitwise instruction semantics.
+// Each check advances the case counter before branching, so a failure reports
+// the case that broke.
+
+extern @printf(fmt: *i8, ...) -> i32
+
+fun @main() -> i32 {
+  @entry:
+    %id = let i32
+    store i32 0, *%id
+
+    // --- add ---
+    %a1 = add i32 2, 3
+    %c1 = eq i32 %a1, 5
+    br %c1, @t1, @fail
+  @t1:
+    store i32 1, *%id
+    %a2 = add i8 200, 100          // wraps to 44
+    %c2 = eq i8 %a2, 44
+    br %c2, @t2, @fail
+
+  @t2:
+    store i32 2, *%id
+    // --- sub ---
+    %s1 = sub i32 10, 3
+    %c3 = eq i32 %s1, 7
+    br %c3, @t3, @fail
+
+  @t3:
+    store i32 3, *%id
+    %s2 = sub i64 0, 1             // -1
+    %c4 = eq i64 %s2, -1
+    br %c4, @t4, @fail
+
+  @t4:
+    store i32 4, *%id
+    // --- mul ---
+    %m1 = mul i32 7, 6
+    %c5 = eq i32 %m1, 42
+    br %c5, @t5, @fail
+
+  @t5:
+    store i32 5, *%id
+    %m2 = mul i64 1000000000, 3
+    %c6 = eq i64 %m2, 3000000000
+    br %c6, @t6, @fail
+
+  @t6:
+    store i32 6, *%id
+    // --- signed div / rem ---
+    %d1 = div i32 -7, 2
+    %c7 = eq i32 %d1, -3
+    br %c7, @t7, @fail
+
+  @t7:
+    store i32 7, *%id
+    %r1 = rem i32 -7, 2
+    %c8 = eq i32 %r1, -1
+    br %c8, @t8, @fail
+
+  @t8:
+    store i32 8, *%id
+    // --- bitwise ---
+    %b1 = and i32 0xF0, 0x3C
+    %c9 = eq i32 %b1, 0x30
+    br %c9, @t9, @fail
+
+  @t9:
+    store i32 9, *%id
+    %b2 = or i32 0xF0, 0x0F
+    %c10 = eq i32 %b2, 0xFF
+    br %c10, @t10, @fail
+
+  @t10:
+    store i32 10, *%id
+    %b3 = xor i32 0xFF, 0x0F
+    %c11 = eq i32 %b3, 0xF0
+    br %c11, @t11, @fail
+
+  @t11:
+    store i32 11, *%id
+    // --- shifts ---
+    %sh1 = shl i32 1, 4
+    %c12 = eq i32 %sh1, 16
+    br %c12, @t12, @fail
+
+  @t12:
+    store i32 12, *%id
+    %sh2 = lshr i32 0x80000000, 31   // logical: 1
+    %c13 = eq i32 %sh2, 1
+    br %c13, @t13, @fail
+
+  @t13:
+    store i32 13, *%id
+    %sh3 = ashr i32 -8, 1            // arithmetic: -4
+    %c14 = eq i32 %sh3, -4
+    br %c14, @t14, @fail
+
+  @t14:
+    store i32 14, *%id
+    // u32 logical shift of a negative value must not sign-extend
+    %sh4 = lshr i64 -1, 63
+    %c15 = eq i64 %sh4, 1
+    br %c15, @t15, @fail
+
+  @t15:
+    store i32 15, *%id
+    // --- width behaviour ---
+    %w1 = add i16 32767, 1           // wraps to -32768
+    %c16 = eq i16 %w1, -32768
+    br %c16, @t16, @fail
+
+  @t16:
+    store i32 16, *%id
+    %w2 = mul i8 16, 16              // 256 -> 0
+    %c17 = eq i8 %w2, 0
+    br %c17, @pass, @fail
+
+  @pass:
+    call @printf("PASS isa/arith\n")
+    ret i32 0
+  @fail:
+    %n = load i32, *%id
+    call @printf("FAIL isa/arith at case %d\n", %n)
+    ret i32 1
+}

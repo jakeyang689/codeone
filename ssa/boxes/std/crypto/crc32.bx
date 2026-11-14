@@ -1,0 +1,67 @@
+// CRC32 checksum computation
+// Uses the standard CRC-32 polynomial (0xEDB88320)
+
+fun @std_crypto_crc32_compute(data: *i8, len: i32) -> i32 {
+  @entry:
+    %crc = let i32
+    %iptr = let i32
+    %jptr = let i32
+    store i32 -1, *%crc
+    store i32 0, *%iptr
+    jmp @crc_ol_cond
+
+  @crc_ol_cond:
+    %i = load i32, *%iptr
+    %c = slt i32 %i, %len
+    br %c, @crc_ol_body, @crc_done
+
+  @crc_ol_body:
+    %iv = load i32, *%iptr
+    %p = gep i8, *%data, %iv
+    %b = load i8, *%p
+    %bi = zext i8 %b to i32
+
+    %crcv = load i32, *%crc
+    %ch = xor i32 %crcv, %bi
+    store i32 0, *%jptr
+    store i32 %ch, *%crc
+    jmp @crc_inner
+
+  @crc_inner:
+    %j = load i32, *%jptr
+    %jc = slt i32 %j, 8
+    br %jc, @crc_bit, @crc_ol_next
+
+  @crc_bit:
+    %crcv2 = load i32, *%crc
+    %lsb = and i32 %crcv2, 1
+    %sr = lshr i32 %crcv2, 1
+    %lsb_nz = eq i32 %lsb, 1
+    br %lsb_nz, @crc_poly, @crc_store
+
+  @crc_poly:
+    %sr2 = xor i32 %sr, -306674912   // 0xEDB88320
+    store i32 %sr2, *%crc
+    jmp @crc_next_bit
+
+  @crc_store:
+    store i32 %sr, *%crc
+    jmp @crc_next_bit
+
+  @crc_next_bit:
+    %jv = load i32, *%jptr
+    %jv2 = add i32 %jv, 1
+    store i32 %jv2, *%jptr
+    jmp @crc_inner
+
+  @crc_ol_next:
+    %iv2 = load i32, *%iptr
+    %iv3 = add i32 %iv2, 1
+    store i32 %iv3, *%iptr
+    jmp @crc_ol_cond
+
+  @crc_done:
+    %final = load i32, *%crc
+    %r = xor i32 %final, -1
+    ret i32 %r
+}

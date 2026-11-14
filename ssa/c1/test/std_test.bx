@@ -1,0 +1,256 @@
+// Standard library integration test
+// Tests: math (min/max/abs), itoa, bitset, fnv1a
+
+// ---- core/math ----
+fun @math_min(a: i32, b: i32) -> i32 {
+  @e:
+    %c = slt i32 %a, %b
+    br %c, @a_ret, @b_ret
+  @a_ret:
+    ret i32 %a
+  @b_ret:
+    ret i32 %b
+}
+
+fun @math_max(a: i32, b: i32) -> i32 {
+  @e:
+    %c = sgt i32 %a, %b
+    br %c, @a_ret, @b_ret
+  @a_ret:
+    ret i32 %a
+  @b_ret:
+    ret i32 %b
+}
+
+fun @math_abs(x: i32) -> i32 {
+  @e:
+    %n = slt i32 %x, 0
+    br %n, @neg, @pos
+  @neg:
+    %r = sub i32 0, %x
+    ret i32 %r
+  @pos:
+    ret i32 %x
+}
+
+// ---- core/convert ----
+fun @convert_itoa(val: i32, buf: *i8) -> i32 {
+  @e:
+    %ip = let i32
+    %vp = let i32
+    %lp = let i32
+    %mp = let i32
+    store i32 0, *%ip
+    %neg = slt i32 %val, 0
+    br %neg, @err, @go
+  @err:
+    store i8 0, *%buf
+    ret i32 0
+  @go:
+    store i32 %val, *%vp
+    jmp @ext
+  @ext:
+    %v = load i32, *%vp
+    %i = load i32, *%ip
+    %d = rem i32 %v, 10
+    %ch = add i32 %d, '0'
+    %c8 = trunc i32 %ch to i8
+    %p = gep i8, *%buf, %i
+    store i8 %c8, *%p
+    %q = div i32 %v, 10
+    store i32 %q, *%vp
+    %i2 = add i32 %i, 1
+    store i32 %i2, *%ip
+    %dn = eq i32 %q, 0
+    br %dn, @sv, @ext
+  @sv:
+    %cnt = load i32, *%ip
+    store i32 %cnt, *%lp
+    store i32 0, *%mp
+    jmp @rc
+  @rc:
+    %lo = load i32, *%mp
+    %hi = load i32, *%ip
+    %h1 = sub i32 %hi, 1
+    %co = slt i32 %lo, %h1
+    br %co, @rs, @rd
+  @rs:
+    %l = load i32, *%mp
+    %h = load i32, *%ip
+    %h2 = sub i32 %h, 1
+    %pl = gep i8, *%buf, %l
+    %ph = gep i8, *%buf, %h2
+    %vl = load i8, *%pl
+    %vh = load i8, *%ph
+    store i8 %vh, *%pl
+    store i8 %vl, *%ph
+    %l2 = add i32 %l, 1
+    %h3 = sub i32 %h2, 1
+    store i32 %h3, *%ip
+    store i32 %l2, *%mp
+    jmp @rc
+  @rd:
+    %len = load i32, *%lp
+    %np = gep i8, *%buf, %len
+    store i8 0, *%np
+    ret i32 %len
+}
+
+// ---- data/bitset ----
+fun @b_init(set: *i32, w: i32) -> void {
+  @e:
+    %ip = let i32
+    store i32 0, *%ip
+    jmp @bc
+  @bc:
+    %i = load i32, *%ip
+    %c = slt i32 %i, %w
+    br %c, @bb, @bd
+  @bb:
+    %iv = load i32, *%ip
+    %pp = gep i32, *%set, %iv
+    store i32 0, *%pp
+    %iv2 = add i32 %iv, 1
+    store i32 %iv2, *%ip
+    jmp @bc
+  @bd:
+    ret void
+}
+
+fun @b_set(set: *i32, bit: i32) -> void {
+  @e:
+    %w = div i32 %bit, 32
+    %bi = rem i32 %bit, 32
+    %p = gep i32, *%set, %w
+    %v = load i32, *%p
+    %one = shl i32 1, %bi
+    %nv = or i32 %v, %one
+    store i32 %nv, *%p
+    ret void
+}
+
+fun @b_test(set: *i32, bit: i32) -> i1 {
+  @e:
+    %w = div i32 %bit, 32
+    %bi = rem i32 %bit, 32
+    %p = gep i32, *%set, %w
+    %v = load i32, *%p
+    %one = shl i32 1, %bi
+    %mk = and i32 %v, %one
+    %nz = ne i32 %mk, 0
+    ret i1 %nz
+}
+
+// ---- crypto/fnv1a ----
+fun @fnv1a(data: *i8, len: i32) -> i32 {
+  @e:
+    %hp = let i32
+    %ip2 = let i32
+    store i32 -2128831035, *%hp
+    store i32 0, *%ip2
+    jmp @fc
+  @fc:
+    %i = load i32, *%ip2
+    %c = slt i32 %i, %len
+    br %c, @fb, @fd
+  @fb:
+    %iv = load i32, *%ip2
+    %pd = gep i8, *%data, %iv
+    %b = load i8, *%pd
+    %bi = zext i8 %b to i32
+    %hv = load i32, *%hp
+    %xh = xor i32 %hv, %bi
+    %mul = mul i32 %xh, 16777619
+    store i32 %mul, *%hp
+    %iv2 = add i32 %iv, 1
+    store i32 %iv2, *%ip2
+    jmp @fc
+  @fd:
+    %h = load i32, *%hp
+    ret i32 %h
+}
+
+// ---- main test ----
+fun @main() -> i32 {
+  @e:
+    %buf = let [i8, 12]
+    %bs = let [i32, 1]
+    %str = let [i8, 6]
+    %bp = gep i8, *%buf, 0
+    %bsp = gep i32, *%bs, 0
+    %ssp = gep i8, *%str, 0
+
+    // math: min
+    %m1 = call @math_min(3, 7)
+    %m1ok = eq i32 %m1, 3
+    br %m1ok, @t_max, @fail
+
+  @t_max:
+    %m2 = call @math_max(3, 7)
+    %m2ok = eq i32 %m2, 7
+    br %m2ok, @t_abs, @fail
+
+  @t_abs:
+    %m3 = call @math_abs(-5)
+    %m3ok = eq i32 %m3, 5
+    br %m3ok, @t_itoa, @fail
+
+  @t_itoa:
+    %len = call @convert_itoa(123, %bp)
+    %lenok = eq i32 %len, 3
+    br %lenok, @t_i0, @fail
+
+  @t_i0:
+    %p0 = gep i8, *%buf, 0
+    %c0 = load i8, *%p0
+    %c0i = zext i8 %c0 to i32
+    %c0ok = eq i32 %c0i, '1'
+    br %c0ok, @t_i1, @fail
+
+  @t_i1:
+    %p1 = gep i8, *%buf, 1
+    %c1 = load i8, *%p1
+    %c1i = zext i8 %c1 to i32
+    %c1ok = eq i32 %c1i, '2'
+    br %c1ok, @t_i2, @fail
+
+  @t_i2:
+    %p2 = gep i8, *%buf, 2
+    %c2 = load i8, *%p2
+    %c2i = zext i8 %c2 to i32
+    %c2ok = eq i32 %c2i, '3'
+    br %c2ok, @t_bset, @fail
+
+  @t_bset:
+    call @b_init(%bsp, 1)
+    call @b_set(%bsp, 5)
+    %t5 = call @b_test(%bsp, 5)
+    %t5ok = eq i1 %t5, 1
+    br %t5ok, @t_bclr, @fail
+
+  @t_bclr:
+    %t0 = call @b_test(%bsp, 0)
+    %t0ok = eq i1 %t0, 0
+    br %t0ok, @t_fnv, @fail
+
+  @t_fnv:
+    %sp0 = gep i8, *%str, 0
+    store i8 'h', *%sp0
+    %sp1 = gep i8, *%str, 1
+    store i8 'e', *%sp1
+    %sp2 = gep i8, *%str, 2
+    store i8 'l', *%sp2
+    %sp3 = gep i8, *%str, 3
+    store i8 'l', *%sp3
+    %sp4 = gep i8, *%str, 4
+    store i8 'o', *%sp4
+    %hash = call @fnv1a(%ssp, 5)
+    %hok = ne i32 %hash, 0
+    br %hok, @pass, @fail
+
+  @pass:
+    ret i32 0
+
+  @fail:
+    ret i32 1
+}

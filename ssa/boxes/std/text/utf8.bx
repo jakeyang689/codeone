@@ -1,0 +1,411 @@
+// UTF-8 validation, decoding, encoding, and codepoint counting.
+//
+// Decoding rejects overlong encodings, UTF-16 surrogates (U+D800..U+DFFF),
+// and values above U+10FFFF. encode() applies the same restrictions.
+
+fun @_utf8_byte(s: *i8, len: i32, idx: i32) -> i32 {
+  @entry:
+    %neg = slt i32 %idx, 0
+    %big = sge i32 %idx, %len
+    %bad = or i1 %neg, %big
+    br %bad, @none, @load
+  @none:
+    ret i32 -1
+  @load:
+    %p = gep i8, *%s, %idx
+    %c = load i8, *%p
+    %ci = zext i8 %c to i32
+    ret i32 %ci
+}
+
+fun @_utf8_cont(c: i32) -> i1 {
+  @entry:
+    %lo = sge i32 %c, 128
+    %hi = sle i32 %c, 191
+    %ok = and i1 %lo, %hi
+    ret i1 %ok
+}
+
+// Decode one codepoint at *pos. Returns 1 on success, 0 at end of input,
+// -1 for an invalid sequence.
+fun @std_text_utf8_decode(s: *i8, len: i32, pos: *i32, cp: *i32) -> i32 {
+  @entry:
+    %p = load i32, *%pos
+    %end = sge i32 %p, %len
+    br %end, @eof, @b0
+  @b0:
+    %b0 = call @_utf8_byte(%s, %len, %p)
+    %neg = slt i32 %b0, 0
+    br %neg, @fail, @lt80
+  @lt80:
+    %ascii = slt i32 %b0, 128
+    br %ascii, @one, @chk2
+  @chk2:
+    %ltC2 = slt i32 %b0, 194
+    br %ltC2, @fail, @chk2b
+  @chk2b:
+    %leDF = sle i32 %b0, 223
+    br %leDF, @two, @chk3
+  @chk3:
+    %isE0 = eq i32 %b0, 224
+    br %isE0, @e0, @chkED
+  @chkED:
+    %isED = eq i32 %b0, 237
+    br %isED, @ed, @chk3b
+  @chk3b:
+    %ltE1 = slt i32 %b0, 225
+    %gtEF = sgt i32 %b0, 239
+    %bad3 = or i1 %ltE1, %gtEF
+    br %bad3, @chk4, @three
+  @chk4:
+    %isF0 = eq i32 %b0, 240
+    br %isF0, @f0, @chkF4
+  @chkF4:
+    %isF4 = eq i32 %b0, 244
+    br %isF4, @f4, @chk4b
+  @chk4b:
+    %ltF1 = slt i32 %b0, 241
+    %gtF3 = sgt i32 %b0, 243
+    %bad4 = or i1 %ltF1, %gtF3
+    br %bad4, @fail, @four
+  @one:
+    %p1 = load i32, *%pos
+    store i32 %b0, *%cp
+    %pn1 = add i32 %p1, 1
+    store i32 %pn1, *%pos
+    ret i32 1
+  @two:
+    %p2 = load i32, *%pos
+    %i1 = add i32 %p2, 1
+    %c1 = call @_utf8_byte(%s, %len, %i1)
+    %ok = call @_utf8_cont(%c1)
+    br %ok, @two_ok, @fail
+  @two_ok:
+    %m1 = and i32 %b0, 31
+    %sh1 = shl i32 %m1, 6
+    %m2 = and i32 %c1, 63
+    %v2 = or i32 %sh1, %m2
+    store i32 %v2, *%cp
+    %pn2 = add i32 %p2, 2
+    store i32 %pn2, *%pos
+    ret i32 1
+  @three:
+    %p3 = load i32, *%pos
+    %j1 = add i32 %p3, 1
+    %d1 = call @_utf8_byte(%s, %len, %j1)
+    %ok1 = call @_utf8_cont(%d1)
+    br %ok1, @three_c2, @fail
+  @three_c2:
+    %j2 = add i32 %p3, 2
+    %d2 = call @_utf8_byte(%s, %len, %j2)
+    %ok2 = call @_utf8_cont(%d2)
+    br %ok2, @three_ok, @fail
+  @three_ok:
+    %n1 = and i32 %b0, 15
+    %ns1 = shl i32 %n1, 12
+    %n2 = and i32 %d1, 63
+    %ns2 = shl i32 %n2, 6
+    %n3 = and i32 %d2, 63
+    %nv1 = or i32 %ns1, %ns2
+    %nv = or i32 %nv1, %n3
+    store i32 %nv, *%cp
+    %pn3 = add i32 %p3, 3
+    store i32 %pn3, *%pos
+    ret i32 1
+  @e0:
+    %pe = load i32, *%pos
+    %e1i = add i32 %pe, 1
+    %e1 = call @_utf8_byte(%s, %len, %e1i)
+    %e1lo = sge i32 %e1, 160
+    %e1hi = sle i32 %e1, 191
+    %e1ok = and i1 %e1lo, %e1hi
+    br %e1ok, @e0_c2, @fail
+  @e0_c2:
+    %e2i = add i32 %pe, 2
+    %e2 = call @_utf8_byte(%s, %len, %e2i)
+    %e2ok = call @_utf8_cont(%e2)
+    br %e2ok, @e0_ok, @fail
+  @e0_ok:
+    %e_m1 = and i32 %b0, 15
+    %e_s1 = shl i32 %e_m1, 12
+    %e_m2 = and i32 %e1, 63
+    %e_s2 = shl i32 %e_m2, 6
+    %e_m3 = and i32 %e2, 63
+    %e_v1 = or i32 %e_s1, %e_s2
+    %e_v = or i32 %e_v1, %e_m3
+    store i32 %e_v, *%cp
+    %e_pn = add i32 %pe, 3
+    store i32 %e_pn, *%pos
+    ret i32 1
+  @ed:
+    %pd = load i32, *%pos
+    %d1i = add i32 %pd, 1
+    %dd1 = call @_utf8_byte(%s, %len, %d1i)
+    %d1lo = sge i32 %dd1, 128
+    %d1hi = sle i32 %dd1, 159
+    %d1ok = and i1 %d1lo, %d1hi
+    br %d1ok, @ed_c2, @fail
+  @ed_c2:
+    %d2i = add i32 %pd, 2
+    %dd2 = call @_utf8_byte(%s, %len, %d2i)
+    %d2ok = call @_utf8_cont(%dd2)
+    br %d2ok, @ed_ok, @fail
+  @ed_ok:
+    %d_m1 = and i32 %b0, 15
+    %d_s1 = shl i32 %d_m1, 12
+    %d_m2 = and i32 %dd1, 63
+    %d_s2 = shl i32 %d_m2, 6
+    %d_m3 = and i32 %dd2, 63
+    %d_v1 = or i32 %d_s1, %d_s2
+    %d_v = or i32 %d_v1, %d_m3
+    store i32 %d_v, *%cp
+    %d_pn = add i32 %pd, 3
+    store i32 %d_pn, *%pos
+    ret i32 1
+  @four:
+    %pf = load i32, *%pos
+    %f1i = add i32 %pf, 1
+    %ff1 = call @_utf8_byte(%s, %len, %f1i)
+    %ff1ok = call @_utf8_cont(%ff1)
+    br %ff1ok, @four_c2, @fail
+  @four_c2:
+    %f2i = add i32 %pf, 2
+    %ff2 = call @_utf8_byte(%s, %len, %f2i)
+    %ff2ok = call @_utf8_cont(%ff2)
+    br %ff2ok, @four_c3, @fail
+  @four_c3:
+    %f3i = add i32 %pf, 3
+    %ff3 = call @_utf8_byte(%s, %len, %f3i)
+    %ff3ok = call @_utf8_cont(%ff3)
+    br %ff3ok, @four_ok, @fail
+  @four_ok:
+    %f_m1 = and i32 %b0, 7
+    %f_s1 = shl i32 %f_m1, 18
+    %f_m2 = and i32 %ff1, 63
+    %f_s2 = shl i32 %f_m2, 12
+    %f_m3 = and i32 %ff2, 63
+    %f_s3 = shl i32 %f_m3, 6
+    %f_m4 = and i32 %ff3, 63
+    %f_v1 = or i32 %f_s1, %f_s2
+    %f_v2 = or i32 %f_v1, %f_s3
+    %f_v = or i32 %f_v2, %f_m4
+    store i32 %f_v, *%cp
+    %f_pn = add i32 %pf, 4
+    store i32 %f_pn, *%pos
+    ret i32 1
+  @f0:
+    %p0 = load i32, *%pos
+    %g1i = add i32 %p0, 1
+    %g1 = call @_utf8_byte(%s, %len, %g1i)
+    %g1lo = sge i32 %g1, 144
+    %g1hi = sle i32 %g1, 191
+    %g1ok = and i1 %g1lo, %g1hi
+    br %g1ok, @f0_c2, @fail
+  @f0_c2:
+    %g2i = add i32 %p0, 2
+    %g2 = call @_utf8_byte(%s, %len, %g2i)
+    %g2ok = call @_utf8_cont(%g2)
+    br %g2ok, @f0_c3, @fail
+  @f0_c3:
+    %g3i = add i32 %p0, 3
+    %g3 = call @_utf8_byte(%s, %len, %g3i)
+    %g3ok = call @_utf8_cont(%g3)
+    br %g3ok, @f0_ok, @fail
+  @f0_ok:
+    %g_m1 = and i32 %b0, 7
+    %g_s1 = shl i32 %g_m1, 18
+    %g_m2 = and i32 %g1, 63
+    %g_s2 = shl i32 %g_m2, 12
+    %g_m3 = and i32 %g2, 63
+    %g_s3 = shl i32 %g_m3, 6
+    %g_m4 = and i32 %g3, 63
+    %g_v1 = or i32 %g_s1, %g_s2
+    %g_v2 = or i32 %g_v1, %g_s3
+    %g_v = or i32 %g_v2, %g_m4
+    store i32 %g_v, *%cp
+    %g_pn = add i32 %p0, 4
+    store i32 %g_pn, *%pos
+    ret i32 1
+  @f4:
+    %q0 = load i32, *%pos
+    %q1i = add i32 %q0, 1
+    %q1 = call @_utf8_byte(%s, %len, %q1i)
+    %q1lo = sge i32 %q1, 128
+    %q1hi = sle i32 %q1, 143
+    %q1ok = and i1 %q1lo, %q1hi
+    br %q1ok, @f4_c2, @fail
+  @f4_c2:
+    %q2i = add i32 %q0, 2
+    %q2 = call @_utf8_byte(%s, %len, %q2i)
+    %q2ok = call @_utf8_cont(%q2)
+    br %q2ok, @f4_c3, @fail
+  @f4_c3:
+    %q3i = add i32 %q0, 3
+    %q3 = call @_utf8_byte(%s, %len, %q3i)
+    %q3ok = call @_utf8_cont(%q3)
+    br %q3ok, @f4_ok, @fail
+  @f4_ok:
+    %q_m1 = and i32 %b0, 7
+    %q_s1 = shl i32 %q_m1, 18
+    %q_m2 = and i32 %q1, 63
+    %q_s2 = shl i32 %q_m2, 12
+    %q_m3 = and i32 %q2, 63
+    %q_s3 = shl i32 %q_m3, 6
+    %q_m4 = and i32 %q3, 63
+    %q_v1 = or i32 %q_s1, %q_s2
+    %q_v2 = or i32 %q_v1, %q_s3
+    %q_v = or i32 %q_v2, %q_m4
+    store i32 %q_v, *%cp
+    %q_pn = add i32 %q0, 4
+    store i32 %q_pn, *%pos
+    ret i32 1
+  @eof:
+    ret i32 0
+  @fail:
+    ret i32 -1
+}
+
+// 1 when the whole buffer is valid UTF-8, 0 otherwise.
+fun @std_text_utf8_validate(s: *i8, len: i32) -> i32 {
+  @entry:
+    %pos = let i32
+    %cp = let i32
+    %posp = gep i32, *%pos, 0
+    %cpp = gep i32, *%cp, 0
+    store i32 0, *%posp
+    jmp @loop
+  @loop:
+    %r = call @std_text_utf8_decode(%s, %len, %posp, %cpp)
+    %neg = slt i32 %r, 0
+    br %neg, @bad, @end
+  @end:
+    %z = eq i32 %r, 0
+    br %z, @good, @loop
+  @good:
+    ret i32 1
+  @bad:
+    ret i32 0
+}
+
+// Number of codepoints, or -1 for invalid UTF-8.
+fun @std_text_utf8_count(s: *i8, len: i32) -> i32 {
+  @entry:
+    %pos = let i32
+    %cp = let i32
+    %n = let i32
+    %posp = gep i32, *%pos, 0
+    %cpp = gep i32, *%cp, 0
+    store i32 0, *%posp
+    store i32 0, *%n
+    jmp @loop
+  @loop:
+    %r = call @std_text_utf8_decode(%s, %len, %posp, %cpp)
+    %neg = slt i32 %r, 0
+    br %neg, @bad, @end
+  @end:
+    %z = eq i32 %r, 0
+    br %z, @done, @body
+  @body:
+    %nv = load i32, *%n
+    %n1 = add i32 %nv, 1
+    store i32 %n1, *%n
+    jmp @loop
+  @done:
+    %r2 = load i32, *%n
+    ret i32 %r2
+  @bad:
+    ret i32 -1
+}
+
+// Encode one codepoint. Returns the byte count or -1 for an invalid value or
+// a buffer that is too small.
+fun @std_text_utf8_encode(cp: i32, out: *i8, cap: i32) -> i32 {
+  @entry:
+    %neg = slt i32 %cp, 0
+    %big = sgt i32 %cp, 1114111
+    %bad = or i1 %neg, %big
+    br %bad, @fail, @sur
+  @sur:
+    %slo = sge i32 %cp, 55296
+    %shi = sle i32 %cp, 57343
+    %surrogate = and i1 %slo, %shi
+    br %surrogate, @fail, @size
+  @size:
+    %lt80 = slt i32 %cp, 128
+    br %lt80, @one, @chk2
+  @chk2:
+    %lt800 = slt i32 %cp, 2048
+    br %lt800, @two, @chk3
+  @chk3:
+    %lt10000 = slt i32 %cp, 65536
+    br %lt10000, @three, @four
+  @one:
+    %cap1 = sge i32 %cap, 1
+    br %cap1, @w1, @fail
+  @w1:
+    %b = trunc i32 %cp to i8
+    store i8 %b, *%out
+    ret i32 1
+  @two:
+    %cap2 = sge i32 %cap, 2
+    br %cap2, @w2, @fail
+  @w2:
+    %s6 = lshr i32 %cp, 6
+    %b0i = or i32 192, %s6
+    %b0 = trunc i32 %b0i to i8
+    store i8 %b0, *%out
+    %m6 = and i32 %cp, 63
+    %b1i = or i32 128, %m6
+    %b1 = trunc i32 %b1i to i8
+    %o1 = gep i8, *%out, 1
+    store i8 %b1, *%o1
+    ret i32 2
+  @three:
+    %cap3 = sge i32 %cap, 3
+    br %cap3, @w3, @fail
+  @w3:
+    %t12 = lshr i32 %cp, 12
+    %tb0i = or i32 224, %t12
+    %tb0 = trunc i32 %tb0i to i8
+    store i8 %tb0, *%out
+    %t6 = lshr i32 %cp, 6
+    %tm6 = and i32 %t6, 63
+    %tb1i = or i32 128, %tm6
+    %tb1 = trunc i32 %tb1i to i8
+    %to1 = gep i8, *%out, 1
+    store i8 %tb1, *%to1
+    %tm6b = and i32 %cp, 63
+    %tb2i = or i32 128, %tm6b
+    %tb2 = trunc i32 %tb2i to i8
+    %to2 = gep i8, *%out, 2
+    store i8 %tb2, *%to2
+    ret i32 3
+  @four:
+    %cap4 = sge i32 %cap, 4
+    br %cap4, @w4, @fail
+  @w4:
+    %f18 = lshr i32 %cp, 18
+    %fb0i = or i32 240, %f18
+    %fb0 = trunc i32 %fb0i to i8
+    store i8 %fb0, *%out
+    %f12 = lshr i32 %cp, 12
+    %fm1 = and i32 %f12, 63
+    %fb1i = or i32 128, %fm1
+    %fb1 = trunc i32 %fb1i to i8
+    %fo1 = gep i8, *%out, 1
+    store i8 %fb1, *%fo1
+    %f6 = lshr i32 %cp, 6
+    %fm2 = and i32 %f6, 63
+    %fb2i = or i32 128, %fm2
+    %fb2 = trunc i32 %fb2i to i8
+    %fo2 = gep i8, *%out, 2
+    store i8 %fb2, *%fo2
+    %fm3 = and i32 %cp, 63
+    %fb3i = or i32 128, %fm3
+    %fb3 = trunc i32 %fb3i to i8
+    %fo3 = gep i8, *%out, 3
+    store i8 %fb3, *%fo3
+    ret i32 4
+  @fail:
+    ret i32 -1
+}

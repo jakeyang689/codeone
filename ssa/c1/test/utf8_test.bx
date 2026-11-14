@@ -1,0 +1,151 @@
+// UTF-8 validation, decoding, encoding, and counting.
+// Prints "PASS utf8" on success.
+
+extern @printf(fmt: *i8, ...) -> i32
+extern @std_text_utf8_validate(s: *i8, len: i32) -> i32
+extern @std_text_utf8_decode(s: *i8, len: i32, pos: *i32, cp: *i32) -> i32
+extern @std_text_utf8_encode(cp: i32, out: *i8, cap: i32) -> i32
+extern @std_text_utf8_count(s: *i8, len: i32) -> i32
+
+const @E_ACUTE: [i8, 2] = [0xC3, 0xA9]
+const @EMOJI: [i8, 4] = [0xF0, 0x9F, 0x98, 0x80]
+const @OVERLONG: [i8, 2] = [0xC0, 0xAF]
+const @SURROGATE: [i8, 3] = [0xED, 0xA0, 0x80]
+const @TRUNCATED: [i8, 2] = [0xE2, 0x82]
+const @MIXED: [i8, 7] = [0x61, 0xC3, 0xA9, 0xF0, 0x9F, 0x98, 0x80]
+
+fun @main() -> i32 {
+  @entry:
+    %id = let i32
+    %pos = let i32
+    %cp = let i32
+    %out = let [i8, 8]
+    %pp = gep i32, *%pos, 0
+    %cpp = gep i32, *%cp, 0
+    %op = gep i8, *%out, 0
+    store i32 0, *%id
+    jmp @c1
+
+  @c1:
+    store i32 1, *%id
+    %v1 = call @std_text_utf8_validate("hello", 5)
+    %v1ok = eq i32 %v1, 1
+    br %v1ok, @c2, @fail
+  @c2:
+    store i32 2, *%id
+    %ep = gep i8, *@E_ACUTE, 0
+    %v2 = call @std_text_utf8_validate(%ep, 2)
+    %v2ok = eq i32 %v2, 1
+    br %v2ok, @c3, @fail
+  @c3:
+    store i32 3, *%id
+    %mp = gep i8, *@EMOJI, 0
+    %v3 = call @std_text_utf8_validate(%mp, 4)
+    %v3ok = eq i32 %v3, 1
+    br %v3ok, @c4, @fail
+  @c4:
+    store i32 4, *%id
+    %ovp = gep i8, *@OVERLONG, 0
+    %v4 = call @std_text_utf8_validate(%ovp, 2)
+    %v4ok = eq i32 %v4, 0
+    br %v4ok, @c5, @fail
+  @c5:
+    store i32 5, *%id
+    %sp = gep i8, *@SURROGATE, 0
+    %v5 = call @std_text_utf8_validate(%sp, 3)
+    %v5ok = eq i32 %v5, 0
+    br %v5ok, @c6, @fail
+  @c6:
+    store i32 6, *%id
+    %tp = gep i8, *@TRUNCATED, 0
+    %v6 = call @std_text_utf8_validate(%tp, 2)
+    %v6ok = eq i32 %v6, 0
+    br %v6ok, @c7, @fail
+  @c7:
+    store i32 7, *%id
+    %v7 = call @std_text_utf8_validate("", 0)
+    %v7ok = eq i32 %v7, 1
+    br %v7ok, @c8, @fail
+
+    // decode "é"
+  @c8:
+    store i32 8, *%id
+    store i32 0, *%pp
+    %d1 = call @std_text_utf8_decode(%ep, 2, %pp, %cpp)
+    %d1cp = load i32, *%cpp
+    %d1pos = load i32, *%pp
+    %d1ok = eq i32 %d1, 1
+    %d1cpok = eq i32 %d1cp, 233
+    %d1posok = eq i32 %d1pos, 2
+    %a8 = and i1 %d1ok, %d1cpok
+    %b8 = and i1 %a8, %d1posok
+    br %b8, @c9, @fail
+  @c9:
+    store i32 9, *%id
+    %d2 = call @std_text_utf8_decode(%ep, 2, %pp, %cpp)
+    %d2ok = eq i32 %d2, 0
+    br %d2ok, @c10, @fail
+
+    // encode U+00E9 and U+1F600
+  @c10:
+    store i32 10, *%id
+    %e1 = call @std_text_utf8_encode(233, %op, 8)
+    %e1b0 = load i8, *%op
+    %e1b0i = zext i8 %e1b0 to i32
+    %e1o1 = gep i8, *%op, 1
+    %e1b1 = load i8, *%e1o1
+    %e1b1i = zext i8 %e1b1 to i32
+    %e1ok = eq i32 %e1, 2
+    %e1a = eq i32 %e1b0i, 195
+    %e1c = eq i32 %e1b1i, 169
+    %f1 = and i1 %e1ok, %e1a
+    %f2 = and i1 %f1, %e1c
+    br %f2, @c11, @fail
+  @c11:
+    store i32 11, *%id
+    %e2 = call @std_text_utf8_encode(128512, %op, 8)
+    %e2b0 = load i8, *%op
+    %e2b0i = zext i8 %e2b0 to i32
+    %e2ok = eq i32 %e2, 4
+    %e2a = eq i32 %e2b0i, 240
+    %f3 = and i1 %e2ok, %e2a
+    br %f3, @c12, @fail
+
+    // counts
+  @c12:
+    store i32 12, *%id
+    %mxp = gep i8, *@MIXED, 0
+    %n1 = call @std_text_utf8_count(%mxp, 7)
+    %n1ok = eq i32 %n1, 3
+    br %n1ok, @c13, @fail
+  @c13:
+    store i32 13, *%id
+    %n2 = call @std_text_utf8_count(%sp, 3)
+    %n2ok = eq i32 %n2, -1
+    br %n2ok, @c14, @fail
+
+    // invalid encode values and small buffers
+  @c14:
+    store i32 14, *%id
+    %x1 = call @std_text_utf8_encode(55296, %op, 8)
+    %x1ok = eq i32 %x1, -1
+    br %x1ok, @c15, @fail
+  @c15:
+    store i32 15, *%id
+    %x2 = call @std_text_utf8_encode(1114112, %op, 8)
+    %x2ok = eq i32 %x2, -1
+    br %x2ok, @c16, @fail
+  @c16:
+    store i32 16, *%id
+    %x3 = call @std_text_utf8_encode(233, %op, 1)
+    %x3ok = eq i32 %x3, -1
+    br %x3ok, @pass, @fail
+
+  @pass:
+    call @printf("PASS utf8\n")
+    ret i32 0
+  @fail:
+    %fid = load i32, *%id
+    call @printf("FAIL utf8 at case %d\n", %fid)
+    ret i32 1
+}

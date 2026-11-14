@@ -1,0 +1,96 @@
+// ECC key generation: write public and private key files
+// Compile from ssa/c1:
+//   ./c1 test/gen_ecc_key.bx boxes/std/crypto/ecc.bx boxes/std/crypto/rsa.bx \
+//     -o test/gen_ecc_key -L ../platform -l platform -O2
+//   ./test/gen_ecc_key
+
+extern @std_crypto_ecc_generate_keypair(priv: *i32, pub_x: *i32, pub_y: *i32) -> void
+extern @std_crypto_rsa_bn_to_bytes(bytes: *i8, a: *i32, byte_len: i32, limbs: i32) -> void
+extern @fopen(path: *i8, mode: *i8) -> *i8
+extern @fwrite(buf: *i8, size: i64, count: i64, fp: *i8) -> i64
+extern @fclose(fp: *i8) -> i32
+
+const @HEX: [i8, 17] = "0123456789ABCDEF"
+const @NL: [i8, 2] = "\n"
+
+// Write bytes as hex string to file (output format: "label: hexchars\n")
+fun @write_hex(fp: *i8, label: *i8, bytes: *i8) -> void {
+  @entry:
+    call @fwrite(%label, 1, 6, %fp)
+    %iptr = let i32
+    store i32 0, *%iptr
+    jmp @wh_cond
+
+  @wh_cond:
+    %i = load i32, *%iptr
+    %c = slt i32 %i, 32
+    br %c, @wh_body, @wh_done
+
+  @wh_body:
+    %iv = load i32, *%iptr
+    %bp_cur = gep i8, *%bytes, %iv
+    %bytev = load i8, *%bp_cur
+    %bytei = zext i8 %bytev to i32
+    %hi = lshr i32 %bytei, 4
+    %lo = and i32 %bytei, 15
+    %hip = gep i8, *@HEX, %hi
+    %hiv = load i8, *%hip
+    %lop = gep i8, *@HEX, %lo
+    %lov = load i8, *%lop
+    %chbuf = let [i8, 2]
+    %chp = gep i8, *%chbuf, 0
+    store i8 %hiv, *%chp
+    %chp2 = gep i8, *%chbuf, 1
+    store i8 %lov, *%chp2
+    call @fwrite(%chp, 1, 2, %fp)
+    %iv2 = add i32 %iv, 1
+    store i32 %iv2, *%iptr
+    jmp @wh_cond
+
+  @wh_done:
+    call @fwrite(@NL, 1, 1, %fp)
+    ret void
+}
+
+fun @main() -> i32 {
+  @entry:
+    %priv = let [i32, 8]
+    %pp = gep i32, *%priv, 0
+    %pub_x = let [i32, 8]
+    %xp = gep i32, *%pub_x, 0
+    %pub_y = let [i32, 8]
+    %yp = gep i32, *%pub_y, 0
+
+    call @std_crypto_ecc_generate_keypair(%pp, %xp, %yp)
+
+    // Convert to bytes (big-endian)
+    %priv_b = let [i8, 32]
+    %priv_bp = gep i8, *%priv_b, 0
+    %pub_x_b = let [i8, 32]
+    %pub_x_bp = gep i8, *%pub_x_b, 0
+    %pub_y_b = let [i8, 32]
+    %pub_y_bp = gep i8, *%pub_y_b, 0
+
+    call @std_crypto_rsa_bn_to_bytes(%priv_bp, %pp, 32, 8)
+    call @std_crypto_rsa_bn_to_bytes(%pub_x_bp, %xp, 32, 8)
+    call @std_crypto_rsa_bn_to_bytes(%pub_y_bp, %yp, 32, 8)
+
+    // Write private key file
+    %fp_priv = call @fopen("ecc_priv.key", "w")
+    call @fwrite("-----BEGIN EC PRIVATE KEY-----\n", 1, 31, %fp_priv)
+    call @write_hex(%fp_priv, "priv: ", %priv_bp)
+    call @write_hex(%fp_priv, "pub_x: ", %pub_x_bp)
+    call @write_hex(%fp_priv, "pub_y: ", %pub_y_bp)
+    call @fwrite("-----END EC PRIVATE KEY-----\n", 1, 29, %fp_priv)
+    call @fclose(%fp_priv)
+
+    // Write public key file
+    %fp_pub = call @fopen("ecc_pub.key", "w")
+    call @fwrite("-----BEGIN EC PUBLIC KEY-----\n", 1, 30, %fp_pub)
+    call @write_hex(%fp_pub, "pub_x: ", %pub_x_bp)
+    call @write_hex(%fp_pub, "pub_y: ", %pub_y_bp)
+    call @fwrite("-----END EC PUBLIC KEY-----\n", 1, 28, %fp_pub)
+    call @fclose(%fp_pub)
+
+    ret i32 0
+}

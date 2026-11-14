@@ -1,0 +1,45 @@
+// RSA encrypt test: known key n=9797(0x2645), e=7, m=42
+// Expected: c = 42^7 mod 9797 = 3123 = 0x0C33
+
+extern @putchar(c: i32) -> i32
+extern @std_crypto_rsa_encrypt(c: *i32, m: *i32, e_key: *i32, n_mod: *i32, limbs: i32) -> void
+extern @std_crypto_rsa_bn_zero(r: *i32, limbs: i32) -> void
+
+fun @main() -> i32 {
+  @entry:
+    // key_n = 9797 = 0x2645
+    %key_n = let [i32, 4]
+    call @std_crypto_rsa_bn_zero(%key_n, 4)
+    %kn0 = gep i32, *%key_n, 0
+    store i32 0x00002645, *%kn0
+
+    // key_e = 7
+    %key_e = let [i32, 4]
+    call @std_crypto_rsa_bn_zero(%key_e, 4)
+    %ke0 = gep i32, *%key_e, 0
+    store i32 7, *%ke0
+
+    // msg = 42
+    %msg = let [i32, 4]
+    call @std_crypto_rsa_bn_zero(%msg, 4)
+    %mp0 = gep i32, *%msg, 0
+    store i32 42, *%mp0
+
+    // ciph buffer
+    %ciph = let [i32, 4]
+    call @std_crypto_rsa_bn_zero(%ciph, 4)
+
+    // Encrypt: c = m^e mod n
+    call @std_crypto_rsa_encrypt(%ciph, %msg, %key_e, %key_n, 4)
+
+    // Check c = 3123 = 0x0C33
+    %cp0 = gep i32, *%ciph, 0
+    %cv = load i32, *%cp0
+    %ok = eq i32 %cv, 0x00000C33
+    br %ok, @pass, @fail
+
+  @pass:
+    ret i32 0
+  @fail:
+    ret i32 1
+}

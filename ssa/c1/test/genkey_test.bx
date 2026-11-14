@@ -1,0 +1,78 @@
+// RSA genkey test: roundtrip + write PEM key files
+// Fixed small primes: p=65521, q=65519, n=4292870399, e=65537, d=1475213633
+
+extern @putchar(c: i32) -> i32
+extern @std_crypto_rsa_encrypt(c: *i32, m: *i32, e_key: *i32, n_mod: *i32, limbs: i32) -> void
+extern @std_crypto_rsa_decrypt(m: *i32, c: *i32, d_key: *i32, n_mod: *i32, limbs: i32) -> void
+extern @std_crypto_rsa_bn_zero(r: *i32, limbs: i32) -> void
+extern @std_crypto_pem_write_rsa_pub(fp: *i8, n: *i32, e: *i32, limbs: i32) -> void
+extern @std_crypto_pem_write_rsa_priv(fp: *i8, n: *i32, e: *i32, d: *i32, p: *i32, q: *i32, limbs: i32) -> void
+extern @fopen(path: *i8, mode: *i8) -> *i8
+extern @fclose(fp: *i8) -> i32
+
+fun @main() -> i32 {
+  @entry:
+    %key_n = let [i32, 4]
+    %key_e = let [i32, 4]
+    %key_d = let [i32, 4]
+    %key_p = let [i32, 4]
+    %key_q = let [i32, 4]
+    %msg = let [i32, 4]
+    %ciph = let [i32, 4]
+    %dec = let [i32, 4]
+
+    call @std_crypto_rsa_bn_zero(%key_n, 4)
+    call @std_crypto_rsa_bn_zero(%key_e, 4)
+    call @std_crypto_rsa_bn_zero(%key_d, 4)
+    call @std_crypto_rsa_bn_zero(%key_p, 4)
+    call @std_crypto_rsa_bn_zero(%key_q, 4)
+    call @std_crypto_rsa_bn_zero(%msg, 4)
+    call @std_crypto_rsa_bn_zero(%ciph, 4)
+    call @std_crypto_rsa_bn_zero(%dec, 4)
+
+    // n = 0xFFE000FF, e = 0x10001, d = 0x57EDF941
+    // p = 0xFFF1, q = 0xFFEF
+    %kn0 = gep i32, *%key_n, 0
+    store i32 0xFFE000FF, *%kn0
+    %ke0 = gep i32, *%key_e, 0
+    store i32 0x00010001, *%ke0
+    %kd0 = gep i32, *%key_d, 0
+    store i32 0x57EDF941, *%kd0
+    %kp0 = gep i32, *%key_p, 0
+    store i32 0x0000FFF1, *%kp0
+    %kq0 = gep i32, *%key_q, 0
+    store i32 0x0000FFEF, *%kq0
+
+    // msg = 42
+    %mp0 = gep i32, *%msg, 0
+    store i32 42, *%mp0
+
+    // Encrypt + decrypt
+    call @std_crypto_rsa_encrypt(%ciph, %msg, %key_e, %key_n, 4)
+    call @std_crypto_rsa_decrypt(%dec, %ciph, %key_d, %key_n, 4)
+
+    // Verify
+    %dp0 = gep i32, *%dec, 0
+    %dv = load i32, *%dp0
+    %ok = eq i32 %dv, 42
+    br %ok, @write, @fail
+
+  @write:
+    // Write public key PEM
+    %fpub = call @fopen("rsa.pub", "w")
+    call @std_crypto_pem_write_rsa_pub(%fpub, %key_n, %key_e, 4)
+    call @fclose(%fpub)
+
+    // Write private key PEM
+    %fpriv = call @fopen("rsa.key", "w")
+    call @std_crypto_pem_write_rsa_priv(%fpriv, %key_n, %key_e, %key_d, %key_p, %key_q, 4)
+    call @fclose(%fpriv)
+
+    call @putchar(79)  // 'O'
+    call @putchar(75)  // 'K'
+    call @putchar(10)  // '\n'
+    ret i32 0
+
+  @fail:
+    ret i32 1
+}

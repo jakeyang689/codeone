@@ -1,0 +1,313 @@
+// Direction-agnostic TLS 1.2 handshake primitives.
+//
+// Both roles share these helpers: parsing a ClientHello, building the
+// ServerHello and Certificate bodies, appending handshake messages to the
+// transcript, and computing Finished verify_data / extended master secret.
+// Nothing in this file depends on whether the caller is a client or a server.
+
+extern @memcpy(dst: *i8, src: *i8, n: i64) -> *i8
+extern @get16(p: *i8) -> i16
+extern @put16(p: *i8, v: i16) -> void
+extern @put24(p: *i8, v: i32) -> void
+extern @std_crypto_sha256_compute(data: *i8, len: i32, digest: *i8) -> void
+extern @std_crypto_tls12_prf_sha256(s: *i8, sl: i32, seed: *i8, sdl: i32, ol: i32, out: *i8) -> void
+
+// Parsed ClientHello summary.
+struct @HSClientHello {
+  @version: i32,
+  @random: [i8, 32],
+  @flags: i32
+}
+
+// Ways the client offers TLS 1.2 features; or-ed together into the flags
+// operand of @hs12_build_ch.
+enum @Hs12Offer: i32 {
+  @Suite = 1,   // TLS_RSA_WITH_AES_128_GCM_SHA256
+  @Ems = 2,     // extended_master_secret
+  @Reneg = 4    // secure renegotiation
+}
+
+const @HS12_SUITE_RSA_GCM: i16 = 156   // 0x009C
+
+const @_hs12_ems_label: [i8, 22] = [101,120,116,101,110,100,101,100,32,109,97,115,116,101,114,32,115,101,99,114,101,116]
+
+// Append one handshake message (header included) to the transcript.
+fun @hs12_tx_append(tx: *i8, tx_off: *i32, src: *i8, len: i32, cap: i32) -> i32 {
+  @entry:
+    %off = load i32, *%tx_off
+    %end = add i32 %off, %len
+    %ok = sle i32 %end, %cap
+    br %ok, @copy, @fail
+  @copy:
+    %dst = gep i8, *%tx, %off
+    %n64 = sext i32 %len to i64
+    call @memcpy(%dst, %src, %n64)
+    store i32 %end, *%tx_off
+    ret i32 0
+  @fail:
+    ret i32 -1
+}
+
+// Parse a ClientHello body (without the 4-byte handshake header).
+// Fills version, client random, and the offered-capability flags.
+fun @hs12_parse_ch(body: *i8, blen: i32, ch: *@HSClientHello) -> i32 {
+  @entry:
+    %short = slt i32 %blen, 38
+    br %short, @fail, @ver
+  @ver:
+    %v = call @get16(%body)
+    %vi = zext i16 %v to i32
+    %vp = field @HSClientHello, *%ch, 0
+    store i32 %vi, *%vp
+    %rp = gep i8, *%body, 2
+    %cr_arr = field @HSClientHello, *%ch, 1
+    %cr = gep i8, *%cr_arr, 0
+    %n32 = let i64
+    store i64 32, *%n32
+    %n32v = load i64, *%n32
+    call @memcpy(%cr, %rp, %n32v)
+    // session_id: 1-byte length at body[34]
+    %sidlp = gep i8, *%body, 34
+    %sidl8 = load i8, *%sidlp
+    %sidl = zext i8 %sidl8 to i32
+    %cs_off = add i32 %sidl, 35
+    // leave room for the 2-byte cipher suite length
+    %lim = sub i32 %blen, 2
+    %fits = sle i32 %cs_off, %lim
+    br %fits, @cs_len, @fail
+  @cs_len:
+    %cslp = gep i8, *%body, %cs_off
+    %csl16 = call @get16(%cslp)
+    %csl = zext i16 %csl16 to i32
+    %cs_start = add i32 %cs_off, 2
+    %cs_end = add i32 %cs_start, %csl
+    %cs_end_ok = slt i32 %cs_end, %blen
+    br %cs_end_ok, @cs_init, @fail
+  @cs_init:
+    %i = let i32
+    %flags = let i32
+    store i32 0, *%i
+    store i32 0, *%flags
+    jmp @cs_loop
+  @cs_loop:
+    %iv = load i32, *%i
+    %more = slt i32 %iv, %csl
+    br %more, @cs_one, @cs_done
+  @cs_one:
+    %off = add i32 %cs_start, %iv
+    %sp = gep i8, *%body, %off
+    %sv = call @get16(%sp)
+    %is_suite = eq i16 %sv, @HS12_SUITE_RSA_GCM
+    br %is_suite, @set_suite, @chk_scsv
+  @set_suite:
+    %f0 = load i32, *%flags
+    %f1 = or i32 %f0, @Hs12Offer.Suite
+    store i32 %f1, *%flags
+    jmp @cs_next
+  @chk_scsv:
+    %is_scsv = eq i16 %sv, 255
+    br %is_scsv, @set_scsv, @cs_next
+  @set_scsv:
+    %f2 = load i32, *%flags
+    %f3 = or i32 %f2, @Hs12Offer.Reneg
+    store i32 %f3, *%flags
+    jmp @cs_next
+  @cs_next:
+    %iv2 = load i32, *%i
+    %n2 = add i32 %iv2, 2
+    store i32 %n2, *%i
+    jmp @cs_loop
+  @cs_done:
+    // compression_methods: 1-byte length followed by that many bytes
+    %comp_off = add i32 %cs_end, 0
+    %comp_in = slt i32 %comp_off, %blen
+    br %comp_in, @comp_len, @fail
+  @comp_len:
+    %cp = gep i8, *%body, %comp_off
+    %cl8 = load i8, *%cp
+    %cl = zext i8 %cl8 to i32
+    %ext_off = add i32 %comp_off, 1
+    %ext_off2 = add i32 %ext_off, %cl
+    %el2 = add i32 %ext_off2, 2
+    %el_fits = sle i32 %el2, %blen
+    br %el_fits, @ext_len, @fail
+  @ext_len:
+    %elp = gep i8, *%body, %ext_off2
+    %el16 = call @get16(%elp)
+    %el = zext i16 %el16 to i32
+    %estart = add i32 %ext_off2, 2
+    %eend = add i32 %estart, %el
+    %eok = sle i32 %eend, %blen
+    br %eok, @ext_init, @fail
+  @ext_init:
+    %eo = let i32
+    store i32 %estart, *%eo
+    jmp @ext_loop
+  @ext_loop:
+    %ov = load i32, *%eo
+    %emore = slt i32 %ov, %eend
+    br %emore, @ext_one, @ext_done
+  @ext_one:
+    %rem = sub i32 %eend, %ov
+    %rmin = slt i32 %rem, 4
+    br %rmin, @fail, @ext_hdr
+  @ext_hdr:
+    %tp = gep i8, *%body, %ov
+    %et = call @get16(%tp)
+    %dlp = gep i8, *%tp, 2
+    %dl16 = call @get16(%dlp)
+    %dl = zext i16 %dl16 to i32
+    %dstart = add i32 %ov, 4
+    %dend = add i32 %dstart, %dl
+    %dok = sle i32 %dend, %eend
+    br %dok, @ext_dispatch, @fail
+  @ext_dispatch:
+    %is_ems = eq i16 %et, 23
+    br %is_ems, @set_ems, @chk_reneg
+  @set_ems:
+    %fe = load i32, *%flags
+    %fe1 = or i32 %fe, @Hs12Offer.Ems
+    store i32 %fe1, *%flags
+    jmp @ext_next
+  @chk_reneg:
+    %is_ri = eq i16 %et, 65281
+    br %is_ri, @set_reneg, @ext_next
+  @set_reneg:
+    %fr = load i32, *%flags
+    %fr1 = or i32 %fr, @Hs12Offer.Reneg
+    store i32 %fr1, *%flags
+    jmp @ext_next
+  @ext_next:
+    store i32 %dend, *%eo
+    jmp @ext_loop
+  @ext_done:
+    %fp = field @HSClientHello, *%ch, 2
+    %fv = load i32, *%flags
+    store i32 %fv, *%fp
+    ret i32 0
+  @fail:
+    ret i32 -1
+}
+
+// Build a TLS 1.2 ServerHello body (without the handshake header).
+// Selects TLS_RSA_WITH_AES_128_GCM_SHA256 and echoes extended_master_secret /
+// secure renegotiation when the client offered them.
+fun @hs12_build_sh(buf: *i8, cap: i32, server_random: *i8, flags: i32, olen: *i32) -> i32 {
+  @entry:
+    %cap_ok = sge i32 %cap, 49
+    br %cap_ok, @body, @fail
+  @body:
+    store i8 3, *%buf
+    %p1 = gep i8, *%buf, 1
+    store i8 3, *%p1
+    %rp = gep i8, *%buf, 2
+    %n32 = let i64
+    store i64 32, *%n32
+    %n32v = load i64, *%n32
+    call @memcpy(%rp, %server_random, %n32v)
+    %sidp = gep i8, *%buf, 34
+    store i8 0, *%sidp
+    %cs0 = gep i8, *%buf, 35
+    store i8 0, *%cs0
+    %cs1 = gep i8, *%buf, 36
+    store i8 0x9C, *%cs1
+    %cmpp = gep i8, *%buf, 37
+    store i8 0, *%cmpp
+    // extension data starts at offset 40; 38-39 hold the total length
+    %eo = let i32
+    store i32 40, *%eo
+    %ems = and i32 %flags, @Hs12Offer.Ems
+    %ems_b = ne i32 %ems, 0
+    br %ems_b, @add_ems, @chk_reneg
+  @add_ems:
+    %o1 = load i32, *%eo
+    %t1 = gep i8, *%buf, %o1
+    call @put16(%t1, 23)
+    %o1d = add i32 %o1, 2
+    %d1 = gep i8, *%buf, %o1d
+    call @put16(%d1, 0)
+    %o1n = add i32 %o1, 4
+    store i32 %o1n, *%eo
+    jmp @chk_reneg
+  @chk_reneg:
+    %reneg = and i32 %flags, @Hs12Offer.Reneg
+    %reneg_b = ne i32 %reneg, 0
+    br %reneg_b, @add_ri, @finish
+  @add_ri:
+    %o2 = load i32, *%eo
+    %t2 = gep i8, *%buf, %o2
+    call @put16(%t2, 65281)
+    %o2d = add i32 %o2, 2
+    %d2 = gep i8, *%buf, %o2d
+    call @put16(%d2, 1)
+    %o2l = add i32 %o2, 4
+    %d2p = gep i8, *%buf, %o2l
+    store i8 0, *%d2p
+    %o2n = add i32 %o2, 5
+    store i32 %o2n, *%eo
+    jmp @finish
+  @finish:
+    %final = load i32, *%eo
+    %extlen = sub i32 %final, 40
+    %el16 = trunc i32 %extlen to i16
+    %elp = gep i8, *%buf, 38
+    call @put16(%elp, %el16)
+    store i32 %final, *%olen
+    ret i32 0
+  @fail:
+    ret i32 -1
+}
+
+// Build a Certificate body: certificate_list with one leaf certificate.
+fun @hs12_build_cert(cert: *i8, cert_len: i32, buf: *i8, cap: i32, olen: *i32) -> i32 {
+  @entry:
+    %need = add i32 %cert_len, 6
+    %fits = sle i32 %need, %cap
+    %pos = sgt i32 %cert_len, 0
+    %ok = and i1 %fits, %pos
+    br %ok, @write, @fail
+  @write:
+    %list_len = add i32 %cert_len, 3
+    call @put24(%buf, %list_len)
+    %p3 = gep i8, *%buf, 3
+    call @put24(%p3, %cert_len)
+    %p6 = gep i8, *%buf, 6
+    %n64 = sext i32 %cert_len to i64
+    call @memcpy(%p6, %cert, %n64)
+    %total = add i32 %cert_len, 6
+    store i32 %total, *%olen
+    ret i32 0
+  @fail:
+    ret i32 -1
+}
+
+// verify_data = PRF(master_secret, label, SHA256(transcript))[0:12]
+fun @hs12_finished_verify(ms: *i8, label: *i8, label_len: i32,
+                          tx: *i8, tlen: i32, out: *i8) -> void {
+  @entry:
+    %th = let [i8, 32]
+    %thp = gep i8, *%th, 0
+    call @std_crypto_sha256_compute(%tx, %tlen, %thp)
+    %seed = let [i8, 96]
+    %sp = gep i8, *%seed, 0
+    %ll64 = sext i32 %label_len to i64
+    call @memcpy(%sp, %label, %ll64)
+    %hp = gep i8, *%sp, %label_len
+    call @memcpy(%hp, %thp, 32)
+    %sl = add i32 %label_len, 32
+    call @std_crypto_tls12_prf_sha256(%ms, 48, %sp, %sl, 12, %out)
+    ret void
+}
+
+// master_secret = PRF(pre_master, "extended master secret", session_hash)
+fun @hs12_master_secret_ems(pms: *i8, session_hash: *i8, out: *i8) -> void {
+  @entry:
+    %seed = let [i8, 64]
+    %sp = gep i8, *%seed, 0
+    %lbl = gep i8, *@_hs12_ems_label, 0
+    call @memcpy(%sp, %lbl, 22)
+    %hp = gep i8, *%sp, 22
+    call @memcpy(%hp, %session_hash, 32)
+    call @std_crypto_tls12_prf_sha256(%pms, 48, %sp, 54, 48, %out)
+    ret void
+}

@@ -1,0 +1,542 @@
+// HTTP/1.0 and HTTP/1.1 response parsing — pure SSA, no extern calls.
+//
+// net_http_parse_response() fills an @HttpResponse describing where the
+// status line, headers and body live in the input buffer. Header lookup and
+// chunked transfer decoding are provided separately.
+
+extern @std_text_str_lower(c: i8) -> i8
+extern @std_text_str_find_ci(buf: *i8, start: i32, end: i32, needle: *i8) -> i32
+extern @std_text_str_find_crlf(buf: *i8, start: i32, len: i32) -> i32
+extern @std_text_str_parse_uint(buf: *i8, start: i32, len: i32) -> i32
+
+// Protocol version as a minor number: 10 for HTTP/1.0, 11 for HTTP/1.1.
+enum @HttpVersion: i32 {
+  @Http10 = 10,
+  @Http11 = 11
+}
+
+struct @HttpResponse {
+  @version: i32,        // 10 or 11
+  @status: i32,         // 200, 404, ...
+  @reason_off: i32,     // offset of the reason phrase
+  @reason_len: i32,
+  @headers_off: i32,    // first header line
+  @headers_len: i32,
+  @body_off: i32,
+  @body_len: i32,       // Content-Length, or -1 when unknown
+  @content_length: i32, // -1 when absent
+  @chunked: i32         // 1 when Transfer-Encoding: chunked
+}
+
+
+
+
+
+// Parse a response. Returns 0 on success, -1 on a malformed status line.
+fun @net_http_parse_response(buf: *i8, len: i32, resp: *@HttpResponse) -> i32 {
+  @entry:
+    // Unknown until a header says otherwise.
+    %dl_bl = field @HttpResponse, *%resp, 7
+    store i32 -1, *%dl_bl
+    %dl_cl = field @HttpResponse, *%resp, 8
+    store i32 -1, *%dl_cl
+    %too_short = slt i32 %len, 12
+    br %too_short, @fail, @ver
+  @ver:
+    %p0 = gep i8, *%buf, 0
+    %c0 = load i8, *%p0
+    %is_h = eq i8 %c0, 72
+    br %is_h, @ver2, @fail
+  @ver2:
+    %p5 = gep i8, *%buf, 5
+    %c5 = load i8, *%p5
+    %is_one = eq i8 %c5, 49
+    br %is_one, @ver3, @fail
+  @ver3:
+    %p6 = gep i8, *%buf, 6
+    %c6 = load i8, *%p6
+    %is_dot = eq i8 %c6, 46
+    br %is_dot, @ver4, @fail
+  @ver4:
+    %p7 = gep i8, *%buf, 7
+    %c7 = load i8, *%p7
+    %is1 = eq i8 %c7, 49
+    %ver_p = field @HttpResponse, *%resp, 0
+    br %is1, @v11, @check10
+  @v11:
+    store i32 @HttpVersion.Http11, *%ver_p
+    jmp @sp
+  @check10:
+    %is0 = eq i8 %c7, 48
+    br %is0, @v10, @fail
+  @v10:
+    store i32 @HttpVersion.Http10, *%ver_p
+    jmp @sp
+  @sp:
+    %p8 = gep i8, *%buf, 8
+    %c8 = load i8, *%p8
+    %is_sp = eq i8 %c8, 32
+    br %is_sp, @status, @fail
+  @status:
+    %st = call @std_text_str_parse_uint(%buf, 9, 12)
+    %st_bad = slt i32 %st, 0
+    br %st_bad, @fail, @store_st
+  @store_st:
+    %st_p = field @HttpResponse, *%resp, 1
+    store i32 %st, *%st_p
+    // Reason phrase starts after the space following the status code.
+    %r0p = gep i8, *%buf, 12
+    %r0 = load i8, *%r0p
+    %has_reason = eq i8 %r0, 32
+    br %has_reason, @reason, @eol
+  @reason:
+    %r_off_p = field @HttpResponse, *%resp, 2
+    store i32 13, *%r_off_p
+    jmp @eol
+  @eol:
+    %cr = call @std_text_str_find_crlf(%buf, 9, %len)
+    %cr_bad = slt i32 %cr, 0
+    br %cr_bad, @fail, @store_reason
+  @store_reason:
+    %r_off_p2 = field @HttpResponse, *%resp, 2
+    %ro = load i32, *%r_off_p2
+    %has_r = eq i8 %r0, 32
+    br %has_r, @reason_len, @no_reason
+  @no_reason:
+    store i32 0, *%r_off_p2
+    %rl_p0 = field @HttpResponse, *%resp, 3
+    store i32 0, *%rl_p0
+    jmp @headers
+  @reason_len:
+    %rl = sub i32 %cr, %ro
+    %rl_p = field @HttpResponse, *%resp, 3
+    store i32 %rl, *%rl_p
+    jmp @headers
+  @headers:
+    %h_off = add i32 %cr, 2
+    %h_off_p = field @HttpResponse, *%resp, 4
+    store i32 %h_off, *%h_off_p
+    // An empty header block starts right after the status line.
+    %hp = gep i8, *%buf, %h_off
+    %hc0 = load i8, *%hp
+    %is_cr0 = eq i8 %hc0, 13
+    br %is_cr0, @empty_h, @scan_h
+  @empty_h:
+    %hl_p0 = field @HttpResponse, *%resp, 5
+    store i32 0, *%hl_p0
+    %bo_p0 = field @HttpResponse, *%resp, 6
+    %bo0 = add i32 %h_off, 2
+    store i32 %bo0, *%bo_p0
+    jmp @derive
+  @scan_h:
+    %hc = call @std_text_str_find_ci(%buf, %h_off, %len, "\r\n\r\n")
+    %hc_bad = slt i32 %hc, 0
+    br %hc_bad, @fail, @have_h
+  @have_h:
+    %h_off2 = load i32, *%h_off_p
+    %h_len = sub i32 %hc, %h_off2
+    %hl_p = field @HttpResponse, *%resp, 5
+    store i32 %h_len, *%hl_p
+    %bo_p = field @HttpResponse, *%resp, 6
+    %b_off = add i32 %hc, 4
+    store i32 %b_off, *%bo_p
+    jmp @derive
+  @derive:
+    %ho = load i32, *%h_off_p
+    %hl_p2 = field @HttpResponse, *%resp, 5
+    %hl_v = load i32, *%hl_p2
+    %hend = add i32 %ho, %hl_v
+    %h_lim = add i32 %hend, 2
+    %bo_p2 = field @HttpResponse, *%resp, 6
+    %b_off_v = load i32, *%bo_p2
+    // Anchored at the start of a header line: a bare substring search would
+    // also match names like X-Content-Length.
+    %cl = call @_net_http_find_name(%buf, %ho, %h_lim, "content-length")
+    %has_cl = sge i32 %cl, 0
+    br %has_cl, @cl, @chunked_chk
+  @cl:
+    %num_start = add i32 %cl, 15
+    %sk = let i32
+    store i32 %num_start, *%sk
+    jmp @cl_skip_cond
+  @cl_skip_cond:
+    %skv = load i32, *%sk
+    %skp = gep i8, *%buf, %skv
+    %skc = load i8, *%skp
+    %sk_sp = eq i8 %skc, 32
+    br %sk_sp, @cl_skip, @cl_num
+  @cl_skip:
+    %skv2 = load i32, *%sk
+    %skn = add i32 %skv2, 1
+    store i32 %skn, *%sk
+    jmp @cl_skip_cond
+  @cl_num:
+    %ns = load i32, *%sk
+    %v = call @std_text_str_parse_uint(%buf, %ns, %hend)
+    %cl_p = field @HttpResponse, *%resp, 8
+    store i32 %v, *%cl_p
+    %avail = sub i32 %len, %b_off_v
+    %v_neg = slt i32 %v, 0
+    br %v_neg, @cl_zero, @cl_store
+  @cl_store:
+    %use_avail = sgt i32 %v, %avail
+    br %use_avail, @cl_avail, @cl_len
+  @cl_len:
+    %bl_p = field @HttpResponse, *%resp, 7
+    store i32 %v, *%bl_p
+    jmp @chunked_chk
+  @cl_avail:
+    %bl_p2 = field @HttpResponse, *%resp, 7
+    store i32 %avail, *%bl_p2
+    jmp @chunked_chk
+  @cl_zero:
+    %bl_p3 = field @HttpResponse, *%resp, 7
+    store i32 -1, *%bl_p3
+    jmp @chunked_chk
+  @chunked_chk:
+    %te = call @_net_http_find_name(%buf, %ho, %h_lim, "transfer-encoding")
+    %has_te = sge i32 %te, 0
+    br %has_te, @te_scan, @no_chunked
+  @te_scan:
+    // Only look for "chunked" inside the Transfer-Encoding value.
+    %te_end = call @std_text_str_find_crlf(%buf, %te, %h_lim)
+    %te_end_bad = slt i32 %te_end, 0
+    br %te_end_bad, @no_chunked, @te_line
+  @te_line:
+    %chk = call @std_text_str_find_ci(%buf, %te, %te_end, "chunked")
+    %is_chunked = sge i32 %chk, 0
+    br %is_chunked, @set_chunked, @no_chunked
+  @set_chunked:
+    %ck_p = field @HttpResponse, *%resp, 9
+    store i32 1, *%ck_p
+    %bl_p4 = field @HttpResponse, *%resp, 7
+    store i32 -1, *%bl_p4
+    jmp @no_cl
+  @no_chunked:
+    %ck_p2 = field @HttpResponse, *%resp, 9
+    store i32 0, *%ck_p2
+    jmp @no_cl
+  @no_cl:
+    ret i32 0
+  @fail:
+    ret i32 -1
+}
+
+// Case-insensitive "name:" anchored at the start of a header line.
+fun @_net_http_find_name(buf: *i8, start: i32, end: i32, name: *i8) -> i32 {
+  @entry:
+    %i = let i32
+    store i32 %start, *%i
+    jmp @line_cond
+  @line_cond:
+    %line = load i32, *%i
+    %more = slt i32 %line, %end
+    br %more, @try, @nf
+  @try:
+    %line2 = load i32, *%i
+    %j = let i32
+    store i32 0, *%j
+    jmp @ch_cond
+  @ch_cond:
+    %jv = load i32, *%j
+    %np = gep i8, *%name, %jv
+    %nc = load i8, *%np
+    %done = eq i8 %nc, 0
+    br %done, @colon, @ch_cmp
+  @ch_cmp:
+    %jv2 = load i32, *%j
+    %idx = add i32 %line2, %jv2
+    %lim = sge i32 %idx, %end
+    br %lim, @next_line, @ch_load
+  @ch_load:
+    %bp = gep i8, *%buf, %idx
+    %bc = load i8, *%bp
+    %bl = call @std_text_str_lower(%bc)
+    %jv3 = load i32, *%j
+    %np2 = gep i8, *%name, %jv3
+    %nc2 = load i8, *%np2
+    %nl = call @std_text_str_lower(%nc2)
+    %eq = eq i8 %bl, %nl
+    br %eq, @ch_next, @next_line
+  @ch_next:
+    %jv4 = load i32, *%j
+    %jn = add i32 %jv4, 1
+    store i32 %jn, *%j
+    jmp @ch_cond
+  @colon:
+    %jv5 = load i32, *%j
+    %ci = add i32 %line2, %jv5
+    %cp = gep i8, *%buf, %ci
+    %cc = load i8, *%cp
+    %is_c = eq i8 %cc, 58
+    br %is_c, @found, @next_line
+  @found:
+    %r = load i32, *%i
+    ret i32 %r
+  @next_line:
+    %line3 = load i32, *%i
+    %cr = call @std_text_str_find_crlf(%buf, %line3, %end)
+    %bad = slt i32 %cr, 0
+    br %bad, @nf, @adv
+  @adv:
+    %nxt = add i32 %cr, 2
+    store i32 %nxt, *%i
+    jmp @line_cond
+  @nf:
+    ret i32 -1
+}
+// Look up a header value by name. Writes it NUL-terminated into out.
+// Returns the value length, or -1 if the header is absent.
+// Find a header by name, starting at from_off (0 means "from the top").
+// Returns the offset of the matching line, or -1. Use the result + 1 as the
+// next from_off to enumerate repeated headers such as Set-Cookie.
+fun @net_http_header_find(buf: *i8, resp: *@HttpResponse, name: *i8,
+                          from_off: i32) -> i32 {
+  @entry:
+    %h_off_p = field @HttpResponse, *%resp, 4
+    %h_off = load i32, *%h_off_p
+    %h_len_p = field @HttpResponse, *%resp, 5
+    %h_len = load i32, *%h_len_p
+    %h_end = add i32 %h_off, %h_len
+    %h_lim = add i32 %h_end, 2
+    %from_ok = sge i32 %from_off, %h_off
+    br %from_ok, @use_from, @use_top
+  @use_from:
+    %pos = call @_net_http_find_name(%buf, %from_off, %h_lim, %name)
+    ret i32 %pos
+  @use_top:
+    %pos2 = call @_net_http_find_name(%buf, %h_off, %h_lim, %name)
+    ret i32 %pos2
+}
+
+// Extract the value of the header line at line_off.
+// Returns the value length, or -1 if the line is malformed or too long.
+fun @net_http_header_value(buf: *i8, resp: *@HttpResponse, line_off: i32,
+                           out: *i8, cap: i32) -> i32 {
+  @entry:
+    %h_off_p = field @HttpResponse, *%resp, 4
+    %h_off = load i32, *%h_off_p
+    %h_len_p = field @HttpResponse, *%resp, 5
+    %h_len = load i32, *%h_len_p
+    %h_end = add i32 %h_off, %h_len
+    %h_lim = add i32 %h_end, 2
+    // Advance past the header name to its ':'.
+    %i = let i32
+    store i32 %line_off, *%i
+    jmp @colon_cond
+  @colon_cond:
+    %cv = load i32, *%i
+    %cp = gep i8, *%buf, %cv
+    %cc = load i8, *%cp
+    %is_colon = eq i8 %cc, 58
+    br %is_colon, @after_colon, @colon_next
+  @colon_next:
+    %cv2 = load i32, *%i
+    %cn = add i32 %cv2, 1
+    store i32 %cn, *%i
+    %over = sge i32 %cn, %h_lim
+    br %over, @fail, @colon_cond
+  @after_colon:
+    %cv3 = load i32, *%i
+    %v0 = add i32 %cv3, 1
+    store i32 %v0, *%i
+    jmp @skip_cond
+  @skip_cond:
+    %iv = load i32, *%i
+    %p = gep i8, *%buf, %iv
+    %c = load i8, *%p
+    %is_sp = eq i8 %c, 32
+    br %is_sp, @skip, @copy_init
+  @skip:
+    %iv2 = load i32, *%i
+    %nx = add i32 %iv2, 1
+    store i32 %nx, *%i
+    jmp @skip_cond
+  @copy_init:
+    %start = load i32, *%i
+    %cr = call @std_text_str_find_crlf(%buf, %start, %h_lim)
+    %cr_bad = slt i32 %cr, 0
+    br %cr_bad, @fail, @copy
+  @copy:
+    %vlen = sub i32 %cr, %start
+    %room = sub i32 %cap, 1
+    %too_long = sgt i32 %vlen, %room
+    br %too_long, @fail, @cp_init
+  @cp_init:
+    %k = let i32
+    store i32 0, *%k
+    jmp @cp_cond
+  @cp_cond:
+    %kv = load i32, *%k
+    %more = slt i32 %kv, %vlen
+    br %more, @cp_body, @cp_done
+  @cp_body:
+    %kv2 = load i32, *%k
+    %src = add i32 %start, %kv2
+    %sp = gep i8, *%buf, %src
+    %ch = load i8, *%sp
+    %dp = gep i8, *%out, %kv2
+    store i8 %ch, *%dp
+    %kn = add i32 %kv2, 1
+    store i32 %kn, *%k
+    jmp @cp_cond
+  @cp_done:
+    %dv = load i32, *%k
+    %dp2 = gep i8, *%out, %dv
+    store i8 0, *%dp2
+    ret i32 %vlen
+  @fail:
+    ret i32 -1
+}
+
+// Convenience: first matching header's value.
+fun @net_http_header_get(buf: *i8, resp: *@HttpResponse, name: *i8,
+                         out: *i8, cap: i32) -> i32 {
+  @entry:
+    %pos = call @net_http_header_find(%buf, %resp, %name, 0)
+    %bad = slt i32 %pos, 0
+    br %bad, @fail, @val
+  @val:
+    %r = call @net_http_header_value(%buf, %resp, %pos, %out, %cap)
+    ret i32 %r
+  @fail:
+    ret i32 -1
+}
+
+
+// Parse a hexadecimal chunk size at start. Returns the value, or -1.
+fun @_net_http_parse_hex(buf: *i8, start: i32, len: i32) -> i32 {
+  @entry:
+    %i = let i32
+    store i32 %start, *%i
+    %acc = let i32
+    store i32 0, *%acc
+    %any = let i32
+    store i32 0, *%any
+    jmp @cond
+  @cond:
+    %iv = load i32, *%i
+    %more = slt i32 %iv, %len
+    br %more, @body, @done
+  @body:
+    %iv2 = load i32, *%i
+    %p = gep i8, *%buf, %iv2
+    %c = load i8, *%p
+    %v = zext i8 %c to i32
+    %d0 = sge i32 %v, 48
+    %d1 = sle i32 %v, 57
+    %is_d = and i1 %d0, %d1
+    br %is_d, @digit, @hex_chk
+  @hex_chk:
+    %l0 = sge i32 %v, 97
+    %l1 = sle i32 %v, 102
+    %is_l = and i1 %l0, %l1
+    br %is_l, @hex_lower, @hex_upper
+  @hex_upper:
+    %u0 = sge i32 %v, 65
+    %u1 = sle i32 %v, 70
+    %is_u = and i1 %u0, %u1
+    br %is_u, @hex_upper_acc, @done
+  @digit:
+    %dv = sub i32 %v, 48
+    jmp @acc
+  @hex_lower:
+    %lv = sub i32 %v, 87
+    jmp @acc
+  @hex_upper_acc:
+    %uv = sub i32 %v, 55
+    jmp @acc
+  @acc:
+    %nib = phi i32 [ %dv, @digit ], [ %lv, @hex_lower ], [ %uv, @hex_upper_acc ]
+    %acc_v = load i32, *%acc
+    %sh = shl i32 %acc_v, 4
+    %sum = or i32 %sh, %nib
+    store i32 %sum, *%acc
+    store i32 1, *%any
+    %iv3 = load i32, *%i
+    %nx = add i32 %iv3, 1
+    store i32 %nx, *%i
+    jmp @cond
+  @done:
+    %had = load i32, *%any
+    %none = eq i32 %had, 0
+    br %none, @fail, @ok
+  @ok:
+    %r = load i32, *%acc
+    ret i32 %r
+  @fail:
+    ret i32 -1
+}
+// Decode a chunked body in place into dst. Returns bytes written, or -1.
+fun @net_http_decode_chunked(src: *i8, src_len: i32, dst: *i8, cap: i32) -> i32 {
+  @entry:
+    %sp = let i32
+    store i32 0, *%sp
+    %dp = let i32
+    store i32 0, *%dp
+    jmp @loop
+  @loop:
+    %sv = load i32, *%sp
+    %more = slt i32 %sv, %src_len
+    br %more, @chunk, @done
+  @chunk:
+    %size = call @_net_http_parse_hex(%src, %sv, %src_len)
+    %bad = slt i32 %size, 0
+    br %bad, @fail, @size_ok
+  @size_ok:
+    %zero = eq i32 %size, 0
+    br %zero, @done, @copy_init
+  @copy_init:
+    // Skip the size line (up to CRLF).
+    %cr = call @std_text_str_find_crlf(%src, %sv, %src_len)
+    %cr_bad = slt i32 %cr, 0
+    br %cr_bad, @fail, @copy
+  @copy:
+    %data0 = add i32 %cr, 2
+    %k = let i32
+    store i32 0, *%k
+    jmp @copy_cond
+  @copy_cond:
+    %kv = load i32, *%k
+    %more2 = slt i32 %kv, %size
+    br %more2, @copy_body, @copy_done
+  @copy_body:
+    %kv2 = load i32, *%k
+    %src_idx = add i32 %data0, %kv2
+    %lim = sge i32 %src_idx, %src_len
+    br %lim, @fail, @chk_cap
+  @chk_cap:
+    %dv = load i32, *%dp
+    %dst_idx = add i32 %dv, %kv2
+    %over = sge i32 %dst_idx, %cap
+    br %over, @fail, @wb
+  @wb:
+    %s_p = gep i8, *%src, %src_idx
+    %ch = load i8, *%s_p
+    %d_p = gep i8, *%dst, %dst_idx
+    store i8 %ch, *%d_p
+    %kn = add i32 %kv2, 1
+    store i32 %kn, *%k
+    jmp @copy_cond
+  @copy_done:
+    %dv2 = load i32, *%dp
+    %dv_n = add i32 %dv2, %size
+    store i32 %dv_n, *%dp
+    // Skip the CRLF that follows the chunk data.
+    %after = add i32 %data0, %size
+    %cr2 = call @std_text_str_find_crlf(%src, %after, %src_len)
+    %cr2_bad = slt i32 %cr2, 0
+    br %cr2_bad, @done_ok, @set_next
+  @set_next:
+    %next = add i32 %cr2, 2
+    store i32 %next, *%sp
+    jmp @loop
+  @done:
+    jmp @done_ok
+  @done_ok:
+    %out = load i32, *%dp
+    ret i32 %out
+  @fail:
+    ret i32 -1
+}
+

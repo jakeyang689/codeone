@@ -1,0 +1,212 @@
+// SHA-256 test: compute @std_crypto_sha256_compute("sha256 is good!")
+// Expected: 8a154e0a749bc3a7375505c1a6f3fb8135d23a93d83da0521e50360c4b103baa
+
+extern @putchar(c: i32) -> i32
+extern @std_crypto_sha256_compute(data: *i8, len: i32, digest: *i8) -> void
+
+fun @main() -> i32 {
+  @entry:
+    // "sha256 is good!" = 15 bytes
+    %data = let [i8, 15]
+    %p0 = gep i8, *%data, 0
+    store i8 115, *%p0  // 's'
+    %p1 = gep i8, *%data, 1
+    store i8 104, *%p1  // 'h'
+    %p2 = gep i8, *%data, 2
+    store i8 97, *%p2   // 'a'
+    %p3 = gep i8, *%data, 3
+    store i8 50, *%p3   // '2'
+    %p4 = gep i8, *%data, 4
+    store i8 53, *%p4   // '5'
+    %p5 = gep i8, *%data, 5
+    store i8 54, *%p5   // '6'
+    %p6 = gep i8, *%data, 6
+    store i8 32, *%p6   // ' '
+    %p7 = gep i8, *%data, 7
+    store i8 105, *%p7  // 'i'
+    %p8 = gep i8, *%data, 8
+    store i8 115, *%p8  // 's'
+    %p9 = gep i8, *%data, 9
+    store i8 32, *%p9   // ' '
+    %p10 = gep i8, *%data, 10
+    store i8 103, *%p10 // 'g'
+    %p11 = gep i8, *%data, 11
+    store i8 111, *%p11 // 'o'
+    %p12 = gep i8, *%data, 12
+    store i8 111, *%p12 // 'o'
+    %p13 = gep i8, *%data, 13
+    store i8 100, *%p13 // 'd'
+    %p14 = gep i8, *%data, 14
+    store i8 33, *%p14  // '!'
+
+    %dp = gep i8, *%data, 0
+    %digest = let [i8, 32]
+    %dg = gep i8, *%digest, 0
+    call @std_crypto_sha256_compute(%dp, 15, %dg)
+
+    // Expected: 8a 15 4e 0a 74 9b c3 a7 37 55 05 c1 a6 f3 fb 81
+    //           35 d2 3a 93 d8 3d a0 52 1e 50 36 0c 4b 10 3b aa
+    %b0 = load i8, *%dg
+    %c0 = eq i8 %b0, 0x8a
+    br %c0, @c1, @fail
+  @c1:
+    %p1c = gep i8, *%digest, 1
+    %b1 = load i8, *%p1c
+    %c1v = eq i8 %b1, 0x15
+    br %c1v, @c2, @fail
+  @c2:
+    %p2c = gep i8, *%digest, 2
+    %b2 = load i8, *%p2c
+    %c2v = eq i8 %b2, 0x4e
+    br %c2v, @c3, @fail
+  @c3:
+    %p3c = gep i8, *%digest, 3
+    %b3 = load i8, *%p3c
+    %c3v = eq i8 %b3, 0x0a
+    br %c3v, @c4, @fail
+  @c4:
+    %p4c = gep i8, *%digest, 4
+    %b4 = load i8, *%p4c
+    %c4v = eq i8 %b4, 0x74
+    br %c4v, @c5, @fail
+  @c5:
+    %p5c = gep i8, *%digest, 5
+    %b5 = load i8, *%p5c
+    %c5v = eq i8 %b5, 0x9b
+    br %c5v, @c6, @fail
+  @c6:
+    %p6c = gep i8, *%digest, 6
+    %b6 = load i8, *%p6c
+    %c6v = eq i8 %b6, 0xc3
+    br %c6v, @c7, @fail
+  @c7:
+    %p7c = gep i8, *%digest, 7
+    %b7 = load i8, *%p7c
+    %c7v = eq i8 %b7, 0xa7
+    br %c7v, @c8, @fail
+  @c8:
+    %p8c = gep i8, *%digest, 8
+    %b8 = load i8, *%p8c
+    %c8v = eq i8 %b8, 0x37
+    br %c8v, @c9, @fail
+  @c9:
+    %p9c = gep i8, *%digest, 9
+    %b9 = load i8, *%p9c
+    %c9v = eq i8 %b9, 0x55
+    br %c9v, @c10, @fail
+  @c10:
+    %p10c = gep i8, *%digest, 10
+    %b10 = load i8, *%p10c
+    %c10v = eq i8 %b10, 0x05
+    br %c10v, @c11, @fail
+  @c11:
+    %p11c = gep i8, *%digest, 11
+    %b11 = load i8, *%p11c
+    %c11v = eq i8 %b11, 0xc1
+    br %c11v, @c12, @fail
+  @c12:
+    %p12c = gep i8, *%digest, 12
+    %b12 = load i8, *%p12c
+    %c12v = eq i8 %b12, 0xa6
+    br %c12v, @c13, @fail
+  @c13:
+    %p13c = gep i8, *%digest, 13
+    %b13 = load i8, *%p13c
+    %c13v = eq i8 %b13, 0xf3
+    br %c13v, @c14, @fail
+  @c14:
+    %p14c = gep i8, *%digest, 14
+    %b14 = load i8, *%p14c
+    %c14v = eq i8 %b14, 0xfb
+    br %c14v, @c15, @fail
+  @c15:
+    %p15c = gep i8, *%digest, 15
+    %b15 = load i8, *%p15c
+    %c15v = eq i8 %b15, 0x81
+    br %c15v, @c16, @fail
+  @c16:
+    %p16c = gep i8, *%digest, 16
+    %b16 = load i8, *%p16c
+    %c16v = eq i8 %b16, 0x35
+    br %c16v, @c17, @fail
+  @c17:
+    %p17c = gep i8, *%digest, 17
+    %b17 = load i8, *%p17c
+    %c17v = eq i8 %b17, 0xd2
+    br %c17v, @c18, @fail
+  @c18:
+    %p18c = gep i8, *%digest, 18
+    %b18 = load i8, *%p18c
+    %c18v = eq i8 %b18, 0x3a
+    br %c18v, @c19, @fail
+  @c19:
+    %p19c = gep i8, *%digest, 19
+    %b19 = load i8, *%p19c
+    %c19v = eq i8 %b19, 0x93
+    br %c19v, @c20, @fail
+  @c20:
+    %p20c = gep i8, *%digest, 20
+    %b20 = load i8, *%p20c
+    %c20v = eq i8 %b20, 0xd8
+    br %c20v, @c21, @fail
+  @c21:
+    %p21c = gep i8, *%digest, 21
+    %b21 = load i8, *%p21c
+    %c21v = eq i8 %b21, 0x3d
+    br %c21v, @c22, @fail
+  @c22:
+    %p22c = gep i8, *%digest, 22
+    %b22 = load i8, *%p22c
+    %c22v = eq i8 %b22, 0xa0
+    br %c22v, @c23, @fail
+  @c23:
+    %p23c = gep i8, *%digest, 23
+    %b23 = load i8, *%p23c
+    %c23v = eq i8 %b23, 0x52
+    br %c23v, @c24, @fail
+  @c24:
+    %p24c = gep i8, *%digest, 24
+    %b24 = load i8, *%p24c
+    %c24v = eq i8 %b24, 0x1e
+    br %c24v, @c25, @fail
+  @c25:
+    %p25c = gep i8, *%digest, 25
+    %b25 = load i8, *%p25c
+    %c25v = eq i8 %b25, 0x50
+    br %c25v, @c26, @fail
+  @c26:
+    %p26c = gep i8, *%digest, 26
+    %b26 = load i8, *%p26c
+    %c26v = eq i8 %b26, 0x36
+    br %c26v, @c27, @fail
+  @c27:
+    %p27c = gep i8, *%digest, 27
+    %b27 = load i8, *%p27c
+    %c27v = eq i8 %b27, 0x0c
+    br %c27v, @c28, @fail
+  @c28:
+    %p28c = gep i8, *%digest, 28
+    %b28 = load i8, *%p28c
+    %c28v = eq i8 %b28, 0x4b
+    br %c28v, @c29, @fail
+  @c29:
+    %p29c = gep i8, *%digest, 29
+    %b29 = load i8, *%p29c
+    %c29v = eq i8 %b29, 0x10
+    br %c29v, @c30, @fail
+  @c30:
+    %p30c = gep i8, *%digest, 30
+    %b30 = load i8, *%p30c
+    %c30v = eq i8 %b30, 0x3b
+    br %c30v, @c31, @fail
+  @c31:
+    %p31c = gep i8, *%digest, 31
+    %b31 = load i8, *%p31c
+    %c31v = eq i8 %b31, 0xaa
+    br %c31v, @pass, @fail
+
+  @pass:
+    ret i32 0
+  @fail:
+    ret i32 1
+}

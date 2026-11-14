@@ -1,0 +1,78 @@
+// asm semantics on x86_64: AT&T template, Intel-dialect template, multiple
+// inputs, void asm with a memory clobber, named operands, alignstack, and a
+// multi-output struct result.
+
+extern @printf(fmt: *i8, ...) -> i32
+
+struct @Pair64 { @lo: i64, @hi: i64 }
+
+fun @main() -> i32 {
+  @entry:
+    %id = let i32
+    store i32 0, *%id
+    %slot = let i64
+    %pair_slot = let @Pair64
+
+    // --- AT&T syntax: output $0, input $1 ---
+    %a = add i64 20, 22
+    %r1 = asm att i64, "movq $1, $0\naddq $1, $0", "=r,r", i64 %a
+    %c1 = eq i64 %r1, 84
+    br %c1, @t1, @fail
+
+  @t1:
+    store i32 1, *%id
+    // --- Intel syntax: same operation, operands reversed ---
+    %r2 = asm intel i64, "mov $0, $1\nadd $0, $1", "=r,r", i64 %a
+    %c2 = eq i64 %r2, 84
+    br %c2, @t2, @fail
+
+  @t2:
+    store i32 2, *%id
+    // --- two inputs, numbered after the output ---
+    %r3 = asm att i64, "movq $1, $0\nsubq $2, $0", "=r,r,r", i64 100, i64 58
+    %c3 = eq i64 %r3, 42
+    br %c3, @t3, @fail
+
+  @t3:
+    store i32 3, *%id
+    // --- void asm with a memory clobber ---
+    asm att void, "mfence", "~{memory}"
+    store i64 %r3, *%slot
+    %r4 = load i64, *%slot
+    %c4 = eq i64 %r4, 42
+    br %c4, @t4, @fail
+
+  @t4:
+    store i32 4, *%id
+    // --- named operands: ${name} resolves to the input's position ---
+    %lhs = add i64 20, 0
+    %rhs = add i64 22, 0
+    %r5 = asm att i64, "movq ${lhs}, $0\naddq ${rhs}, $0", "=r,r,r", i64 %lhs, i64 %rhs
+    %c5 = eq i64 %r5, 42
+    br %c5, @t5, @fail
+
+  @t5:
+    store i32 5, *%id
+    // --- alignstack flag ---
+    asm alignstack att void, "nop", ""
+    // --- two outputs returned through a struct ---
+    // Early-clobber outputs: both are written before the input is last read.
+    %p = asm att @Pair64, "leaq 1($2), $0\nleaq 2($2), $1", "=&r,=&r,r", i64 40
+    store @Pair64 %p, *%pair_slot
+    %lo_p = field @Pair64, *%pair_slot, 0
+    %hi_p = field @Pair64, *%pair_slot, 1
+    %lo = load i64, *%lo_p
+    %hi = load i64, *%hi_p
+    %clo = eq i64 %lo, 41
+    %chi = eq i64 %hi, 42
+    %cboth = and i1 %clo, %chi
+    br %cboth, @pass, @fail
+
+  @pass:
+    call @printf("PASS isa/asm_x86_64\n")
+    ret i32 0
+  @fail:
+    %n = load i32, *%id
+    call @printf("FAIL isa/asm_x86_64 at case %d\n", %n)
+    ret i32 1
+}

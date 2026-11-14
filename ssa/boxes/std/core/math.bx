@@ -1,0 +1,72 @@
+// Core math utilities
+// All functions operate on i32.
+
+fun @std_core_math_min(a: i32, b: i32) -> i32 {
+  @entry:
+    %c = slt i32 %a, %b
+    br %c, @a_ret, @b_ret
+  @a_ret:
+    ret i32 %a
+  @b_ret:
+    ret i32 %b
+}
+
+fun @std_core_math_max(a: i32, b: i32) -> i32 {
+  @entry:
+    %c = sgt i32 %a, %b
+    br %c, @a_ret, @b_ret
+  @a_ret:
+    ret i32 %a
+  @b_ret:
+    ret i32 %b
+}
+
+fun @std_core_math_abs(x: i32) -> i32 {
+  @entry:
+    %neg = slt i32 %x, 0
+    br %neg, @do_neg, @done
+  @do_neg:
+    %r = sub i32 0, %x
+    ret i32 %r
+  @done:
+    ret i32 %x
+}
+
+fun @std_core_math_abs64(x: i64) -> i64 {
+  @entry:
+    %neg = slt i64 %x, 0
+    br %neg, @do_neg, @done
+  @do_neg:
+    %r = sub i64 0, %x
+    ret i64 %r
+  @done:
+    ret i64 %x
+}
+
+fun @std_core_math_clamp(x: i32, lo: i32, hi: i32) -> i32 {
+  @entry:
+    %c1 = slt i32 %x, %lo
+    br %c1, @ret_lo, @check_hi
+  @check_hi:
+    %c2 = sgt i32 %x, %hi
+    br %c2, @ret_hi, @ret_x
+  @ret_lo:
+    ret i32 %lo
+  @ret_hi:
+    ret i32 %hi
+  @ret_x:
+    ret i32 %x
+}
+
+fun @std_core_math_is_power_of_two(x: i32) -> i1 {
+  @entry:
+    %c = sgt i32 %x, 0
+    br %c, @check, @false
+  @check:
+    %m1 = sub i32 %x, 1
+    %a = and i32 %x, %m1
+    %z = eq i32 %a, 0
+    ret i1 %z
+  @false:
+    ret i1 0
+}

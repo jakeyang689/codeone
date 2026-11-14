@@ -1,0 +1,38 @@
+// Standard stream handles and writers. Prints "PASS stdio" on success.
+
+extern @printf(fmt: *i8, ...) -> i32
+extern @std_io_stdio_stdin() -> *i8
+extern @std_io_stdio_stdout() -> *i8
+extern @std_io_stdio_stderr() -> *i8
+extern @std_io_stdio_write(buf: *i8, len: i32) -> i32
+extern @std_io_stdio_write_err(buf: *i8, len: i32) -> i32
+extern @std_io_stdio_flush() -> i32
+
+fun @main() -> i32 {
+  @entry:
+    %in = call @std_io_stdio_stdin()
+    %out = call @std_io_stdio_stdout()
+    %err = call @std_io_stdio_stderr()
+    %inok = ne *i8 %in, null
+    %outok = ne *i8 %out, null
+    %errok = ne *i8 %err, null
+    %w = call @std_io_stdio_write("stdio ok\n", 9)
+    %we = call @std_io_stdio_write_err("stdio err\n", 10)
+    %fl = call @std_io_stdio_flush()
+    %wok = eq i32 %w, 0
+    %weok = eq i32 %we, 0
+    %flok = eq i32 %fl, 0
+    %a1 = and i1 %inok, %outok
+    %a2 = and i1 %errok, %wok
+    %a3 = and i1 %weok, %flok
+    %b1 = and i1 %a1, %a2
+    %all = and i1 %b1, %a3
+    br %all, @pass, @fail
+
+  @pass:
+    call @printf("PASS stdio\n")
+    ret i32 0
+  @fail:
+    call @printf("FAIL stdio\n")
+    ret i32 1
+}

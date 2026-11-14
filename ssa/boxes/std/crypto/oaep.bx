@@ -1,0 +1,357 @@
+// RSAES-OAEP with SHA-256 and MGF1-SHA256 (RFC 8017 §7.1).
+//
+// The label is empty (lHash = SHA-256("")). Buffer sizes follow the modulus
+// size: k = limbs * 4, and the message may be at most k - 2*32 - 2 bytes.
+
+extern @memcpy(dst: *i8, src: *i8, n: i64) -> *i8
+extern @memset(s: *i8, c: i32, n: i64) -> *i8
+extern @c1_random_buf(buf: *i8, len: i64) -> void
+extern @std_crypto_sha256_compute(data: *i8, len: i32, digest: *i8) -> void
+extern @std_crypto_rsa_bn_from_bytes(r: *i32, bytes: *i8, byte_len: i32,
+                                     limbs: i32) -> void
+extern @std_crypto_rsa_bn_to_bytes(bytes: *i8, a: *i32, byte_len: i32,
+                                   limbs: i32) -> void
+extern @std_crypto_rsa_bn_mod_pow_mont(r: *i32, base: *i32, exp: *i32,
+                                       exp_limbs: i32, n: *i32,
+                                       limbs: i32) -> void
+
+// MGF1 with SHA-256.
+fun @_oaep_mgf1(seed: *i8, seed_len: i32, out: *i8, out_len: i32) -> void {
+  @entry:
+    // seed_len can be as large as dbLen (k - 33), so allow room for it plus
+    // the 4-byte counter.
+    %inbuf = let [i8, 512]
+    %inp = gep i8, *%inbuf, 0
+    %hbuf = let [i8, 32]
+    %hp = gep i8, *%hbuf, 0
+    %counter = let i32
+    %written = let i32
+    store i32 0, *%counter
+    store i32 0, *%written
+    jmp @loop
+  @loop:
+    %w = load i32, *%written
+    %done = sge i32 %w, %out_len
+    br %done, @finished, @iter
+  @iter:
+    %sl64 = sext i32 %seed_len to i64
+    call @memcpy(%inp, %seed, %sl64)
+    %c = load i32, *%counter
+    %cp = gep i8, *%inbuf, %seed_len
+    %c0 = lshr i32 %c, 24
+    %c0b = trunc i32 %c0 to i8
+    store i8 %c0b, *%cp
+    %cp1 = gep i8, *%cp, 1
+    %c1 = lshr i32 %c, 16
+    %c1b = trunc i32 %c1 to i8
+    store i8 %c1b, *%cp1
+    %cp2 = gep i8, *%cp, 2
+    %c2 = lshr i32 %c, 8
+    %c2b = trunc i32 %c2 to i8
+    store i8 %c2b, *%cp2
+    %cp3 = gep i8, *%cp, 3
+    %c3b = trunc i32 %c to i8
+    store i8 %c3b, *%cp3
+    %tot = add i32 %seed_len, 4
+    call @std_crypto_sha256_compute(%inp, %tot, %hp)
+    %w2 = load i32, *%written
+    %rem = sub i32 %out_len, %w2
+    %big = sgt i32 %rem, 32
+    br %big, @take32, @take_rem
+  @take32:
+    jmp @copy
+  @take_rem:
+    jmp @copy
+  @copy:
+    %w3 = load i32, *%written
+    %rem2 = sub i32 %out_len, %w3
+    %big2 = sgt i32 %rem2, 32
+    %take = let i32
+    br %big2, @t32, @trem
+  @t32:
+    store i32 32, *%take
+    jmp @do_copy
+  @trem:
+    store i32 %rem2, *%take
+    jmp @do_copy
+  @do_copy:
+    %tv = load i32, *%take
+    %dst = gep i8, *%out, %w3
+    %t64 = sext i32 %tv to i64
+    call @memcpy(%dst, %hp, %t64)
+    %nw = add i32 %w3, %tv
+    store i32 %nw, *%written
+    %nc = load i32, *%counter
+    %ncn = add i32 %nc, 1
+    store i32 %ncn, *%counter
+    jmp @loop
+  @finished:
+    ret void
+}
+
+// Constant-time equality for the label hash.
+fun @_oaep_ct_eq(a: *i8, b: *i8, len: i32) -> i1 {
+  @entry:
+    %i = let i32
+    %acc = let i32
+    store i32 0, *%i
+    store i32 0, *%acc
+    jmp @cond
+  @cond:
+    %iv = load i32, *%i
+    %more = slt i32 %iv, %len
+    br %more, @body, @done
+  @body:
+    %pa = gep i8, *%a, %iv
+    %va = load i8, *%pa
+    %pb = gep i8, *%b, %iv
+    %vb = load i8, *%pb
+    %x = xor i8 %va, %vb
+    %xi = zext i8 %x to i32
+    %av = load i32, *%acc
+    %acc2 = or i32 %av, %xi
+    store i32 %acc2, *%acc
+    %n = add i32 %iv, 1
+    store i32 %n, *%i
+    jmp @cond
+  @done:
+    %af = load i32, *%acc
+    %z = eq i32 %af, 0
+    ret i1 %z
+}
+
+// Encrypt msg with RSAES-OAEP. Returns 0 on success, -1 on bad sizes.
+fun @std_crypto_rsa_encrypt_oaep_sha256(msg: *i8, msg_len: i32,
+                                        e: *i32, e_limbs: i32,
+                                        n: *i32, limbs: i32, ct: *i8) -> i32 {
+  @entry:
+    %k = shl i32 %limbs, 2
+    %k_ok = sge i32 %k, 66
+    br %k_ok, @m_ok, @fail
+  @m_ok:
+    %mneg = slt i32 %msg_len, 0
+    %max = sub i32 %k, 66
+    %mbig = sgt i32 %msg_len, %max
+    %mbad = or i1 %mneg, %mbig
+    br %mbad, @fail, @build
+  @build:
+    %dblen = sub i32 %k, 33
+    %db = let [i8, 512]
+    %dbp = gep i8, *%db, 0
+    %dl64 = sext i32 %dblen to i64
+    call @memset(%dbp, 0, %dl64)
+    // lHash = SHA256("") at DB[0..32]
+    %empty = let [i8, 1]
+    %ep = gep i8, *%empty, 0
+    store i8 0, *%ep
+    call @std_crypto_sha256_compute(%ep, 0, %dbp)
+    // DB = lHash || PS || 0x01 || msg
+    %sep_off = sub i32 %dblen, %msg_len
+    %sep_off2 = sub i32 %sep_off, 1
+    %sep = gep i8, *%dbp, %sep_off2
+    store i8 1, *%sep
+    %mpos = sgt i32 %msg_len, 0
+    br %mpos, @copy_msg, @seed
+  @copy_msg:
+    %mp = gep i8, *%dbp, %sep_off
+    %m64 = sext i32 %msg_len to i64
+    call @memcpy(%mp, %msg, %m64)
+    jmp @seed
+  @seed:
+    %seed = let [i8, 32]
+    %seedp = gep i8, *%seed, 0
+    call @c1_random_buf(%seedp, 32)
+    // maskedDB = DB xor MGF1(seed)
+    %dbmask = let [i8, 512]
+    %dbmp = gep i8, *%dbmask, 0
+    call @_oaep_mgf1(%seedp, 32, %dbmp, %dblen)
+    %i = let i32
+    store i32 0, *%i
+    jmp @xor1_cond
+  @xor1_cond:
+    %iv = load i32, *%i
+    %id = sge i32 %iv, %dblen
+    br %id, @xor1_done, @xor1_body
+  @xor1_body:
+    %iv2 = load i32, *%i
+    %p = gep i8, *%dbp, %iv2
+    %v = load i8, *%p
+    %mkp = gep i8, *%dbmp, %iv2
+    %mkv = load i8, *%mkp
+    %xo = xor i8 %v, %mkv
+    store i8 %xo, *%p
+    %ivn = add i32 %iv2, 1
+    store i32 %ivn, *%i
+    jmp @xor1_cond
+  @xor1_done:
+    // maskedSeed = seed xor MGF1(maskedDB)
+    %smask = let [i8, 32]
+    %smp = gep i8, *%smask, 0
+    call @_oaep_mgf1(%dbp, %dblen, %smp, 32)
+    %j = let i32
+    store i32 0, *%j
+    jmp @xor2_cond
+  @xor2_cond:
+    %jv = load i32, *%j
+    %jd = sge i32 %jv, 32
+    br %jd, @em, @xor2_body
+  @xor2_body:
+    %jv2 = load i32, *%j
+    %sp = gep i8, *%seedp, %jv2
+    %sv = load i8, *%sp
+    %skp = gep i8, *%smp, %jv2
+    %skv = load i8, *%skp
+    %sx = xor i8 %sv, %skv
+    store i8 %sx, *%sp
+    %jn = add i32 %jv2, 1
+    store i32 %jn, *%j
+    jmp @xor2_cond
+  @em:
+    // EM = 0x00 || maskedSeed || maskedDB
+    %em = let [i8, 512]
+    %emp = gep i8, *%em, 0
+    store i8 0, *%emp
+    %e1 = gep i8, *%emp, 1
+    call @memcpy(%e1, %seedp, 32)
+    %e33 = gep i8, *%emp, 33
+    %d64 = sext i32 %dblen to i64
+    call @memcpy(%e33, %dbp, %d64)
+    // ct = EM^e mod n
+    %m_bn = let [i32, 128]
+    %c_bn = let [i32, 128]
+    %mbp = gep i32, *%m_bn, 0
+    %cbp = gep i32, *%c_bn, 0
+    call @std_crypto_rsa_bn_from_bytes(%mbp, %emp, %k, %limbs)
+    call @std_crypto_rsa_bn_mod_pow_mont(%cbp, %mbp, %e, %e_limbs, %n, %limbs)
+    call @std_crypto_rsa_bn_to_bytes(%ct, %cbp, %k, %limbs)
+    ret i32 0
+  @fail:
+    ret i32 -1
+}
+
+// Decrypt an RSAES-OAEP ciphertext. Returns the message length, or -1 on
+// padding/format failure or when out is too small.
+fun @std_crypto_rsa_decrypt_oaep_sha256(ct: *i8, d: *i32, n: *i32, limbs: i32,
+                                        out: *i8, out_cap: i32) -> i32 {
+  @entry:
+    %k = shl i32 %limbs, 2
+    %k_ok = sge i32 %k, 66
+    br %k_ok, @rsa, @fail
+  @rsa:
+    %m_bn = let [i32, 128]
+    %c_bn = let [i32, 128]
+    %mbp = gep i32, *%m_bn, 0
+    %cbp = gep i32, *%c_bn, 0
+    call @std_crypto_rsa_bn_from_bytes(%cbp, %ct, %k, %limbs)
+    call @std_crypto_rsa_bn_mod_pow_mont(%mbp, %cbp, %d, %limbs, %n, %limbs)
+    %em = let [i8, 512]
+    %emp = gep i8, *%em, 0
+    call @std_crypto_rsa_bn_to_bytes(%emp, %mbp, %k, %limbs)
+    %lead = load i8, *%emp
+    %leadz = eq i8 %lead, 0
+    br %leadz, @split, @fail
+  @split:
+    %masked_seed = gep i8, *%emp, 1
+    %masked_db = gep i8, *%emp, 33
+    %dblen = sub i32 %k, 33
+    // seed = maskedSeed xor MGF1(maskedDB)
+    %seed = let [i8, 32]
+    %seedp = gep i8, *%seed, 0
+    %smask = let [i8, 32]
+    %smp = gep i8, *%smask, 0
+    call @_oaep_mgf1(%masked_db, %dblen, %smp, 32)
+    %i = let i32
+    store i32 0, *%i
+    jmp @seed_cond
+  @seed_cond:
+    %iv = load i32, *%i
+    %id = sge i32 %iv, 32
+    br %id, @db, @seed_body
+  @seed_body:
+    %iv2 = load i32, *%i
+    %sp = gep i8, *%masked_seed, %iv2
+    %sv = load i8, *%sp
+    %kkp = gep i8, *%smp, %iv2
+    %kkv = load i8, *%kkp
+    %sx = xor i8 %sv, %kkv
+    %dp = gep i8, *%seedp, %iv2
+    store i8 %sx, *%dp
+    %sn = add i32 %iv2, 1
+    store i32 %sn, *%i
+    jmp @seed_cond
+  @db:
+    // DB = maskedDB xor MGF1(seed)
+    %db = let [i8, 512]
+    %dbp = gep i8, *%db, 0
+    call @_oaep_mgf1(%seedp, 32, %dbp, %dblen)
+    %j = let i32
+    store i32 0, *%j
+    jmp @db_cond
+  @db_cond:
+    %jv = load i32, *%j
+    %jd = sge i32 %jv, %dblen
+    br %jd, @lhash, @db_body
+  @db_body:
+    %jv2 = load i32, *%j
+    %mdp = gep i8, *%masked_db, %jv2
+    %mdv = load i8, *%mdp
+    %dbkp = gep i8, *%dbp, %jv2
+    %dbkv = load i8, *%dbkp
+    %dx = xor i8 %mdv, %dbkv
+    store i8 %dx, *%dbkp
+    %jn = add i32 %jv2, 1
+    store i32 %jn, *%j
+    jmp @db_cond
+  @lhash:
+    %lhash = let [i8, 32]
+    %lhp = gep i8, *%lhash, 0
+    %empty = let [i8, 1]
+    %ep = gep i8, *%empty, 0
+    store i8 0, *%ep
+    call @std_crypto_sha256_compute(%ep, 0, %lhp)
+    %same = call @_oaep_ct_eq(%dbp, %lhp, 32)
+    br %same, @scan_init, @fail
+  @scan_init:
+    %pos = let i32
+    store i32 32, *%pos
+    jmp @scan_cond
+  @scan_cond:
+    %pv = load i32, *%pos
+    %pdone = sge i32 %pv, %dblen
+    br %pdone, @fail, @scan_body
+  @scan_body:
+    %pv2 = load i32, *%pos
+    %bp = gep i8, *%dbp, %pv2
+    %bv = load i8, *%bp
+    %is_sep = eq i8 %bv, 1
+    br %is_sep, @found, @scan_zero
+  @scan_zero:
+    %bz = eq i8 %bv, 0
+    br %bz, @scan_next, @fail
+  @scan_next:
+    %pv3 = load i32, *%pos
+    %pn = add i32 %pv3, 1
+    store i32 %pn, *%pos
+    jmp @scan_cond
+  @found:
+    %pv4 = load i32, *%pos
+    %msg_off = add i32 %pv4, 1
+    %msg_len = sub i32 %dblen, %msg_off
+    %fits = sle i32 %msg_len, %out_cap
+    br %fits, @out_copy, @fail
+  @out_copy:
+    %has = sgt i32 %msg_len, 0
+    br %has, @need_out, @done
+  @need_out:
+    %on = eq *i8 %out, null
+    br %on, @fail, @copy_out
+  @copy_out:
+    %src = gep i8, *%dbp, %msg_off
+    %m64 = sext i32 %msg_len to i64
+    call @memcpy(%out, %src, %m64)
+    jmp @done
+  @done:
+    ret i32 %msg_len
+  @fail:
+    ret i32 -1
+}

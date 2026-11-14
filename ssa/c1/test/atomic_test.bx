@@ -1,0 +1,112 @@
+// Test atomic instructions with memory ordering
+// Prints "AOK" on success, 'F' on failure.
+
+extern @putchar(c: i32) -> i32
+
+fun @main() -> i32 {
+  @entry:
+    %val = let i32
+
+    // ---- load atomic ----
+    store i32 'A', *%val
+    %r1 = load atomic i32, *%val, seq_cst
+    %ok1 = eq i32 %r1, 'A'
+    br %ok1, @t2, @fail
+
+  @t2:
+    // ---- store atomic ----
+    store atomic i32 'O', *%val, seq_cst
+    %r2 = load i32, *%val
+    %ok2 = eq i32 %r2, 'O'
+    br %ok2, @t3, @fail
+
+  @t3:
+    // ---- atomicrmw add ----
+    store i32 'A', *%val
+    %r3 = atomicrmw add, i32, *%val, 10, seq_cst
+    %ok3 = eq i32 %r3, 'A'
+    br %ok3, @t4, @fail
+
+  @t4:
+    %r4 = load i32, *%val
+    %ok4 = eq i32 %r4, 'K'    // 'A' + 10 = 'K'
+    br %ok4, @t5, @fail
+
+  @t5:
+    // ---- atomicrmw sub ----
+    store i32 'Z', *%val
+    %r5 = atomicrmw sub, i32, *%val, 10, seq_cst
+    %ok5 = eq i32 %r5, 'Z'
+    br %ok5, @t6, @fail
+
+  @t6:
+    // ---- atomicrmw and ----
+    store i32 63, *%val
+    %r6 = atomicrmw and, i32, *%val, 63, seq_cst
+    %ok6 = eq i32 %r6, 63
+    br %ok6, @t7, @fail
+
+  @t7:
+    // ---- atomicrmw or ----
+    %r7 = atomicrmw or, i32, *%val, 64, seq_cst
+    %ok7 = eq i32 %r7, 63
+    br %ok7, @t8, @fail
+
+  @t8:
+    %r8 = load i32, *%val
+    %ok8 = eq i32 %r8, 127
+    br %ok8, @t9, @fail
+
+  @t9:
+    // ---- atomicrmw xor ----
+    store i32 15, *%val
+    %r9 = atomicrmw xor, i32, *%val, 15, seq_cst
+    %ok9 = eq i32 %r9, 15
+    br %ok9, @t10, @fail
+
+  @t10:
+    %r10 = load i32, *%val
+    %ok10 = eq i32 %r10, 0
+    br %ok10, @t11, @fail
+
+  @t11:
+    // ---- atomicrmw xchg ----
+    store i32 42, *%val
+    %r11 = atomicrmw xchg, i32, *%val, 99, seq_cst
+    %ok11 = eq i32 %r11, 42
+    br %ok11, @t12, @fail
+
+  @t12:
+    %r12 = load i32, *%val
+    %ok12 = eq i32 %r12, 99
+    br %ok12, @t13, @fail
+
+  @t13:
+    // ---- cmpxchg ----
+    store i32 10, *%val
+    %cmp_ok = cmpxchg i32, *%val, 10, 20, seq_cst, seq_cst
+    br %cmp_ok, @t14, @fail
+
+  @t14:
+    %r14 = load i32, *%val
+    %ok14 = eq i32 %r14, 20
+    br %ok14, @t15, @fail
+
+  @t15:
+    // ---- cmpxchg failure case ----
+    %cmp_fail = cmpxchg i32, *%val, 99, 0, acquire, seq_cst
+    %not_ok = eq i1 %cmp_fail, 0
+    br %not_ok, @pass, @fail
+
+  @pass:
+    call @putchar('A')
+    call @putchar('O')
+    call @putchar('K')
+    call @putchar('\n')
+    ret i32 0
+
+  @fail:
+    call @putchar('F')
+    call @putchar('\n')
+    ret i32 1
+}

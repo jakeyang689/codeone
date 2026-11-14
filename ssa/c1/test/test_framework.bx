@@ -1,0 +1,13 @@
+// Test the c1 test framework itself.
+// c1 test discovers all @test_* functions and runs them.
+// Expected: 1 pass, 1 fail
+
+fun @test_pass() -> i32 {
+  @entry:
+    ret i32 0
+}
+
+fun @test_fail() -> i32 {
+  @entry:
+    ret i32 1
+}

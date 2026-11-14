@@ -1,0 +1,140 @@
+// Standard input/output/error streams.
+//
+// The FILE* handles come from ssa/platform/stdio.c, so programs must link the
+// platform library. Read/write helpers return byte counts or -1; write helpers
+// loop until everything is written.
+
+extern @c1_stdio_stdin() -> *i8
+extern @c1_stdio_stdout() -> *i8
+extern @c1_stdio_stderr() -> *i8
+extern @fread(buf: *i8, size: i64, count: i64, fp: *i8) -> i64
+extern @fwrite(buf: *i8, size: i64, count: i64, fp: *i8) -> i64
+extern @fgetc(fp: *i8) -> i32
+extern @fflush(fp: *i8) -> i32
+
+fun @std_io_stdio_stdin() -> *i8 {
+  @entry:
+    %fp = call @c1_stdio_stdin()
+    ret *i8 %fp
+}
+
+fun @std_io_stdio_stdout() -> *i8 {
+  @entry:
+    %fp = call @c1_stdio_stdout()
+    ret *i8 %fp
+}
+
+fun @std_io_stdio_stderr() -> *i8 {
+  @entry:
+    %fp = call @c1_stdio_stderr()
+    ret *i8 %fp
+}
+
+fun @_stdio_write(fp: *i8, buf: *i8, len: i32) -> i32 {
+  @entry:
+    %neg = slt i32 %len, 0
+    br %neg, @fail, @init
+  @init:
+    %off = let i32
+    store i32 0, *%off
+    jmp @loop
+  @loop:
+    %ov = load i32, *%off
+    %rem = sub i32 %len, %ov
+    %done = sle i32 %rem, 0
+    br %done, @ok, @write
+  @write:
+    %ov2 = load i32, *%off
+    %src = gep i8, *%buf, %ov2
+    %rem64 = sext i32 %rem to i64
+    %r = call @fwrite(%src, 1, %rem64, %fp)
+    %got = trunc i64 %r to i32
+    %z = sle i32 %got, 0
+    br %z, @fail, @adv
+  @adv:
+    %ov3 = load i32, *%off
+    %no = add i32 %ov3, %got
+    store i32 %no, *%off
+    jmp @loop
+  @ok:
+    ret i32 0
+  @fail:
+    ret i32 -1
+}
+
+// Write to stdout. Returns 0 or -1.
+fun @std_io_stdio_write(buf: *i8, len: i32) -> i32 {
+  @entry:
+    %fp = call @c1_stdio_stdout()
+    %r = call @_stdio_write(%fp, %buf, %len)
+    ret i32 %r
+}
+
+// Write to stderr. Returns 0 or -1.
+fun @std_io_stdio_write_err(buf: *i8, len: i32) -> i32 {
+  @entry:
+    %fp = call @c1_stdio_stderr()
+    %r = call @_stdio_write(%fp, %buf, %len)
+    ret i32 %r
+}
+
+// Read up to cap bytes from stdin. Returns bytes read (0 at EOF) or -1.
+fun @std_io_stdio_read(buf: *i8, cap: i32) -> i32 {
+  @entry:
+    %bad = sle i32 %cap, 0
+    br %bad, @fail, @read
+  @read:
+    %fp = call @c1_stdio_stdin()
+    %cap64 = sext i32 %cap to i64
+    %r = call @fread(%buf, 1, %cap64, %fp)
+    %n = trunc i64 %r to i32
+    ret i32 %n
+  @fail:
+    ret i32 -1
+}
+
+// Read one line from stdin (including '\n') or up to cap-1 bytes.
+// Returns the length, 0 at EOF, or -1 when cap <= 0.
+fun @std_io_stdio_read_line(buf: *i8, cap: i32) -> i32 {
+  @entry:
+    %room = sub i32 %cap, 1
+    %bad = slt i32 %room, 0
+    br %bad, @fail, @init
+  @init:
+    %fp = call @c1_stdio_stdin()
+    %off = let i32
+    store i32 0, *%off
+    jmp @loop
+  @loop:
+    %ov = load i32, *%off
+    %full = sge i32 %ov, %room
+    br %full, @finish, @getc
+  @getc:
+    %c = call @fgetc(%fp)
+    %eof = slt i32 %c, 0
+    br %eof, @finish, @store
+  @store:
+    %ov2 = load i32, *%off
+    %bp = gep i8, *%buf, %ov2
+    %c8 = trunc i32 %c to i8
+    store i8 %c8, *%bp
+    %no = add i32 %ov2, 1
+    store i32 %no, *%off
+    %isnl = eq i32 %c, 10
+    br %isnl, @finish, @loop
+  @finish:
+    %of = load i32, *%off
+    %zp = gep i8, *%buf, %of
+    store i8 0, *%zp
+    ret i32 %of
+  @fail:
+    ret i32 -1
+}
+
+// Flush stdout. Returns 0 or -1.
+fun @std_io_stdio_flush() -> i32 {
+  @entry:
+    %fp = call @c1_stdio_stdout()
+    %r = call @fflush(%fp)
+    ret i32 %r
+}

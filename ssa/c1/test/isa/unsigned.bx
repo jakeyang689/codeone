@@ -1,0 +1,78 @@
+// udiv / urem / mulhi semantics, including values above 2^63.
+
+extern @printf(fmt: *i8, ...) -> i32
+extern @malloc(n: i64) -> *i8
+
+fun @main() -> i32 {
+  @entry:
+    %id = let i32
+    store i32 0, *%id
+
+    %q1 = udiv i64 100, 7
+    %c1 = eq i64 %q1, 14
+    br %c1, @t1, @fail
+  @t1:
+    store i32 1, *%id
+    %r1 = urem i64 100, 7
+    %c2 = eq i64 %r1, 2
+    br %c2, @t2, @fail
+
+  @t2:
+    store i32 2, *%id
+    // -1 is the largest u64; dividing it must not be treated as signed
+    %m = sub i64 0, 1
+    %q2 = udiv i64 %m, 2
+    %c3 = eq i64 %q2, 0x7FFFFFFFFFFFFFFF
+    br %c3, @t3, @fail
+
+  @t3:
+    store i32 3, *%id
+    %r2 = urem i64 %m, 2
+    %c4 = eq i64 %r2, 1
+    br %c4, @t4, @fail
+
+  @t4:
+    store i32 4, *%id
+    // mulhi of (2^32)^2 is 1, low half is 0
+    %buf = call @malloc(24)
+    %bp = gep i8, *%buf, 0
+    store i64 0x100000000, *%bp
+    %bp2 = gep i8, *%buf, 8
+    store i64 0x100000000, *%bp2
+    %x1 = load i64, *%bp
+    %x2 = load i64, *%bp2
+    %h1 = mulhi i64 %x1, %x2
+    %c5 = eq i64 %h1, 1
+    br %c5, @t5, @fail
+
+  @t5:
+    store i32 5, *%id
+    // 0xFFFFFFFF * 0xFFFFFFFF = 0xFFFFFFFE00000001, high half is 0
+    %bp3 = gep i8, *%buf, 16
+    store i64 0xFFFFFFFF, *%bp3
+    %x3 = load i64, *%bp3
+    %h2 = mulhi i64 %x3, %x3
+    %c6 = eq i64 %h2, 0
+    br %c6, @t6, @fail
+
+  @t6:
+    store i32 6, *%id
+    // (2^62) * 4 = 2^64, high half is 1
+    %bp4 = gep i8, *%buf, 0
+    store i64 0x4000000000000000, *%bp4
+    %bp5 = gep i8, *%buf, 8
+    store i64 4, *%bp5
+    %x4 = load i64, *%bp4
+    %x5 = load i64, *%bp5
+    %h3 = mulhi i64 %x4, %x5
+    %c7 = eq i64 %h3, 1
+    br %c7, @pass, @fail
+
+  @pass:
+    call @printf("PASS isa/unsigned\n")
+    ret i32 0
+  @fail:
+    %n = load i32, *%id
+    call @printf("FAIL isa/unsigned at case %d\n", %n)
+    ret i32 1
+}

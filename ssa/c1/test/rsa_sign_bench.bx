@@ -1,0 +1,37 @@
+// RSA-2048 private-key exponentiation timing (no CRT, full 2048-bit d).
+extern @printf(fmt: *i8, ...) -> i32
+extern @clock() -> i64
+extern @std_crypto_rsa_bn_random(r: *i32, limbs: i32) -> void
+extern @std_crypto_rsa_decrypt(m: *i32, c: *i32, d_key: *i32, n_mod: *i32, limbs: i32) -> void
+
+fun @main() -> i32 {
+  @entry:
+    %n = let [i32, 64]
+    %c = let [i32, 64]
+    %d = let [i32, 64]
+    %m = let [i32, 64]
+    %np = gep i32, *%n, 0
+    %cp = gep i32, *%c, 0
+    %dp = gep i32, *%d, 0
+    %mp = gep i32, *%m, 0
+
+    call @std_crypto_rsa_bn_random(%np, 64)
+    %n0p = gep i32, *%np, 0
+    %n0 = load i32, *%n0p
+    %n0o = or i32 %n0, 1
+    store i32 %n0o, *%n0p
+    %ntp = gep i32, *%np, 63
+    %nt = load i32, *%ntp
+    %nto = or i32 %nt, 0x80000000
+    store i32 %nto, *%ntp
+
+    call @std_crypto_rsa_bn_random(%cp, 64)
+    call @std_crypto_rsa_bn_random(%dp, 64)
+
+    %t0 = call @clock()
+    call @std_crypto_rsa_decrypt(%mp, %cp, %dp, %np, 64)
+    %t1 = call @clock()
+    %us = sub i64 %t1, %t0
+    call @printf("RSA-2048 private op: %lld us\n", %us)
+    ret i32 0
+}

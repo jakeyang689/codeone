@@ -1,0 +1,798 @@
+// HKDF (HMAC-based Key Derivation Function) — RFC 5869
+// Implementations: HKDF-Extract + HKDF-Expand for SHA-256
+// TLS 1.3 uses HKDF-Expand-Label on top of this raw HKDF
+
+extern @memset(s: *i8, c: i32, n: i64) -> *i8
+extern @memcpy(dst: *i8, src: *i8, n: i64) -> *i8
+extern @std_crypto_hmac_sha256(key: *i8, key_len: i32, data: *i8, data_len: i32, mac: *i8) -> void
+
+
+// ============================================================
+// HKDF-Extract (SHA-256)
+// ============================================================
+// PRK = HMAC-SHA256(salt, IKM)
+// If salt_len == 0, use 32 zero bytes as the salt
+
+fun @std_crypto_hkdf_extract_sha256(salt: *i8, salt_len: i32, ikm: *i8, ikm_len: i32, prk: *i8) -> void {
+  @entry:
+    %has_salt = sgt i32 %salt_len, 0
+    br %has_salt, @use_salt, @use_zero_salt
+
+  @use_salt:
+    call @std_crypto_hmac_sha256(%salt, %salt_len, %ikm, %ikm_len, %prk)
+    ret void
+
+  @use_zero_salt:
+    %zero_salt = let [i8, 32]
+    %zero_salt_p = gep i8, *%zero_salt, 0
+    %n32 = let i64
+    store i64 32, *%n32
+    %n32v = load i64, *%n32
+    call @memset(%zero_salt_p, 0, %n32v)
+    call @std_crypto_hmac_sha256(%zero_salt_p, 32, %ikm, %ikm_len, %prk)
+    ret void
+}
+
+
+// ============================================================
+// HKDF-Expand (SHA-256)
+// ============================================================
+// OKM = T(1) || T(2) || ... || T(N)
+// T(i) = HMAC-SHA256(PRK, T(i-1) || info || i)
+// T(0) = empty (zero-length string)
+// N = ceil(out_len / 32), must be ≤ 255
+
+fun @std_crypto_hkdf_expand_sha256(prk: *i8, info: *i8, info_len: i32, out_len: i32, okm: *i8) -> void {
+  @entry:
+    %no_output = sle i32 %out_len, 0
+    br %no_output, @expand_done, @expand_start
+
+  @expand_start:
+    %buf = let [i8, 256]
+    %buf_p = gep i8, *%buf, 0
+    %prev_T = let [i8, 32]
+    %prev_T_p = gep i8, *%prev_T, 0
+    %cur_T = let [i8, 32]
+    %cur_T_p = gep i8, *%cur_T, 0
+    %n32e = let i64
+    store i64 32, *%n32e
+
+    // prev_T_len: length of prev_T data (0 for first iteration)
+    %pt_len = let i32
+    store i32 0, *%pt_len
+
+    // rem_ptr = remaining output bytes
+    %rem_ptr = let i32
+    store i32 %out_len, *%rem_ptr
+    // out_ptr = current output position
+    %out_ptr = let i32
+    store i32 0, *%out_ptr
+    // counter
+    %ctr = let i32
+    store i32 1, *%ctr
+    jmp @exp_cond
+
+  @exp_cond:
+    %rem = load i32, *%rem_ptr
+    %has_more = sgt i32 %rem, 0
+    br %has_more, @exp_body, @expand_done
+
+  @exp_body:
+    // Build buf = prev_T || info || counter_byte
+    %pt_len_v = load i32, *%pt_len
+
+    // Copy prev_T (pt_len_v bytes) to buf[0..pt_len_v-1]
+    %pt_len_64 = sext i32 %pt_len_v to i64
+    call @memcpy(%buf_p, %prev_T_p, %pt_len_64)
+
+    // Copy info to buf[pt_len_v..pt_len_v+info_len-1]
+    %info_off = gep i8, *%buf_p, %pt_len_v
+    %info_len_64 = sext i32 %info_len to i64
+    call @memcpy(%info_off, %info, %info_len_64)
+
+    // Write counter at buf[pt_len_v + info_len]
+    %counter_off = add i32 %pt_len_v, %info_len
+    %cb_p = gep i8, *%buf_p, %counter_off
+    %ctr_v = load i32, *%ctr
+    %ctr_byte = trunc i32 %ctr_v to i8
+    store i8 %ctr_byte, *%cb_p
+
+    // Total input length = pt_len_v + info_len + 1
+    %input_len = add i32 %pt_len_v, %info_len
+    %input_total = add i32 %input_len, 1
+
+    // T(i) = HMAC-SHA256(PRK, buf[0..input_total])
+    call @std_crypto_hmac_sha256(%prk, 32, %buf_p, %input_total, %cur_T_p)
+
+    // Copy to output: min(32, rem) bytes
+    %rem_v2 = load i32, *%rem_ptr
+    %full_block = sge i32 %rem_v2, 32
+    br %full_block, @copy_full_block, @copy_partial_block
+
+  @copy_full_block:
+    %out_pos = load i32, *%out_ptr
+    %out_dst = gep i8, *%okm, %out_pos
+    %n32e3 = load i64, *%n32e
+    call @memcpy(%out_dst, %cur_T_p, %n32e3)
+    %new_rem = sub i32 %rem_v2, 32
+    %new_pos = add i32 %out_pos, 32
+    store i32 %new_rem, *%rem_ptr
+    store i32 %new_pos, *%out_ptr
+
+    // prev_T = cur_T, prev_T_len = 32 for next iteration
+    call @memcpy(%prev_T_p, %cur_T_p, %n32e3)
+    store i32 32, *%pt_len
+
+    // counter++
+    %ctr_v2 = load i32, *%ctr
+    %ctr_next = add i32 %ctr_v2, 1
+    store i32 %ctr_next, *%ctr
+    jmp @exp_cond
+
+  @copy_partial_block:
+    // Copy only rem bytes from cur_T
+    %out_pos2 = load i32, *%out_ptr
+    %out_dst2 = gep i8, *%okm, %out_pos2
+    %rem_64 = sext i32 %rem_v2 to i64
+    call @memcpy(%out_dst2, %cur_T_p, %rem_64)
+
+    // Set rem to 0 to exit
+    store i32 0, *%rem_ptr
+    jmp @exp_cond
+
+  @expand_done: ret void
+}
+
+
+// ============================================================
+// HKDF-Expand-Label — TLS 1.3 key derivation (RFC 8446 §7.1)
+// ============================================================
+// HkdfLabel = length(2) || label_len(1) || "tls13 "||Label || context_len(1) || Context
+// Output = HKDF-Expand(Secret, HkdfLabel, Length)
+
+fun @std_crypto_hkdf_expand_label_sha256(secret: *i8, label: *i8, label_len: i32,
+                                          context: *i8, context_len: i32,
+                                          out_len: i32, out: *i8) -> void {
+  @entry:
+    // Build HkdfLabel in a temp buffer
+    // Format: length(2) || label_len(1) || "tls13 " || label || context_len(1) || context
+    %prefix_len = add i32 6, %label_len
+    // 2-byte length + 1-byte label_len + label + 1-byte context_len + context
+    %total = add i32 4, %prefix_len
+    %total2 = add i32 %total, %context_len
+    %buf = let [i8, 256]
+    %buf_p = gep i8, *%buf, 0
+
+    // Write length (2 bytes, big-endian)
+    %len_hi = lshr i32 %out_len, 8
+    %len_hi_b = trunc i32 %len_hi to i8
+    %len_lo = trunc i32 %out_len to i8
+    store i8 %len_hi_b, *%buf_p
+    %blen1 = gep i8, *%buf_p, 1
+    store i8 %len_lo, *%blen1
+
+    // Write label_len = 7 + label_len
+    %ll = add i32 6, %label_len
+    %ll_b = trunc i32 %ll to i8
+    %blen2 = gep i8, *%buf_p, 2
+    store i8 %ll_b, *%blen2
+
+    // Write "tls13 " prefix (7 bytes)
+    %tls13 = gep i8, *%buf_p, 3
+    store i8 0x74, *%tls13       // 't'
+    %t1 = gep i8, *%buf_p, 4
+    store i8 0x6c, *%t1          // 'l'
+    %t2 = gep i8, *%buf_p, 5
+    store i8 0x73, *%t2          // 's'
+    %t3 = gep i8, *%buf_p, 6
+    store i8 0x31, *%t3          // '1'
+    %t4 = gep i8, *%buf_p, 7
+    store i8 0x33, *%t4          // '3'
+    %t5 = gep i8, *%buf_p, 8
+    store i8 0x20, *%t5          // ' '
+
+    // Copy label after prefix
+    %label_off = add i32 0, 9
+    %li = let i32
+    store i32 0, *%li
+    jmp @hl_cond
+  @hl_cond:
+    %liv = load i32, *%li
+    %more = slt i32 %liv, %label_len
+    br %more, @hl_body, @hl_done
+  @hl_body:
+    %liv2 = load i32, *%li
+    %src = gep i8, *%label, %liv2
+    %sv = load i8, *%src
+    %off = add i32 %label_off, %liv2
+    %dst = gep i8, *%buf_p, %off
+    store i8 %sv, *%dst
+    %next = add i32 %liv2, 1
+    store i32 %next, *%li
+    jmp @hl_cond
+  @hl_done:
+    // Write context_len
+    %ctx_off = add i32 %label_off, %label_len
+    %ctx_len_b = trunc i32 %context_len to i8
+    %ctx_len_p = gep i8, *%buf_p, %ctx_off
+    store i8 %ctx_len_b, *%ctx_len_p
+
+    // Copy context
+    %ctx_data_off = add i32 %ctx_off, 1
+    %ci = let i32
+    store i32 0, *%ci
+    jmp @hl_ctx_cond
+  @hl_ctx_cond:
+    %civ = load i32, *%ci
+    %cmore = slt i32 %civ, %context_len
+    br %cmore, @hl_ctx_body, @hl_ctx_done
+  @hl_ctx_body:
+    %civ2 = load i32, *%ci
+    %csrc = gep i8, *%context, %civ2
+    %csv = load i8, *%csrc
+    %coff = add i32 %ctx_data_off, %civ2
+    %cdst = gep i8, *%buf_p, %coff
+    store i8 %csv, *%cdst
+    %cnext = add i32 %civ2, 1
+    store i32 %cnext, *%ci
+    jmp @hl_ctx_cond
+  @hl_ctx_done:
+    // Call HKDF-Expand with the HkdfLabel as info
+    call @std_crypto_hkdf_expand_sha256(%secret, %buf_p, %total2, %out_len, %out)
+    ret void
+}
+
+
+// Derive-Secret for TLS 1.3 (RFC 8446 §7.1)
+// Derive-Secret(Secret, Label, Messages) =
+//   HKDF-Expand-Label(Secret, Label, Transcript-Hash, Hash.length)
+// Hash.length = 32 for SHA-256
+
+fun @std_crypto_tls13_derive_secret_sha256(secret: *i8, label: *i8, label_len: i32,
+                                            transcript_hash: *i8, out: *i8) -> void {
+  @entry:
+    call @std_crypto_hkdf_expand_label_sha256(%secret, %label, %label_len,
+                                               %transcript_hash, 32, 32, %out)
+    ret void
+}
+
+
+// ============================================================
+// HKDF-SHA384 — RFC 5869 (SHA-384 variant)
+// ============================================================
+
+extern @std_crypto_hmac_sha384(key: *i8, key_len: i32, data: *i8, data_len: i32, mac: *i8) -> void
+extern @std_crypto_sha256_compute(data: *i8, len: i32, digest: *i8) -> void
+extern @std_crypto_sha384_compute(data: *i8, len: i32, digest: *i8) -> void
+
+// HKDF-Extract (SHA-384): PRK = HMAC-SHA384(salt, IKM)
+// If salt_len == 0, use 48 zero bytes as the salt
+fun @std_crypto_hkdf_extract_sha384(salt: *i8, salt_len: i32, ikm: *i8, ikm_len: i32, prk: *i8) -> void {
+  @entry:
+    %has_salt = sgt i32 %salt_len, 0
+    br %has_salt, @use_salt_384, @use_zero_salt_384
+
+  @use_salt_384:
+    call @std_crypto_hmac_sha384(%salt, %salt_len, %ikm, %ikm_len, %prk)
+    ret void
+
+  @use_zero_salt_384:
+    %zero_salt = let [i8, 48]
+    %zero_salt_p = gep i8, *%zero_salt, 0
+    %n48 = let i64
+    store i64 48, *%n48
+    %n48v = load i64, *%n48
+    call @memset(%zero_salt_p, 0, %n48v)
+    call @std_crypto_hmac_sha384(%zero_salt_p, 48, %ikm, %ikm_len, %prk)
+    ret void
+}
+
+// HKDF-Expand (SHA-384): OKM = T(1) || T(2) || ... || T(N)
+// T(i) = HMAC-SHA384(PRK, T(i-1) || info || i)
+// Each T(i) is 48 bytes (SHA-384 digest size)
+// N = ceil(out_len / 48), must be ≤ 255
+fun @std_crypto_hkdf_expand_sha384(prk: *i8, info: *i8, info_len: i32, out_len: i32, okm: *i8) -> void {
+  @entry:
+    %no_output = sle i32 %out_len, 0
+    br %no_output, @exp_done_384, @exp_start_384
+
+  @exp_start_384:
+    %buf = let [i8, 256]
+    %buf_p = gep i8, *%buf, 0
+    %prev_T = let [i8, 48]
+    %prev_T_p = gep i8, *%prev_T, 0
+    %cur_T = let [i8, 48]
+    %cur_T_p = gep i8, *%cur_T, 0
+    %n48e = let i64
+    store i64 48, *%n48e
+
+    %pt_len = let i32
+    store i32 0, *%pt_len
+    %rem_ptr = let i32
+    store i32 %out_len, *%rem_ptr
+    %out_ptr = let i32
+    store i32 0, *%out_ptr
+    %ctr = let i32
+    store i32 1, *%ctr
+    jmp @exp_cond_384
+
+  @exp_cond_384:
+    %rem = load i32, *%rem_ptr
+    %has_more = sgt i32 %rem, 0
+    br %has_more, @exp_body_384, @exp_done_384
+
+  @exp_body_384:
+    %pt_len_v = load i32, *%pt_len
+    %pt_len_64 = sext i32 %pt_len_v to i64
+    call @memcpy(%buf_p, %prev_T_p, %pt_len_64)
+    %info_off = gep i8, *%buf_p, %pt_len_v
+    %info_len_64 = sext i32 %info_len to i64
+    call @memcpy(%info_off, %info, %info_len_64)
+    %counter_off = add i32 %pt_len_v, %info_len
+    %cb_p = gep i8, *%buf_p, %counter_off
+    %ctr_v = load i32, *%ctr
+    %ctr_byte = trunc i32 %ctr_v to i8
+    store i8 %ctr_byte, *%cb_p
+    %input_len = add i32 %pt_len_v, %info_len
+    %input_total = add i32 %input_len, 1
+    call @std_crypto_hmac_sha384(%prk, 48, %buf_p, %input_total, %cur_T_p)
+
+    %rem_v2 = load i32, *%rem_ptr
+    %full_block = sge i32 %rem_v2, 48
+    br %full_block, @copy_full_384, @copy_part_384
+
+  @copy_full_384:
+    %out_pos = load i32, *%out_ptr
+    %out_dst = gep i8, *%okm, %out_pos
+    %n48e3 = load i64, *%n48e
+    call @memcpy(%out_dst, %cur_T_p, %n48e3)
+    %new_rem = sub i32 %rem_v2, 48
+    %new_pos = add i32 %out_pos, 48
+    store i32 %new_rem, *%rem_ptr
+    store i32 %new_pos, *%out_ptr
+    call @memcpy(%prev_T_p, %cur_T_p, %n48e3)
+    store i32 48, *%pt_len
+    %ctr_v2 = load i32, *%ctr
+    %ctr_next = add i32 %ctr_v2, 1
+    store i32 %ctr_next, *%ctr
+    jmp @exp_cond_384
+
+  @copy_part_384:
+    %out_pos2 = load i32, *%out_ptr
+    %out_dst2 = gep i8, *%okm, %out_pos2
+    %rem_64 = sext i32 %rem_v2 to i64
+    call @memcpy(%out_dst2, %cur_T_p, %rem_64)
+    store i32 0, *%rem_ptr
+    jmp @exp_cond_384
+
+  @exp_done_384: ret void
+}
+
+
+// ============================================================
+// HKDF-Expand-Label (SHA-384) — TLS 1.3 RFC 8446 §7.1
+// ============================================================
+
+fun @std_crypto_hkdf_expand_label_sha384(secret: *i8, label: *i8, label_len: i32,
+                                          context: *i8, context_len: i32,
+                                          out_len: i32, out: *i8) -> void {
+  @entry:
+    %prefix_len = add i32 6, %label_len
+    // 2-byte length + 1-byte label_len + label + 1-byte context_len + context
+    %total = add i32 4, %prefix_len
+    %total2 = add i32 %total, %context_len
+    %buf = let [i8, 256]
+    %buf_p = gep i8, *%buf, 0
+
+    %len_hi = lshr i32 %out_len, 8
+    %len_hi_b = trunc i32 %len_hi to i8
+    %len_lo = trunc i32 %out_len to i8
+    store i8 %len_hi_b, *%buf_p
+    %blen1 = gep i8, *%buf_p, 1
+    store i8 %len_lo, *%blen1
+
+    %ll = add i32 6, %label_len
+    %ll_b = trunc i32 %ll to i8
+    %blen2 = gep i8, *%buf_p, 2
+    store i8 %ll_b, *%blen2
+
+    // Write "tls13 " prefix (7 bytes)
+    %tls13 = gep i8, *%buf_p, 3
+    store i8 0x74, *%tls13
+    %t1 = gep i8, *%buf_p, 4
+    store i8 0x6c, *%t1
+    %t2 = gep i8, *%buf_p, 5
+    store i8 0x73, *%t2
+    %t3 = gep i8, *%buf_p, 6
+    store i8 0x31, *%t3
+    %t4 = gep i8, *%buf_p, 7
+    store i8 0x33, *%t4
+    %t5 = gep i8, *%buf_p, 8
+    store i8 0x20, *%t5
+
+    %label_off = add i32 0, 9
+    %li = let i32
+    store i32 0, *%li
+    jmp @hl_cond_384
+  @hl_cond_384:
+    %liv = load i32, *%li
+    %more = slt i32 %liv, %label_len
+    br %more, @hl_body_384, @hl_done_384
+  @hl_body_384:
+    %liv2 = load i32, *%li
+    %src = gep i8, *%label, %liv2
+    %sv = load i8, *%src
+    %off = add i32 %label_off, %liv2
+    %dst = gep i8, *%buf_p, %off
+    store i8 %sv, *%dst
+    %next = add i32 %liv2, 1
+    store i32 %next, *%li
+    jmp @hl_cond_384
+  @hl_done_384:
+    %ctx_off = add i32 %label_off, %label_len
+    %ctx_len_b = trunc i32 %context_len to i8
+    %ctx_len_p = gep i8, *%buf_p, %ctx_off
+    store i8 %ctx_len_b, *%ctx_len_p
+    %ctx_data_off = add i32 %ctx_off, 1
+    %ci = let i32
+    store i32 0, *%ci
+    jmp @hl_ctx_cond_384
+  @hl_ctx_cond_384:
+    %civ = load i32, *%ci
+    %cmore = slt i32 %civ, %context_len
+    br %cmore, @hl_ctx_body_384, @hl_ctx_done_384
+  @hl_ctx_body_384:
+    %civ2 = load i32, *%ci
+    %csrc = gep i8, *%context, %civ2
+    %csv = load i8, *%csrc
+    %coff = add i32 %ctx_data_off, %civ2
+    %cdst = gep i8, *%buf_p, %coff
+    store i8 %csv, *%cdst
+    %cnext = add i32 %civ2, 1
+    store i32 %cnext, *%ci
+    jmp @hl_ctx_cond_384
+  @hl_ctx_done_384:
+    call @std_crypto_hkdf_expand_sha384(%secret, %buf_p, %total2, %out_len, %out)
+    ret void
+}
+
+// Derive-Secret for TLS 1.3 (SHA-384 variant)
+// Hash.length = 48 for SHA-384
+fun @std_crypto_tls13_derive_secret_sha384(secret: *i8, label: *i8, label_len: i32,
+                                            transcript_hash: *i8, out: *i8) -> void {
+  @entry:
+    call @std_crypto_hkdf_expand_label_sha384(%secret, %label, %label_len,
+                                               %transcript_hash, 48, 48, %out)
+    ret void
+}
+
+
+// ============================================================
+// TLS 1.3 Full Key Schedule — RFC 8446 §7.1
+// ============================================================
+// Chain: early_secret → handshake_secret → master_secret → traffic secrets
+// Each Derive-Secret incorporates the transcript hash at the appropriate stage.
+
+// TLS 1.3 label constants — labels used in key schedule derivation
+const @_tls13_label_derived: [i8, 7] = [100, 101, 114, 105, 118, 101, 100]   // "derived"
+const @_tls13_label_c_hs_traffic: [i8, 12] = [99, 32, 104, 115, 32, 116, 114, 97, 102, 102, 105, 99]
+const @_tls13_label_s_hs_traffic: [i8, 12] = [115, 32, 104, 115, 32, 116, 114, 97, 102, 102, 105, 99]
+const @_tls13_label_c_ap_traffic: [i8, 12] = [99, 32, 97, 112, 32, 116, 114, 97, 102, 102, 105, 99]
+const @_tls13_label_s_ap_traffic: [i8, 12] = [115, 32, 97, 112, 32, 116, 114, 97, 102, 102, 105, 99]
+const @_tls13_label_exp_master: [i8, 10] = [101, 120, 112, 32, 109, 97, 115, 116, 101, 114]
+const @_tls13_label_key: [i8, 3] = [107, 101, 121]
+const @_tls13_label_iv: [i8, 2] = [105, 118]
+const @_tls13_label_res_binder: [i8, 10] = [114, 101, 115, 32, 98, 105, 110, 100, 101, 114]
+const @_tls13_label_early: [i8, 5] = [101, 97, 114, 108, 121]
+const @_tls13_label_handshake: [i8, 9] = [104, 97, 110, 100, 115, 104, 97, 107, 101]
+const @_tls13_label_master: [i8, 6] = [109, 97, 115, 116, 101, 114]
+const @_tls13_label_finished: [i8, 8] = [102, 105, 110, 105, 115, 104, 101, 100]
+
+
+// ============================================================
+// TLS 1.3 Early Secret (SHA-256)
+// ============================================================
+// early_secret = HKDF-Extract(salt=0, ikm=PSK)
+// For PSK=0 (no PSK): early_secret = HKDF-Extract(salt=32-zeros, ikm=32-zeros)
+// In practice: Derive-Secret(0, "early", "") = HKDF-Expand-Label(0, "early", "", 32)
+//   where 0 is a string of Hash.length (32) zero bytes
+
+fun @std_crypto_tls13_early_secret_sha256(psk: *i8, psk_len: i32, out: *i8) -> void {
+  @entry:
+    %has_psk = sgt i32 %psk_len, 0
+    br %has_psk, @early_with_psk_256, @early_no_psk_256
+
+  @early_with_psk_256:
+    // early_secret = HKDF-Extract(salt=0, ikm=PSK)
+    %zero_salt = let [i8, 32]
+    %zero_salt_p = gep i8, *%zero_salt, 0
+    %n32 = let i64
+    store i64 32, *%n32
+    %n32v = load i64, *%n32
+    call @memset(%zero_salt_p, 0, %n32v)
+    call @std_crypto_hkdf_extract_sha256(%zero_salt_p, 32, %psk, %psk_len, %out)
+    ret void
+
+  @early_no_psk_256:
+    // No PSK: early_secret = HKDF-Extract(salt=0, IKM="")
+    %zero_out = let [i8, 32]
+    %zero_out_p = gep i8, *%zero_out, 0
+    %n32b = let i64
+    store i64 32, *%n32b
+    %n32bv = load i64, *%n32b
+    call @memset(%zero_out_p, 0, %n32bv)
+    // IKM is Hash.length zero bytes when no PSK is used.
+    call @std_crypto_hkdf_extract_sha256(%zero_out_p, 32, %zero_out_p, 32, %out)
+    ret void
+}
+
+
+// ============================================================
+// TLS 1.3 Handshake Secret (SHA-256)
+// ============================================================
+// handshake_secret = HKDF-Extract(
+//     HKDF-Expand-Label(early_secret, "derived", "", 32),
+//     ECDHE_shared_secret)
+
+fun @std_crypto_tls13_handshake_secret_sha256(early_secret: *i8, ecdhe_secret: *i8,
+                                               ecdhe_len: i32, out: *i8) -> void {
+  @entry:
+    // derived = HKDF-Expand-Label(early_secret, "derived", "", 32)
+    %derived = let [i8, 32]
+    %derived_p = gep i8, *%derived, 0
+    %empty = let [i8, 0]
+    %empty_p = gep i8, *%empty, 0
+    // Derive-Secret(., "derived", "") uses Hash("") as the context.
+    %eh = let [i8, 32]
+    %ehp = gep i8, *%eh, 0
+    call @std_crypto_sha256_compute(%empty_p, 0, %ehp)
+    %label_p = gep i8, *@_tls13_label_derived, 0
+    call @std_crypto_hkdf_expand_label_sha256(%early_secret, %label_p, 7, %ehp, 32, 32, %derived_p)
+
+    // handshake_secret = HKDF-Extract(derived, ECDHE_shared_secret)
+    call @std_crypto_hkdf_extract_sha256(%derived_p, 32, %ecdhe_secret, %ecdhe_len, %out)
+    ret void
+}
+
+
+// ============================================================
+// TLS 1.3 Master Secret (SHA-256)
+// ============================================================
+// master_secret = HKDF-Extract(
+//     HKDF-Expand-Label(handshake_secret, "derived", "", 32),
+//     0)
+
+fun @std_crypto_tls13_master_secret_sha256(handshake_secret: *i8, out: *i8) -> void {
+  @entry:
+    // derived = HKDF-Expand-Label(handshake_secret, "derived", "", 32)
+    %derived = let [i8, 32]
+    %derived_p = gep i8, *%derived, 0
+    %empty = let [i8, 0]
+    %empty_p = gep i8, *%empty, 0
+    %eh = let [i8, 32]
+    %ehp = gep i8, *%eh, 0
+    call @std_crypto_sha256_compute(%empty_p, 0, %ehp)
+    %label_p = gep i8, *@_tls13_label_derived, 0
+    call @std_crypto_hkdf_expand_label_sha256(%handshake_secret, %label_p, 7, %ehp, 32, 32, %derived_p)
+
+    // Zero IKM (32 bytes of 0)
+    %zero_ikm = let [i8, 32]
+    %zero_ikm_p = gep i8, *%zero_ikm, 0
+    %n32 = let i64
+    store i64 32, *%n32
+    %n32v = load i64, *%n32
+    call @memset(%zero_ikm_p, 0, %n32v)
+
+    // master_secret = HKDF-Extract(derived, 0)
+    call @std_crypto_hkdf_extract_sha256(%derived_p, 32, %zero_ikm_p, 32, %out)
+    ret void
+}
+
+
+// ============================================================
+// TLS 1.3 Traffic Secret Derivation
+// ============================================================
+// server_handshake_traffic_secret = Derive-Secret(handshake_secret, "s hs traffic", hello_hash)
+// client_handshake_traffic_secret = Derive-Secret(handshake_secret, "c hs traffic", hello_hash)
+// server_application_traffic_secret = Derive-Secret(master_secret, "s ap traffic", session_hash)
+// client_application_traffic_secret = Derive-Secret(master_secret, "c ap traffic", session_hash)
+
+fun @std_crypto_tls13_server_hs_traffic_sha256(handshake_secret: *i8,
+                                                 hello_hash: *i8, out: *i8) -> void {
+  @entry:
+    %label_p = gep i8, *@_tls13_label_s_hs_traffic, 0
+    call @std_crypto_tls13_derive_secret_sha256(%handshake_secret, %label_p, 12,
+                                                 %hello_hash, %out)
+    ret void
+}
+
+fun @std_crypto_tls13_client_hs_traffic_sha256(handshake_secret: *i8,
+                                                 hello_hash: *i8, out: *i8) -> void {
+  @entry:
+    %label_p = gep i8, *@_tls13_label_c_hs_traffic, 0
+    call @std_crypto_tls13_derive_secret_sha256(%handshake_secret, %label_p, 12,
+                                                 %hello_hash, %out)
+    ret void
+}
+
+fun @std_crypto_tls13_server_ap_traffic_sha256(master_secret: *i8,
+                                                 session_hash: *i8, out: *i8) -> void {
+  @entry:
+    %label_p = gep i8, *@_tls13_label_s_ap_traffic, 0
+    call @std_crypto_tls13_derive_secret_sha256(%master_secret, %label_p, 12,
+                                                 %session_hash, %out)
+    ret void
+}
+
+fun @std_crypto_tls13_client_ap_traffic_sha256(master_secret: *i8,
+                                                 session_hash: *i8, out: *i8) -> void {
+  @entry:
+    %label_p = gep i8, *@_tls13_label_c_ap_traffic, 0
+    call @std_crypto_tls13_derive_secret_sha256(%master_secret, %label_p, 12,
+                                                 %session_hash, %out)
+    ret void
+}
+
+
+// ============================================================
+// TLS 1.3 Traffic Key and IV Derivation
+// ============================================================
+// key = HKDF-Expand-Label(traffic_secret, "key", "", key_length)
+// iv  = HKDF-Expand-Label(traffic_secret, "iv", "", 12)
+
+fun @std_crypto_tls13_traffic_key_sha256(traffic_secret: *i8, out: *i8) -> void {
+  @entry:
+    %empty = let [i8, 0]
+    %empty_p = gep i8, *%empty, 0
+    %label_p = gep i8, *@_tls13_label_key, 0
+    call @std_crypto_hkdf_expand_label_sha256(%traffic_secret, %label_p, 3, %empty_p, 0, 16, %out)
+    ret void
+}
+
+fun @std_crypto_tls13_traffic_iv_sha256(traffic_secret: *i8, out: *i8) -> void {
+  @entry:
+    %empty = let [i8, 0]
+    %empty_p = gep i8, *%empty, 0
+    %label_p = gep i8, *@_tls13_label_iv, 0
+    call @std_crypto_hkdf_expand_label_sha256(%traffic_secret, %label_p, 2, %empty_p, 0, 12, %out)
+    ret void
+}
+
+// TLS 1.3 Finished Key
+// finished_key = HKDF-Expand-Label(traffic_secret, "finished", "", 32)
+
+fun @std_crypto_tls13_finished_key_sha256(traffic_secret: *i8, out: *i8) -> void {
+  @entry:
+    %empty = let [i8, 0]
+    %empty_p = gep i8, *%empty, 0
+    %label_p = gep i8, *@_tls13_label_finished, 0
+    call @std_crypto_hkdf_expand_label_sha256(%traffic_secret, %label_p, 8, %empty_p, 0, 32, %out)
+    ret void
+}
+
+
+// ============================================================
+// TLS 1.3 Key Schedule — SHA-384 variants
+// ============================================================
+
+fun @std_crypto_tls13_early_secret_sha384(psk: *i8, psk_len: i32, out: *i8) -> void {
+  @entry:
+    %has_psk = sgt i32 %psk_len, 0
+    br %has_psk, @early_with_psk_384, @early_no_psk_384
+
+  @early_with_psk_384:
+    %zero_salt = let [i8, 48]
+    %zero_salt_p = gep i8, *%zero_salt, 0
+    %n48 = let i64
+    store i64 48, *%n48
+    %n48v = load i64, *%n48
+    call @memset(%zero_salt_p, 0, %n48v)
+    call @std_crypto_hkdf_extract_sha384(%zero_salt_p, 48, %psk, %psk_len, %out)
+    ret void
+
+  @early_no_psk_384:
+    %zero_out = let [i8, 48]
+    %zero_out_p = gep i8, *%zero_out, 0
+    %n48b = let i64
+    store i64 48, *%n48b
+    %n48bv = load i64, *%n48b
+    call @memset(%zero_out_p, 0, %n48bv)
+    call @std_crypto_hkdf_extract_sha384(%zero_out_p, 48, %zero_out_p, 48, %out)
+    ret void
+}
+
+fun @std_crypto_tls13_handshake_secret_sha384(early_secret: *i8, ecdhe_secret: *i8,
+                                               ecdhe_len: i32, out: *i8) -> void {
+  @entry:
+    %derived = let [i8, 48]
+    %derived_p = gep i8, *%derived, 0
+    %empty = let [i8, 0]
+    %empty_p = gep i8, *%empty, 0
+    %eh = let [i8, 48]
+    %ehp = gep i8, *%eh, 0
+    call @std_crypto_sha384_compute(%empty_p, 0, %ehp)
+    %label_p = gep i8, *@_tls13_label_derived, 0
+    call @std_crypto_hkdf_expand_label_sha384(%early_secret, %label_p, 7, %ehp, 48, 48, %derived_p)
+    call @std_crypto_hkdf_extract_sha384(%derived_p, 48, %ecdhe_secret, %ecdhe_len, %out)
+    ret void
+}
+
+fun @std_crypto_tls13_master_secret_sha384(handshake_secret: *i8, out: *i8) -> void {
+  @entry:
+    %derived = let [i8, 48]
+    %derived_p = gep i8, *%derived, 0
+    %empty = let [i8, 0]
+    %empty_p = gep i8, *%empty, 0
+    %eh = let [i8, 48]
+    %ehp = gep i8, *%eh, 0
+    call @std_crypto_sha384_compute(%empty_p, 0, %ehp)
+    %label_p = gep i8, *@_tls13_label_derived, 0
+    call @std_crypto_hkdf_expand_label_sha384(%handshake_secret, %label_p, 7, %ehp, 48, 48, %derived_p)
+    %zero_ikm = let [i8, 48]
+    %zero_ikm_p = gep i8, *%zero_ikm, 0
+    %n48 = let i64
+    store i64 48, *%n48
+    %n48v = load i64, *%n48
+    call @memset(%zero_ikm_p, 0, %n48v)
+    call @std_crypto_hkdf_extract_sha384(%derived_p, 48, %zero_ikm_p, 48, %out)
+    ret void
+}
+
+fun @std_crypto_tls13_server_hs_traffic_sha384(handshake_secret: *i8,
+                                                 hello_hash: *i8, out: *i8) -> void {
+  @entry:
+    %label_p = gep i8, *@_tls13_label_s_hs_traffic, 0
+    call @std_crypto_tls13_derive_secret_sha384(%handshake_secret, %label_p, 12, %hello_hash, %out)
+    ret void
+}
+
+fun @std_crypto_tls13_client_hs_traffic_sha384(handshake_secret: *i8,
+                                                 hello_hash: *i8, out: *i8) -> void {
+  @entry:
+    %label_p = gep i8, *@_tls13_label_c_hs_traffic, 0
+    call @std_crypto_tls13_derive_secret_sha384(%handshake_secret, %label_p, 12, %hello_hash, %out)
+    ret void
+}
+
+fun @std_crypto_tls13_server_ap_traffic_sha384(master_secret: *i8,
+                                                 session_hash: *i8, out: *i8) -> void {
+  @entry:
+    %label_p = gep i8, *@_tls13_label_s_ap_traffic, 0
+    call @std_crypto_tls13_derive_secret_sha384(%master_secret, %label_p, 12, %session_hash, %out)
+    ret void
+}
+
+fun @std_crypto_tls13_client_ap_traffic_sha384(master_secret: *i8,
+                                                 session_hash: *i8, out: *i8) -> void {
+  @entry:
+    %label_p = gep i8, *@_tls13_label_c_ap_traffic, 0
+    call @std_crypto_tls13_derive_secret_sha384(%master_secret, %label_p, 12, %session_hash, %out)
+    ret void
+}
+
+fun @std_crypto_tls13_traffic_key_sha384(traffic_secret: *i8, out: *i8) -> void {
+  @entry:
+    %empty = let [i8, 0]
+    %empty_p = gep i8, *%empty, 0
+    %label_p = gep i8, *@_tls13_label_key, 0
+    call @std_crypto_hkdf_expand_label_sha384(%traffic_secret, %label_p, 3, %empty_p, 0, 32, %out)
+    ret void
+}
+
+fun @std_crypto_tls13_traffic_iv_sha384(traffic_secret: *i8, out: *i8) -> void {
+  @entry:
+    %empty = let [i8, 0]
+    %empty_p = gep i8, *%empty, 0
+    %label_p = gep i8, *@_tls13_label_iv, 0
+    call @std_crypto_hkdf_expand_label_sha384(%traffic_secret, %label_p, 2, %empty_p, 0, 12, %out)
+    ret void
+}
+
+fun @std_crypto_tls13_finished_key_sha384(traffic_secret: *i8, out: *i8) -> void {
+  @entry:
+    %empty = let [i8, 0]
+    %empty_p = gep i8, *%empty, 0
+    %label_p = gep i8, *@_tls13_label_finished, 0
+    call @std_crypto_hkdf_expand_label_sha384(%traffic_secret, %label_p, 8, %empty_p, 0, 48, %out)
+    ret void
+}

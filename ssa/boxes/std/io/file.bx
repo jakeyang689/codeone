@@ -1,0 +1,191 @@
+// File I/O using standard C libc interfaces (fopen/fread/fwrite/fclose)
+// Cross-platform: available on all ISO C environments
+
+extern @fopen(path: *i8, mode: *i8) -> *i8
+extern @fread(buf: *i8, size: i64, count: i64, fp: *i8) -> i64
+extern @fwrite(buf: *i8, size: i64, count: i64, fp: *i8) -> i64
+extern @fclose(fp: *i8) -> i32
+extern @fseek(fp: *i8, offset: i64, whence: i32) -> i32
+extern @ftell(fp: *i8) -> i64
+extern @fgetc(fp: *i8) -> i32
+
+// Mode strings for fopen
+const @std_io_file_mode_r: [i8, 2] = [114, 0]   // "r"
+const @std_io_file_mode_w: [i8, 2] = [119, 0]   // "w"
+const @std_io_file_mode_a: [i8, 2] = [97, 0]    // "a"
+
+// fseek origins, matching the C SEEK_* macros.
+enum @FileSeek: i32 {
+  @Set = 0,
+  @Cur = 1,
+  @End = 2
+}
+
+// Open file for reading, returns FILE*
+fun @std_io_file_open_read(path: *i8) -> *i8 {
+  @entry:
+    %mp = gep i8, *@std_io_file_mode_r, 0
+    %fp = call @fopen(%path, %mp)
+    ret *i8 %fp
+}
+
+// Open file for writing, returns FILE*
+fun @std_io_file_open_write(path: *i8) -> *i8 {
+  @entry:
+    %mp = gep i8, *@std_io_file_mode_w, 0
+    %fp = call @fopen(%path, %mp)
+    ret *i8 %fp
+}
+
+// Read up to count bytes from file, returns bytes read (size_t)
+fun @std_io_file_read(fp: *i8, buf: *i8, count: i32) -> i64 {
+  @entry:
+    %c64 = sext i32 %count to i64
+    %r = call @fread(%buf, 1, %c64, %fp)
+    ret i64 %r
+}
+
+// Write up to count bytes to file, returns bytes written (size_t)
+fun @std_io_file_write(fp: *i8, buf: *i8, count: i32) -> i64 {
+  @entry:
+    %c64 = sext i32 %count to i64
+    %r = call @fwrite(%buf, 1, %c64, %fp)
+    ret i64 %r
+}
+
+// Open file for appending, returns FILE*
+fun @std_io_file_open_append(path: *i8) -> *i8 {
+  @entry:
+    %mp = gep i8, *@std_io_file_mode_a, 0
+    %fp = call @fopen(%path, %mp)
+    ret *i8 %fp
+}
+
+// Close file, returns 0 on success
+fun @std_io_file_close(fp: *i8) -> i32 {
+  @entry:
+    %r = call @fclose(%fp)
+    ret i32 %r
+}
+
+// Read until EOF or until cap-1 bytes fit; buf is NUL-terminated.
+// Returns the number of bytes read, or -1 when cap <= 0.
+fun @std_io_file_read_all(fp: *i8, buf: *i8, cap: i32) -> i32 {
+  @entry:
+    %room = sub i32 %cap, 1
+    %bad = slt i32 %room, 0
+    br %bad, @fail, @init
+  @init:
+    %off = let i32
+    store i32 0, *%off
+    jmp @loop
+  @loop:
+    %ov = load i32, *%off
+    %rem = sub i32 %room, %ov
+    %done = sle i32 %rem, 0
+    br %done, @finish, @read
+  @read:
+    %ov2 = load i32, *%off
+    %dst = gep i8, *%buf, %ov2
+    %rem64 = sext i32 %rem to i64
+    %r = call @fread(%dst, 1, %rem64, %fp)
+    %got = trunc i64 %r to i32
+    %z = sle i32 %got, 0
+    br %z, @finish, @adv
+  @adv:
+    %ov3 = load i32, *%off
+    %no = add i32 %ov3, %got
+    store i32 %no, *%off
+    jmp @loop
+  @finish:
+    %of = load i32, *%off
+    %zp = gep i8, *%buf, %of
+    store i8 0, *%zp
+    ret i32 %of
+  @fail:
+    ret i32 -1
+}
+
+// Write exactly len bytes. Returns 0 on success, -1 on a short write.
+fun @std_io_file_write_all(fp: *i8, buf: *i8, len: i32) -> i32 {
+  @entry:
+    %neg = slt i32 %len, 0
+    br %neg, @fail, @init
+  @init:
+    %off = let i32
+    store i32 0, *%off
+    jmp @loop
+  @loop:
+    %ov = load i32, *%off
+    %rem = sub i32 %len, %ov
+    %done = sle i32 %rem, 0
+    br %done, @ok, @write
+  @write:
+    %ov2 = load i32, *%off
+    %src = gep i8, *%buf, %ov2
+    %rem64 = sext i32 %rem to i64
+    %r = call @fwrite(%src, 1, %rem64, %fp)
+    %got = trunc i64 %r to i32
+    %z = sle i32 %got, 0
+    br %z, @fail, @adv
+  @adv:
+    %ov3 = load i32, *%off
+    %no = add i32 %ov3, %got
+    store i32 %no, *%off
+    jmp @loop
+  @ok:
+    ret i32 0
+  @fail:
+    ret i32 -1
+}
+
+// Read one line (including the newline, like fgets) or up to cap-1 bytes.
+// Returns the length, 0 at EOF, or -1 when cap <= 0.
+fun @std_io_file_read_line(fp: *i8, buf: *i8, cap: i32) -> i32 {
+  @entry:
+    %room = sub i32 %cap, 1
+    %bad = slt i32 %room, 0
+    br %bad, @fail, @init
+  @init:
+    %off = let i32
+    store i32 0, *%off
+    jmp @loop
+  @loop:
+    %ov = load i32, *%off
+    %full = sge i32 %ov, %room
+    br %full, @finish, @getc
+  @getc:
+    %c = call @fgetc(%fp)
+    %eof = slt i32 %c, 0
+    br %eof, @finish, @store
+  @store:
+    %ov2 = load i32, *%off
+    %bp = gep i8, *%buf, %ov2
+    %c8 = trunc i32 %c to i8
+    store i8 %c8, *%bp
+    %no = add i32 %ov2, 1
+    store i32 %no, *%off
+    %isnl = eq i32 %c, 10
+    br %isnl, @finish, @loop
+  @finish:
+    %of = load i32, *%off
+    %zp = gep i8, *%buf, %of
+    store i8 0, *%zp
+    ret i32 %of
+  @fail:
+    ret i32 -1
+}
+
+// Seek within a file. whence is one of STD_IO_FILE_SEEK_*. Returns 0 or -1.
+fun @std_io_file_seek(fp: *i8, offset: i64, whence: i32) -> i32 {
+  @entry:
+    %r = call @fseek(%fp, %offset, %whence)
+    ret i32 %r
+}
+
+// Current file position, or -1 on error.
+fun @std_io_file_tell(fp: *i8) -> i64 {
+  @entry:
+    %r = call @ftell(%fp)
+    ret i64 %r
+}

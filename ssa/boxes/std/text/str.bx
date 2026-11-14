@@ -1,0 +1,603 @@
+// String operations on i8 arrays
+
+extern @memcpy(dst: *i8, src: *i8, n: i64) -> *i8
+extern @strlen(s: *i8) -> i64
+extern @strcmp(s1: *i8, s2: *i8) -> i32
+extern @strcpy(dst: *i8, src: *i8) -> *i8
+extern @strncmp(s1: *i8, s2: *i8, n: i64) -> i32
+extern @strchr(s: *i8, c: i32) -> *i8
+extern @strstr(haystack: *i8, needle: *i8) -> *i8
+extern @strncpy(dst: *i8, src: *i8, n: i64) -> *i8
+
+fun @std_text_str_len(s: *i8) -> i32 {
+  @entry:
+    %len64 = call @strlen(%s)
+    %len = trunc i64 %len64 to i32
+    ret i32 %len
+}
+
+fun @std_text_str_eq(s1: *i8, s2: *i8) -> i1 {
+  @entry:
+    %r = call @strcmp(%s1, %s2)
+    %eq = eq i32 %r, 0
+    ret i1 %eq
+}
+
+fun @std_text_str_copy(dst: *i8, src: *i8) -> void {
+  @entry:
+    call @strcpy(%dst, %src)
+    ret void
+}
+
+fun @std_text_str_ncmp(s1: *i8, s2: *i8, n: i32) -> i32 {
+  @entry:
+    %n64 = sext i32 %n to i64
+    %r = call @strncmp(%s1, %s2, %n64)
+    ret i32 %r
+}
+
+fun @std_text_str_chr(s: *i8, c: i8) -> *i8 {
+  @entry:
+    %ci = zext i8 %c to i32
+    %r = call @strchr(%s, %ci)
+    ret *i8 %r
+}
+
+fun @std_text_str_str(haystack: *i8, needle: *i8) -> *i8 {
+  @entry:
+    %r = call @strstr(%haystack, %needle)
+    ret *i8 %r
+}
+
+fun @std_text_str_ncpy(dst: *i8, src: *i8, n: i32) -> void {
+  @entry:
+    %n64 = sext i32 %n to i64
+    call @strncpy(%dst, %src, %n64)
+    ret void
+}
+
+// Check if string ends with suffix
+fun @std_text_str_ends_with(s: *i8, suffix: *i8) -> i1 {
+  @entry:
+    %s_len = call @std_text_str_len(%s)
+    %suf_len = call @std_text_str_len(%suffix)
+    %c1 = slt i32 %s_len, %suf_len
+    br %c1, @false, @check_suffix
+
+  @check_suffix:
+    %start = sub i32 %s_len, %suf_len
+    %iptr = let i32
+    store i32 0, *%iptr
+    jmp @es_cond
+
+  @es_cond:
+    %i = load i32, *%iptr
+    %c2 = slt i32 %i, %suf_len
+    br %c2, @es_cmp, @true
+
+  @es_cmp:
+    %i_c = load i32, *%iptr
+    %pos = add i32 %start, %i_c
+    %ps = gep i8, *%s, %pos
+    %p_suf = gep i8, *%suffix, %i_c
+    %cs = load i8, *%ps
+    %csuf = load i8, *%p_suf
+    %c_eq = eq i8 %cs, %csuf
+    br %c_eq, @es_next, @false
+
+  @es_next:
+    %i2 = add i32 %i_c, 1
+    store i32 %i2, *%iptr
+    jmp @es_cond
+
+  @false:
+    ret i1 0
+  @true:
+    ret i1 1
+}
+
+// ============================================================
+// Buffer building and scanning helpers
+// ============================================================
+
+// Lowercase a single ASCII byte.
+fun @std_text_str_lower(c: i8) -> i8 {
+  @entry:
+    %v = zext i8 %c to i32
+    %ge = sge i32 %v, 65
+    %le = sle i32 %v, 90
+    %up = and i1 %ge, %le
+    br %up, @lower, @keep
+  @lower:
+    %d = add i32 %v, 32
+    %d8 = trunc i32 %d to i8
+    ret i8 %d8
+  @keep:
+    ret i8 %c
+}
+
+// Append len bytes of src at dst[off]. Returns the new offset, or -1 on overflow.
+fun @std_text_str_append(dst: *i8, cap: i32, off: i32, src: *i8, len: i32) -> i32 {
+  @entry:
+    %neg = slt i32 %off, 0
+    br %neg, @fail, @fit
+  @fit:
+    %end = add i32 %off, %len
+    %over = sgt i32 %end, %cap
+    br %over, @fail, @init
+  @init:
+    %none = sle i32 %len, 0
+    br %none, @done, @copy
+  @copy:
+    %dp = gep i8, *%dst, %off
+    %len64 = sext i32 %len to i64
+    call @memcpy(%dp, %src, %len64)
+    jmp @done
+  @done:
+    %res = add i32 %off, %len
+    ret i32 %res
+  @fail:
+    ret i32 -1
+}
+
+// Append a NUL-terminated string.
+fun @std_text_str_append_cstr(dst: *i8, cap: i32, off: i32, s: *i8) -> i32 {
+  @entry:
+    %n = let i32
+    store i32 0, *%n
+    jmp @len_cond
+  @len_cond:
+    %nv = load i32, *%n
+    %sp = gep i8, *%s, %nv
+    %c = load i8, *%sp
+    %z = eq i8 %c, 0
+    br %z, @copy, @len_next
+  @len_next:
+    %nv2 = load i32, *%n
+    %nn = add i32 %nv2, 1
+    store i32 %nn, *%n
+    jmp @len_cond
+  @copy:
+    %len = load i32, *%n
+    %r = call @std_text_str_append(%dst, %cap, %off, %s, %len)
+    ret i32 %r
+}
+
+// Append a non-negative decimal integer.
+fun @std_text_str_append_int(dst: *i8, cap: i32, off: i32, v: i32) -> i32 {
+  @entry:
+    %neg = slt i32 %v, 0
+    br %neg, @fail, @digits
+  @digits:
+    %tmp = let [i8, 16]
+    %tp = gep i8, *%tmp, 0
+    %n = let i32
+    store i32 0, *%n
+    %x = let i32
+    store i32 %v, *%x
+    %iszero = eq i32 %v, 0
+    br %iszero, @zero, @loop
+  @zero:
+    store i8 48, *%tp
+    store i32 1, *%n
+    jmp @emit
+  @loop:
+    %xv = load i32, *%x
+    %done = eq i32 %xv, 0
+    br %done, @emit, @step
+  @step:
+    %xv2 = load i32, *%x
+    %q = div i32 %xv2, 10
+    %r = rem i32 %xv2, 10
+    %ch = add i32 %r, 48
+    %ch8 = trunc i32 %ch to i8
+    %nv = load i32, *%n
+    %dp = gep i8, *%tp, %nv
+    store i8 %ch8, *%dp
+    %nn = add i32 %nv, 1
+    store i32 %nn, *%n
+    store i32 %q, *%x
+    jmp @loop
+  @emit:
+    %len = load i32, *%n
+    %i = let i32
+    store i32 0, *%i
+    jmp @ec
+  @ec:
+    %iv = load i32, *%i
+    %more = slt i32 %iv, %len
+    br %more, @eb, @ed
+  @eb:
+    %iv2 = load i32, *%i
+    %src = sub i32 %len, %iv2
+    %src2 = sub i32 %src, 1
+    %sp = gep i8, *%tp, %src2
+    %c = load i8, *%sp
+    %dst_i = add i32 %off, %iv2
+    %over = sge i32 %dst_i, %cap
+    br %over, @fail, @wb
+  @wb:
+    %dp2 = gep i8, *%dst, %dst_i
+    store i8 %c, *%dp2
+    %nx = add i32 %iv2, 1
+    store i32 %nx, *%i
+    jmp @ec
+  @ed:
+    %repltal = add i32 %off, %len
+    ret i32 %repltal
+  @fail:
+    ret i32 -1
+}
+
+// Case-insensitive substring search in buf[start, end). needle is NUL-terminated.
+// Returns the match offset, or -1.
+fun @std_text_str_find_ci(buf: *i8, start: i32, end: i32, needle: *i8) -> i32 {
+  @entry:
+    %i = let i32
+    store i32 %start, *%i
+    jmp @cond
+  @cond:
+    %iv = load i32, *%i
+    %more = slt i32 %iv, %end
+    br %more, @try, @nf
+  @try:
+    %pos = load i32, *%i
+    %j = let i32
+    store i32 0, *%j
+    jmp @mcond
+  @mcond:
+    %jv = load i32, *%j
+    %np = gep i8, *%needle, %jv
+    %nc = load i8, *%np
+    %done = eq i8 %nc, 0
+    br %done, @found, @mcmp
+  @mcmp:
+    %jv2 = load i32, *%j
+    %idx = add i32 %pos, %jv2
+    %lim = sge i32 %idx, %end
+    br %lim, @next, @mchk
+  @mchk:
+    %bp = gep i8, *%buf, %idx
+    %bc = load i8, *%bp
+    %bl = call @std_text_str_lower(%bc)
+    %jv3 = load i32, *%j
+    %np2 = gep i8, *%needle, %jv3
+    %nc2 = load i8, *%np2
+    %nl = call @std_text_str_lower(%nc2)
+    %eq = eq i8 %bl, %nl
+    br %eq, @mnext, @next
+  @mnext:
+    %jv4 = load i32, *%j
+    %jn = add i32 %jv4, 1
+    store i32 %jn, *%j
+    jmp @mcond
+  @found:
+    %r = load i32, *%i
+    ret i32 %r
+  @next:
+    %iv2 = load i32, *%i
+    %nx = add i32 %iv2, 1
+    store i32 %nx, *%i
+    jmp @cond
+  @nf:
+    ret i32 -1
+}
+
+// Index of the CR in the next CRLF at or after start, or -1.
+fun @std_text_str_find_crlf(buf: *i8, start: i32, len: i32) -> i32 {
+  @entry:
+    %i = let i32
+    store i32 %start, *%i
+    jmp @cond
+  @cond:
+    %iv = load i32, *%i
+    %lim = sub i32 %len, 1
+    %more = slt i32 %iv, %lim
+    br %more, @body, @nf
+  @body:
+    %iv2 = load i32, *%i
+    %p = gep i8, *%buf, %iv2
+    %c = load i8, *%p
+    %isr = eq i8 %c, 13
+    br %isr, @chk, @next
+  @chk:
+    %iv3 = load i32, *%i
+    %n1 = add i32 %iv3, 1
+    %p2 = gep i8, *%buf, %n1
+    %c2 = load i8, *%p2
+    %isn = eq i8 %c2, 10
+    br %isn, @found, @next
+  @found:
+    %r = load i32, *%i
+    ret i32 %r
+  @next:
+    %iv4 = load i32, *%i
+    %nx = add i32 %iv4, 1
+    store i32 %nx, *%i
+    jmp @cond
+  @nf:
+    ret i32 -1
+}
+
+// Parse leading decimal digits. Returns the value, or -1 if none.
+fun @std_text_str_parse_uint(buf: *i8, start: i32, len: i32) -> i32 {
+  @entry:
+    %i = let i32
+    store i32 %start, *%i
+    %acc = let i32
+    store i32 0, *%acc
+    %any = let i32
+    store i32 0, *%any
+    jmp @cond
+  @cond:
+    %iv = load i32, *%i
+    %more = slt i32 %iv, %len
+    br %more, @body, @done
+  @body:
+    %iv2 = load i32, *%i
+    %p = gep i8, *%buf, %iv2
+    %c = load i8, *%p
+    %v = zext i8 %c to i32
+    %is_d = sge i32 %v, 48
+    %is_d2 = sle i32 %v, 57
+    %digit = and i1 %is_d, %is_d2
+    br %digit, @digit_acc, @done
+  @digit_acc:
+    %acc_v = load i32, *%acc
+    %ten = mul i32 %acc_v, 10
+    %iv3 = load i32, *%i
+    %p3 = gep i8, *%buf, %iv3
+    %c3 = load i8, *%p3
+    %v3 = zext i8 %c3 to i32
+    %d = sub i32 %v3, 48
+    %sum = add i32 %ten, %d
+    store i32 %sum, *%acc
+    store i32 1, *%any
+    %iv4 = load i32, *%i
+    %nx = add i32 %iv4, 1
+    store i32 %nx, *%i
+    jmp @cond
+  @done:
+    %had = load i32, *%any
+    %none = eq i32 %had, 0
+    br %none, @fail, @ok
+  @ok:
+    %r = load i32, *%acc
+    ret i32 %r
+  @fail:
+    ret i32 -1
+}
+
+// True when s begins with prefix.
+fun @std_text_str_starts_with(s: *i8, prefix: *i8) -> i1 {
+  @entry:
+    %pl64 = call @strlen(%prefix)
+    %n = call @strncmp(%s, %prefix, %pl64)
+    %eqz = eq i32 %n, 0
+    ret i1 %eqz
+}
+
+fun @_str_is_ws(c: i8) -> i1 {
+  @entry:
+    %is_sp = eq i8 %c, 32
+    %is_tab = eq i8 %c, 9
+    %is_nl = eq i8 %c, 10
+    %is_vt = eq i8 %c, 11
+    %is_ff = eq i8 %c, 12
+    %is_cr = eq i8 %c, 13
+    %a1 = or i1 %is_sp, %is_tab
+    %a2 = or i1 %is_nl, %is_vt
+    %a3 = or i1 %is_ff, %is_cr
+    %b1 = or i1 %a1, %a2
+    %all = or i1 %b1, %a3
+    ret i1 %all
+}
+
+// Copy a slice into out and return the new offset, or -1 when it does not fit.
+fun @_str_put(out: *i8, cap: i32, off: i32, src: *i8, len: i32) -> i32 {
+  @entry:
+    %end = add i32 %off, %len
+    %need = add i32 %end, 1
+    %fits = sle i32 %need, %cap
+    br %fits, @copy, @fail
+  @copy:
+    %dst = gep i8, *%out, %off
+    %n64 = sext i32 %len to i64
+    call @memcpy(%dst, %src, %n64)
+    ret i32 %end
+  @fail:
+    ret i32 -1
+}
+
+// Copy s with leading and trailing whitespace removed. Returns the length.
+fun @std_text_str_trim(s: *i8, out: *i8, cap: i32) -> i32 {
+  @entry:
+    %l64 = call @strlen(%s)
+    %len = trunc i64 %l64 to i32
+    %start = let i32
+    store i32 0, *%start
+    jmp @lead
+  @lead:
+    %sv = load i32, *%start
+    %more = slt i32 %sv, %len
+    br %more, @lead_one, @trail_init
+  @lead_one:
+    %sv2 = load i32, *%start
+    %p = gep i8, *%s, %sv2
+    %c = load i8, *%p
+    %isws = call @_str_is_ws(%c)
+    br %isws, @lead_inc, @trail_init
+  @lead_inc:
+    %sv3 = load i32, *%start
+    %n = add i32 %sv3, 1
+    store i32 %n, *%start
+    jmp @lead
+  @trail_init:
+    %end = let i32
+    store i32 %len, *%end
+    jmp @trail
+  @trail:
+    %ev = load i32, *%end
+    %sv4 = load i32, *%start
+    %more2 = sgt i32 %ev, %sv4
+    br %more2, @trail_one, @copy
+  @trail_one:
+    %ev2 = load i32, *%end
+    %ei = sub i32 %ev2, 1
+    %p2 = gep i8, *%s, %ei
+    %c2 = load i8, *%p2
+    %isws2 = call @_str_is_ws(%c2)
+    br %isws2, @trail_dec, @copy
+  @trail_dec:
+    %ev3 = load i32, *%end
+    %d = sub i32 %ev3, 1
+    store i32 %d, *%end
+    jmp @trail
+  @copy:
+    %sf = load i32, *%start
+    %ef = load i32, *%end
+    %n2 = sub i32 %ef, %sf
+    %need = add i32 %n2, 1
+    %fits = sle i32 %need, %cap
+    br %fits, @do_copy, @fail
+  @do_copy:
+    %src = gep i8, *%s, %sf
+    %n64 = sext i32 %n2 to i64
+    call @memcpy(%out, %src, %n64)
+    %zp = gep i8, *%out, %n2
+    store i8 0, *%zp
+    ret i32 %n2
+  @fail:
+    ret i32 -1
+}
+
+// Return the next separator-delimited part in out and advance *pos.
+// Returns the part length, or -1 when there are no more parts.
+fun @std_text_str_split_next(s: *i8, pos: *i32, sep: i8, out: *i8, cap: i32) -> i32 {
+  @entry:
+    %l64 = call @strlen(%s)
+    %len = trunc i64 %l64 to i32
+    %pv = load i32, *%pos
+    %after = sgt i32 %pv, %len
+    br %after, @done, @scan
+  @scan:
+    %start = let i32
+    %i = let i32
+    store i32 %pv, *%start
+    store i32 %pv, *%i
+    jmp @cond
+  @cond:
+    %iv = load i32, *%i
+    %more = slt i32 %iv, %len
+    br %more, @one, @found
+  @one:
+    %iv2 = load i32, *%i
+    %p = gep i8, *%s, %iv2
+    %c = load i8, *%p
+    %issep = eq i8 %c, %sep
+    br %issep, @found, @next
+  @next:
+    %iv3 = load i32, *%i
+    %n = add i32 %iv3, 1
+    store i32 %n, *%i
+    jmp @cond
+  @found:
+    %sf = load i32, *%start
+    %iv4 = load i32, *%i
+    %part = sub i32 %iv4, %sf
+    %need = add i32 %part, 1
+    %fits = sle i32 %need, %cap
+    br %fits, @copy, @fail
+  @copy:
+    %src = gep i8, *%s, %sf
+    %n64 = sext i32 %part to i64
+    call @memcpy(%out, %src, %n64)
+    %zp = gep i8, *%out, %part
+    store i8 0, *%zp
+    %iv5 = load i32, *%i
+    %has_sep = slt i32 %iv5, %len
+    br %has_sep, @after_sep, @at_end
+  @after_sep:
+    %iv6 = load i32, *%i
+    %nxt = add i32 %iv6, 1
+    store i32 %nxt, *%pos
+    ret i32 %part
+  @at_end:
+    %over = add i32 %len, 1
+    store i32 %over, *%pos
+    ret i32 %part
+  @done:
+    ret i32 -1
+  @fail:
+    ret i32 -1
+}
+
+// Replace every occurrence of from with to. from must not be empty.
+// Returns the output length, or -1 when it does not fit.
+fun @std_text_str_replace(s: *i8, needle: *i8, repl: *i8, out: *i8, cap: i32) -> i32 {
+  @entry:
+    %fl64 = call @strlen(%needle)
+    %fl = trunc i64 %fl64 to i32
+    %fz = eq i32 %fl, 0
+    br %fz, @fail, @init
+  @init:
+    %sl64 = call @strlen(%s)
+    %sl = trunc i64 %sl64 to i32
+    %tl64 = call @strlen(%repl)
+    %tl = trunc i64 %tl64 to i32
+    %pos = let i32
+    %off = let i32
+    store i32 0, *%pos
+    store i32 0, *%off
+    jmp @search
+  @search:
+    %pv = load i32, *%pos
+    %endp = add i32 %pv, %fl
+    %canfit = sle i32 %endp, %sl
+    br %canfit, @cmp, @tail
+  @cmp:
+    %pv2 = load i32, *%pos
+    %sp = gep i8, *%s, %pv2
+    %n64 = sext i32 %fl to i64
+    %c = call @strncmp(%sp, %needle, %n64)
+    %hit = eq i32 %c, 0
+    br %hit, @match, @advance
+  @advance:
+    %pv3 = load i32, *%pos
+    %bp = gep i8, *%s, %pv3
+    %ov = load i32, *%off
+    %nof = call @_str_put(%out, %cap, %ov, %bp, 1)
+    %ok = sge i32 %nof, 0
+    br %ok, @adv_ok, @fail
+  @adv_ok:
+    store i32 %nof, *%off
+    %pn = add i32 %pv3, 1
+    store i32 %pn, *%pos
+    jmp @search
+  @match:
+    %ov2 = load i32, *%off
+    %nof2 = call @_str_put(%out, %cap, %ov2, %repl, %tl)
+    %ok2 = sge i32 %nof2, 0
+    br %ok2, @match_ok, @fail
+  @match_ok:
+    store i32 %nof2, *%off
+    %pv4 = load i32, *%pos
+    %pn2 = add i32 %pv4, %fl
+    store i32 %pn2, *%pos
+    jmp @search
+  @tail:
+    %pv5 = load i32, *%pos
+    %rem = sub i32 %sl, %pv5
+    %src = gep i8, *%s, %pv5
+    %ov3 = load i32, *%off
+    %nof3 = call @_str_put(%out, %cap, %ov3, %src, %rem)
+    %ok3 = sge i32 %nof3, 0
+    br %ok3, @finish, @fail
+  @finish:
+    store i32 %nof3, *%off
+    %zp = gep i8, *%out, %nof3
+    store i8 0, *%zp
+    ret i32 %nof3
+  @fail:
+    ret i32 -1
+}

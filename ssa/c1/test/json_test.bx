@@ -1,0 +1,394 @@
+// JSON parser, builder, and serializer tests.
+// Prints "PASS json" on success, "FAIL json at case N" otherwise.
+
+extern @printf(fmt: *i8, ...) -> i32
+extern @strlen(s: *i8) -> i64
+extern @strcmp(a: *i8, b: *i8) -> i32
+extern @std_json_parse(text: *i8, len: i32) -> *i8
+extern @std_json_parse_ex(text: *i8, len: i32, err_pos: *i32) -> *i8
+extern @std_json_type(v: *i8) -> i32
+extern @std_json_count(v: *i8) -> i32
+extern @std_json_at(v: *i8, idx: i32) -> *i8
+extern @std_json_get(v: *i8, key: *i8) -> *i8
+extern @std_json_bool(v: *i8) -> i32
+extern @std_json_int(v: *i8) -> i64
+extern @std_json_float(v: *i8) -> f64
+extern @std_json_str(v: *i8, out_len: *i32) -> *i8
+extern @std_json_new_null() -> *i8
+extern @std_json_new_bool(b: i32) -> *i8
+extern @std_json_new_int(i: i64) -> *i8
+extern @std_json_new_string(s: *i8, len: i32) -> *i8
+extern @std_json_new_array() -> *i8
+extern @std_json_new_object() -> *i8
+extern @std_json_add(v: *i8, child: *i8) -> i32
+extern @std_json_set(v: *i8, key: *i8, key_len: i32, child: *i8) -> i32
+extern @std_json_free(v: *i8) -> void
+extern @std_json_write(v: *i8, out: *i8, cap: i32) -> i32
+
+const @DOC = "{\"a\":1,\"b\":[true,null,\"x\"],\"c\":{\"d\":2.5}}"
+const @ESC = "\"a\\nb\\\"c\\\\d\\u0041\""
+const @BAD = "{bad}"
+const @TRAIL = "{\"x\":1}x"
+const @EXPECTED = "{\"n\":42,\"s\":\"hi\",\"arr\":[true]}"
+const @UNI = "\"\\u00e9\""
+const @SURR = "\"\\uD83D\\uDE00\""
+const @EXP = "1e3"
+const @NEG = "-12"
+const @BIG = "9223372036854775807"
+const @NEST = "[[1],[2]]"
+const @ARR1 = "[1]"
+
+fun @len_of(s: *i8) -> i32 {
+  @entry:
+    %l64 = call @strlen(%s)
+    %l = trunc i64 %l64 to i32
+    ret i32 %l
+}
+
+fun @main() -> i32 {
+  @entry:
+    %id = let i32
+    %strlen_p = let i32
+    %out = let [i8, 256]
+    %numout = let [i8, 64]
+    %ctrl = let [i8, 2]
+    %lc = let i32
+    store i32 0, *%id
+
+    // ---- parse the document ----
+    store i32 1, *%id
+    %docp = gep i8, *@DOC, 0
+    %docl = call @len_of(%docp)
+    %root = call @std_json_parse(%docp, %docl)
+    %rn = eq *i8 %root, null
+    br %rn, @fail, @c2
+
+    // {"a":1,...}
+  @c2:
+    store i32 2, *%id
+    %rt = call @std_json_type(%root)
+    %rtok = eq i32 %rt, 6
+    br %rtok, @c3, @fail
+  @c3:
+    store i32 3, *%id
+    %a = call @std_json_get(%root, "a")
+    %at = call @std_json_type(%a)
+    %atok = eq i32 %at, 2
+    br %atok, @c4, @fail
+  @c4:
+    store i32 4, *%id
+    %av = call @std_json_int(%a)
+    %avok = eq i64 %av, 1
+    br %avok, @c5, @fail
+
+    // "b":[true,null,"x"]
+  @c5:
+    store i32 5, *%id
+    %b = call @std_json_get(%root, "b")
+    %bt = call @std_json_type(%b)
+    %btok = eq i32 %bt, 5
+    br %btok, @c6, @fail
+  @c6:
+    store i32 6, *%id
+    %bc = call @std_json_count(%b)
+    %bcok = eq i32 %bc, 3
+    br %bcok, @c7, @fail
+  @c7:
+    store i32 7, *%id
+    %b0 = call @std_json_at(%b, 0)
+    %b0b = call @std_json_bool(%b0)
+    %b0ok = eq i32 %b0b, 1
+    br %b0ok, @c8, @fail
+  @c8:
+    store i32 8, *%id
+    %b1 = call @std_json_at(%b, 1)
+    %b1t = call @std_json_type(%b1)
+    %b1ok = eq i32 %b1t, 0
+    br %b1ok, @c9, @fail
+  @c9:
+    store i32 9, *%id
+    %b2 = call @std_json_at(%b, 2)
+    %b2t = call @std_json_type(%b2)
+    %b2ok = eq i32 %b2t, 4
+    br %b2ok, @c10, @fail
+
+    // "c":{"d":2.5}
+  @c10:
+    store i32 10, *%id
+    %c = call @std_json_get(%root, "c")
+    %d = call @std_json_get(%c, "d")
+    %dt = call @std_json_type(%d)
+    %dtok = eq i32 %dt, 3
+    br %dtok, @c11, @fail
+  @c11:
+    store i32 11, *%id
+    %nump = gep i8, *%numout, 0
+    %nw = call @std_json_write(%d, %nump, 64)
+    %nwok = sgt i32 %nw, 0
+    br %nwok, @c11b, @fail
+  @c11b:
+    %dcmp = call @strcmp(%nump, "2.5")
+    %dvok = eq i32 %dcmp, 0
+    br %dvok, @c12, @fail
+
+    // ---- string escapes ----
+  @c12:
+    store i32 12, *%id
+    %escp = gep i8, *@ESC, 0
+    %escl = call @len_of(%escp)
+    %sv = call @std_json_parse(%escp, %escl)
+    %svn = eq *i8 %sv, null
+    br %svn, @fail, @c13
+  @c13:
+    store i32 13, *%id
+    %slp = gep i32, *%strlen_p, 0
+    %sp = call @std_json_str(%sv, %slp)
+    %sl = load i32, *%slp
+    %slok = eq i32 %sl, 8
+    br %slok, @c14, @fail
+  @c14:
+    store i32 14, *%id
+    %p1 = gep i8, *%sp, 1
+    %v1 = load i8, *%p1
+    %v1ok = eq i8 %v1, 10
+    br %v1ok, @c15, @fail
+  @c15:
+    store i32 15, *%id
+    %p3 = gep i8, *%sp, 3
+    %v3 = load i8, *%p3
+    %v3ok = eq i8 %v3, 34
+    br %v3ok, @c16, @fail
+  @c16:
+    store i32 16, *%id
+    %p5 = gep i8, *%sp, 5
+    %v5 = load i8, *%p5
+    %v5ok = eq i8 %v5, 92
+    br %v5ok, @c17, @fail
+  @c17:
+    store i32 17, *%id
+    %p7 = gep i8, *%sp, 7
+    %v7 = load i8, *%p7
+    %v7ok = eq i8 %v7, 65
+    br %v7ok, @c18, @fail
+
+    // ---- build a tree and serialize it ----
+  @c18:
+    store i32 18, *%id
+    %obj = call @std_json_new_object()
+    %ni = call @std_json_new_int(42)
+    %r1 = call @std_json_set(%obj, "n", 1, %ni)
+    %ns = call @std_json_new_string("hi", 2)
+    %r2 = call @std_json_set(%obj, "s", 1, %ns)
+    %arr = call @std_json_new_array()
+    %bl = call @std_json_new_bool(1)
+    %r3 = call @std_json_add(%arr, %bl)
+    %r4 = call @std_json_set(%obj, "arr", 3, %arr)
+    %rsum = add i32 %r1, %r2
+    %rsum2 = add i32 %r3, %r4
+    %rall = add i32 %rsum, %rsum2
+    %rok = eq i32 %rall, 0
+    br %rok, @c19, @fail
+  @c19:
+    store i32 19, *%id
+    %outp = gep i8, *%out, 0
+    %w = call @std_json_write(%obj, %outp, 256)
+    %wpos = sgt i32 %w, 0
+    br %wpos, @c20, @fail
+  @c20:
+    store i32 20, *%id
+    %cmp = call @strcmp(%outp, @EXPECTED)
+    %cmpok = eq i32 %cmp, 0
+    br %cmpok, @c21, @fail
+
+    // ---- malformed input reports an error position ----
+  @c21:
+    store i32 21, *%id
+    %badp = gep i8, *@BAD, 0
+    %badl = call @len_of(%badp)
+    %bad_ep = gep i32, *%strlen_p, 0
+    %bad = call @std_json_parse_ex(%badp, %badl, %bad_ep)
+    %badn = eq *i8 %bad, null
+    br %badn, @c22, @fail
+  @c22:
+    store i32 22, *%id
+    %badpos = load i32, *%bad_ep
+    %badposok = eq i32 %badpos, 1
+    br %badposok, @c23, @fail
+  @c23:
+    store i32 23, *%id
+    %trp = gep i8, *@TRAIL, 0
+    %trl = call @len_of(%trp)
+    %tr_ep = gep i32, *%strlen_p, 0
+    %tr = call @std_json_parse_ex(%trp, %trl, %tr_ep)
+    %trn = eq *i8 %tr, null
+    br %trn, @c24, @fail
+  @c24:
+    store i32 24, *%id
+    %trpos = load i32, *%tr_ep
+    %trposok = eq i32 %trpos, 7
+    br %trposok, @c25, @fail
+
+    // ---- unicode escapes ----
+  @c25:
+    store i32 25, *%id
+    %unip = gep i8, *@UNI, 0
+    %unil = call @len_of(%unip)
+    %uni = call @std_json_parse(%unip, %unil)
+    %unin = eq *i8 %uni, null
+    br %unin, @fail, @c26
+  @c26:
+    store i32 26, *%id
+    %ulp = gep i32, *%strlen_p, 0
+    %us = call @std_json_str(%uni, %ulp)
+    %ul = load i32, *%ulp
+    %u0p = gep i8, *%us, 0
+    %u0 = load i8, *%u0p
+    %u1p = gep i8, *%us, 1
+    %u1 = load i8, *%u1p
+    %ulok = eq i32 %ul, 2
+    %u0ok = eq i8 %u0, 195
+    %u1ok = eq i8 %u1, 169
+    %ua = and i1 %u0ok, %u1ok
+    %ub = and i1 %ulok, %ua
+    br %ub, @c27, @fail
+  @c27:
+    store i32 27, *%id
+    %surp = gep i8, *@SURR, 0
+    %surl = call @len_of(%surp)
+    %sur = call @std_json_parse(%surp, %surl)
+    %surn = eq *i8 %sur, null
+    br %surn, @fail, @c28
+  @c28:
+    store i32 28, *%id
+    %slp2 = gep i32, *%strlen_p, 0
+    %ss = call @std_json_str(%sur, %slp2)
+    %sslen = load i32, *%slp2
+    %s0p = gep i8, *%ss, 0
+    %s0 = load i8, *%s0p
+    %s1p = gep i8, *%ss, 1
+    %s1 = load i8, *%s1p
+    %s2p = gep i8, *%ss, 2
+    %s2 = load i8, *%s2p
+    %s3p = gep i8, *%ss, 3
+    %s3 = load i8, *%s3p
+    %ssok = eq i32 %sslen, 4
+    %s0ok = eq i8 %s0, 240
+    %s1ok = eq i8 %s1, 159
+    %s2ok = eq i8 %s2, 152
+    %s3ok = eq i8 %s3, 128
+    %sa = and i1 %s0ok, %s1ok
+    %sb = and i1 %s2ok, %s3ok
+    %sc = and i1 %sa, %sb
+    %sd = and i1 %ssok, %sc
+    br %sd, @c29, @fail
+
+    // ---- number forms ----
+  @c29:
+    store i32 29, *%id
+    %expp = gep i8, *@EXP, 0
+    %expl = call @len_of(%expp)
+    %expv = call @std_json_parse(%expp, %expl)
+    %expn = eq *i8 %expv, null
+    br %expn, @fail, @c30
+  @c30:
+    store i32 30, *%id
+    %expnp = gep i8, *%numout, 0
+    %expw = call @std_json_write(%expv, %expnp, 64)
+    %expcmp = call @strcmp(%expnp, "1000")
+    %expok = eq i32 %expcmp, 0
+    br %expok, @c31, @fail
+  @c31:
+    store i32 31, *%id
+    %negp = gep i8, *@NEG, 0
+    %negl = call @len_of(%negp)
+    %negv = call @std_json_parse(%negp, %negl)
+    %negiv = call @std_json_int(%negv)
+    %negok = eq i64 %negiv, -12
+    br %negok, @c32, @fail
+  @c32:
+    store i32 32, *%id
+    %bigp = gep i8, *@BIG, 0
+    %bigl = call @len_of(%bigp)
+    %bigv = call @std_json_parse(%bigp, %bigl)
+    %bignp = gep i8, *%numout, 0
+    %bigw = call @std_json_write(%bigv, %bignp, 64)
+    %bigcmp = call @strcmp(%bignp, @BIG)
+    %bigok = eq i32 %bigcmp, 0
+    br %bigok, @c33, @fail
+
+    // ---- serializer escapes control characters ----
+  @c33:
+    store i32 33, *%id
+    %ctlp = gep i8, *%ctrl, 0
+    store i8 1, *%ctlp
+    %ctlp2 = gep i8, *%ctrl, 1
+    store i8 65, *%ctlp2
+    %cs = call @std_json_new_string(%ctlp, 2)
+    %coutp = gep i8, *%out, 0
+    %cw = call @std_json_write(%cs, %coutp, 256)
+    %ccmp = call @strcmp(%coutp, "\"\\u0001A\"")
+    %cok = eq i32 %ccmp, 0
+    br %cok, @c34, @fail
+
+    // ---- nested arrays, and get on a non-object ----
+  @c34:
+    store i32 34, *%id
+    %nestp = gep i8, *@NEST, 0
+    %nestl = call @len_of(%nestp)
+    %nest = call @std_json_parse(%nestp, %nestl)
+    %n1 = call @std_json_at(%nest, 1)
+    %n2 = call @std_json_at(%n1, 0)
+    %n2v = call @std_json_int(%n2)
+    %n2ok = eq i64 %n2v, 2
+    br %n2ok, @c35, @fail
+  @c35:
+    store i32 35, *%id
+    %arrp = gep i8, *@ARR1, 0
+    %arrl = call @len_of(%arrp)
+    %arrv = call @std_json_parse(%arrp, %arrl)
+    %miss = call @std_json_get(%arrv, "x")
+    %missn = eq *i8 %miss, null
+    br %missn, @c36, @fail
+
+    // ---- repeated parse/free ----
+  @c36:
+    store i32 36, *%id
+    store i32 0, *%lc
+    jmp @loop_cond
+  @loop_cond:
+    %lci = load i32, *%lc
+    %lmore = slt i32 %lci, 50
+    br %lmore, @loop_body, @done
+  @loop_body:
+    %lp = gep i8, *@DOC, 0
+    %ll = call @len_of(%lp)
+    %lv = call @std_json_parse(%lp, %ll)
+    %lvn = eq *i8 %lv, null
+    br %lvn, @fail, @loop_free
+  @loop_free:
+    call @std_json_free(%lv)
+    %lci2 = load i32, *%lc
+    %ln = add i32 %lci2, 1
+    store i32 %ln, *%lc
+    jmp @loop_cond
+
+  @done:
+    call @std_json_free(%root)
+    call @std_json_free(%sv)
+    call @std_json_free(%obj)
+    call @std_json_free(%uni)
+    call @std_json_free(%sur)
+    call @std_json_free(%expv)
+    call @std_json_free(%negv)
+    call @std_json_free(%bigv)
+    call @std_json_free(%cs)
+    call @std_json_free(%nest)
+    call @std_json_free(%arrv)
+    call @printf("PASS json\n")
+    ret i32 0
+
+  @fail:
+    %fid = load i32, *%id
+    call @printf("FAIL json at case %d\n", %fid)
+    ret i32 1
+}

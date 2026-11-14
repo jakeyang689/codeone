@@ -1,0 +1,74 @@
+// Echo client — connects to server:8888, sends "hello", receives echo
+
+extern @putchar(c: i32) -> i32
+
+extern @c1_socket_create(domain: i32, type: i32, protocol: i32) -> i32
+extern @c1_socket_connect_loopback(fd: i32, port: i32) -> i32
+extern @c1_socket_send(fd: i32, buf: *i8, len: i32) -> i32
+extern @c1_socket_recv(fd: i32, buf: *i8, len: i32) -> i32
+extern @c1_socket_close(fd: i32) -> i32
+
+// Test message: "hello"
+const @msg: [i8, 5] = [104, 101, 108, 108, 111]
+
+fun @main() -> i32 {
+  @entry:
+    // Create TCP socket
+    %fd = call @c1_socket_create(2, 1, 0)
+    %neg = slt i32 %fd, 0
+    br %neg, @fail, @do_connect
+
+  @do_connect:
+    call @putchar(99)   // 'c' = connect
+    %r = call @c1_socket_connect_loopback(%fd, 8888)
+    %cneg = slt i32 %r, 0
+    br %cneg, @fail, @do_send
+
+  @do_send:
+    call @putchar(115)  // 's' = send
+    %mp = gep i8, *@msg, 0
+    %sent = call @c1_socket_send(%fd, %mp, 5)
+    %sneg = slt i32 %sent, 0
+    br %sneg, @fail, @do_recv
+
+  @do_recv:
+    call @putchar(114)  // 'r' = recv
+    %buf = let [i8, 256]
+    %bp = gep i8, *%buf, 0
+    %n = call @c1_socket_recv(%fd, %bp, 256)
+    %nneg = slt i32 %n, 0
+    br %nneg, @fail, @print_data
+
+  @print_data:
+    call @putchar(61)   // '=' = results
+    // Print received data as characters
+    %iptr = let i32
+    store i32 0, *%iptr
+    jmp @loop_cond
+
+  @loop_cond:
+    %i = load i32, *%iptr
+    %done = slt i32 %i, %n
+    br %done, @loop_body, @close
+
+  @loop_body:
+    %ci = load i32, *%iptr
+    %p = gep i8, *%buf, %ci
+    %cv = load i8, *%p
+    %cvi = zext i8 %cv to i32
+    call @putchar(%cvi)
+    %ni = add i32 %ci, 1
+    store i32 %ni, *%iptr
+    jmp @loop_cond
+
+  @close:
+    call @putchar(10)   // newline
+    call @c1_socket_close(%fd)
+    ret i32 0
+
+  @fail:
+    call @putchar(33)   // '!'
+    call @putchar(10)   // newline
+    call @c1_socket_close(%fd)
+    ret i32 1
+}

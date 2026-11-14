@@ -1,0 +1,208 @@
+// ASN.1 DER parser (minimal)
+// TLV (Tag-Length-Value) decode for X.509 certificate parsing
+
+// Tag bytes this parser understands. Callers compare @asn1_read_tag results
+// against their own copy of this enum; declarations are file-local.
+enum @Asn1Tag: i8 {
+  @Integer = 0x02,
+  @BitString = 0x03,
+  @OctetString = 0x04,
+  @Null = 0x05,
+  @Oid = 0x06,
+  @Utf8String = 0x0C,
+  @PrintableString = 0x13,
+  @Ia5String = 0x16,
+  @Constructed = 0x20,
+  @Sequence = 0x30,
+  @Set = 0x31
+}
+
+// read_tag: read tag byte at offset off from buf
+// Updates off to point after the tag
+fun @asn1_read_tag(buf: *i8, off: *i32) -> i8 {
+  @entry:
+    %off_v = load i32, *%off
+    %p = gep i8, *%buf, %off_v
+    %tag = load i8, *%p
+    %new_off = add i32 %off_v, 1
+    store i32 %new_off, *%off
+    ret i8 %tag
+}
+
+// read_length: read DER length at offset off from buf
+// Updates off to point after the length bytes
+// Returns the length value, or -1 on error
+fun @asn1_read_length(buf: *i8, off: *i32) -> i32 {
+  @entry:
+    %off_v = load i32, *%off
+    %p = gep i8, *%buf, %off_v
+    %first = load i8, *%p
+    %first_i = zext i8 %first to i32
+    %short = and i32 %first_i, 0x80
+    %is_short = eq i32 %short, 0
+    br %is_short, @short_len, @long_len
+
+  @short_len:
+    %new_off = add i32 %off_v, 1
+    store i32 %new_off, *%off
+    ret i32 %first_i
+
+  @long_len:
+    %num_bytes = and i32 %first_i, 0x7F
+    // Too many bytes for our simple parser
+    %too_many = sgt i32 %num_bytes, 4
+    br %too_many, @error, @read_long
+
+  @read_long:
+    %len = let i32
+    store i32 0, *%len
+    %li = let i32
+    store i32 0, *%li
+    jmp @rl_cond
+  @rl_cond:
+    %liv = load i32, *%li
+    %more = slt i32 %liv, %num_bytes
+    br %more, @rl_body, @rl_done
+  @rl_body:
+    %liv2 = load i32, *%li
+    %boff = add i32 %off_v, 1
+    %boff2 = add i32 %boff, %liv2
+    %bp = gep i8, *%buf, %boff2
+    %bv = load i8, *%bp
+    %bvi = zext i8 %bv to i32
+    %lenv = load i32, *%len
+    %len_sh = shl i32 %lenv, 8
+    %len_new = or i32 %len_sh, %bvi
+    store i32 %len_new, *%len
+    %next = add i32 %liv2, 1
+    store i32 %next, *%li
+    jmp @rl_cond
+  @rl_done:
+    %new_off2 = add i32 %off_v, 1
+    %new_off3 = add i32 %new_off2, %num_bytes
+    store i32 %new_off3, *%off
+    %len_v = load i32, *%len
+    ret i32 %len_v
+
+  @error:
+    ret i32 -1
+}
+
+// skip_tlv: skip one TLV (tag + length + value) at offset off
+// off is updated to point past the TLV
+fun @asn1_skip_tlv(buf: *i8, off: *i32) -> void {
+  @entry:
+    %tag = call @asn1_read_tag(%buf, %off)
+    %len = call @asn1_read_length(%buf, %off)
+    // A negative length means the header was malformed; leave off where it is.
+    %len_neg = slt i32 %len, 0
+    br %len_neg, @done, @adv
+  @adv:
+    %off_v = load i32, *%off
+    %new_off = add i32 %off_v, %len
+    store i32 %new_off, *%off
+    jmp @done
+  @done:
+    ret void
+}
+
+// find_in_seq: find first element with given tag inside a SEQUENCE
+// buf points to start of SEQUENCE value, len is the SEQUENCE length
+// Sets out_off to the value offset (after tag+length), out_len to the value length
+// Returns 1 if found, 0 if not found
+fun @asn1_find_in_seq(buf: *i8, len: i32, target_tag: i8, out_off: *i32, out_len: *i32) -> i1 {
+  @entry:
+    %pos = let i32
+    store i32 0, *%pos
+    jmp @find_cond
+  @find_cond:
+    %piv = load i32, *%pos
+    %more = slt i32 %piv, %len
+    br %more, @find_body, @find_none
+  @find_body:
+    %piv2 = load i32, *%pos
+    // Need at least one tag byte and one length byte.
+    %after_tag = add i32 %piv2, 1
+    %room = slt i32 %after_tag, %len
+    br %room, @find_read, @find_none
+  @find_read:
+    %tag = call @asn1_read_tag(%buf, %pos)
+    %match = eq i8 %tag, %target_tag
+    %tag_piv = load i32, *%pos  // position after tag
+    %el_len = call @asn1_read_length(%buf, %pos)
+    %len_neg = slt i32 %el_len, 0
+    br %len_neg, @find_none, @find_dispatch
+  @find_dispatch:
+    br %match, @found, @skip_element
+
+  @found:
+    store i32 %tag_piv, *%out_off
+    store i32 %el_len, *%out_len
+    ret i1 1
+
+  @skip_element:
+    %cur_off = load i32, *%pos
+    %new_off = add i32 %cur_off, %el_len
+    store i32 %new_off, *%pos
+    jmp @find_cond
+
+  @find_none:
+    ret i1 0
+}
+
+// read_oid: read an OID at position off (tag already consumed)
+// off points to length, updates past OID value
+// Returns: 1 on success, 0 on error. out stores first 20 components.
+fun @asn1_read_oid(buf: *i8, off: *i32) -> i32 {
+  @entry:
+    %len = call @asn1_read_length(%buf, %off)
+    %len_neg = slt i32 %len, 0
+    br %len_neg, @oid_err, @oid_ok
+  @oid_ok:
+    %off_v = load i32, *%off
+    %new_off = add i32 %off_v, %len
+    store i32 %new_off, *%off
+    ret i32 %len
+  @oid_err:
+    ret i32 -1
+}
+
+// read_integer: read an ASN.1 INTEGER at position off (tag already consumed)
+// off points to length, updates past INTEGER value
+// bytes: output buffer (max 32 bytes), byte_len: output actual length
+// Returns: 1 on success, 0 on error
+fun @asn1_read_integer(buf: *i8, off: *i32, bytes: *i8, byte_len: *i32) -> i1 {
+  @entry:
+    %len = call @asn1_read_length(%buf, %off)
+    %len_neg = slt i32 %len, 0
+    br %len_neg, @int_err, @int_chk
+  @int_chk:
+    %too_long = sgt i32 %len, 32
+    br %too_long, @int_err, @int_read
+  @int_read:
+    %off_v = load i32, *%off
+    store i32 %len, *%byte_len
+    %ii = let i32
+    store i32 0, *%ii
+    jmp @int_cond
+  @int_cond:
+    %iiv = load i32, *%ii
+    %more = slt i32 %iiv, %len
+    br %more, @int_body, @int_done
+  @int_body:
+    %iiv2 = load i32, *%ii
+    %src_off = add i32 %off_v, %iiv2
+    %sp = gep i8, *%buf, %src_off
+    %sv = load i8, *%sp
+    %dp = gep i8, *%bytes, %iiv2
+    store i8 %sv, *%dp
+    %next = add i32 %iiv2, 1
+    store i32 %next, *%ii
+    jmp @int_cond
+  @int_done:
+    %new_off = add i32 %off_v, %len
+    store i32 %new_off, *%off
+    ret i1 1
+  @int_err:
+    ret i1 0
+}

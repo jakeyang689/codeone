@@ -1,0 +1,67 @@
+// Character type classification and conversion — backed by libc <ctype.h>.
+// The wrappers take an i8 and widen it as unsigned char, which is the only
+// range the C standard allows besides EOF.
+
+extern @isdigit(c: i32) -> i32
+extern @isalpha(c: i32) -> i32
+extern @isupper(c: i32) -> i32
+extern @islower(c: i32) -> i32
+extern @isspace(c: i32) -> i32
+extern @toupper(c: i32) -> i32
+extern @tolower(c: i32) -> i32
+
+fun @std_text_ctype_isdigit(c: i8) -> i1 {
+  @entry:
+    %w = zext i8 %c to i32
+    %r = call @isdigit(%w)
+    %nz = ne i32 %r, 0
+    ret i1 %nz
+}
+
+fun @std_text_ctype_isalpha(c: i8) -> i1 {
+  @entry:
+    %w = zext i8 %c to i32
+    %r = call @isalpha(%w)
+    %nz = ne i32 %r, 0
+    ret i1 %nz
+}
+
+fun @std_text_ctype_isupper(c: i8) -> i1 {
+  @entry:
+    %w = zext i8 %c to i32
+    %r = call @isupper(%w)
+    %nz = ne i32 %r, 0
+    ret i1 %nz
+}
+
+fun @std_text_ctype_islower(c: i8) -> i1 {
+  @entry:
+    %w = zext i8 %c to i32
+    %r = call @islower(%w)
+    %nz = ne i32 %r, 0
+    ret i1 %nz
+}
+
+fun @std_text_ctype_isspace(c: i8) -> i1 {
+  @entry:
+    %w = zext i8 %c to i32
+    %r = call @isspace(%w)
+    %nz = ne i32 %r, 0
+    ret i1 %nz
+}
+
+fun @std_text_ctype_toupper(c: i8) -> i8 {
+  @entry:
+    %w = zext i8 %c to i32
+    %r = call @toupper(%w)
+    %b = trunc i32 %r to i8
+    ret i8 %b
+}
+
+fun @std_text_ctype_tolower(c: i8) -> i8 {
+  @entry:
+    %w = zext i8 %c to i32
+    %r = call @tolower(%w)
+    %b = trunc i32 %r to i8
+    ret i8 %b
+}

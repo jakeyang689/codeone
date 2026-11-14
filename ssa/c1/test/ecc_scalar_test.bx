@@ -1,0 +1,70 @@
+// Scalar arithmetic (mod n) tests for secp256k1.
+//
+// The carry path previously added 2^256 mod p instead of 2^256 mod n, so any
+// a + b that overflowed 256 bits produced a wrong scalar.
+
+extern @printf(fmt: *i8, ...) -> i32
+extern @ecc_sc_add(r: *i32, a: *i32, b: *i32) -> void
+extern @std_crypto_rsa_bn_cmp(a: *i32, b: *i32, limbs: i32) -> i32
+
+const @N1: [i32, 8] = [ 0xD0364140, 0xBFD25E8C, 0xAF48A03B, 0xBAAEDCE6,
+                        0xFFFFFFFE, -1, -1, -1 ]
+const @N2: [i32, 8] = [ 0xD036413F, 0xBFD25E8C, 0xAF48A03B, 0xBAAEDCE6,
+                        0xFFFFFFFE, -1, -1, -1 ]
+const @N3: [i32, 8] = [ 0xD036413E, 0xBFD25E8C, 0xAF48A03B, 0xBAAEDCE6,
+                        0xFFFFFFFE, -1, -1, -1 ]
+const @ONE: [i32, 8] = [ 1, 0, 0, 0, 0, 0, 0, 0 ]
+const @TWO: [i32, 8] = [ 2, 0, 0, 0, 0, 0, 0, 0 ]
+const @THREE: [i32, 8] = [ 3, 0, 0, 0, 0, 0, 0, 0 ]
+const @HALF: [i32, 8] = [ 0, 0, 0, 0, 0, 0, 0, 0x80000000 ]
+const @ZERO: [i32, 8] = [ 0, 0, 0, 0, 0, 0, 0, 0 ]
+// 2^256 mod n = 2^256 - n
+const @CARRY: [i32, 8] = [ 0x2FC9BEBF, 0x402DA173, 0x50B75FC4, 0x45512319,
+                           1, 0, 0, 0 ]
+
+fun @main() -> i32 {
+  @entry:
+    %r = let [i32, 16]
+    %rp = gep i32, *%r, 0
+
+    // 1 + 2 = 3
+    call @ecc_sc_add(%rp, @ONE, @TWO)
+    %c1 = call @std_crypto_rsa_bn_cmp(%rp, @THREE, 8)
+    %ok1 = eq i32 %c1, 0
+    br %ok1, @t2, @fail
+
+  // (n-1) + 2 = 1
+  @t2:
+    call @ecc_sc_add(%rp, @N1, @TWO)
+    %c2 = call @std_crypto_rsa_bn_cmp(%rp, @ONE, 8)
+    %ok2 = eq i32 %c2, 0
+    br %ok2, @t3, @fail
+
+  // (n-1) + (n-2) = n-3, with a 256-bit carry
+  @t3:
+    call @ecc_sc_add(%rp, @N1, @N2)
+    %c3 = call @std_crypto_rsa_bn_cmp(%rp, @N3, 8)
+    %ok3 = eq i32 %c3, 0
+    br %ok3, @t4, @fail
+
+  // 2^255 + 2^255 = 2^256 = (2^256 mod n) mod n
+  @t4:
+    call @ecc_sc_add(%rp, @HALF, @HALF)
+    %c4 = call @std_crypto_rsa_bn_cmp(%rp, @CARRY, 8)
+    %ok4 = eq i32 %c4, 0
+    br %ok4, @t5, @fail
+
+  // n-1 + 0 = n-1
+  @t5:
+    call @ecc_sc_add(%rp, @N1, @ZERO)
+    %c5 = call @std_crypto_rsa_bn_cmp(%rp, @N1, 8)
+    %ok5 = eq i32 %c5, 0
+    br %ok5, @pass, @fail
+
+  @pass:
+    call @printf("PASS ecc_scalar\n")
+    ret i32 0
+  @fail:
+    call @printf("FAIL ecc_scalar\n")
+    ret i32 1
+}

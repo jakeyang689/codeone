@@ -1,0 +1,14 @@
+// {{PROJECT_NAME}} — library entry point.
+// Keep this file small: put library logic in separate <module>.bx files and
+// expose it through functions here (see agents.md).
+
+extern @printf(fmt: *i8, ...) -> i32
+
+const @msg: [i8, 15] = "Hello, World!\n"
+
+fun @hello() -> i32 {
+  @entry:
+    %fmt = gep i8, *@msg, 0
+    call @printf(%fmt)
+    ret i32 0
+}

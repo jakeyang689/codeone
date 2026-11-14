@@ -1,0 +1,123 @@
+// TLS 1.2 Client Test Program
+// Connects to a TLS server and sends an HTTP request
+//
+// Build:
+//   cd ssa/c1
+//   ./c1 test/tls_client_test.bx <deps> -o test/tls_client_test -L ../platform -l platform -O2
+//
+// Run:
+//   ./test/tls_client_test
+
+extern @printf(fmt: *i8, ...) -> i32
+extern @memset(s: *i8, c: i32, n: i64) -> *i8
+extern @memcpy(dst: *i8, src: *i8, n: i64) -> *i8
+extern @putchar(c: i32) -> i32
+
+// TLS Client API
+extern @net_tls12_connect(ctx: *i8, fd: i32, limbs: i32) -> i32
+extern @net_tls_set_host(ctx: *i8, host: *i8, len: i32) -> void
+extern @net_tls_send(ctx: *i8, data: *i8, len: i32) -> i32
+extern @net_tls_recv(ctx: *i8, buf: *i8, cap: i32, out_len: *i32) -> i32
+extern @net_tls_close(ctx: *i8) -> i32
+
+// Socket API
+extern @net_socket_tcp() -> i32
+extern @net_socket_connect_ip(fd: i32, ip: *i8, port: i32) -> i32
+extern @net_dns_resolve(hostname: *i8, addr_buf: *i8, addr_buf_len: i32) -> i32
+extern @net_socket_close(fd: i32) -> i32
+
+// Change these to connect to your server
+const @HOST: [i8, 12] = [101, 120, 97, 109, 112, 108, 101, 46, 99, 111, 109, 0]
+const @PORT: i32 = 443
+const @LIMBS: i32 = 64
+
+fun @main() -> i32 {
+  @entry:
+    call @printf("=== TLS 1.2 Client ===\n")
+    %host_p = gep i8, *@HOST, 0
+    call @printf("Resolving %s...\n", %host_p)
+    %addr = let [i8, 64]
+    %addr_p = gep i8, *%addr, 0
+    %rd = call @net_dns_resolve(%host_p, %addr_p, 64)
+    %rd_ok = eq i32 %rd, 0
+    br %rd_ok, @sock, @dns_fail
+  @dns_fail:
+    call @printf("DNS FAIL\n")
+    ret i32 1
+
+  @sock:
+    call @printf("Connecting %s:%d...\n", %addr_p, @PORT)
+    %fd = call @net_socket_tcp()
+    %fd_ok = sge i32 %fd, 0
+    br %fd_ok, @conn, @fail
+  @conn:
+    %cr = call @net_socket_connect_ip(%fd, %addr_p, @PORT)
+    %c_ok = eq i32 %cr, 0
+    br %c_ok, @hs, @fail
+
+  @hs:
+    call @printf("TLS 1.2 handshake...\n")
+    %ctx = let [i8, 1024]
+    %ctxp = gep i8, *%ctx, 0
+    call @memset(%ctxp, 0, 1024)
+    call @net_tls_set_host(%ctxp, %host_p, 11)
+    %hs_r = call @net_tls12_connect(%ctxp, %fd, @LIMBS)
+    %hs_ok = eq i32 %hs_r, 0
+    br %hs_ok, @send, @hs_fail
+  @hs_fail:
+    call @printf("TLS handshake FAILED at step %d\n", %hs_r)
+    jmp @close
+
+  @send:
+    call @printf("Sending HTTP request...\n")
+    %req = let [i8, 128]
+    %req_p = gep i8, *%req, 0
+    call @memcpy(%req_p, "GET / HTTP/1.1\r\nHost: ", 21)
+    %r1 = gep i8, *%req_p, 21
+    call @memcpy(%r1, "example.com", 11)
+    %r2 = gep i8, *%req_p, 32
+    call @memcpy(%r2, "\r\nConnection: close\r\n\r\n", 23)
+    %sr = call @net_tls_send(%ctxp, %req_p, 55)
+    %s_ok = eq i32 %sr, 0
+    br %s_ok, @recv, @close
+
+  @recv:
+    %buf = let [i8, 8192]
+    %buf_p = gep i8, *%buf, 0
+    %out_len = let i32
+    %out_len_p = gep i32, *%out_len, 0
+    call @printf("Reading response...\n")
+    %rr = call @net_tls_recv(%ctxp, %buf_p, 8192, %out_len_p)
+    %r_ok = eq i32 %rr, 0
+    br %r_ok, @print, @close
+
+  @print:
+    %lenv = load i32, *%out_len_p
+    call @printf("Got %d bytes:\n", %lenv)
+    %i = let i32
+    store i32 0, *%i
+    jmp @p_loop
+  @p_loop:
+    %iv = load i32, *%i
+    %more = slt i32 %iv, %lenv
+    br %more, @p_body, @close
+  @p_body:
+    %iv2 = load i32, *%i
+    %cp = gep i8, *%buf_p, %iv2
+    %c = load i8, *%cp
+    %ci = zext i8 %c to i32
+    call @putchar(%ci)
+    %next = add i32 %iv2, 1
+    store i32 %next, *%i
+    jmp @p_loop
+
+  @close:
+    call @net_tls_close(%ctxp)
+    call @net_socket_close(%fd)
+    call @printf("\nDone.\n")
+    ret i32 0
+
+  @fail:
+    call @printf("Connect FAIL\n")
+    ret i32 1
+}

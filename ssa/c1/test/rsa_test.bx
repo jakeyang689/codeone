@@ -1,0 +1,65 @@
+// RSA test: basic arithmetic (add, sub, mul)
+// mod_pow is correct but runs very slowly at -O0 (naive repeated-subtraction mod)
+
+extern @std_crypto_rsa_bn_zero(r: *i32, limbs: i32) -> void
+extern @std_crypto_rsa_bn_add(r: *i32, a: *i32, b: *i32, limbs: i32) -> i32
+extern @std_crypto_rsa_bn_sub(r: *i32, a: *i32, b: *i32, limbs: i32) -> i32
+extern @std_crypto_rsa_bn_mul(r: *i32, a: *i32, b: *i32, limbs: i32) -> void
+
+fun @main() -> i32 {
+  @entry:
+    %a = let [i32, 4]
+    %b = let [i32, 4]
+    %r = let [i32, 4]
+    call @std_crypto_rsa_bn_zero(%a, 4)
+    call @std_crypto_rsa_bn_zero(%b, 4)
+
+    // add: 5 + 3 = 8
+    %ap0 = gep i32, *%a, 0
+    store i32 5, *%ap0
+    %bp0 = gep i32, *%b, 0
+    store i32 3, *%bp0
+    %carry = call @std_crypto_rsa_bn_add(%r, %a, %b, 4)
+    %rp0 = gep i32, *%r, 0
+    %rv = load i32, *%rp0
+    %add_ok = eq i32 %rv, 8
+    br %add_ok, @t1_ck, @fail
+  @t1_ck:
+    %cok = eq i32 %carry, 0
+    br %cok, @t2, @fail
+
+  @t2:
+    // sub: 100 - 30 = 70
+    %ap0_2 = gep i32, *%a, 0
+    store i32 100, *%ap0_2
+    %bp0_2 = gep i32, *%b, 0
+    store i32 30, *%bp0_2
+    %brw = call @std_crypto_rsa_bn_sub(%r, %a, %b, 4)
+    %rp0_2 = gep i32, *%r, 0
+    %rv2 = load i32, *%rp0_2
+    %sub_ok = eq i32 %rv2, 70
+    br %sub_ok, @t2_ck, @fail
+  @t2_ck:
+    %bok = eq i32 %brw, 0
+    br %bok, @t3, @fail
+
+  @t3:
+    // mul: 7 * 6 = 42
+    call @std_crypto_rsa_bn_zero(%a, 4)
+    call @std_crypto_rsa_bn_zero(%b, 4)
+    %ap0_3 = gep i32, *%a, 0
+    store i32 7, *%ap0_3
+    %bp0_3 = gep i32, *%b, 0
+    store i32 6, *%bp0_3
+    %rm = let [i32, 8]
+    call @std_crypto_rsa_bn_mul(%rm, %a, %b, 4)
+    %rmp0 = gep i32, *%rm, 0
+    %rmv = load i32, *%rmp0
+    %mul_ok = eq i32 %rmv, 42
+    br %mul_ok, @pass, @fail
+
+  @pass:
+    ret i32 0
+  @fail:
+    ret i32 1
+}

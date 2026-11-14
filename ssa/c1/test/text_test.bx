@@ -1,0 +1,130 @@
+// String helpers: starts_with, trim, split_next, replace.
+// Prints "PASS text" on success.
+
+extern @printf(fmt: *i8, ...) -> i32
+extern @strcmp(a: *i8, b: *i8) -> i32
+extern @std_text_str_starts_with(s: *i8, prefix: *i8) -> i1
+extern @std_text_str_trim(s: *i8, out: *i8, cap: i32) -> i32
+extern @std_text_str_split_next(s: *i8, pos: *i32, sep: i8,
+                                out: *i8, cap: i32) -> i32
+extern @std_text_str_replace(s: *i8, needle: *i8, repl: *i8,
+                             out: *i8, cap: i32) -> i32
+
+fun @main() -> i32 {
+  @entry:
+    %id = let i32
+    %out = let [i8, 128]
+    %pos = let i32
+    %op = gep i8, *%out, 0
+    %pp = gep i32, *%pos, 0
+    store i32 0, *%id
+    jmp @c1
+
+  @c1:
+    store i32 1, *%id
+    %s1 = call @std_text_str_starts_with("hello world", "hello")
+    %ok1 = eq i1 %s1, true
+    br %ok1, @c2, @fail
+  @c2:
+    store i32 2, *%id
+    %s2 = call @std_text_str_starts_with("hello", "world")
+    %ok2 = eq i1 %s2, false
+    br %ok2, @c3, @fail
+  @c3:
+    store i32 3, *%id
+    %s3 = call @std_text_str_starts_with("hi", "hello")
+    %ok3 = eq i1 %s3, false
+    br %ok3, @c4, @fail
+  @c4:
+    store i32 4, *%id
+    %t1 = call @std_text_str_trim("  hi there \n", %op, 128)
+    %t1c = call @strcmp(%op, "hi there")
+    %t1ok = eq i32 %t1, 8
+    %t1cok = eq i32 %t1c, 0
+    %a4 = and i1 %t1ok, %t1cok
+    br %a4, @c5, @fail
+  @c5:
+    store i32 5, *%id
+    %t2 = call @std_text_str_trim("   ", %op, 128)
+    %t2c = call @strcmp(%op, "")
+    %t2ok = eq i32 %t2, 0
+    %t2cok = eq i32 %t2c, 0
+    %a5 = and i1 %t2ok, %t2cok
+    br %a5, @c6, @fail
+
+    // split "a,b,,c"
+  @c6:
+    store i32 6, *%id
+    store i32 0, *%pp
+    %p1 = call @std_text_str_split_next("a,b,,c", %pp, ',', %op, 128)
+    %p1c = call @strcmp(%op, "a")
+    %p1ok = eq i32 %p1, 1
+    %p1cok = eq i32 %p1c, 0
+    %b1 = and i1 %p1ok, %p1cok
+    br %b1, @c7, @fail
+  @c7:
+    store i32 7, *%id
+    %p2 = call @std_text_str_split_next("a,b,,c", %pp, ',', %op, 128)
+    %p2c = call @strcmp(%op, "b")
+    %p2ok = eq i32 %p2, 1
+    %p2cok = eq i32 %p2c, 0
+    %b2 = and i1 %p2ok, %p2cok
+    br %b2, @c8, @fail
+  @c8:
+    store i32 8, *%id
+    %p3 = call @std_text_str_split_next("a,b,,c", %pp, ',', %op, 128)
+    %p3c = call @strcmp(%op, "")
+    %p3ok = eq i32 %p3, 0
+    %p3cok = eq i32 %p3c, 0
+    %b3 = and i1 %p3ok, %p3cok
+    br %b3, @c9, @fail
+  @c9:
+    store i32 9, *%id
+    %p4 = call @std_text_str_split_next("a,b,,c", %pp, ',', %op, 128)
+    %p4c = call @strcmp(%op, "c")
+    %p4ok = eq i32 %p4, 1
+    %p4cok = eq i32 %p4c, 0
+    %b4 = and i1 %p4ok, %p4cok
+    br %b4, @c10, @fail
+  @c10:
+    store i32 10, *%id
+    %p5 = call @std_text_str_split_next("a,b,,c", %pp, ',', %op, 128)
+    %p5ok = eq i32 %p5, -1
+    br %p5ok, @c11, @fail
+
+    // replace
+  @c11:
+    store i32 11, *%id
+    %r1 = call @std_text_str_replace("a-b-c", "-", "+", %op, 128)
+    %r1c = call @strcmp(%op, "a+b+c")
+    %r1ok = eq i32 %r1, 5
+    %r1cok = eq i32 %r1c, 0
+    %d1 = and i1 %r1ok, %r1cok
+    br %d1, @c12, @fail
+  @c12:
+    store i32 12, *%id
+    %r2 = call @std_text_str_replace("aaa", "aa", "b", %op, 128)
+    %r2c = call @strcmp(%op, "ba")
+    %r2ok = eq i32 %r2, 2
+    %r2cok = eq i32 %r2c, 0
+    %d2 = and i1 %r2ok, %r2cok
+    br %d2, @c13, @fail
+  @c13:
+    store i32 13, *%id
+    %r3 = call @std_text_str_replace("abc", "", "x", %op, 128)
+    %r3ok = eq i32 %r3, -1
+    br %r3ok, @c14, @fail
+  @c14:
+    store i32 14, *%id
+    %r4 = call @std_text_str_replace("abc", "a", "xxxx", %op, 4)
+    %r4ok = eq i32 %r4, -1
+    br %r4ok, @pass, @fail
+
+  @pass:
+    call @printf("PASS text\n")
+    ret i32 0
+  @fail:
+    %fid = load i32, *%id
+    call @printf("FAIL text at case %d\n", %fid)
+    ret i32 1
+}

@@ -1,0 +1,14 @@
+// {{PROJECT_NAME}} — entry point.
+// Keep this file small: put application logic in separate <module>.bx files
+// and call it from @main (see agents.md).
+
+extern @printf(fmt: *i8, ...) -> i32
+
+const @msg: [i8, 15] = "Hello, World!\n"
+
+fun @main() -> i32 {
+  @entry:
+    %fmt = gep i8, *@msg, 0
+    call @printf(%fmt)
+    ret i32 0
+}

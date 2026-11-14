@@ -1,0 +1,145 @@
+// Hexadecimal encoding and decoding (lowercase output, mixed-case input).
+
+fun @_hex_val(c: i32) -> i32 {
+  @entry:
+    %ge0 = sge i32 %c, 48
+    %le9 = sle i32 %c, 57
+    %isd = and i1 %ge0, %le9
+    br %isd, @digit, @lower
+  @digit:
+    %d = sub i32 %c, 48
+    ret i32 %d
+  @lower:
+    %gea = sge i32 %c, 97
+    %lez = sle i32 %c, 102
+    %isl = and i1 %gea, %lez
+    br %isl, @low, @upper
+  @low:
+    %l = sub i32 %c, 87
+    ret i32 %l
+  @upper:
+    %geA = sge i32 %c, 65
+    %leZ = sle i32 %c, 70
+    %isU = and i1 %geA, %leZ
+    br %isU, @up, @bad
+  @up:
+    %u = sub i32 %c, 55
+    ret i32 %u
+  @bad:
+    ret i32 -1
+}
+
+fun @_hex_ch(n: i32) -> i8 {
+  @entry:
+    %lt = slt i32 %n, 10
+    br %lt, @dig, @alpha
+  @dig:
+    %d = add i32 %n, 48
+    %c = trunc i32 %d to i8
+    ret i8 %c
+  @alpha:
+    %a = add i32 %n, 87
+    %c2 = trunc i32 %a to i8
+    ret i8 %c2
+}
+
+// Encode len bytes as 2*len lowercase hex characters plus a NUL.
+// Returns the character count or -1 when the buffer is too small.
+fun @std_text_hex_encode(data: *i8, len: i32, out: *i8, cap: i32) -> i32 {
+  @entry:
+    %neg = slt i32 %len, 0
+    br %neg, @fail, @check
+  @check:
+    %chars = mul i32 %len, 2
+    %need = add i32 %chars, 1
+    %fits = sle i32 %need, %cap
+    br %fits, @init, @fail
+  @init:
+    %i = let i32
+    store i32 0, *%i
+    jmp @loop
+  @loop:
+    %iv = load i32, *%i
+    %more = slt i32 %iv, %len
+    br %more, @body, @done
+  @body:
+    %p = gep i8, *%data, %iv
+    %b = load i8, *%p
+    %bi = zext i8 %b to i32
+    %hi = lshr i32 %bi, 4
+    %lo = and i32 %bi, 15
+    %hic = call @_hex_ch(%hi)
+    %loc = call @_hex_ch(%lo)
+    %o = mul i32 %iv, 2
+    %op = gep i8, *%out, %o
+    store i8 %hic, *%op
+    %o1 = add i32 %o, 1
+    %op1 = gep i8, *%out, %o1
+    store i8 %loc, *%op1
+    %n = add i32 %iv, 1
+    store i32 %n, *%i
+    jmp @loop
+  @done:
+    %of = load i32, *%i
+    %chars2 = mul i32 %of, 2
+    %zp = gep i8, *%out, %chars2
+    store i8 0, *%zp
+    ret i32 %chars2
+  @fail:
+    ret i32 -1
+}
+
+// Decode src_len hex characters into bytes. The length must be even.
+// Returns 0 and writes the byte count to out_len, or -1.
+fun @std_text_hex_decode(src: *i8, src_len: i32, out: *i8,
+                         out_cap: i32, out_len: *i32) -> i32 {
+  @entry:
+    %neg = slt i32 %src_len, 0
+    %odd = and i32 %src_len, 1
+    %isodd = ne i32 %odd, 0
+    %bad = or i1 %neg, %isodd
+    br %bad, @fail, @check
+  @check:
+    %n = div i32 %src_len, 2
+    %fits = sle i32 %n, %out_cap
+    br %fits, @init, @fail
+  @init:
+    %i = let i32
+    store i32 0, *%i
+    jmp @loop
+  @loop:
+    %iv = load i32, *%i
+    %more = slt i32 %iv, %src_len
+    br %more, @body, @done
+  @body:
+    %p = gep i8, *%src, %iv
+    %c1 = load i8, *%p
+    %c1i = zext i8 %c1 to i32
+    %i1 = add i32 %iv, 1
+    %p1 = gep i8, *%src, %i1
+    %c2 = load i8, *%p1
+    %c2i = zext i8 %c2 to i32
+    %h = call @_hex_val(%c1i)
+    %l = call @_hex_val(%c2i)
+    %ok1 = sge i32 %h, 0
+    %ok2 = sge i32 %l, 0
+    %ok = and i1 %ok1, %ok2
+    br %ok, @store, @fail
+  @store:
+    %v = mul i32 %h, 16
+    %b = add i32 %v, %l
+    %b8 = trunc i32 %b to i8
+    %o = div i32 %iv, 2
+    %op = gep i8, *%out, %o
+    store i8 %b8, *%op
+    %nxt = add i32 %iv, 2
+    store i32 %nxt, *%i
+    jmp @loop
+  @done:
+    %n2 = div i32 %src_len, 2
+    store i32 %n2, *%out_len
+    ret i32 0
+  @fail:
+    store i32 0, *%out_len
+    ret i32 -1
+}

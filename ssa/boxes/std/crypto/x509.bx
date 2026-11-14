@@ -1,0 +1,1556 @@
+// X.509 v3 Certificate Parser — RFC 5280
+// Built on existing asn1.bx DER parser. Extracts public keys (RSA, P-256)
+// from DER-encoded X.509 certificates for TLS handshake use.
+
+extern @memcpy(dst: *i8, src: *i8, n: i64) -> *i8
+extern @memcmp(a: *i8, b: *i8, n: i64) -> i32
+extern @memset(s: *i8, c: i32, n: i64) -> *i8
+extern @asn1_read_tag(buf: *i8, off: *i32) -> i8
+extern @asn1_read_length(buf: *i8, off: *i32) -> i32
+extern @asn1_skip_tlv(buf: *i8, off: *i32) -> void
+extern @asn1_find_in_seq(buf: *i8, len: i32, tag: i8, out_off: *i32, out_len: *i32) -> i1
+extern @std_crypto_sha256_compute(data: *i8, len: i32, digest: *i8) -> void
+extern @std_crypto_rsa_bn_from_bytes(r: *i32, bytes: *i8, byte_len: i32, limbs: i32) -> void
+extern @std_crypto_rsa_bn_to_bytes(bytes: *i8, a: *i32, byte_len: i32, limbs: i32) -> void
+extern @std_crypto_rsa_bn_zero(r: *i32, limbs: i32) -> void
+extern @std_crypto_rsa_bn_mod_pow(r: *i32, base: *i32, exp: *i32, exp_limbs: i32, m: *i32, limbs: i32) -> void
+extern @std_crypto_pkcs1_v15_encode(hash: *i8, em: *i8, em_len: i32) -> void
+extern @std_crypto_rsa_verify_pss_sha256(hash: *i8, sig: *i8, sig_len: i32,
+                                         e: *i32, e_limbs: i32, n: *i32,
+                                         limbs: i32) -> i1
+extern @std_crypto_p256_verify(pub_x: *i32, pub_y: *i32, hash: *i8,
+                               r: *i32, s: *i32) -> i1
+
+
+// ============================================================
+// Known OID byte sequences (DER-encoded)
+// ============================================================
+
+// rsaEncryption: 1.2.840.113549.1.1.1
+const @X509_OID_RSA: [i8, 9] = [0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x01]
+
+// sha256WithRSAEncryption: 1.2.840.113549.1.1.11
+const @X509_OID_SHA256_RSA: [i8, 9] = [0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0B]
+
+// ecPublicKey: 1.2.840.10045.2.1
+const @X509_OID_EC: [i8, 7] = [0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01]
+
+// secp256r1: 1.2.840.10045.3.1.7
+const @X509_OID_P256: [i8, 8] = [0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07]
+
+// RSASSA-PSS: 1.2.840.113549.1.1.10
+const @X509_OID_PSS: [i8, 9] = [0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0A]
+
+// ecdsa-with-SHA256: 1.2.840.10045.4.3.2
+const @X509_OID_ECDSA_SHA256: [i8, 8] = [0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x02]
+
+// subjectAltName: 2.5.29.17
+const @X509_OID_SAN: [i8, 3] = [0x55, 0x1D, 0x11]
+
+// ASN.1 DER tag bytes. The context-specific tags are named for what they
+// carry in the X.509 structures this file parses.
+enum @Asn1Tag: i8 {
+  @Boolean = 0x01,
+  @Integer = 0x02,
+  @BitString = 0x03,
+  @OctetString = 0x04,
+  @Oid = 0x06,
+  @UtcTime = 0x17,
+  @GeneralizedTime = 0x18,
+  @Sequence = 0x30,
+  @DnsName = 0x82,
+  @Version = 0xA0,
+  @Extensions = 0xA3
+}
+
+
+// ============================================================
+// Internal: compare OID bytes at position off in buf
+// Returns 1 if the OID at off matches the given oid bytes
+// ============================================================
+fun @_x509_match_oid(buf: *i8, off: *i32, oid: *i8, oid_len: i32) -> i1 {
+  @entry:
+    // Read the OID length from DER
+    %len = call @asn1_read_length(%buf, %off)
+    %match_len = eq i32 %len, %oid_len
+    br %match_len, @match_oid_val, @oid_no_match
+
+  @match_oid_val:
+    %off_v = load i32, *%off
+    // Temporarily adjust off back since read_length advanced it past length
+    // We need the value start. read_length already advanced off past length.
+    %oid_len_64 = sext i32 %oid_len to i64
+    %buf_at_val = gep i8, *%buf, %off_v
+    %cmp = call @memcmp(%buf_at_val, %oid, %oid_len_64)
+    %eq = eq i32 %cmp, 0
+    br %eq, @oid_match, @oid_no_match
+
+  @oid_no_match:
+    // Advance off past the OID value for proper skipping
+    %off_v2 = load i32, *%off
+    %skip = add i32 %off_v2, %len
+    store i32 %skip, *%off
+    ret i1 0
+
+  @oid_match:
+    ret i1 1
+}
+
+
+// ============================================================
+// Internal: skip one TLV, return tag and length
+// ============================================================
+fun @_x509_peek_skip(buf: *i8, off: *i32, out_tag: *i8, out_len: *i32) -> void {
+  @entry:
+    %tag = call @asn1_read_tag(%buf, %off)
+    %len = call @asn1_read_length(%buf, %off)
+    store i8 %tag, *%out_tag
+    store i32 %len, *%out_len
+    %off_v = load i32, *%off
+    %skip = add i32 %off_v, %len
+    store i32 %skip, *%off
+    ret void
+}
+
+
+// ============================================================
+// x509_find_tbs_certificate: locate TBSCertificate inside a
+// DER-encoded Certificate.
+// Certificate ::= SEQUENCE { tbsCertificate TBSCertificate, ... }
+// Returns:
+//   tbs_val_off: offset of TBS value (after tag+length)
+//   tbs_val_len: length of TBS value
+//   tbs_der_off: offset of TBS SEQUENCE tag (start of full TBS DER)
+//   tbs_der_len: length of full TBS DER (tag + length + value)
+// ============================================================
+fun @x509_find_tbs_certificate(cert_der: *i8, cert_len: i32,
+                                 tbs_val_off: *i32, tbs_val_len: *i32,
+                                 tbs_der_off: *i32, tbs_der_len: *i32) -> i1 {
+  @entry:
+    %off = let i32
+    store i32 0, *%off
+
+    // Outer SEQUENCE
+    %outer_tag = call @asn1_read_tag(%cert_der, %off)
+    %outer_is_seq = eq i8 %outer_tag, @Asn1Tag.Sequence
+    br %outer_is_seq, @read_outer_len, @tbs_not_found
+
+  @read_outer_len:
+    %outer_len = call @asn1_read_length(%cert_der, %off)
+    %outer_neg = slt i32 %outer_len, 0
+    br %outer_neg, @tbs_not_found, @outer_bound
+
+  @outer_bound:
+    %outer_after = load i32, *%off
+    %outer_end = add i32 %outer_after, %outer_len
+    %outer_over = sgt i32 %outer_end, %cert_len
+    br %outer_over, @tbs_not_found, @find_tbs
+
+  @find_tbs:
+    // First element of Certificate SEQUENCE is TBSCertificate
+    // Save the offset where TBS SEQUENCE starts (its tag)
+    %tbs_der_start = load i32, *%off
+    store i32 %tbs_der_start, *%tbs_der_off
+
+    %tbs_tag = call @asn1_read_tag(%cert_der, %off)
+    %tbs_is_seq = eq i8 %tbs_tag, @Asn1Tag.Sequence
+    br %tbs_is_seq, @read_tbs_len, @tbs_not_found
+
+  @read_tbs_len:
+    %tbs_len_v = call @asn1_read_length(%cert_der, %off)
+    %tbs_neg = slt i32 %tbs_len_v, 0
+    br %tbs_neg, @tbs_not_found, @tbs_bound
+
+  @tbs_bound:
+    %tbs_after = load i32, *%off
+    %tbs_end = add i32 %tbs_after, %tbs_len_v
+    %tbs_over = sgt i32 %tbs_end, %cert_len
+    br %tbs_over, @tbs_not_found, @tbs_value_start
+
+  @tbs_value_start:
+    // off is now at the start of TBS value (after tag+length)
+    %tbs_val_start = load i32, *%off
+    store i32 %tbs_val_start, *%tbs_val_off
+    jmp @compute_der_len
+
+  @compute_der_len:
+    // Full TBS DER = from TBS tag start to end of value
+    %tbs_val_after = load i32, *%off
+    %tbs_der_end = add i32 %tbs_val_after, %tbs_len_v
+    %full_der_len = sub i32 %tbs_der_end, %tbs_der_start
+    store i32 %full_der_len, *%tbs_der_len
+    store i32 %tbs_len_v, *%tbs_val_len
+    ret i1 1
+
+  @tbs_not_found:
+    ret i1 0
+}
+
+
+// ============================================================
+// x509_find_spki: locate SubjectPublicKeyInfo inside TBSCertificate
+// Navigates through TBSCertificate fields in order to skip to SPKI.
+// TBSCertificate field order:
+//   [0] version (context-specific, optional)
+//   INTEGER serialNumber
+//   SEQUENCE signature (AlgorithmIdentifier)
+//   SET issuer (Name)
+//   SEQUENCE validity (Validity)
+//   SET subject (Name)
+//   SEQUENCE subjectPublicKeyInfo  ← target
+// ============================================================
+fun @x509_find_spki(tbs_der: *i8, tbs_len: i32,
+                      spki_off: *i32, spki_len: *i32) -> i1 {
+  @entry:
+    %off = let i32
+    store i32 0, *%off
+
+    %tmp_tag = let i8
+    %tmp_len = let i32
+
+    // Check if first element is [0] version (tag 0xA0)
+    %probe_tag = call @asn1_read_tag(%tbs_der, %off)
+    %is_version = eq i8 %probe_tag, @Asn1Tag.Version
+    br %is_version, @skip_version, @no_version
+
+  @skip_version:
+    // Version field present: skip its length+value
+    %v_len = call @asn1_read_length(%tbs_der, %off)
+    %v_off = load i32, *%off
+    %v_skip = add i32 %v_off, %v_len
+    store i32 %v_skip, *%off
+    // Now skip serial INTEGER
+    call @_x509_peek_skip(%tbs_der, %off, %tmp_tag, %tmp_len)
+    jmp @skip_sig
+
+  @no_version:
+    // No version field: rewind, first field is serial INTEGER
+    store i32 0, *%off
+    call @_x509_peek_skip(%tbs_der, %off, %tmp_tag, %tmp_len)
+    jmp @skip_sig
+
+  @skip_sig:
+    // Skip SEQUENCE signature
+    call @_x509_peek_skip(%tbs_der, %off, %tmp_tag, %tmp_len)
+    // Skip SET issuer
+    call @_x509_peek_skip(%tbs_der, %off, %tmp_tag, %tmp_len)
+    // Skip SEQUENCE validity
+    call @_x509_peek_skip(%tbs_der, %off, %tmp_tag, %tmp_len)
+    // Skip SET subject
+    call @_x509_peek_skip(%tbs_der, %off, %tmp_tag, %tmp_len)
+
+    // Now at SEQUENCE subjectPublicKeyInfo
+    %spki_off_v = load i32, *%off
+    %spki_tag = call @asn1_read_tag(%tbs_der, %off)
+    %spki_is_seq = eq i8 %spki_tag, @Asn1Tag.Sequence
+    br %spki_is_seq, @read_spki_len, @spki_not_found
+
+  @read_spki_len:
+    %spki_len_v = call @asn1_read_length(%tbs_der, %off)
+    %spki_neg = slt i32 %spki_len_v, 0
+    br %spki_neg, @spki_not_found, @spki_found
+
+  @spki_found:
+    store i32 %spki_off_v, *%spki_off
+    store i32 %spki_len_v, *%spki_len
+    ret i1 1
+
+  @spki_not_found:
+    ret i1 0
+}
+
+
+// ============================================================
+// x509_spki_get_algorithm_oid: parse the AlgorithmIdentifier
+// inside SPKI and return the OID bytes and length.
+// spki_der points to SPKI value (after tag+length)
+// Returns OID value offset and length, algorithm tag for type
+// ============================================================
+fun @x509_spki_get_algorithm_oid(spki_val: *i8, spki_len: i32,
+                                   oid_off: *i32, oid_len: *i32) -> i1 {
+  @entry:
+    %off = let i32
+    store i32 0, *%off
+
+    // SPKI ::= SEQUENCE { algorithm AlgorithmIdentifier, subjectPublicKey BIT STRING }
+    // First element: AlgorithmIdentifier SEQUENCE
+    %alg_seq_tag = call @asn1_read_tag(%spki_val, %off)
+    %is_seq = eq i8 %alg_seq_tag, @Asn1Tag.Sequence
+    br %is_seq, @read_alg_len, @alg_not_found
+
+  @read_alg_len:
+    %alg_len = call @asn1_read_length(%spki_val, %off)
+    %alg_neg = slt i32 %alg_len, 0
+    br %alg_neg, @alg_not_found, @read_alg_oid
+
+  @read_alg_oid:
+    // AlgorithmIdentifier ::= SEQUENCE { algorithm OID, parameters ANY ... }
+    // Read OID tag
+    %oid_tag = call @asn1_read_tag(%spki_val, %off)
+    %is_oid = eq i8 %oid_tag, @Asn1Tag.Oid
+    br %is_oid, @found_oid, @alg_not_found
+
+  @found_oid:
+    %oid_off_v = load i32, *%off
+    store i32 %oid_off_v, *%oid_off
+    // Read OID length to get oid_len
+    %oid_val_len = call @asn1_read_length(%spki_val, %off)
+    store i32 %oid_val_len, *%oid_len
+    ret i1 1
+
+  @alg_not_found:
+    ret i1 0
+}
+
+
+// ============================================================
+// x509_spki_get_rsa_pubkey: extract RSA modulus and exponent
+// from a SubjectPublicKeyInfo SEQUENCE.
+// spki_ptr points to the SPKI SEQUENCE tag byte (0x30).
+// Parses the SEQUENCE header internally.
+// Returns RSA n (as i32 limbs in rsa.bx format) and e
+// ============================================================
+fun @x509_spki_get_rsa_pubkey(spki_val: *i8, spki_len: i32,
+                                n_out: *i32, e_out: *i32,
+                                limbs: i32) -> i1 {
+  @entry:
+    %off = let i32
+    store i32 0, *%off
+
+    // Parse SPKI SEQUENCE header
+    %seq_tag = call @asn1_read_tag(%spki_val, %off)
+    %is_seq = eq i8 %seq_tag, @Asn1Tag.Sequence
+    br %is_seq, @read_spki_seq_len, @rsa_not_found
+
+  @read_spki_seq_len:
+    %seq_len = call @asn1_read_length(%spki_val, %off)
+    %neg_len = slt i32 %seq_len, 0
+    br %neg_len, @rsa_not_found, @parse_alg
+
+  @parse_alg:
+    // First element inside SPKI: AlgorithmIdentifier SEQUENCE (skip it)
+    call @asn1_skip_tlv(%spki_val, %off)
+
+    // Second element: BIT STRING subjectPublicKey
+    %pk_tag = call @asn1_read_tag(%spki_val, %off)
+    %is_bitstr = eq i8 %pk_tag, @Asn1Tag.BitString
+    br %is_bitstr, @read_pk_len, @rsa_not_found
+
+  @read_pk_len:
+    %pk_len = call @asn1_read_length(%spki_val, %off)
+    %pk_neg = slt i32 %pk_len, 0
+    br %pk_neg, @rsa_not_found, @skip_unused
+
+  @skip_unused:
+    // BIT STRING: skip the "unused bits" byte
+    %pk_off = load i32, *%off
+    %pk_off2 = add i32 %pk_off, 1
+    store i32 %pk_off2, *%off
+
+    // The remaining bytes contain a DER-encoded RSAPublicKey SEQUENCE
+    // RSAPublicKey ::= SEQUENCE { modulus INTEGER, publicExponent INTEGER }
+    %rsa_seq_tag = call @asn1_read_tag(%spki_val, %off)
+    %is_rsa_seq = eq i8 %rsa_seq_tag, @Asn1Tag.Sequence
+    br %is_rsa_seq, @read_rsa_seq_len, @rsa_not_found
+
+  @read_rsa_seq_len:
+    %rsa_seq_len = call @asn1_read_length(%spki_val, %off)
+    %rsa_seq_neg = slt i32 %rsa_seq_len, 0
+    br %rsa_seq_neg, @rsa_not_found, @read_modulus
+
+  @read_modulus:
+    // First INTEGER: modulus n
+    %n_tag = call @asn1_read_tag(%spki_val, %off)
+    %is_n_int = eq i8 %n_tag, @Asn1Tag.Integer
+    br %is_n_int, @read_n_len, @rsa_not_found
+
+  @read_n_len:
+    %n_der_len = call @asn1_read_length(%spki_val, %off)
+    %n_neg = slt i32 %n_der_len, 0
+    br %n_neg, @rsa_not_found, @copy_n
+
+  @copy_n:
+    %n_off = load i32, *%off
+    // Skip leading 0x00 if present (DER INTEGER may have leading zero for sign)
+    %n_byte = gep i8, *%spki_val, %n_off
+    %n_first = load i8, *%n_byte
+    %has_leading_zero = eq i8 %n_first, 0
+    br %has_leading_zero, @copy_n_skip_zero, @copy_n_direct
+
+  @copy_n_skip_zero:
+    %n_off2 = add i32 %n_off, 1
+    %n_actual_len = sub i32 %n_der_len, 1
+    %n_p = gep i8, *%spki_val, %n_off2
+    call @std_crypto_rsa_bn_from_bytes(%n_out, %n_p, %n_actual_len, %limbs)
+    %n_past = add i32 %n_off2, %n_actual_len
+    store i32 %n_past, *%off
+    jmp @read_exponent
+
+  @copy_n_direct:
+    %n_p2 = gep i8, *%spki_val, %n_off
+    call @std_crypto_rsa_bn_from_bytes(%n_out, %n_p2, %n_der_len, %limbs)
+    %n_past2 = add i32 %n_off, %n_der_len
+    store i32 %n_past2, *%off
+    jmp @read_exponent
+
+  @read_exponent:
+    %e_tag = call @asn1_read_tag(%spki_val, %off)
+    %is_e_int = eq i8 %e_tag, @Asn1Tag.Integer
+    br %is_e_int, @read_e_len, @rsa_not_found
+
+  @read_e_len:
+    %e_der_len = call @asn1_read_length(%spki_val, %off)
+    %e_neg = slt i32 %e_der_len, 0
+    br %e_neg, @rsa_not_found, @copy_e
+
+  @copy_e:
+    %e_off = load i32, *%off
+    %e_p = gep i8, *%spki_val, %e_off
+    call @std_crypto_rsa_bn_from_bytes(%e_out, %e_p, %e_der_len, %limbs)
+    ret i1 1
+
+  @rsa_not_found:
+    ret i1 0
+}
+
+
+// ============================================================
+// x509_parse_rsa_pubkey: full path from DER certificate to
+// RSA public key (n, e). Combines all the above steps.
+// ============================================================
+fun @x509_parse_rsa_pubkey(cert_der: *i8, cert_len: i32,
+                             n_out: *i32, e_out: *i32,
+                             limbs: i32) -> i1 {
+  @entry:
+    %tbs_val_off = let i32
+    %tbs_val_len = let i32
+    %tbs_der_off = let i32
+    %tbs_der_len = let i32
+    %found_tbs = call @x509_find_tbs_certificate(%cert_der, %cert_len, %tbs_val_off, %tbs_val_len, %tbs_der_off, %tbs_der_len)
+    br %found_tbs, @find_rsa_spki, @pubkey_not_found
+
+  @find_rsa_spki:
+    %tbs_off_v = load i32, *%tbs_val_off
+    %tbs_len_v = load i32, *%tbs_val_len
+    %tbs_val = gep i8, *%cert_der, %tbs_off_v
+    %spki_off = let i32
+    %spki_len = let i32
+    %found_spki = call @x509_find_spki(%tbs_val, %tbs_len_v, %spki_off, %spki_len)
+    br %found_spki, @parse_rsa_spki, @pubkey_not_found
+
+  @parse_rsa_spki:
+    %spki_rel_off = load i32, *%spki_off
+    %spki_len_v = load i32, *%spki_len
+    // spki_rel_off is relative to tbs_val; convert to absolute
+    %spki_abs_off = add i32 %tbs_off_v, %spki_rel_off
+    %spki_val = gep i8, *%cert_der, %spki_abs_off
+    %got = call @x509_spki_get_rsa_pubkey(%spki_val, %spki_len_v, %n_out, %e_out, %limbs)
+    ret i1 %got
+
+  @pubkey_not_found:
+    ret i1 0
+}
+
+
+// ============================================================
+// x509_find_signature: locate signatureValue at end of
+// Certificate (after TBSCertificate + AlgorithmIdentifier).
+// Returns the raw signature bytes and their length.
+// ============================================================
+fun @x509_find_signature(cert_der: *i8, cert_len: i32,
+                           sig_bytes: *i8, sig_byte_off: *i32,
+                           sig_byte_len: *i32) -> i1 {
+  @entry:
+    %off = let i32
+    store i32 0, *%off
+
+    // Outer SEQUENCE
+    call @asn1_read_tag(%cert_der, %off)
+    %outer_len = call @asn1_read_length(%cert_der, %off)
+
+    // Skip TBSCertificate (first element)
+    call @asn1_skip_tlv(%cert_der, %off)
+
+    // Skip signatureAlgorithm (second element, SEQUENCE)
+    call @asn1_skip_tlv(%cert_der, %off)
+
+    // Third element: signatureValue BIT STRING
+    %sig_tag = call @asn1_read_tag(%cert_der, %off)
+    %is_bitstr = eq i8 %sig_tag, @Asn1Tag.BitString
+    br %is_bitstr, @read_sig_len, @sig_not_found
+
+  @read_sig_len:
+    %sig_der_len = call @asn1_read_length(%cert_der, %off)
+    %sig_neg = slt i32 %sig_der_len, 1
+    br %sig_neg, @sig_not_found, @sig_bound
+
+  @sig_bound:
+    %sig_after = load i32, *%off
+    %sig_end = add i32 %sig_after, %sig_der_len
+    %sig_over = sgt i32 %sig_end, %cert_len
+    br %sig_over, @sig_not_found, @skip_unused_bits
+
+  @skip_unused_bits:
+    // Skip 1 byte (unused bits count)
+    %sig_off = load i32, *%off
+    %sig_off2 = add i32 %sig_off, 1
+    %actual_len = sub i32 %sig_der_len, 1
+    store i32 %sig_off2, *%sig_byte_off
+    store i32 %actual_len, *%sig_byte_len
+    ret i1 1
+
+  @sig_not_found:
+    ret i1 0
+}
+
+
+// ============================================================
+// Certificate validity (notBefore / notAfter)
+// ============================================================
+
+// Read two ASCII decimal digits at off.
+fun @_x509_two_digit(buf: *i8, off: i32) -> i32 {
+  @entry:
+    %p0 = gep i8, *%buf, %off
+    %c0 = load i8, *%p0
+    %c0i = zext i8 %c0 to i32
+    %d0 = sub i32 %c0i, 48
+    %o1 = add i32 %off, 1
+    %p1 = gep i8, *%buf, %o1
+    %c1 = load i8, *%p1
+    %c1i = zext i8 %c1 to i32
+    %d1 = sub i32 %c1i, 48
+    %t = mul i32 %d0, 10
+    %v = add i32 %t, %d1
+    ret i32 %v
+}
+
+// Read four ASCII decimal digits at off.
+fun @_x509_four_digit(buf: *i8, off: i32) -> i32 {
+  @entry:
+    %hi = call @_x509_two_digit(%buf, %off)
+    %o2 = add i32 %off, 2
+    %lo = call @_x509_two_digit(%buf, %o2)
+    %hi100 = mul i32 %hi, 100
+    %v = add i32 %hi100, %lo
+    ret i32 %v
+}
+
+// Days since 1970-01-01 for a proleptic Gregorian date.
+// Same integer formula as Howard Hinnant's days_from_civil.
+fun @_x509_days_from_civil(y: i32, m: i32, d: i32) -> i64 {
+  @entry:
+    %y64 = sext i32 %y to i64
+    %m64 = sext i32 %m to i64
+    %d64 = sext i32 %d to i64
+    %le2 = sle i32 %m, 2
+    %le2i = zext i1 %le2 to i32
+    %le2l = sext i32 %le2i to i64
+    %y2 = sub i64 %y64, %le2l
+    %era = div i64 %y2, 400
+    %era400 = mul i64 %era, 400
+    %yoe = sub i64 %y2, %era400
+    %gt2 = sgt i32 %m, 2
+    %gt2i = zext i1 %gt2 to i32
+    %gt2l = sext i32 %gt2i to i64
+    %twelve = mul i64 %gt2l, 12
+    %adjm = sub i64 9, %twelve
+    %mp = add i64 %m64, %adjm
+    %mp153 = mul i64 %mp, 153
+    %mp153b = add i64 %mp153, 2
+    %doy0 = div i64 %mp153b, 5
+    %doy1 = add i64 %doy0, %d64
+    %doy = sub i64 %doy1, 1
+    %yoe365 = mul i64 %yoe, 365
+    %yoe4 = div i64 %yoe, 4
+    %yoe100 = div i64 %yoe, 100
+    %doe0 = add i64 %yoe365, %yoe4
+    %doe1 = sub i64 %doe0, %yoe100
+    %doe = add i64 %doe1, %doy
+    %erad = mul i64 %era, 146097
+    %days0 = add i64 %erad, %doe
+    %days = sub i64 %days0, 719468
+    ret i64 %days
+}
+
+// Convert parsed date/time fields to Unix seconds.
+fun @_x509_make_time(y: i32, m: i32, d: i32, h: i32, mi: i32, s: i32,
+                     out: *i64) -> i1 {
+  @entry:
+    %days = call @_x509_days_from_civil(%y, %m, %d)
+    %dsec = mul i64 %days, 86400
+    %h64 = sext i32 %h to i64
+    %hsec = mul i64 %h64, 3600
+    %mi64 = sext i32 %mi to i64
+    %misec = mul i64 %mi64, 60
+    %s64 = sext i32 %s to i64
+    %t0 = add i64 %dsec, %hsec
+    %t1 = add i64 %t0, %misec
+    %secs = add i64 %t1, %s64
+    store i64 %secs, *%out
+    ret i1 1
+}
+
+// Parse an ASN.1 Time value at val_off (value bytes, not the TLV).
+// Accepts UTCTime (0x17, YYMMDDHHMMSSZ) and GeneralizedTime
+// (0x18, YYYYMMDDHHMMSSZ), both restricted to UTC ("Z").
+fun @_x509_parse_time(buf: *i8, val_off: i32, val_len: i32, tag: i8,
+                      out: *i64) -> i1 {
+  @entry:
+    %is_utc = eq i8 %tag, @Asn1Tag.UtcTime
+    br %is_utc, @utc, @gen_check
+  @utc:
+    %ok13 = eq i32 %val_len, 13
+    br %ok13, @utc_fields, @fail
+  @utc_fields:
+    %yy = call @_x509_two_digit(%buf, %val_off)
+    %lt50 = slt i32 %yy, 50
+    %lt50i = zext i1 %lt50 to i32
+    %y2000 = add i32 2000, %yy
+    %y1900 = add i32 1900, %yy
+    %diff = sub i32 %y2000, %y1900
+    %adj = mul i32 %lt50i, %diff
+    %year = add i32 %y1900, %adj
+    %o2 = add i32 %val_off, 2
+    %month = call @_x509_two_digit(%buf, %o2)
+    %o4 = add i32 %val_off, 4
+    %day = call @_x509_two_digit(%buf, %o4)
+    %o6 = add i32 %val_off, 6
+    %hour = call @_x509_two_digit(%buf, %o6)
+    %o8 = add i32 %val_off, 8
+    %minu = call @_x509_two_digit(%buf, %o8)
+    %o10 = add i32 %val_off, 10
+    %sec = call @_x509_two_digit(%buf, %o10)
+    %oz = add i32 %val_off, 12
+    %pz = gep i8, *%buf, %oz
+    %cz = load i8, *%pz
+    %isz = eq i8 %cz, 90
+    br %isz, @utc_calc, @fail
+  @utc_calc:
+    %uok = call @_x509_make_time(%year, %month, %day, %hour, %minu, %sec, %out)
+    ret i1 %uok
+  @gen_check:
+    %is_gen = eq i8 %tag, @Asn1Tag.GeneralizedTime
+    br %is_gen, @gen_len, @fail
+  @gen_len:
+    %ok15 = eq i32 %val_len, 15
+    br %ok15, @gen_fields, @fail
+  @gen_fields:
+    %gyear = call @_x509_four_digit(%buf, %val_off)
+    %go4 = add i32 %val_off, 4
+    %gmonth = call @_x509_two_digit(%buf, %go4)
+    %go6 = add i32 %val_off, 6
+    %gday = call @_x509_two_digit(%buf, %go6)
+    %go8 = add i32 %val_off, 8
+    %ghour = call @_x509_two_digit(%buf, %go8)
+    %go10 = add i32 %val_off, 10
+    %gminu = call @_x509_two_digit(%buf, %go10)
+    %go12 = add i32 %val_off, 12
+    %gsec = call @_x509_two_digit(%buf, %go12)
+    %goz = add i32 %val_off, 14
+    %gpz = gep i8, *%buf, %goz
+    %gcz = load i8, *%gpz
+    %gisz = eq i8 %gcz, 90
+    br %gisz, @gen_calc, @fail
+  @gen_calc:
+    %gok = call @_x509_make_time(%gyear, %gmonth, %gday, %ghour, %gminu, %gsec, %out)
+    ret i1 %gok
+  @fail:
+    ret i1 0
+}
+
+// Extract notBefore and notAfter as Unix seconds.
+fun @x509_get_validity(cert_der: *i8, cert_len: i32,
+                       nb_out: *i64, na_out: *i64) -> i1 {
+  @entry:
+    %tv_off = let i32
+    %tv_len = let i32
+    %td_off = let i32
+    %td_len = let i32
+    %found = call @x509_find_tbs_certificate(%cert_der, %cert_len,
+                                             %tv_off, %tv_len, %td_off, %td_len)
+    br %found, @prep, @fail
+
+  @prep:
+    %tvo = load i32, *%tv_off
+    %tdp = gep i8, *%cert_der, %tvo
+    %off = let i32
+    store i32 0, *%off
+    %tmp_tag = let i8
+    %tmp_len = let i32
+    %ptag = call @asn1_read_tag(%tdp, %off)
+    %is_ver = eq i8 %ptag, @Asn1Tag.Version
+    br %is_ver, @skip_ver, @rewind
+
+  @skip_ver:
+    %vlen = call @asn1_read_length(%tdp, %off)
+    %voff = load i32, *%off
+    %vend = add i32 %voff, %vlen
+    store i32 %vend, *%off
+    call @_x509_peek_skip(%tdp, %off, %tmp_tag, %tmp_len)
+    jmp @after_serial
+
+  @rewind:
+    store i32 0, *%off
+    call @_x509_peek_skip(%tdp, %off, %tmp_tag, %tmp_len)
+    jmp @after_serial
+
+  @after_serial:
+    call @_x509_peek_skip(%tdp, %off, %tmp_tag, %tmp_len)
+    call @_x509_peek_skip(%tdp, %off, %tmp_tag, %tmp_len)
+    %val_tag = call @asn1_read_tag(%tdp, %off)
+    %is_seq = eq i8 %val_tag, @Asn1Tag.Sequence
+    br %is_seq, @val_len, @fail
+
+  @val_len:
+    %vl = call @asn1_read_length(%tdp, %off)
+    %vl_ok = sgt i32 %vl, 0
+    br %vl_ok, @nb, @fail
+
+  @nb:
+    %nb_tag = call @asn1_read_tag(%tdp, %off)
+    %nb_len = call @asn1_read_length(%tdp, %off)
+    %nb_off = load i32, *%off
+    %nb_ok = call @_x509_parse_time(%tdp, %nb_off, %nb_len, %nb_tag, %nb_out)
+    br %nb_ok, @nb_advance, @fail
+
+  @nb_advance:
+    %nbv = load i32, *%off
+    %nbend = add i32 %nbv, %nb_len
+    store i32 %nbend, *%off
+    jmp @na
+
+  @na:
+    %na_tag = call @asn1_read_tag(%tdp, %off)
+    %na_len = call @asn1_read_length(%tdp, %off)
+    %na_off = load i32, *%off
+    %na_ok = call @_x509_parse_time(%tdp, %na_off, %na_len, %na_tag, %na_out)
+    ret i1 %na_ok
+
+  @fail:
+    ret i1 0
+}
+
+// Check that now_secs lies within the certificate's validity window.
+fun @x509_cert_valid_at(cert_der: *i8, cert_len: i32, now_secs: i64) -> i1 {
+  @entry:
+    %nb = let i64
+    %na = let i64
+    %ok = call @x509_get_validity(%cert_der, %cert_len, %nb, %na)
+    br %ok, @cmp, @fail
+  @cmp:
+    %nbv = load i64, *%nb
+    %nav = load i64, *%na
+    %after = sge i64 %now_secs, %nbv
+    %before = sle i64 %now_secs, %nav
+    %both = and i1 %after, %before
+    ret i1 %both
+  @fail:
+    ret i1 0
+}
+
+
+// ============================================================
+// x509_verify_chain: validate a leaf certificate against a set
+// of intermediate certificates and trust anchors.
+//
+// pool/offsets/lens describe `count` intermediate DER certificates
+// laid out contiguously; roots/root_offsets/root_lens describe the
+// trust store the same way. The chain is walked from the leaf:
+// every certificate must be valid at now_secs and signed by a
+// certificate from the intermediates or the trust store. A
+// certificate signed by a trust anchor ends the walk.
+//
+// Returns 0 on success, -1 on depth overflow, -2 when a
+// certificate is expired or not yet valid, -3 when no issuer can
+// be found.
+// ============================================================
+fun @x509_verify_chain(leaf: *i8, leaf_len: i32,
+                       pool: *i8, offsets: *i32, lens: *i32, count: i32,
+                       roots: *i8, root_offsets: *i32, root_lens: *i32,
+                       root_count: i32, now_secs: i64, limbs: i32) -> i32 {
+  @entry:
+    %cur = let *i8
+    %cur_len = let i32
+    %depth = let i32
+    store *i8 %leaf, *%cur
+    store i32 %leaf_len, *%cur_len
+    store i32 0, *%depth
+    jmp @loop
+
+  @loop:
+    %d = load i32, *%depth
+    %too_deep = sge i32 %d, 8
+    br %too_deep, @err_depth, @check_valid
+
+  @check_valid:
+    %cp0 = load *i8, *%cur
+    %cl0 = load i32, *%cur_len
+    %vok = call @x509_cert_valid_at(%cp0, %cl0, %now_secs)
+    br %vok, @check_roots, @err_valid
+
+  @check_roots:
+    %ri = let i32
+    store i32 0, *%ri
+    jmp @root_cond
+
+  @root_cond:
+    %riv = load i32, *%ri
+    %rdone = sge i32 %riv, %root_count
+    br %rdone, @check_chain, @root_try
+
+  @root_try:
+    %ri2 = load i32, *%ri
+    %rop = gep i32, *%root_offsets, %ri2
+    %roff = load i32, *%rop
+    %rlp = gep i32, *%root_lens, %ri2
+    %rlen = load i32, *%rlp
+    %cand_r = gep i8, *%roots, %roff
+    %cp1 = load *i8, *%cur
+    %cl1 = load i32, *%cur_len
+    %rok = call @x509_verify_signed_by(%cp1, %cl1, %cand_r, %rlen, %limbs)
+    br %rok, @ok, @root_next
+
+  @root_next:
+    %rn = add i32 %ri2, 1
+    store i32 %rn, *%ri
+    jmp @root_cond
+
+  @check_chain:
+    %ci = let i32
+    store i32 0, *%ci
+    jmp @chain_cond
+
+  @chain_cond:
+    %civ = load i32, *%ci
+    %cdone = sge i32 %civ, %count
+    br %cdone, @err_noissuer, @chain_try
+
+  @chain_try:
+    %ci2 = load i32, *%ci
+    %cop = gep i32, *%offsets, %ci2
+    %coff = load i32, *%cop
+    %cand_c = gep i8, *%pool, %coff
+    %cp2 = load *i8, *%cur
+    %self = eq *i8 %cand_c, %cp2
+    br %self, @chain_next, @chain_verify
+
+  @chain_verify:
+    %ci3 = load i32, *%ci
+    %cop2 = gep i32, *%offsets, %ci3
+    %coff2 = load i32, *%cop2
+    %clp3 = gep i32, *%lens, %ci3
+    %clen3 = load i32, *%clp3
+    %cand3 = gep i8, *%pool, %coff2
+    %cp3 = load *i8, *%cur
+    %cl3 = load i32, *%cur_len
+    %cok = call @x509_verify_signed_by(%cp3, %cl3, %cand3, %clen3, %limbs)
+    br %cok, @advance, @chain_next
+
+  @advance:
+    %ci4 = load i32, *%ci
+    %cop3 = gep i32, *%offsets, %ci4
+    %coff3 = load i32, *%cop3
+    %clp4 = gep i32, *%lens, %ci4
+    %clen4 = load i32, *%clp4
+    %cand4 = gep i8, *%pool, %coff3
+    store *i8 %cand4, *%cur
+    store i32 %clen4, *%cur_len
+    %dprev = load i32, *%depth
+    %dnext = add i32 %dprev, 1
+    store i32 %dnext, *%depth
+    jmp @loop
+
+  @chain_next:
+    %cni = load i32, *%ci
+    %cn = add i32 %cni, 1
+    store i32 %cn, *%ci
+    jmp @chain_cond
+
+  @ok:
+    ret i32 0
+  @err_depth:
+    ret i32 -1
+  @err_valid:
+    ret i32 -2
+  @err_noissuer:
+    ret i32 -3
+}
+
+
+// ============================================================
+// Signature algorithm and hostname helpers
+// ============================================================
+
+fun @_x509_oid_eq(buf: *i8, off: i32, len: i32, oid: *i8, oid_len: i32) -> i1 {
+  @entry:
+    %le = eq i32 %len, %oid_len
+    br %le, @cmp, @no
+  @cmp:
+    %p = gep i8, *%buf, %off
+    %n64 = sext i32 %len to i64
+    %c = call @memcmp(%p, %oid, %n64)
+    %z = eq i32 %c, 0
+    ret i1 %z
+  @no:
+    ret i1 0
+}
+
+// Locate the certificate's signatureAlgorithm OID value.
+fun @x509_get_sig_oid(cert_der: *i8, cert_len: i32,
+                      out_off: *i32, out_len: *i32) -> i1 {
+  @entry:
+    %off = let i32
+    store i32 0, *%off
+    %tag = call @asn1_read_tag(%cert_der, %off)
+    %is_seq = eq i8 %tag, @Asn1Tag.Sequence
+    br %is_seq, @outer_len, @sig_oid_nf
+  @outer_len:
+    %olen = call @asn1_read_length(%cert_der, %off)
+    %olen_ok = sge i32 %olen, 0
+    br %olen_ok, @skip_tbs, @sig_oid_nf
+  @skip_tbs:
+    call @asn1_skip_tlv(%cert_der, %off)
+    %soff = load i32, *%off
+    %slim = sub i32 %cert_len, 2
+    %s_ok = sle i32 %soff, %slim
+    br %s_ok, @alg_tag, @sig_oid_nf
+  @alg_tag:
+    %atag = call @asn1_read_tag(%cert_der, %off)
+    %a_seq = eq i8 %atag, @Asn1Tag.Sequence
+    br %a_seq, @alg_len, @sig_oid_nf
+  @alg_len:
+    %alen = call @asn1_read_length(%cert_der, %off)
+    %alen_ok = sge i32 %alen, 0
+    br %alen_ok, @oid_tag, @sig_oid_nf
+  @oid_tag:
+    %otag = call @asn1_read_tag(%cert_der, %off)
+    %o_oid = eq i8 %otag, @Asn1Tag.Oid
+    br %o_oid, @oid_len, @sig_oid_nf
+  @oid_len:
+    %vlen = call @asn1_read_length(%cert_der, %off)
+    %vlen_ok = sge i32 %vlen, 0
+    br %vlen_ok, @oid_store, @sig_oid_nf
+  @oid_store:
+    %voff = load i32, *%off
+    %vend = add i32 %voff, %vlen
+    %in_bounds = sle i32 %vend, %cert_len
+    br %in_bounds, @oid_ok, @sig_oid_nf
+  @oid_ok:
+    store i32 %voff, *%out_off
+    store i32 %vlen, *%out_len
+    ret i1 1
+  @sig_oid_nf:
+    ret i1 0
+}
+
+// Read an INTEGER TLV into an 8-limb value, skipping a leading zero.
+// limit bounds every offset against the enclosing buffer.
+fun @_x509_read_ec_int(buf: *i8, off: *i32, out: *i32, limit: i32) -> i1 {
+  @entry:
+    %tag = call @asn1_read_tag(%buf, %off)
+    %ok = eq i8 %tag, @Asn1Tag.Integer
+    br %ok, @len, @bad
+  @len:
+    %l = call @asn1_read_length(%buf, %off)
+    %lok = sge i32 %l, 0
+    br %lok, @val, @bad
+  @val:
+    %v = load i32, *%off
+    %vend = add i32 %v, %l
+    %v_ok = sle i32 %vend, %limit
+    br %v_ok, @b0, @bad
+  @b0:
+    %p = gep i8, *%buf, %v
+    %b0 = load i8, *%p
+    %z = eq i8 %b0, 0
+    br %z, @skip0, @use
+  @skip0:
+    %v2 = add i32 %v, 1
+    %l2 = sub i32 %l, 1
+    %n2 = add i32 %v2, %l2
+    store i32 %n2, *%off
+    %too2 = sgt i32 %l2, 32
+    br %too2, @bad, @conv2
+  @conv2:
+    %p2 = gep i8, *%buf, %v2
+    call @std_crypto_rsa_bn_from_bytes(%out, %p2, %l2, 8)
+    ret i1 1
+  @use:
+    %n = add i32 %v, %l
+    store i32 %n, *%off
+    %too = sgt i32 %l, 32
+    br %too, @bad, @conv
+  @conv:
+    call @std_crypto_rsa_bn_from_bytes(%out, %p, %l, 8)
+    ret i1 1
+  @bad:
+    ret i1 0
+}
+
+// Parse ECDSA-Sig-Value ::= SEQUENCE { r INTEGER, s INTEGER }.
+fun @_x509_parse_ecdsa_sig(buf: *i8, len: i32, r_out: *i32, s_out: *i32) -> i1 {
+  @entry:
+    %off = let i32
+    store i32 0, *%off
+    %tag = call @asn1_read_tag(%buf, %off)
+    %is_seq = eq i8 %tag, @Asn1Tag.Sequence
+    br %is_seq, @seq_len, @bad
+  @seq_len:
+    %sl = call @asn1_read_length(%buf, %off)
+    %sl_ok = sge i32 %sl, 0
+    br %sl_ok, @seq_bound, @bad
+  @seq_bound:
+    %so = load i32, *%off
+    %se = add i32 %so, %sl
+    %se_ok = sle i32 %se, %len
+    br %se_ok, @read_r, @bad
+  @read_r:
+    %r_ok = call @_x509_read_ec_int(%buf, %off, %r_out, %len)
+    br %r_ok, @read_s, @bad
+  @read_s:
+    %s_ok = call @_x509_read_ec_int(%buf, %off, %s_out, %len)
+    br %s_ok, @ok, @bad
+  @ok:
+    ret i1 1
+  @bad:
+    ret i1 0
+}
+
+fun @_x509_lower(c: i8) -> i8 {
+  @entry:
+    %v = zext i8 %c to i32
+    %ge = sge i32 %v, 65
+    %le = sle i32 %v, 90
+    %in = and i1 %ge, %le
+    br %in, @lower, @keep
+  @lower:
+    %nv = add i32 %v, 32
+    %nb = trunc i32 %nv to i8
+    ret i8 %nb
+  @keep:
+    ret i8 %c
+}
+
+fun @_x509_eq_ci(a: *i8, a_len: i32, b: *i8, b_len: i32) -> i1 {
+  @entry:
+    %le = eq i32 %a_len, %b_len
+    br %le, @init, @no
+  @init:
+    %i = let i32
+    store i32 0, *%i
+    jmp @cond
+  @cond:
+    %iv = load i32, *%i
+    %more = slt i32 %iv, %a_len
+    br %more, @body, @yes
+  @body:
+    %iv2 = load i32, *%i
+    %ap = gep i8, *%a, %iv2
+    %ac = load i8, *%ap
+    %bp = gep i8, *%b, %iv2
+    %bc = load i8, *%bp
+    %al = call @_x509_lower(%ac)
+    %bl = call @_x509_lower(%bc)
+    %eq = eq i8 %al, %bl
+    br %eq, @next, @no
+  @next:
+    %iv3 = load i32, *%i
+    %n = add i32 %iv3, 1
+    store i32 %n, *%i
+    jmp @cond
+  @yes:
+    ret i1 1
+  @no:
+    ret i1 0
+}
+
+// Match a dNSName against the host, allowing a single leading "*." label.
+fun @_x509_host_match(name: *i8, name_len: i32, host: *i8, host_len: i32) -> i1 {
+  @entry:
+    %len2 = sge i32 %name_len, 2
+    br %len2, @chk_star, @exact
+  @chk_star:
+    %c0 = load i8, *%name
+    %is_star = eq i8 %c0, 42
+    br %is_star, @chk_dot, @exact
+  @chk_dot:
+    %p1 = gep i8, *%name, 1
+    %c1 = load i8, *%p1
+    %is_dot = eq i8 %c1, 46
+    br %is_dot, @wild_path, @exact
+  @wild_path:
+    %suf = gep i8, *%name, 2
+    %suf_len = sub i32 %name_len, 2
+    %host_gt = sgt i32 %host_len, %suf_len
+    br %host_gt, @prefix, @no
+  @prefix:
+    %pref_len = sub i32 %host_len, %suf_len
+    %pref_ok = sge i32 %pref_len, 2
+    br %pref_ok, @last_dot, @no
+  @last_dot:
+    %last = sub i32 %pref_len, 1
+    %lp = gep i8, *%host, %last
+    %lc = load i8, *%lp
+    %is_dot2 = eq i8 %lc, 46
+    br %is_dot2, @single, @no
+  @single:
+    %i = let i32
+    store i32 0, *%i
+    %lim = sub i32 %pref_len, 1
+    jmp @scan_cond
+  @scan_cond:
+    %iv = load i32, *%i
+    %more = slt i32 %iv, %lim
+    br %more, @scan_body, @suffix
+  @scan_body:
+    %iv2 = load i32, *%i
+    %sp = gep i8, *%host, %iv2
+    %sc = load i8, *%sp
+    %isdot = eq i8 %sc, 46
+    br %isdot, @no, @scan_next
+  @scan_next:
+    %iv3 = load i32, *%i
+    %n = add i32 %iv3, 1
+    store i32 %n, *%i
+    jmp @scan_cond
+  @suffix:
+    %hp = gep i8, *%host, %pref_len
+    %eq = call @_x509_eq_ci(%hp, %suf_len, %suf, %suf_len)
+    ret i1 %eq
+  @exact:
+    %eq2 = call @_x509_eq_ci(%host, %host_len, %name, %name_len)
+    ret i1 %eq2
+  @no:
+    ret i1 0
+}
+
+// Check a hostname against the certificate's subjectAltName dNSName entries.
+fun @x509_check_hostname(cert_der: *i8, cert_len: i32,
+                         host: *i8, host_len: i32) -> i1 {
+  @entry:
+    %tbs_val_off = let i32
+    %tbs_val_len = let i32
+    %tbs_der_off = let i32
+    %tbs_der_len = let i32
+    %ft = call @x509_find_tbs_certificate(%cert_der, %cert_len, %tbs_val_off, %tbs_val_len, %tbs_der_off, %tbs_der_len)
+    br %ft, @walk_init, @host_no
+  @walk_init:
+    %to = load i32, *%tbs_val_off
+    %tl = load i32, *%tbs_val_len
+    %tv = gep i8, *%cert_der, %to
+    %off = let i32
+    store i32 0, *%off
+    %tbuf = let i8
+    %tb = gep i8, *%tbuf, 0
+    %lbuf = let i32
+    %lb = gep i32, *%lbuf, 0
+    call @_x509_peek_skip(%tv, %off, %tb, %lb)
+    %t0 = load i8, *%tb
+    %is_ver = eq i8 %t0, @Asn1Tag.Version
+    br %is_ver, @skip_ver, @after_ver
+  @skip_ver:
+    call @_x509_peek_skip(%tv, %off, %tb, %lb)
+    jmp @after_ver
+  @after_ver:
+    // signature, issuer, validity, subject, subjectPublicKeyInfo
+    call @_x509_peek_skip(%tv, %off, %tb, %lb)
+    call @_x509_peek_skip(%tv, %off, %tb, %lb)
+    call @_x509_peek_skip(%tv, %off, %tb, %lb)
+    call @_x509_peek_skip(%tv, %off, %tb, %lb)
+    call @_x509_peek_skip(%tv, %off, %tb, %lb)
+    %foff = load i32, *%off
+    %flim = sub i32 %tl, 2
+    %f_ok = sle i32 %foff, %flim
+    br %f_ok, @ext_tag, @host_no
+  @ext_tag:
+    %etag = call @asn1_read_tag(%tv, %off)
+    %is_ext = eq i8 %etag, @Asn1Tag.Extensions
+    br %is_ext, @ext_len, @host_no
+  @ext_len:
+    %xlen = call @asn1_read_length(%tv, %off)
+    %xlen_ok = sge i32 %xlen, 0
+    br %xlen_ok, @ext_seq, @host_no
+  @ext_seq:
+    %st = call @asn1_read_tag(%tv, %off)
+    %is_seq = eq i8 %st, @Asn1Tag.Sequence
+    br %is_seq, @ext_seq_len, @host_no
+  @ext_seq_len:
+    %slen = call @asn1_read_length(%tv, %off)
+    %slen_ok = sge i32 %slen, 0
+    br %slen_ok, @ext_loop_init, @host_no
+  @ext_loop_init:
+    %pstart = load i32, *%off
+    %pend = add i32 %pstart, %slen
+    %pend_ok = sle i32 %pend, %tl
+    br %pend_ok, @ext_loop_set, @host_no
+  @ext_loop_set:
+    %pos = let i32
+    store i32 %pstart, *%pos
+    %endv = let i32
+    store i32 %pend, *%endv
+    jmp @walk_cond
+  @walk_cond:
+    %pv = load i32, *%pos
+    %ev = load i32, *%endv
+    %more = slt i32 %pv, %ev
+    br %more, @walk_ext, @host_no
+  @walk_ext:
+    %xt = call @asn1_read_tag(%tv, %pos)
+    %xt_ok = eq i8 %xt, @Asn1Tag.Sequence
+    br %xt_ok, @ext_body, @host_no
+  @ext_body:
+    %xbl = call @asn1_read_length(%tv, %pos)
+    %xbl_ok = sge i32 %xbl, 0
+    br %xbl_ok, @ext_oid, @host_no
+  @ext_oid:
+    %obody = load i32, *%pos
+    %ext_end = add i32 %obody, %xbl
+    %ee_ok = sle i32 %ext_end, %tl
+    br %ee_ok, @ext_oid_read, @host_no
+  @ext_oid_read:
+    %ot = call @asn1_read_tag(%tv, %pos)
+    %ot_ok = eq i8 %ot, @Asn1Tag.Oid
+    br %ot_ok, @oid_len2, @next_ext
+  @oid_len2:
+    %ol = call @asn1_read_length(%tv, %pos)
+    %ol_ok = sge i32 %ol, 0
+    br %ol_ok, @oid_cmp, @next_ext
+  @oid_cmp:
+    %ooff = load i32, *%pos
+    %is_san = call @_x509_oid_eq(%tv, %ooff, %ol, @X509_OID_SAN, 3)
+    br %is_san, @san, @next_ext
+  @san:
+    %oend = add i32 %ooff, %ol
+    store i32 %oend, *%pos
+    %nt = call @asn1_read_tag(%tv, %pos)
+    %is_bool = eq i8 %nt, @Asn1Tag.Boolean
+    br %is_bool, @skip_bool, @octet_have
+  @skip_bool:
+    %bl = call @asn1_read_length(%tv, %pos)
+    %bl_ok = sge i32 %bl, 0
+    br %bl_ok, @skip_bool_val, @next_ext
+  @skip_bool_val:
+    %bv_off = load i32, *%pos
+    %bv_end = add i32 %bv_off, %bl
+    store i32 %bv_end, *%pos
+    %ctag = call @asn1_read_tag(%tv, %pos)
+    %ct_ok = eq i8 %ctag, @Asn1Tag.OctetString
+    br %ct_ok, @octet_len, @next_ext
+  @octet_have:
+    %ct_ok2 = eq i8 %nt, @Asn1Tag.OctetString
+    br %ct_ok2, @octet_len, @next_ext
+  @octet_len:
+    %cl = call @asn1_read_length(%tv, %pos)
+    %cl_ok = sge i32 %cl, 0
+    br %cl_ok, @san_parse, @next_ext
+  @san_parse:
+    %soff = load i32, *%pos
+    %send = add i32 %soff, %cl
+    %send_ok = sle i32 %send, %ext_end
+    br %send_ok, @san_seq, @next_ext
+  @san_seq:
+    %sseq = let i32
+    store i32 %soff, *%sseq
+    %sqt = call @asn1_read_tag(%tv, %sseq)
+    %sq_ok = eq i8 %sqt, @Asn1Tag.Sequence
+    br %sq_ok, @san_seq_len, @next_ext
+  @san_seq_len:
+    %sql = call @asn1_read_length(%tv, %sseq)
+    %sql_ok = sge i32 %sql, 0
+    br %sql_ok, @san_loop_init, @next_ext
+  @san_loop_init:
+    %ns = load i32, *%sseq
+    %ne = add i32 %ns, %sql
+    %ne_ok = sle i32 %ne, %send
+    br %ne_ok, @san_loop_set, @next_ext
+  @san_loop_set:
+    %npos = let i32
+    store i32 %ns, *%npos
+    %nend = let i32
+    store i32 %ne, *%nend
+    jmp @san_cond
+  @san_cond:
+    %npv = load i32, *%npos
+    %nev = load i32, *%nend
+    %nmore = slt i32 %npv, %nev
+    br %nmore, @san_name, @next_ext
+  @san_name:
+    %gtag = call @asn1_read_tag(%tv, %npos)
+    %gl = call @asn1_read_length(%tv, %npos)
+    %gl_ok = sge i32 %gl, 0
+    br %gl_ok, @san_name_body, @next_ext
+  @san_name_body:
+    %gv = load i32, *%npos
+    %g_end = add i32 %gv, %gl
+    %g_ok = sle i32 %g_end, %ne
+    br %g_ok, @san_name_ok, @next_ext
+  @san_name_ok:
+    %is_dns = eq i8 %gtag, @Asn1Tag.DnsName
+    br %is_dns, @dns_check, @san_skip
+  @dns_check:
+    %gp = gep i8, *%tv, %gv
+    %hm = call @_x509_host_match(%gp, %gl, %host, %host_len)
+    br %hm, @host_yes, @san_skip
+  @san_skip:
+    store i32 %g_end, *%npos
+    jmp @san_cond
+  @next_ext:
+    store i32 %ext_end, *%pos
+    jmp @walk_cond
+  @host_yes:
+    ret i1 1
+  @host_no:
+    ret i1 0
+}
+
+// ============================================================
+// _x509_verify_with_key: verify cert_der's signature using the
+// public key found in key_der. The signature algorithm is read
+// from cert_der (SHA-256 with RSA PKCS#1 v1.5, RSASSA-PSS, or
+// ECDSA P-256).
+// ============================================================
+fun @_x509_verify_with_key(cert_der: *i8, cert_len: i32,
+                           key_der: *i8, key_der_len: i32,
+                           limbs: i32) -> i1 {
+  @entry:
+    %alg_off = let i32
+    %alg_len = let i32
+    %pss = let i32
+    store i32 0, *%pss
+    %got_alg = call @x509_get_sig_oid(%cert_der, %cert_len, %alg_off, %alg_len)
+    br %got_alg, @hash_tbs, @vfy_fail
+
+  @hash_tbs:
+    %tbs_val_off = let i32
+    %tbs_val_len = let i32
+    %tbs_der_off = let i32
+    %tbs_der_len = let i32
+    %found_tbs = call @x509_find_tbs_certificate(%cert_der, %cert_len, %tbs_val_off, %tbs_val_len, %tbs_der_off, %tbs_der_len)
+    br %found_tbs, @hash, @vfy_fail
+
+  @hash:
+    %tbs_der_start = load i32, *%tbs_der_off
+    %tbs_der_len_v = load i32, *%tbs_der_len
+    %tbs_der_start_p = gep i8, *%cert_der, %tbs_der_start
+    %hash = let [i8, 32]
+    %hash_p = gep i8, *%hash, 0
+    call @std_crypto_sha256_compute(%tbs_der_start_p, %tbs_der_len_v, %hash_p)
+    %ao = load i32, *%alg_off
+    %al = load i32, *%alg_len
+    %is_ec = call @_x509_oid_eq(%cert_der, %ao, %al, @X509_OID_ECDSA_SHA256, 8)
+    br %is_ec, @ecdsa_path, @rsa_alg
+
+  @rsa_alg:
+    %is_pss = call @_x509_oid_eq(%cert_der, %ao, %al, @X509_OID_PSS, 9)
+    br %is_pss, @rsa_pss, @rsa_p1
+  @rsa_p1:
+    %is_p1 = call @_x509_oid_eq(%cert_der, %ao, %al, @X509_OID_SHA256_RSA, 9)
+    br %is_p1, @rsa_p1_key, @vfy_fail
+  @rsa_p1_key:
+    store i32 0, *%pss
+    jmp @rsa_key
+  @rsa_pss:
+    store i32 1, *%pss
+    jmp @rsa_key
+
+  @rsa_key:
+    %n = let [i32, 128]
+    %e = let [i32, 128]
+    %np = gep i32, *%n, 0
+    %ep = gep i32, *%e, 0
+    %got_key = call @x509_parse_rsa_pubkey(%key_der, %key_der_len, %np, %ep, %limbs)
+    br %got_key, @extract_sig, @vfy_fail
+
+  @extract_sig:
+    %sig_off = let i32
+    %sig_len = let i32
+    %found_sig = call @x509_find_signature(%cert_der, %cert_len, %cert_der, %sig_off, %sig_len)
+    br %found_sig, @rsa_dispatch, @vfy_fail
+
+  @rsa_dispatch:
+    %sig_off_v = load i32, *%sig_off
+    %sig_len_v = load i32, *%sig_len
+    %sig_p = gep i8, *%cert_der, %sig_off_v
+    %pf = load i32, *%pss
+    %is_pss_v = ne i32 %pf, 0
+    br %is_pss_v, @verify_pss, @verify_pkcs1
+
+  @verify_pss:
+    %pv = call @std_crypto_rsa_verify_pss_sha256(%hash_p, %sig_p, %sig_len_v, %ep, %limbs, %np, %limbs)
+    ret i1 %pv
+
+  @verify_pkcs1:
+    %em_len = shl i32 %limbs, 2
+    %em = let [i8, 512]
+    %emp = gep i8, *%em, 0
+    call @std_crypto_pkcs1_v15_encode(%hash_p, %emp, %em_len)
+    %sig_bn = let [i32, 128]
+    %sig_bnp = gep i32, *%sig_bn, 0
+    call @std_crypto_rsa_bn_from_bytes(%sig_bnp, %sig_p, %sig_len_v, %limbs)
+    %m_bn = let [i32, 128]
+    %m_bnp = gep i32, *%m_bn, 0
+    call @std_crypto_rsa_bn_mod_pow(%m_bnp, %sig_bnp, %ep, %limbs, %np, %limbs)
+    %em2 = let [i8, 512]
+    %em2p = gep i8, *%em2, 0
+    call @std_crypto_rsa_bn_to_bytes(%em2p, %m_bnp, %em_len, %limbs)
+    %ci = let i32
+    store i32 0, *%ci
+    jmp @vfy_cmp_cond
+
+  @vfy_cmp_cond:
+    %civ = load i32, *%ci
+    %cmore = slt i32 %civ, %em_len
+    br %cmore, @vfy_cmp_body, @vfy_pass
+
+  @vfy_cmp_body:
+    %civ2 = load i32, *%ci
+    %ep_vfy = gep i8, *%em2p, %civ2
+    %ev_vfy = load i8, *%ep_vfy
+    %xp_vfy = gep i8, *%emp, %civ2
+    %xv_vfy = load i8, *%xp_vfy
+    %match_vfy = eq i8 %ev_vfy, %xv_vfy
+    br %match_vfy, @vfy_next, @vfy_fail
+
+  @vfy_next:
+    %civ3 = add i32 %civ2, 1
+    store i32 %civ3, *%ci
+    jmp @vfy_cmp_cond
+
+  @ecdsa_path:
+    %px = let [i32, 8]
+    %py = let [i32, 8]
+    %pxp = gep i32, *%px, 0
+    %pyp = gep i32, *%py, 0
+    %gk2 = call @x509_parse_p256_pubkey(%key_der, %key_der_len, %pxp, %pyp)
+    br %gk2, @ec_sig, @vfy_fail
+
+  @ec_sig:
+    %ec_off = let i32
+    %ec_len = let i32
+    %fs2 = call @x509_find_signature(%cert_der, %cert_len, %cert_der, %ec_off, %ec_len)
+    br %fs2, @ec_parse, @vfy_fail
+
+  @ec_parse:
+    %ec_off_v = load i32, *%ec_off
+    %ec_len_v = load i32, *%ec_len
+    %ec_p = gep i8, *%cert_der, %ec_off_v
+    %r_bn = let [i32, 8]
+    %s_bn = let [i32, 8]
+    %rbp = gep i32, *%r_bn, 0
+    %sbp = gep i32, *%s_bn, 0
+    %parsed = call @_x509_parse_ecdsa_sig(%ec_p, %ec_len_v, %rbp, %sbp)
+    br %parsed, @ec_verify, @vfy_fail
+
+  @ec_verify:
+    %ev = call @std_crypto_p256_verify(%pxp, %pyp, %hash_p, %rbp, %sbp)
+    ret i1 %ev
+
+  @vfy_pass:
+    ret i1 1
+
+  @vfy_fail:
+    ret i1 0
+}
+
+// Verify a self-signed certificate: its own public key verifies
+// its signature.
+fun @x509_verify_self_signed(cert_der: *i8, cert_len: i32,
+                               limbs: i32) -> i1 {
+  @entry:
+    %ok = call @_x509_verify_with_key(%cert_der, %cert_len,
+                                      %cert_der, %cert_len, %limbs)
+    ret i1 %ok
+}
+
+// Verify that issuer_der signed cert_der: the issuer's public key
+// must validate the certificate's signature.
+fun @x509_verify_signed_by(cert_der: *i8, cert_len: i32,
+                           issuer_der: *i8, issuer_len: i32,
+                           limbs: i32) -> i1 {
+  @entry:
+    %ok = call @_x509_verify_with_key(%cert_der, %cert_len,
+                                      %issuer_der, %issuer_len, %limbs)
+    ret i1 %ok
+}
+
+// ============================================================
+// x509_parse_p256_pubkey: extract P-256 public key point
+// from SubjectPublicKeyInfo. Returns x and y as 8-limb i32 arrays.
+// ============================================================
+fun @x509_parse_p256_pubkey(cert_der: *i8, cert_len: i32,
+                              pub_x: *i32, pub_y: *i32) -> i1 {
+  @entry:
+    %tbs_val_off = let i32
+    %tbs_val_len = let i32
+    %tbs_der_off = let i32
+    %tbs_der_len = let i32
+    %found_tbs = call @x509_find_tbs_certificate(%cert_der, %cert_len, %tbs_val_off, %tbs_val_len, %tbs_der_off, %tbs_der_len)
+    br %found_tbs, @find_p256_spki, @p256_not_found
+
+  @find_p256_spki:
+    %tbs_off_v = load i32, *%tbs_val_off
+    %tbs_len_v = load i32, *%tbs_val_len
+    %tbs_val = gep i8, *%cert_der, %tbs_off_v
+    %spki_off = let i32
+    %spki_len = let i32
+    %found_spki = call @x509_find_spki(%tbs_val, %tbs_len_v, %spki_off, %spki_len)
+    br %found_spki, @parse_p256_spki, @p256_not_found
+
+  @parse_p256_spki:
+    %spki_rel_off = load i32, *%spki_off
+    %spki_abs_off = add i32 %tbs_off_v, %spki_rel_off
+    %spki_val = gep i8, *%cert_der, %spki_abs_off
+    %aoff = let i32
+    store i32 0, *%aoff
+    // spki_off points at the SubjectPublicKeyInfo SEQUENCE tag.
+    %ss_tag = call @asn1_read_tag(%spki_val, %aoff)
+    %ss_ok = eq i8 %ss_tag, @Asn1Tag.Sequence
+    br %ss_ok, @p256_seq_len, @p256_not_found
+  @p256_seq_len:
+    %ss_len = call @asn1_read_length(%spki_val, %aoff)
+    %ss_ok2 = sge i32 %ss_len, 0
+    br %ss_ok2, @p256_alg, @p256_not_found
+  @p256_alg:
+    // Skip AlgorithmIdentifier
+    call @asn1_skip_tlv(%spki_val, %aoff)
+
+    // Read BIT STRING
+    %pk_tag = call @asn1_read_tag(%spki_val, %aoff)
+    %is_bitstr = eq i8 %pk_tag, @Asn1Tag.BitString
+    br %is_bitstr, @read_p256_pk_len, @p256_not_found
+
+  @read_p256_pk_len:
+    %pk_len = call @asn1_read_length(%spki_val, %aoff)
+    // 1 unused-bits byte + 0x04 + 32-byte x + 32-byte y
+    %pk_small = slt i32 %pk_len, 66
+    br %pk_small, @p256_not_found, @check_uncompressed
+
+  @check_uncompressed:
+    %pk_off = load i32, *%aoff
+    // Skip unused bits byte
+    %pk_off2 = add i32 %pk_off, 1
+    store i32 %pk_off2, *%aoff
+
+    // Check for uncompressed point marker: 0x04
+    %point_start = gep i8, *%spki_val, %pk_off2
+    %point_format = load i8, *%point_start
+    %is_uncompressed = eq i8 %point_format, 0x04
+    br %is_uncompressed, @copy_p256_point, @p256_not_found
+
+  @copy_p256_point:
+    // x = bytes[1..32], y = bytes[33..64] (after 0x04 prefix)
+    %coord_off = add i32 %pk_off2, 1
+
+    %x_p = gep i8, *%spki_val, %coord_off
+    call @std_crypto_rsa_bn_from_bytes(%pub_x, %x_p, 32, 8)
+
+    %y_off = add i32 %coord_off, 32
+    %y_p = gep i8, *%spki_val, %y_off
+    call @std_crypto_rsa_bn_from_bytes(%pub_y, %y_p, 32, 8)
+
+    ret i1 1
+
+  @p256_not_found:
+    ret i1 0
+}

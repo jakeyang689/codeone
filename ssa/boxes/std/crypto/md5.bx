@@ -1,0 +1,1427 @@
+// MD5 message digest implementation
+// Processes input data in 64-byte blocks using the MD5 compression function.
+// Outputs 16 bytes (128 bits) of digest in little-endian byte order.
+
+extern @memset(s: *i8, c: i32, n: i64) -> *i8
+
+// Internal: process one 64-byte block and update the hash state.
+fun @std_crypto_md5_transform(aptr: *i32, bptr: *i32, cptr: *i32, dptr: *i32, block: *i8) -> void {
+  @entry:
+    // Load current hash state
+    %a0 = load i32, *%aptr
+    %b0 = load i32, *%bptr
+    %c0 = load i32, *%cptr
+    %d0 = load i32, *%dptr
+
+    // Load 16 words from block (little-endian)
+    // Word 0: bytes 0-3
+    %w0p0 = gep i8, *%block, 0
+    %w0b0 = load i8, *%w0p0
+    %w0z0 = zext i8 %w0b0 to i32
+    %w0p1 = gep i8, *%block, 1
+    %w0b1 = load i8, *%w0p1
+    %w0z1 = zext i8 %w0b1 to i32
+    %w0s1 = shl i32 %w0z1, 8
+    %w0p2 = gep i8, *%block, 2
+    %w0b2 = load i8, *%w0p2
+    %w0z2 = zext i8 %w0b2 to i32
+    %w0s2 = shl i32 %w0z2, 16
+    %w0p3 = gep i8, *%block, 3
+    %w0b3 = load i8, *%w0p3
+    %w0z3 = zext i8 %w0b3 to i32
+    %w0s3 = shl i32 %w0z3, 24
+    %w0t0 = or i32 %w0z0, %w0s1
+    %w0t1 = or i32 %w0t0, %w0s2
+    %w0 = or i32 %w0t1, %w0s3
+
+    // Word 1: bytes 4-7
+    %w1p0 = gep i8, *%block, 4
+    %w1b0 = load i8, *%w1p0
+    %w1z0 = zext i8 %w1b0 to i32
+    %w1p1 = gep i8, *%block, 5
+    %w1b1 = load i8, *%w1p1
+    %w1z1 = zext i8 %w1b1 to i32
+    %w1s1 = shl i32 %w1z1, 8
+    %w1p2 = gep i8, *%block, 6
+    %w1b2 = load i8, *%w1p2
+    %w1z2 = zext i8 %w1b2 to i32
+    %w1s2 = shl i32 %w1z2, 16
+    %w1p3 = gep i8, *%block, 7
+    %w1b3 = load i8, *%w1p3
+    %w1z3 = zext i8 %w1b3 to i32
+    %w1s3 = shl i32 %w1z3, 24
+    %w1t0 = or i32 %w1z0, %w1s1
+    %w1t1 = or i32 %w1t0, %w1s2
+    %w1 = or i32 %w1t1, %w1s3
+
+    // Word 2: bytes 8-11
+    %w2p0 = gep i8, *%block, 8
+    %w2b0 = load i8, *%w2p0
+    %w2z0 = zext i8 %w2b0 to i32
+    %w2p1 = gep i8, *%block, 9
+    %w2b1 = load i8, *%w2p1
+    %w2z1 = zext i8 %w2b1 to i32
+    %w2s1 = shl i32 %w2z1, 8
+    %w2p2 = gep i8, *%block, 10
+    %w2b2 = load i8, *%w2p2
+    %w2z2 = zext i8 %w2b2 to i32
+    %w2s2 = shl i32 %w2z2, 16
+    %w2p3 = gep i8, *%block, 11
+    %w2b3 = load i8, *%w2p3
+    %w2z3 = zext i8 %w2b3 to i32
+    %w2s3 = shl i32 %w2z3, 24
+    %w2t0 = or i32 %w2z0, %w2s1
+    %w2t1 = or i32 %w2t0, %w2s2
+    %w2 = or i32 %w2t1, %w2s3
+
+    // Word 3: bytes 12-15
+    %w3p0 = gep i8, *%block, 12
+    %w3b0 = load i8, *%w3p0
+    %w3z0 = zext i8 %w3b0 to i32
+    %w3p1 = gep i8, *%block, 13
+    %w3b1 = load i8, *%w3p1
+    %w3z1 = zext i8 %w3b1 to i32
+    %w3s1 = shl i32 %w3z1, 8
+    %w3p2 = gep i8, *%block, 14
+    %w3b2 = load i8, *%w3p2
+    %w3z2 = zext i8 %w3b2 to i32
+    %w3s2 = shl i32 %w3z2, 16
+    %w3p3 = gep i8, *%block, 15
+    %w3b3 = load i8, *%w3p3
+    %w3z3 = zext i8 %w3b3 to i32
+    %w3s3 = shl i32 %w3z3, 24
+    %w3t0 = or i32 %w3z0, %w3s1
+    %w3t1 = or i32 %w3t0, %w3s2
+    %w3 = or i32 %w3t1, %w3s3
+
+    // Word 4: bytes 16-19
+    %w4p0 = gep i8, *%block, 16
+    %w4b0 = load i8, *%w4p0
+    %w4z0 = zext i8 %w4b0 to i32
+    %w4p1 = gep i8, *%block, 17
+    %w4b1 = load i8, *%w4p1
+    %w4z1 = zext i8 %w4b1 to i32
+    %w4s1 = shl i32 %w4z1, 8
+    %w4p2 = gep i8, *%block, 18
+    %w4b2 = load i8, *%w4p2
+    %w4z2 = zext i8 %w4b2 to i32
+    %w4s2 = shl i32 %w4z2, 16
+    %w4p3 = gep i8, *%block, 19
+    %w4b3 = load i8, *%w4p3
+    %w4z3 = zext i8 %w4b3 to i32
+    %w4s3 = shl i32 %w4z3, 24
+    %w4t0 = or i32 %w4z0, %w4s1
+    %w4t1 = or i32 %w4t0, %w4s2
+    %w4 = or i32 %w4t1, %w4s3
+
+    // Word 5: bytes 20-23
+    %w5p0 = gep i8, *%block, 20
+    %w5b0 = load i8, *%w5p0
+    %w5z0 = zext i8 %w5b0 to i32
+    %w5p1 = gep i8, *%block, 21
+    %w5b1 = load i8, *%w5p1
+    %w5z1 = zext i8 %w5b1 to i32
+    %w5s1 = shl i32 %w5z1, 8
+    %w5p2 = gep i8, *%block, 22
+    %w5b2 = load i8, *%w5p2
+    %w5z2 = zext i8 %w5b2 to i32
+    %w5s2 = shl i32 %w5z2, 16
+    %w5p3 = gep i8, *%block, 23
+    %w5b3 = load i8, *%w5p3
+    %w5z3 = zext i8 %w5b3 to i32
+    %w5s3 = shl i32 %w5z3, 24
+    %w5t0 = or i32 %w5z0, %w5s1
+    %w5t1 = or i32 %w5t0, %w5s2
+    %w5 = or i32 %w5t1, %w5s3
+
+    // Word 6: bytes 24-27
+    %w6p0 = gep i8, *%block, 24
+    %w6b0 = load i8, *%w6p0
+    %w6z0 = zext i8 %w6b0 to i32
+    %w6p1 = gep i8, *%block, 25
+    %w6b1 = load i8, *%w6p1
+    %w6z1 = zext i8 %w6b1 to i32
+    %w6s1 = shl i32 %w6z1, 8
+    %w6p2 = gep i8, *%block, 26
+    %w6b2 = load i8, *%w6p2
+    %w6z2 = zext i8 %w6b2 to i32
+    %w6s2 = shl i32 %w6z2, 16
+    %w6p3 = gep i8, *%block, 27
+    %w6b3 = load i8, *%w6p3
+    %w6z3 = zext i8 %w6b3 to i32
+    %w6s3 = shl i32 %w6z3, 24
+    %w6t0 = or i32 %w6z0, %w6s1
+    %w6t1 = or i32 %w6t0, %w6s2
+    %w6 = or i32 %w6t1, %w6s3
+
+    // Word 7: bytes 28-31
+    %w7p0 = gep i8, *%block, 28
+    %w7b0 = load i8, *%w7p0
+    %w7z0 = zext i8 %w7b0 to i32
+    %w7p1 = gep i8, *%block, 29
+    %w7b1 = load i8, *%w7p1
+    %w7z1 = zext i8 %w7b1 to i32
+    %w7s1 = shl i32 %w7z1, 8
+    %w7p2 = gep i8, *%block, 30
+    %w7b2 = load i8, *%w7p2
+    %w7z2 = zext i8 %w7b2 to i32
+    %w7s2 = shl i32 %w7z2, 16
+    %w7p3 = gep i8, *%block, 31
+    %w7b3 = load i8, *%w7p3
+    %w7z3 = zext i8 %w7b3 to i32
+    %w7s3 = shl i32 %w7z3, 24
+    %w7t0 = or i32 %w7z0, %w7s1
+    %w7t1 = or i32 %w7t0, %w7s2
+    %w7 = or i32 %w7t1, %w7s3
+
+    // Word 8: bytes 32-35
+    %w8p0 = gep i8, *%block, 32
+    %w8b0 = load i8, *%w8p0
+    %w8z0 = zext i8 %w8b0 to i32
+    %w8p1 = gep i8, *%block, 33
+    %w8b1 = load i8, *%w8p1
+    %w8z1 = zext i8 %w8b1 to i32
+    %w8s1 = shl i32 %w8z1, 8
+    %w8p2 = gep i8, *%block, 34
+    %w8b2 = load i8, *%w8p2
+    %w8z2 = zext i8 %w8b2 to i32
+    %w8s2 = shl i32 %w8z2, 16
+    %w8p3 = gep i8, *%block, 35
+    %w8b3 = load i8, *%w8p3
+    %w8z3 = zext i8 %w8b3 to i32
+    %w8s3 = shl i32 %w8z3, 24
+    %w8t0 = or i32 %w8z0, %w8s1
+    %w8t1 = or i32 %w8t0, %w8s2
+    %w8 = or i32 %w8t1, %w8s3
+
+    // Word 9: bytes 36-39
+    %w9p0 = gep i8, *%block, 36
+    %w9b0 = load i8, *%w9p0
+    %w9z0 = zext i8 %w9b0 to i32
+    %w9p1 = gep i8, *%block, 37
+    %w9b1 = load i8, *%w9p1
+    %w9z1 = zext i8 %w9b1 to i32
+    %w9s1 = shl i32 %w9z1, 8
+    %w9p2 = gep i8, *%block, 38
+    %w9b2 = load i8, *%w9p2
+    %w9z2 = zext i8 %w9b2 to i32
+    %w9s2 = shl i32 %w9z2, 16
+    %w9p3 = gep i8, *%block, 39
+    %w9b3 = load i8, *%w9p3
+    %w9z3 = zext i8 %w9b3 to i32
+    %w9s3 = shl i32 %w9z3, 24
+    %w9t0 = or i32 %w9z0, %w9s1
+    %w9t1 = or i32 %w9t0, %w9s2
+    %w9 = or i32 %w9t1, %w9s3
+
+    // Word 10: bytes 40-43
+    %w10p0 = gep i8, *%block, 40
+    %w10b0 = load i8, *%w10p0
+    %w10z0 = zext i8 %w10b0 to i32
+    %w10p1 = gep i8, *%block, 41
+    %w10b1 = load i8, *%w10p1
+    %w10z1 = zext i8 %w10b1 to i32
+    %w10s1 = shl i32 %w10z1, 8
+    %w10p2 = gep i8, *%block, 42
+    %w10b2 = load i8, *%w10p2
+    %w10z2 = zext i8 %w10b2 to i32
+    %w10s2 = shl i32 %w10z2, 16
+    %w10p3 = gep i8, *%block, 43
+    %w10b3 = load i8, *%w10p3
+    %w10z3 = zext i8 %w10b3 to i32
+    %w10s3 = shl i32 %w10z3, 24
+    %w10t0 = or i32 %w10z0, %w10s1
+    %w10t1 = or i32 %w10t0, %w10s2
+    %w10 = or i32 %w10t1, %w10s3
+
+    // Word 11: bytes 44-47
+    %w11p0 = gep i8, *%block, 44
+    %w11b0 = load i8, *%w11p0
+    %w11z0 = zext i8 %w11b0 to i32
+    %w11p1 = gep i8, *%block, 45
+    %w11b1 = load i8, *%w11p1
+    %w11z1 = zext i8 %w11b1 to i32
+    %w11s1 = shl i32 %w11z1, 8
+    %w11p2 = gep i8, *%block, 46
+    %w11b2 = load i8, *%w11p2
+    %w11z2 = zext i8 %w11b2 to i32
+    %w11s2 = shl i32 %w11z2, 16
+    %w11p3 = gep i8, *%block, 47
+    %w11b3 = load i8, *%w11p3
+    %w11z3 = zext i8 %w11b3 to i32
+    %w11s3 = shl i32 %w11z3, 24
+    %w11t0 = or i32 %w11z0, %w11s1
+    %w11t1 = or i32 %w11t0, %w11s2
+    %w11 = or i32 %w11t1, %w11s3
+
+    // Word 12: bytes 48-51
+    %w12p0 = gep i8, *%block, 48
+    %w12b0 = load i8, *%w12p0
+    %w12z0 = zext i8 %w12b0 to i32
+    %w12p1 = gep i8, *%block, 49
+    %w12b1 = load i8, *%w12p1
+    %w12z1 = zext i8 %w12b1 to i32
+    %w12s1 = shl i32 %w12z1, 8
+    %w12p2 = gep i8, *%block, 50
+    %w12b2 = load i8, *%w12p2
+    %w12z2 = zext i8 %w12b2 to i32
+    %w12s2 = shl i32 %w12z2, 16
+    %w12p3 = gep i8, *%block, 51
+    %w12b3 = load i8, *%w12p3
+    %w12z3 = zext i8 %w12b3 to i32
+    %w12s3 = shl i32 %w12z3, 24
+    %w12t0 = or i32 %w12z0, %w12s1
+    %w12t1 = or i32 %w12t0, %w12s2
+    %w12 = or i32 %w12t1, %w12s3
+
+    // Word 13: bytes 52-55
+    %w13p0 = gep i8, *%block, 52
+    %w13b0 = load i8, *%w13p0
+    %w13z0 = zext i8 %w13b0 to i32
+    %w13p1 = gep i8, *%block, 53
+    %w13b1 = load i8, *%w13p1
+    %w13z1 = zext i8 %w13b1 to i32
+    %w13s1 = shl i32 %w13z1, 8
+    %w13p2 = gep i8, *%block, 54
+    %w13b2 = load i8, *%w13p2
+    %w13z2 = zext i8 %w13b2 to i32
+    %w13s2 = shl i32 %w13z2, 16
+    %w13p3 = gep i8, *%block, 55
+    %w13b3 = load i8, *%w13p3
+    %w13z3 = zext i8 %w13b3 to i32
+    %w13s3 = shl i32 %w13z3, 24
+    %w13t0 = or i32 %w13z0, %w13s1
+    %w13t1 = or i32 %w13t0, %w13s2
+    %w13 = or i32 %w13t1, %w13s3
+
+    // Word 14: bytes 56-59
+    %w14p0 = gep i8, *%block, 56
+    %w14b0 = load i8, *%w14p0
+    %w14z0 = zext i8 %w14b0 to i32
+    %w14p1 = gep i8, *%block, 57
+    %w14b1 = load i8, *%w14p1
+    %w14z1 = zext i8 %w14b1 to i32
+    %w14s1 = shl i32 %w14z1, 8
+    %w14p2 = gep i8, *%block, 58
+    %w14b2 = load i8, *%w14p2
+    %w14z2 = zext i8 %w14b2 to i32
+    %w14s2 = shl i32 %w14z2, 16
+    %w14p3 = gep i8, *%block, 59
+    %w14b3 = load i8, *%w14p3
+    %w14z3 = zext i8 %w14b3 to i32
+    %w14s3 = shl i32 %w14z3, 24
+    %w14t0 = or i32 %w14z0, %w14s1
+    %w14t1 = or i32 %w14t0, %w14s2
+    %w14 = or i32 %w14t1, %w14s3
+
+    // Word 15: bytes 60-63
+    %w15p0 = gep i8, *%block, 60
+    %w15b0 = load i8, *%w15p0
+    %w15z0 = zext i8 %w15b0 to i32
+    %w15p1 = gep i8, *%block, 61
+    %w15b1 = load i8, *%w15p1
+    %w15z1 = zext i8 %w15b1 to i32
+    %w15s1 = shl i32 %w15z1, 8
+    %w15p2 = gep i8, *%block, 62
+    %w15b2 = load i8, *%w15p2
+    %w15z2 = zext i8 %w15b2 to i32
+    %w15s2 = shl i32 %w15z2, 16
+    %w15p3 = gep i8, *%block, 63
+    %w15b3 = load i8, *%w15p3
+    %w15z3 = zext i8 %w15b3 to i32
+    %w15s3 = shl i32 %w15z3, 24
+    %w15t0 = or i32 %w15z0, %w15s1
+    %w15t1 = or i32 %w15t0, %w15s2
+    %w15 = or i32 %w15t1, %w15s3
+
+    // Round 1: F function - F(x,y,z) = (x & y) | (~x & z)
+    // Step 0: g=0, s=7, K=0xd76aa478, first=a
+    // F(b0,c0,d0) = (b0 & c0) | (~b0 & d0); result = b0 + ROL(a0 + F + M[0] + K[0], 7)
+    %f0_a1 = and i32 %b0, %c0
+    %f0_nb = xor i32 %b0, 0xFFFFFFFF
+    %f0_a2 = and i32 %f0_nb, %d0
+    %f0_0 = or i32 %f0_a1, %f0_a2
+    %f0_1 = add i32 %a0, %f0_0
+    %f0_2 = add i32 %f0_1, %w0
+    %f0_3 = add i32 %f0_2, 0xD76AA478
+    %f0_l = shl i32 %f0_3, 7
+    %f0_r = lshr i32 %f0_3, 25
+    %f0_o = or i32 %f0_l, %f0_r
+    %r0 = add i32 %f0_o, %b0
+
+    // Step 1: g=1, s=12, K=0xe8c7b756, first=d
+    // F(%r0,b0,c0) = (%r0 & b0) | (~%r0 & c0); d = %r0 + ROL(d0 + F + M[1] + K[1], 12)
+    %f1_a1 = and i32 %r0, %b0
+    %f1_nb = xor i32 %r0, 0xFFFFFFFF
+    %f1_a2 = and i32 %f1_nb, %c0
+    %f1_0 = or i32 %f1_a1, %f1_a2
+    %f1_1 = add i32 %d0, %f1_0
+    %f1_2 = add i32 %f1_1, %w1
+    %f1_3 = add i32 %f1_2, 0xE8C7B756
+    %f1_l = shl i32 %f1_3, 12
+    %f1_r = lshr i32 %f1_3, 20
+    %f1_o = or i32 %f1_l, %f1_r
+    %r1 = add i32 %f1_o, %r0
+
+    // Step 2: g=2, s=17, K=0x242070db, first=c
+    // F(%r1,%r0,b0) = (%r1 & %r0) | (~%r1 & b0); c = %r1 + ROL(c0 + F + M[2] + K[2], 17)
+    %f2_a1 = and i32 %r1, %r0
+    %f2_nb = xor i32 %r1, 0xFFFFFFFF
+    %f2_a2 = and i32 %f2_nb, %b0
+    %f2_0 = or i32 %f2_a1, %f2_a2
+    %f2_1 = add i32 %c0, %f2_0
+    %f2_2 = add i32 %f2_1, %w2
+    %f2_3 = add i32 %f2_2, 0x242070DB
+    %f2_l = shl i32 %f2_3, 17
+    %f2_r = lshr i32 %f2_3, 15
+    %f2_o = or i32 %f2_l, %f2_r
+    %r2 = add i32 %f2_o, %r1
+
+    // Step 3: g=3, s=22, K=0xc1bdceee, first=b
+    // F(%r2,%r1,%r0) = (%r2 & %r1) | (~%r2 & %r0); b = %r2 + ROL(b0 + F + M[3] + K[3], 22)
+    %f3_a1 = and i32 %r2, %r1
+    %f3_nb = xor i32 %r2, 0xFFFFFFFF
+    %f3_a2 = and i32 %f3_nb, %r0
+    %f3_0 = or i32 %f3_a1, %f3_a2
+    %f3_1 = add i32 %b0, %f3_0
+    %f3_2 = add i32 %f3_1, %w3
+    %f3_3 = add i32 %f3_2, 0xC1BDCEEE
+    %f3_l = shl i32 %f3_3, 22
+    %f3_r = lshr i32 %f3_3, 10
+    %f3_o = or i32 %f3_l, %f3_r
+    %r3 = add i32 %f3_o, %r2
+
+    // Step 4: g=4, s=7, K=0xf57c0faf, first=a
+    // F(%r3,%r2,%r1) = (%r3 & %r2) | (~%r3 & %r1); a = %r3 + ROL(%r0 + F + M[4] + K[4], 7)
+    %f4_a1 = and i32 %r3, %r2
+    %f4_nb = xor i32 %r3, 0xFFFFFFFF
+    %f4_a2 = and i32 %f4_nb, %r1
+    %f4_0 = or i32 %f4_a1, %f4_a2
+    %f4_1 = add i32 %r0, %f4_0
+    %f4_2 = add i32 %f4_1, %w4
+    %f4_3 = add i32 %f4_2, 0xF57C0FAF
+    %f4_l = shl i32 %f4_3, 7
+    %f4_r = lshr i32 %f4_3, 25
+    %f4_o = or i32 %f4_l, %f4_r
+    %r4 = add i32 %f4_o, %r3
+
+    // Step 5: g=5, s=12, K=0x4787c62a, first=d
+    // F(%r4,%r3,%r2) = (%r4 & %r3) | (~%r4 & %r2); d = %r4 + ROL(%r1 + F + M[5] + K[5], 12)
+    %f5_a1 = and i32 %r4, %r3
+    %f5_nb = xor i32 %r4, 0xFFFFFFFF
+    %f5_a2 = and i32 %f5_nb, %r2
+    %f5_0 = or i32 %f5_a1, %f5_a2
+    %f5_1 = add i32 %r1, %f5_0
+    %f5_2 = add i32 %f5_1, %w5
+    %f5_3 = add i32 %f5_2, 0x4787C62A
+    %f5_l = shl i32 %f5_3, 12
+    %f5_r = lshr i32 %f5_3, 20
+    %f5_o = or i32 %f5_l, %f5_r
+    %r5 = add i32 %f5_o, %r4
+
+    // Step 6: g=6, s=17, K=0xa8304613, first=c
+    // F(%r5,%r4,%r3) = (%r5 & %r4) | (~%r5 & %r3); c = %r5 + ROL(%r2 + F + M[6] + K[6], 17)
+    %f6_a1 = and i32 %r5, %r4
+    %f6_nb = xor i32 %r5, 0xFFFFFFFF
+    %f6_a2 = and i32 %f6_nb, %r3
+    %f6_0 = or i32 %f6_a1, %f6_a2
+    %f6_1 = add i32 %r2, %f6_0
+    %f6_2 = add i32 %f6_1, %w6
+    %f6_3 = add i32 %f6_2, 0xA8304613
+    %f6_l = shl i32 %f6_3, 17
+    %f6_r = lshr i32 %f6_3, 15
+    %f6_o = or i32 %f6_l, %f6_r
+    %r6 = add i32 %f6_o, %r5
+
+    // Step 7: g=7, s=22, K=0xfd469501, first=b
+    // F(%r6,%r5,%r4) = (%r6 & %r5) | (~%r6 & %r4); b = %r6 + ROL(%r3 + F + M[7] + K[7], 22)
+    %f7_a1 = and i32 %r6, %r5
+    %f7_nb = xor i32 %r6, 0xFFFFFFFF
+    %f7_a2 = and i32 %f7_nb, %r4
+    %f7_0 = or i32 %f7_a1, %f7_a2
+    %f7_1 = add i32 %r3, %f7_0
+    %f7_2 = add i32 %f7_1, %w7
+    %f7_3 = add i32 %f7_2, 0xFD469501
+    %f7_l = shl i32 %f7_3, 22
+    %f7_r = lshr i32 %f7_3, 10
+    %f7_o = or i32 %f7_l, %f7_r
+    %r7 = add i32 %f7_o, %r6
+
+    // Step 8: g=8, s=7, K=0x698098d8, first=a
+    // F(%r7,%r6,%r5) = (%r7 & %r6) | (~%r7 & %r5); a = %r7 + ROL(%r4 + F + M[8] + K[8], 7)
+    %f8_a1 = and i32 %r7, %r6
+    %f8_nb = xor i32 %r7, 0xFFFFFFFF
+    %f8_a2 = and i32 %f8_nb, %r5
+    %f8_0 = or i32 %f8_a1, %f8_a2
+    %f8_1 = add i32 %r4, %f8_0
+    %f8_2 = add i32 %f8_1, %w8
+    %f8_3 = add i32 %f8_2, 0x698098D8
+    %f8_l = shl i32 %f8_3, 7
+    %f8_r = lshr i32 %f8_3, 25
+    %f8_o = or i32 %f8_l, %f8_r
+    %r8 = add i32 %f8_o, %r7
+
+    // Step 9: g=9, s=12, K=0x8b44f7af, first=d
+    // F(%r8,%r7,%r6) = (%r8 & %r7) | (~%r8 & %r6); d = %r8 + ROL(%r5 + F + M[9] + K[9], 12)
+    %f9_a1 = and i32 %r8, %r7
+    %f9_nb = xor i32 %r8, 0xFFFFFFFF
+    %f9_a2 = and i32 %f9_nb, %r6
+    %f9_0 = or i32 %f9_a1, %f9_a2
+    %f9_1 = add i32 %r5, %f9_0
+    %f9_2 = add i32 %f9_1, %w9
+    %f9_3 = add i32 %f9_2, 0x8B44F7AF
+    %f9_l = shl i32 %f9_3, 12
+    %f9_r = lshr i32 %f9_3, 20
+    %f9_o = or i32 %f9_l, %f9_r
+    %r9 = add i32 %f9_o, %r8
+
+    // Step 10: g=10, s=17, K=0xffff5bb1, first=c
+    // F(%r9,%r8,%r7) = (%r9 & %r8) | (~%r9 & %r7); c = %r9 + ROL(%r6 + F + M[10] + K[10], 17)
+    %f10_a1 = and i32 %r9, %r8
+    %f10_nb = xor i32 %r9, 0xFFFFFFFF
+    %f10_a2 = and i32 %f10_nb, %r7
+    %f10_0 = or i32 %f10_a1, %f10_a2
+    %f10_1 = add i32 %r6, %f10_0
+    %f10_2 = add i32 %f10_1, %w10
+    %f10_3 = add i32 %f10_2, 0xFFFF5BB1
+    %f10_l = shl i32 %f10_3, 17
+    %f10_r = lshr i32 %f10_3, 15
+    %f10_o = or i32 %f10_l, %f10_r
+    %r10 = add i32 %f10_o, %r9
+
+    // Step 11: g=11, s=22, K=0x895cd7be, first=b
+    // F(%r10,%r9,%r8) = (%r10 & %r9) | (~%r10 & %r8); b = %r10 + ROL(%r7 + F + M[11] + K[11], 22)
+    %f11_a1 = and i32 %r10, %r9
+    %f11_nb = xor i32 %r10, 0xFFFFFFFF
+    %f11_a2 = and i32 %f11_nb, %r8
+    %f11_0 = or i32 %f11_a1, %f11_a2
+    %f11_1 = add i32 %r7, %f11_0
+    %f11_2 = add i32 %f11_1, %w11
+    %f11_3 = add i32 %f11_2, 0x895CD7BE
+    %f11_l = shl i32 %f11_3, 22
+    %f11_r = lshr i32 %f11_3, 10
+    %f11_o = or i32 %f11_l, %f11_r
+    %r11 = add i32 %f11_o, %r10
+
+    // Step 12: g=12, s=7, K=0x6b901122, first=a
+    // F(%r11,%r10,%r9) = (%r11 & %r10) | (~%r11 & %r9); a = %r11 + ROL(%r8 + F + M[12] + K[12], 7)
+    %f12_a1 = and i32 %r11, %r10
+    %f12_nb = xor i32 %r11, 0xFFFFFFFF
+    %f12_a2 = and i32 %f12_nb, %r9
+    %f12_0 = or i32 %f12_a1, %f12_a2
+    %f12_1 = add i32 %r8, %f12_0
+    %f12_2 = add i32 %f12_1, %w12
+    %f12_3 = add i32 %f12_2, 0x6B901122
+    %f12_l = shl i32 %f12_3, 7
+    %f12_r = lshr i32 %f12_3, 25
+    %f12_o = or i32 %f12_l, %f12_r
+    %r12 = add i32 %f12_o, %r11
+
+    // Step 13: g=13, s=12, K=0xfd987193, first=d
+    // F(%r12,%r11,%r10) = (%r12 & %r11) | (~%r12 & %r10); d = %r12 + ROL(%r9 + F + M[13] + K[13], 12)
+    %f13_a1 = and i32 %r12, %r11
+    %f13_nb = xor i32 %r12, 0xFFFFFFFF
+    %f13_a2 = and i32 %f13_nb, %r10
+    %f13_0 = or i32 %f13_a1, %f13_a2
+    %f13_1 = add i32 %r9, %f13_0
+    %f13_2 = add i32 %f13_1, %w13
+    %f13_3 = add i32 %f13_2, 0xFD987193
+    %f13_l = shl i32 %f13_3, 12
+    %f13_r = lshr i32 %f13_3, 20
+    %f13_o = or i32 %f13_l, %f13_r
+    %r13 = add i32 %f13_o, %r12
+
+    // Step 14: g=14, s=17, K=0xa679438e, first=c
+    // F(%r13,%r12,%r11) = (%r13 & %r12) | (~%r13 & %r11); c = %r13 + ROL(%r10 + F + M[14] + K[14], 17)
+    %f14_a1 = and i32 %r13, %r12
+    %f14_nb = xor i32 %r13, 0xFFFFFFFF
+    %f14_a2 = and i32 %f14_nb, %r11
+    %f14_0 = or i32 %f14_a1, %f14_a2
+    %f14_1 = add i32 %r10, %f14_0
+    %f14_2 = add i32 %f14_1, %w14
+    %f14_3 = add i32 %f14_2, 0xA679438E
+    %f14_l = shl i32 %f14_3, 17
+    %f14_r = lshr i32 %f14_3, 15
+    %f14_o = or i32 %f14_l, %f14_r
+    %r14 = add i32 %f14_o, %r13
+
+    // Step 15: g=15, s=22, K=0x49b40821, first=b
+    // F(%r14,%r13,%r12) = (%r14 & %r13) | (~%r14 & %r12); b = %r14 + ROL(%r11 + F + M[15] + K[15], 22)
+    %f15_a1 = and i32 %r14, %r13
+    %f15_nb = xor i32 %r14, 0xFFFFFFFF
+    %f15_a2 = and i32 %f15_nb, %r12
+    %f15_0 = or i32 %f15_a1, %f15_a2
+    %f15_1 = add i32 %r11, %f15_0
+    %f15_2 = add i32 %f15_1, %w15
+    %f15_3 = add i32 %f15_2, 0x49B40821
+    %f15_l = shl i32 %f15_3, 22
+    %f15_r = lshr i32 %f15_3, 10
+    %f15_o = or i32 %f15_l, %f15_r
+    %r15 = add i32 %f15_o, %r14
+
+    // Round 2: G function - G(x,y,z) = (x & z) | (y & ~z)
+    // Step 16: g=1, s=5, K=0xf61e2562, first=a
+    // G(%r15,%r14,%r13) = (%r15 & %r13) | (%r14 & ~%r13); a = %r15 + ROL(%r12 + G + M[1] + K[16], 5)
+    %g16_a1 = and i32 %r15, %r13
+    %g16_nz = xor i32 %r13, 0xFFFFFFFF
+    %g16_a2 = and i32 %r14, %g16_nz
+    %g16_0 = or i32 %g16_a1, %g16_a2
+    %g16_1 = add i32 %r12, %g16_0
+    %g16_2 = add i32 %g16_1, %w1
+    %g16_3 = add i32 %g16_2, 0xF61E2562
+    %g16_l = shl i32 %g16_3, 5
+    %g16_r = lshr i32 %g16_3, 27
+    %g16_o = or i32 %g16_l, %g16_r
+    %r16 = add i32 %g16_o, %r15
+
+    // Step 17: g=6, s=9, K=0xc040b340, first=d
+    // G(%r16,%r15,%r14) = (%r16 & %r14) | (%r15 & ~%r14); d = %r16 + ROL(%r13 + G + M[6] + K[17], 9)
+    %g17_a1 = and i32 %r16, %r14
+    %g17_nz = xor i32 %r14, 0xFFFFFFFF
+    %g17_a2 = and i32 %r15, %g17_nz
+    %g17_0 = or i32 %g17_a1, %g17_a2
+    %g17_1 = add i32 %r13, %g17_0
+    %g17_2 = add i32 %g17_1, %w6
+    %g17_3 = add i32 %g17_2, 0xC040B340
+    %g17_l = shl i32 %g17_3, 9
+    %g17_r = lshr i32 %g17_3, 23
+    %g17_o = or i32 %g17_l, %g17_r
+    %r17 = add i32 %g17_o, %r16
+
+    // Step 18: g=11, s=14, K=0x265e5a51, first=c
+    // G(%r17,%r16,%r15) = (%r17 & %r15) | (%r16 & ~%r15); c = %r17 + ROL(%r14 + G + M[11] + K[18], 14)
+    %g18_a1 = and i32 %r17, %r15
+    %g18_nz = xor i32 %r15, 0xFFFFFFFF
+    %g18_a2 = and i32 %r16, %g18_nz
+    %g18_0 = or i32 %g18_a1, %g18_a2
+    %g18_1 = add i32 %r14, %g18_0
+    %g18_2 = add i32 %g18_1, %w11
+    %g18_3 = add i32 %g18_2, 0x265E5A51
+    %g18_l = shl i32 %g18_3, 14
+    %g18_r = lshr i32 %g18_3, 18
+    %g18_o = or i32 %g18_l, %g18_r
+    %r18 = add i32 %g18_o, %r17
+
+    // Step 19: g=0, s=20, K=0xe9b6c7aa, first=b
+    // G(%r18,%r17,%r16) = (%r18 & %r16) | (%r17 & ~%r16); b = %r18 + ROL(%r15 + G + M[0] + K[19], 20)
+    %g19_a1 = and i32 %r18, %r16
+    %g19_nz = xor i32 %r16, 0xFFFFFFFF
+    %g19_a2 = and i32 %r17, %g19_nz
+    %g19_0 = or i32 %g19_a1, %g19_a2
+    %g19_1 = add i32 %r15, %g19_0
+    %g19_2 = add i32 %g19_1, %w0
+    %g19_3 = add i32 %g19_2, 0xE9B6C7AA
+    %g19_l = shl i32 %g19_3, 20
+    %g19_r = lshr i32 %g19_3, 12
+    %g19_o = or i32 %g19_l, %g19_r
+    %r19 = add i32 %g19_o, %r18
+
+    // Step 20: g=5, s=5, K=0xd62f105d, first=a
+    // G(%r19,%r18,%r17) = (%r19 & %r17) | (%r18 & ~%r17); a = %r19 + ROL(%r16 + G + M[5] + K[20], 5)
+    %g20_a1 = and i32 %r19, %r17
+    %g20_nz = xor i32 %r17, 0xFFFFFFFF
+    %g20_a2 = and i32 %r18, %g20_nz
+    %g20_0 = or i32 %g20_a1, %g20_a2
+    %g20_1 = add i32 %r16, %g20_0
+    %g20_2 = add i32 %g20_1, %w5
+    %g20_3 = add i32 %g20_2, 0xD62F105D
+    %g20_l = shl i32 %g20_3, 5
+    %g20_r = lshr i32 %g20_3, 27
+    %g20_o = or i32 %g20_l, %g20_r
+    %r20 = add i32 %g20_o, %r19
+
+    // Step 21: g=10, s=9, K=0x02441453, first=d
+    // G(%r20,%r19,%r18) = (%r20 & %r18) | (%r19 & ~%r18); d = %r20 + ROL(%r17 + G + M[10] + K[21], 9)
+    %g21_a1 = and i32 %r20, %r18
+    %g21_nz = xor i32 %r18, 0xFFFFFFFF
+    %g21_a2 = and i32 %r19, %g21_nz
+    %g21_0 = or i32 %g21_a1, %g21_a2
+    %g21_1 = add i32 %r17, %g21_0
+    %g21_2 = add i32 %g21_1, %w10
+    %g21_3 = add i32 %g21_2, 0x02441453
+    %g21_l = shl i32 %g21_3, 9
+    %g21_r = lshr i32 %g21_3, 23
+    %g21_o = or i32 %g21_l, %g21_r
+    %r21 = add i32 %g21_o, %r20
+
+    // Step 22: g=15, s=14, K=0xd8a1e681, first=c
+    // G(%r21,%r20,%r19) = (%r21 & %r19) | (%r20 & ~%r19); c = %r21 + ROL(%r18 + G + M[15] + K[22], 14)
+    %g22_a1 = and i32 %r21, %r19
+    %g22_nz = xor i32 %r19, 0xFFFFFFFF
+    %g22_a2 = and i32 %r20, %g22_nz
+    %g22_0 = or i32 %g22_a1, %g22_a2
+    %g22_1 = add i32 %r18, %g22_0
+    %g22_2 = add i32 %g22_1, %w15
+    %g22_3 = add i32 %g22_2, 0xD8A1E681
+    %g22_l = shl i32 %g22_3, 14
+    %g22_r = lshr i32 %g22_3, 18
+    %g22_o = or i32 %g22_l, %g22_r
+    %r22 = add i32 %g22_o, %r21
+
+    // Step 23: g=4, s=20, K=0xe7d3fbc8, first=b
+    // G(%r22,%r21,%r20) = (%r22 & %r20) | (%r21 & ~%r20); b = %r22 + ROL(%r19 + G + M[4] + K[23], 20)
+    %g23_a1 = and i32 %r22, %r20
+    %g23_nz = xor i32 %r20, 0xFFFFFFFF
+    %g23_a2 = and i32 %r21, %g23_nz
+    %g23_0 = or i32 %g23_a1, %g23_a2
+    %g23_1 = add i32 %r19, %g23_0
+    %g23_2 = add i32 %g23_1, %w4
+    %g23_3 = add i32 %g23_2, 0xE7D3FBC8
+    %g23_l = shl i32 %g23_3, 20
+    %g23_r = lshr i32 %g23_3, 12
+    %g23_o = or i32 %g23_l, %g23_r
+    %r23 = add i32 %g23_o, %r22
+
+    // Step 24: g=9, s=5, K=0x21e1cde6, first=a
+    // G(%r23,%r22,%r21) = (%r23 & %r21) | (%r22 & ~%r21); a = %r23 + ROL(%r20 + G + M[9] + K[24], 5)
+    %g24_a1 = and i32 %r23, %r21
+    %g24_nz = xor i32 %r21, 0xFFFFFFFF
+    %g24_a2 = and i32 %r22, %g24_nz
+    %g24_0 = or i32 %g24_a1, %g24_a2
+    %g24_1 = add i32 %r20, %g24_0
+    %g24_2 = add i32 %g24_1, %w9
+    %g24_3 = add i32 %g24_2, 0x21E1CDE6
+    %g24_l = shl i32 %g24_3, 5
+    %g24_r = lshr i32 %g24_3, 27
+    %g24_o = or i32 %g24_l, %g24_r
+    %r24 = add i32 %g24_o, %r23
+
+    // Step 25: g=14, s=9, K=0xc33707d6, first=d
+    // G(%r24,%r23,%r22) = (%r24 & %r22) | (%r23 & ~%r22); d = %r24 + ROL(%r21 + G + M[14] + K[25], 9)
+    %g25_a1 = and i32 %r24, %r22
+    %g25_nz = xor i32 %r22, 0xFFFFFFFF
+    %g25_a2 = and i32 %r23, %g25_nz
+    %g25_0 = or i32 %g25_a1, %g25_a2
+    %g25_1 = add i32 %r21, %g25_0
+    %g25_2 = add i32 %g25_1, %w14
+    %g25_3 = add i32 %g25_2, 0xC33707D6
+    %g25_l = shl i32 %g25_3, 9
+    %g25_r = lshr i32 %g25_3, 23
+    %g25_o = or i32 %g25_l, %g25_r
+    %r25 = add i32 %g25_o, %r24
+
+    // Step 26: g=3, s=14, K=0xf4d50d87, first=c
+    // G(%r25,%r24,%r23) = (%r25 & %r23) | (%r24 & ~%r23); c = %r25 + ROL(%r22 + G + M[3] + K[26], 14)
+    %g26_a1 = and i32 %r25, %r23
+    %g26_nz = xor i32 %r23, 0xFFFFFFFF
+    %g26_a2 = and i32 %r24, %g26_nz
+    %g26_0 = or i32 %g26_a1, %g26_a2
+    %g26_1 = add i32 %r22, %g26_0
+    %g26_2 = add i32 %g26_1, %w3
+    %g26_3 = add i32 %g26_2, 0xF4D50D87
+    %g26_l = shl i32 %g26_3, 14
+    %g26_r = lshr i32 %g26_3, 18
+    %g26_o = or i32 %g26_l, %g26_r
+    %r26 = add i32 %g26_o, %r25
+
+    // Step 27: g=8, s=20, K=0x455a14ed, first=b
+    // G(%r26,%r25,%r24) = (%r26 & %r24) | (%r25 & ~%r24); b = %r26 + ROL(%r23 + G + M[8] + K[27], 20)
+    %g27_a1 = and i32 %r26, %r24
+    %g27_nz = xor i32 %r24, 0xFFFFFFFF
+    %g27_a2 = and i32 %r25, %g27_nz
+    %g27_0 = or i32 %g27_a1, %g27_a2
+    %g27_1 = add i32 %r23, %g27_0
+    %g27_2 = add i32 %g27_1, %w8
+    %g27_3 = add i32 %g27_2, 0x455A14ED
+    %g27_l = shl i32 %g27_3, 20
+    %g27_r = lshr i32 %g27_3, 12
+    %g27_o = or i32 %g27_l, %g27_r
+    %r27 = add i32 %g27_o, %r26
+
+    // Step 28: g=13, s=5, K=0xa9e3e905, first=a
+    // G(%r27,%r26,%r25) = (%r27 & %r25) | (%r26 & ~%r25); a = %r27 + ROL(%r24 + G + M[13] + K[28], 5)
+    %g28_a1 = and i32 %r27, %r25
+    %g28_nz = xor i32 %r25, 0xFFFFFFFF
+    %g28_a2 = and i32 %r26, %g28_nz
+    %g28_0 = or i32 %g28_a1, %g28_a2
+    %g28_1 = add i32 %r24, %g28_0
+    %g28_2 = add i32 %g28_1, %w13
+    %g28_3 = add i32 %g28_2, 0xA9E3E905
+    %g28_l = shl i32 %g28_3, 5
+    %g28_r = lshr i32 %g28_3, 27
+    %g28_o = or i32 %g28_l, %g28_r
+    %r28 = add i32 %g28_o, %r27
+
+    // Step 29: g=2, s=9, K=0xfcefa3f8, first=d
+    // G(%r28,%r27,%r26) = (%r28 & %r26) | (%r27 & ~%r26); d = %r28 + ROL(%r25 + G + M[2] + K[29], 9)
+    %g29_a1 = and i32 %r28, %r26
+    %g29_nz = xor i32 %r26, 0xFFFFFFFF
+    %g29_a2 = and i32 %r27, %g29_nz
+    %g29_0 = or i32 %g29_a1, %g29_a2
+    %g29_1 = add i32 %r25, %g29_0
+    %g29_2 = add i32 %g29_1, %w2
+    %g29_3 = add i32 %g29_2, 0xFCEFA3F8
+    %g29_l = shl i32 %g29_3, 9
+    %g29_r = lshr i32 %g29_3, 23
+    %g29_o = or i32 %g29_l, %g29_r
+    %r29 = add i32 %g29_o, %r28
+
+    // Step 30: g=7, s=14, K=0x676f02d9, first=c
+    // G(%r29,%r28,%r27) = (%r29 & %r27) | (%r28 & ~%r27); c = %r29 + ROL(%r26 + G + M[7] + K[30], 14)
+    %g30_a1 = and i32 %r29, %r27
+    %g30_nz = xor i32 %r27, 0xFFFFFFFF
+    %g30_a2 = and i32 %r28, %g30_nz
+    %g30_0 = or i32 %g30_a1, %g30_a2
+    %g30_1 = add i32 %r26, %g30_0
+    %g30_2 = add i32 %g30_1, %w7
+    %g30_3 = add i32 %g30_2, 0x676F02D9
+    %g30_l = shl i32 %g30_3, 14
+    %g30_r = lshr i32 %g30_3, 18
+    %g30_o = or i32 %g30_l, %g30_r
+    %r30 = add i32 %g30_o, %r29
+
+    // Step 31: g=12, s=20, K=0x8d2a4c8a, first=b
+    // G(%r30,%r29,%r28) = (%r30 & %r28) | (%r29 & ~%r28); b = %r30 + ROL(%r27 + G + M[12] + K[31], 20)
+    %g31_a1 = and i32 %r30, %r28
+    %g31_nz = xor i32 %r28, 0xFFFFFFFF
+    %g31_a2 = and i32 %r29, %g31_nz
+    %g31_0 = or i32 %g31_a1, %g31_a2
+    %g31_1 = add i32 %r27, %g31_0
+    %g31_2 = add i32 %g31_1, %w12
+    %g31_3 = add i32 %g31_2, 0x8D2A4C8A
+    %g31_l = shl i32 %g31_3, 20
+    %g31_r = lshr i32 %g31_3, 12
+    %g31_o = or i32 %g31_l, %g31_r
+    %r31 = add i32 %g31_o, %r30
+
+    // Round 3: H function - H(x,y,z) = x ^ y ^ z
+    // Step 32: g=5, s=4, K=0xfffa3942, first=a
+    // H(%r31,%r30,%r29) = %r31 ^ %r30 ^ %r29; a = %r31 + ROL(%r28 + H + M[5] + K[32], 4)
+    %h32_0 = xor i32 %r31, %r30
+    %h32_1 = xor i32 %h32_0, %r29
+    %h32_2 = add i32 %r28, %h32_1
+    %h32_3 = add i32 %h32_2, %w5
+    %h32_4 = add i32 %h32_3, 0xFFFA3942
+    %h32_l = shl i32 %h32_4, 4
+    %h32_r = lshr i32 %h32_4, 28
+    %h32_o = or i32 %h32_l, %h32_r
+    %r32 = add i32 %h32_o, %r31
+
+    // Step 33: g=8, s=11, K=0x8771f681, first=d
+    // H(%r32,%r31,%r30) = %r32 ^ %r31 ^ %r30; d = %r32 + ROL(%r29 + H + M[8] + K[33], 11)
+    %h33_0 = xor i32 %r32, %r31
+    %h33_1 = xor i32 %h33_0, %r30
+    %h33_2 = add i32 %r29, %h33_1
+    %h33_3 = add i32 %h33_2, %w8
+    %h33_4 = add i32 %h33_3, 0x8771F681
+    %h33_l = shl i32 %h33_4, 11
+    %h33_r = lshr i32 %h33_4, 21
+    %h33_o = or i32 %h33_l, %h33_r
+    %r33 = add i32 %h33_o, %r32
+
+    // Step 34: g=11, s=16, K=0x6d9d6122, first=c
+    // H(%r33,%r32,%r31) = %r33 ^ %r32 ^ %r31; c = %r33 + ROL(%r30 + H + M[11] + K[34], 16)
+    %h34_0 = xor i32 %r33, %r32
+    %h34_1 = xor i32 %h34_0, %r31
+    %h34_2 = add i32 %r30, %h34_1
+    %h34_3 = add i32 %h34_2, %w11
+    %h34_4 = add i32 %h34_3, 0x6D9D6122
+    %h34_l = shl i32 %h34_4, 16
+    %h34_r = lshr i32 %h34_4, 16
+    %h34_o = or i32 %h34_l, %h34_r
+    %r34 = add i32 %h34_o, %r33
+
+    // Step 35: g=14, s=23, K=0xfde5380c, first=b
+    // H(%r34,%r33,%r32) = %r34 ^ %r33 ^ %r32; b = %r34 + ROL(%r31 + H + M[14] + K[35], 23)
+    %h35_0 = xor i32 %r34, %r33
+    %h35_1 = xor i32 %h35_0, %r32
+    %h35_2 = add i32 %r31, %h35_1
+    %h35_3 = add i32 %h35_2, %w14
+    %h35_4 = add i32 %h35_3, 0xFDE5380C
+    %h35_l = shl i32 %h35_4, 23
+    %h35_r = lshr i32 %h35_4, 9
+    %h35_o = or i32 %h35_l, %h35_r
+    %r35 = add i32 %h35_o, %r34
+
+    // Step 36: g=1, s=4, K=0xa4beea44, first=a
+    // H(%r35,%r34,%r33) = %r35 ^ %r34 ^ %r33; a = %r35 + ROL(%r32 + H + M[1] + K[36], 4)
+    %h36_0 = xor i32 %r35, %r34
+    %h36_1 = xor i32 %h36_0, %r33
+    %h36_2 = add i32 %r32, %h36_1
+    %h36_3 = add i32 %h36_2, %w1
+    %h36_4 = add i32 %h36_3, 0xA4BEEA44
+    %h36_l = shl i32 %h36_4, 4
+    %h36_r = lshr i32 %h36_4, 28
+    %h36_o = or i32 %h36_l, %h36_r
+    %r36 = add i32 %h36_o, %r35
+
+    // Step 37: g=4, s=11, K=0x4bdecfa9, first=d
+    // H(%r36,%r35,%r34) = %r36 ^ %r35 ^ %r34; d = %r36 + ROL(%r33 + H + M[4] + K[37], 11)
+    %h37_0 = xor i32 %r36, %r35
+    %h37_1 = xor i32 %h37_0, %r34
+    %h37_2 = add i32 %r33, %h37_1
+    %h37_3 = add i32 %h37_2, %w4
+    %h37_4 = add i32 %h37_3, 0x4BDECFA9
+    %h37_l = shl i32 %h37_4, 11
+    %h37_r = lshr i32 %h37_4, 21
+    %h37_o = or i32 %h37_l, %h37_r
+    %r37 = add i32 %h37_o, %r36
+
+    // Step 38: g=7, s=16, K=0xf6bb4b60, first=c
+    // H(%r37,%r36,%r35) = %r37 ^ %r36 ^ %r35; c = %r37 + ROL(%r34 + H + M[7] + K[38], 16)
+    %h38_0 = xor i32 %r37, %r36
+    %h38_1 = xor i32 %h38_0, %r35
+    %h38_2 = add i32 %r34, %h38_1
+    %h38_3 = add i32 %h38_2, %w7
+    %h38_4 = add i32 %h38_3, 0xF6BB4B60
+    %h38_l = shl i32 %h38_4, 16
+    %h38_r = lshr i32 %h38_4, 16
+    %h38_o = or i32 %h38_l, %h38_r
+    %r38 = add i32 %h38_o, %r37
+
+    // Step 39: g=10, s=23, K=0xbebfbc70, first=b
+    // H(%r38,%r37,%r36) = %r38 ^ %r37 ^ %r36; b = %r38 + ROL(%r35 + H + M[10] + K[39], 23)
+    %h39_0 = xor i32 %r38, %r37
+    %h39_1 = xor i32 %h39_0, %r36
+    %h39_2 = add i32 %r35, %h39_1
+    %h39_3 = add i32 %h39_2, %w10
+    %h39_4 = add i32 %h39_3, 0xBEBFBC70
+    %h39_l = shl i32 %h39_4, 23
+    %h39_r = lshr i32 %h39_4, 9
+    %h39_o = or i32 %h39_l, %h39_r
+    %r39 = add i32 %h39_o, %r38
+
+    // Step 40: g=13, s=4, K=0x289b7ec6, first=a
+    // H(%r39,%r38,%r37) = %r39 ^ %r38 ^ %r37; a = %r39 + ROL(%r36 + H + M[13] + K[40], 4)
+    %h40_0 = xor i32 %r39, %r38
+    %h40_1 = xor i32 %h40_0, %r37
+    %h40_2 = add i32 %r36, %h40_1
+    %h40_3 = add i32 %h40_2, %w13
+    %h40_4 = add i32 %h40_3, 0x289B7EC6
+    %h40_l = shl i32 %h40_4, 4
+    %h40_r = lshr i32 %h40_4, 28
+    %h40_o = or i32 %h40_l, %h40_r
+    %r40 = add i32 %h40_o, %r39
+
+    // Step 41: g=0, s=11, K=0xeaa127fa, first=d
+    // H(%r40,%r39,%r38) = %r40 ^ %r39 ^ %r38; d = %r40 + ROL(%r37 + H + M[0] + K[41], 11)
+    %h41_0 = xor i32 %r40, %r39
+    %h41_1 = xor i32 %h41_0, %r38
+    %h41_2 = add i32 %r37, %h41_1
+    %h41_3 = add i32 %h41_2, %w0
+    %h41_4 = add i32 %h41_3, 0xEAA127FA
+    %h41_l = shl i32 %h41_4, 11
+    %h41_r = lshr i32 %h41_4, 21
+    %h41_o = or i32 %h41_l, %h41_r
+    %r41 = add i32 %h41_o, %r40
+
+    // Step 42: g=3, s=16, K=0xd4ef3085, first=c
+    // H(%r41,%r40,%r39) = %r41 ^ %r40 ^ %r39; c = %r41 + ROL(%r38 + H + M[3] + K[42], 16)
+    %h42_0 = xor i32 %r41, %r40
+    %h42_1 = xor i32 %h42_0, %r39
+    %h42_2 = add i32 %r38, %h42_1
+    %h42_3 = add i32 %h42_2, %w3
+    %h42_4 = add i32 %h42_3, 0xD4EF3085
+    %h42_l = shl i32 %h42_4, 16
+    %h42_r = lshr i32 %h42_4, 16
+    %h42_o = or i32 %h42_l, %h42_r
+    %r42 = add i32 %h42_o, %r41
+
+    // Step 43: g=6, s=23, K=0x04881d05, first=b
+    // H(%r42,%r41,%r40) = %r42 ^ %r41 ^ %r40; b = %r42 + ROL(%r39 + H + M[6] + K[43], 23)
+    %h43_0 = xor i32 %r42, %r41
+    %h43_1 = xor i32 %h43_0, %r40
+    %h43_2 = add i32 %r39, %h43_1
+    %h43_3 = add i32 %h43_2, %w6
+    %h43_4 = add i32 %h43_3, 0x04881D05
+    %h43_l = shl i32 %h43_4, 23
+    %h43_r = lshr i32 %h43_4, 9
+    %h43_o = or i32 %h43_l, %h43_r
+    %r43 = add i32 %h43_o, %r42
+
+    // Step 44: g=9, s=4, K=0xd9d4d039, first=a
+    // H(%r43,%r42,%r41) = %r43 ^ %r42 ^ %r41; a = %r43 + ROL(%r40 + H + M[9] + K[44], 4)
+    %h44_0 = xor i32 %r43, %r42
+    %h44_1 = xor i32 %h44_0, %r41
+    %h44_2 = add i32 %r40, %h44_1
+    %h44_3 = add i32 %h44_2, %w9
+    %h44_4 = add i32 %h44_3, 0xD9D4D039
+    %h44_l = shl i32 %h44_4, 4
+    %h44_r = lshr i32 %h44_4, 28
+    %h44_o = or i32 %h44_l, %h44_r
+    %r44 = add i32 %h44_o, %r43
+
+    // Step 45: g=12, s=11, K=0xe6db99e5, first=d
+    // H(%r44,%r43,%r42) = %r44 ^ %r43 ^ %r42; d = %r44 + ROL(%r41 + H + M[12] + K[45], 11)
+    %h45_0 = xor i32 %r44, %r43
+    %h45_1 = xor i32 %h45_0, %r42
+    %h45_2 = add i32 %r41, %h45_1
+    %h45_3 = add i32 %h45_2, %w12
+    %h45_4 = add i32 %h45_3, 0xE6DB99E5
+    %h45_l = shl i32 %h45_4, 11
+    %h45_r = lshr i32 %h45_4, 21
+    %h45_o = or i32 %h45_l, %h45_r
+    %r45 = add i32 %h45_o, %r44
+
+    // Step 46: g=15, s=16, K=0x1fa27cf8, first=c
+    // H(%r45,%r44,%r43) = %r45 ^ %r44 ^ %r43; c = %r45 + ROL(%r42 + H + M[15] + K[46], 16)
+    %h46_0 = xor i32 %r45, %r44
+    %h46_1 = xor i32 %h46_0, %r43
+    %h46_2 = add i32 %r42, %h46_1
+    %h46_3 = add i32 %h46_2, %w15
+    %h46_4 = add i32 %h46_3, 0x1FA27CF8
+    %h46_l = shl i32 %h46_4, 16
+    %h46_r = lshr i32 %h46_4, 16
+    %h46_o = or i32 %h46_l, %h46_r
+    %r46 = add i32 %h46_o, %r45
+
+    // Step 47: g=2, s=23, K=0xc4ac5665, first=b
+    // H(%r46,%r45,%r44) = %r46 ^ %r45 ^ %r44; b = %r46 + ROL(%r43 + H + M[2] + K[47], 23)
+    %h47_0 = xor i32 %r46, %r45
+    %h47_1 = xor i32 %h47_0, %r44
+    %h47_2 = add i32 %r43, %h47_1
+    %h47_3 = add i32 %h47_2, %w2
+    %h47_4 = add i32 %h47_3, 0xC4AC5665
+    %h47_l = shl i32 %h47_4, 23
+    %h47_r = lshr i32 %h47_4, 9
+    %h47_o = or i32 %h47_l, %h47_r
+    %r47 = add i32 %h47_o, %r46
+
+    // Round 4: I function - I(x,y,z) = y ^ (x | ~z)
+    // Step 48: g=0, s=6, K=0xf4292244, first=a
+    // I(%r47,%r46,%r45) = %r46 ^ (%r47 | ~%r45); a = %r47 + ROL(%r44 + I + M[0] + K[48], 6)
+    %i48_nz = xor i32 %r45, 0xFFFFFFFF
+    %i48_0 = or i32 %r47, %i48_nz
+    %i48_1 = xor i32 %r46, %i48_0
+    %i48_2 = add i32 %r44, %i48_1
+    %i48_3 = add i32 %i48_2, %w0
+    %i48_4 = add i32 %i48_3, 0xF4292244
+    %i48_l = shl i32 %i48_4, 6
+    %i48_r = lshr i32 %i48_4, 26
+    %i48_o = or i32 %i48_l, %i48_r
+    %r48 = add i32 %i48_o, %r47
+
+    // Step 49: g=7, s=10, K=0x432aff97, first=d
+    // I(%r48,%r47,%r46) = %r47 ^ (%r48 | ~%r46); d = %r48 + ROL(%r45 + I + M[7] + K[49], 10)
+    %i49_nz = xor i32 %r46, 0xFFFFFFFF
+    %i49_0 = or i32 %r48, %i49_nz
+    %i49_1 = xor i32 %r47, %i49_0
+    %i49_2 = add i32 %r45, %i49_1
+    %i49_3 = add i32 %i49_2, %w7
+    %i49_4 = add i32 %i49_3, 0x432AFF97
+    %i49_l = shl i32 %i49_4, 10
+    %i49_r = lshr i32 %i49_4, 22
+    %i49_o = or i32 %i49_l, %i49_r
+    %r49 = add i32 %i49_o, %r48
+
+    // Step 50: g=14, s=15, K=0xab9423a7, first=c
+    // I(%r49,%r48,%r47) = %r48 ^ (%r49 | ~%r47); c = %r49 + ROL(%r46 + I + M[14] + K[50], 15)
+    %i50_nz = xor i32 %r47, 0xFFFFFFFF
+    %i50_0 = or i32 %r49, %i50_nz
+    %i50_1 = xor i32 %r48, %i50_0
+    %i50_2 = add i32 %r46, %i50_1
+    %i50_3 = add i32 %i50_2, %w14
+    %i50_4 = add i32 %i50_3, 0xAB9423A7
+    %i50_l = shl i32 %i50_4, 15
+    %i50_r = lshr i32 %i50_4, 17
+    %i50_o = or i32 %i50_l, %i50_r
+    %r50 = add i32 %i50_o, %r49
+
+    // Step 51: g=5, s=21, K=0xfc93a039, first=b
+    // I(%r50,%r49,%r48) = %r49 ^ (%r50 | ~%r48); b = %r50 + ROL(%r47 + I + M[5] + K[51], 21)
+    %i51_nz = xor i32 %r48, 0xFFFFFFFF
+    %i51_0 = or i32 %r50, %i51_nz
+    %i51_1 = xor i32 %r49, %i51_0
+    %i51_2 = add i32 %r47, %i51_1
+    %i51_3 = add i32 %i51_2, %w5
+    %i51_4 = add i32 %i51_3, 0xFC93A039
+    %i51_l = shl i32 %i51_4, 21
+    %i51_r = lshr i32 %i51_4, 11
+    %i51_o = or i32 %i51_l, %i51_r
+    %r51 = add i32 %i51_o, %r50
+
+    // Step 52: g=12, s=6, K=0x655b59c3, first=a
+    // I(%r51,%r50,%r49) = %r50 ^ (%r51 | ~%r49); a = %r51 + ROL(%r48 + I + M[12] + K[52], 6)
+    %i52_nz = xor i32 %r49, 0xFFFFFFFF
+    %i52_0 = or i32 %r51, %i52_nz
+    %i52_1 = xor i32 %r50, %i52_0
+    %i52_2 = add i32 %r48, %i52_1
+    %i52_3 = add i32 %i52_2, %w12
+    %i52_4 = add i32 %i52_3, 0x655B59C3
+    %i52_l = shl i32 %i52_4, 6
+    %i52_r = lshr i32 %i52_4, 26
+    %i52_o = or i32 %i52_l, %i52_r
+    %r52 = add i32 %i52_o, %r51
+
+    // Step 53: g=3, s=10, K=0x8f0ccc92, first=d
+    // I(%r52,%r51,%r50) = %r51 ^ (%r52 | ~%r50); d = %r52 + ROL(%r49 + I + M[3] + K[53], 10)
+    %i53_nz = xor i32 %r50, 0xFFFFFFFF
+    %i53_0 = or i32 %r52, %i53_nz
+    %i53_1 = xor i32 %r51, %i53_0
+    %i53_2 = add i32 %r49, %i53_1
+    %i53_3 = add i32 %i53_2, %w3
+    %i53_4 = add i32 %i53_3, 0x8F0CCC92
+    %i53_l = shl i32 %i53_4, 10
+    %i53_r = lshr i32 %i53_4, 22
+    %i53_o = or i32 %i53_l, %i53_r
+    %r53 = add i32 %i53_o, %r52
+
+    // Step 54: g=10, s=15, K=0xffeff47d, first=c
+    // I(%r53,%r52,%r51) = %r52 ^ (%r53 | ~%r51); c = %r53 + ROL(%r50 + I + M[10] + K[54], 15)
+    %i54_nz = xor i32 %r51, 0xFFFFFFFF
+    %i54_0 = or i32 %r53, %i54_nz
+    %i54_1 = xor i32 %r52, %i54_0
+    %i54_2 = add i32 %r50, %i54_1
+    %i54_3 = add i32 %i54_2, %w10
+    %i54_4 = add i32 %i54_3, 0xFFEFF47D
+    %i54_l = shl i32 %i54_4, 15
+    %i54_r = lshr i32 %i54_4, 17
+    %i54_o = or i32 %i54_l, %i54_r
+    %r54 = add i32 %i54_o, %r53
+
+    // Step 55: g=1, s=21, K=0x85845dd1, first=b
+    // I(%r54,%r53,%r52) = %r53 ^ (%r54 | ~%r52); b = %r54 + ROL(%r51 + I + M[1] + K[55], 21)
+    %i55_nz = xor i32 %r52, 0xFFFFFFFF
+    %i55_0 = or i32 %r54, %i55_nz
+    %i55_1 = xor i32 %r53, %i55_0
+    %i55_2 = add i32 %r51, %i55_1
+    %i55_3 = add i32 %i55_2, %w1
+    %i55_4 = add i32 %i55_3, 0x85845DD1
+    %i55_l = shl i32 %i55_4, 21
+    %i55_r = lshr i32 %i55_4, 11
+    %i55_o = or i32 %i55_l, %i55_r
+    %r55 = add i32 %i55_o, %r54
+
+    // Step 56: g=8, s=6, K=0x6fa87e4f, first=a
+    // I(%r55,%r54,%r53) = %r54 ^ (%r55 | ~%r53); a = %r55 + ROL(%r52 + I + M[8] + K[56], 6)
+    %i56_nz = xor i32 %r53, 0xFFFFFFFF
+    %i56_0 = or i32 %r55, %i56_nz
+    %i56_1 = xor i32 %r54, %i56_0
+    %i56_2 = add i32 %r52, %i56_1
+    %i56_3 = add i32 %i56_2, %w8
+    %i56_4 = add i32 %i56_3, 0x6FA87E4F
+    %i56_l = shl i32 %i56_4, 6
+    %i56_r = lshr i32 %i56_4, 26
+    %i56_o = or i32 %i56_l, %i56_r
+    %r56 = add i32 %i56_o, %r55
+
+    // Step 57: g=15, s=10, K=0xfe2ce6e0, first=d
+    // I(%r56,%r55,%r54) = %r55 ^ (%r56 | ~%r54); d = %r56 + ROL(%r53 + I + M[15] + K[57], 10)
+    %i57_nz = xor i32 %r54, 0xFFFFFFFF
+    %i57_0 = or i32 %r56, %i57_nz
+    %i57_1 = xor i32 %r55, %i57_0
+    %i57_2 = add i32 %r53, %i57_1
+    %i57_3 = add i32 %i57_2, %w15
+    %i57_4 = add i32 %i57_3, 0xFE2CE6E0
+    %i57_l = shl i32 %i57_4, 10
+    %i57_r = lshr i32 %i57_4, 22
+    %i57_o = or i32 %i57_l, %i57_r
+    %r57 = add i32 %i57_o, %r56
+
+    // Step 58: g=6, s=15, K=0xa3014314, first=c
+    // I(%r57,%r56,%r55) = %r56 ^ (%r57 | ~%r55); c = %r57 + ROL(%r54 + I + M[6] + K[58], 15)
+    %i58_nz = xor i32 %r55, 0xFFFFFFFF
+    %i58_0 = or i32 %r57, %i58_nz
+    %i58_1 = xor i32 %r56, %i58_0
+    %i58_2 = add i32 %r54, %i58_1
+    %i58_3 = add i32 %i58_2, %w6
+    %i58_4 = add i32 %i58_3, 0xA3014314
+    %i58_l = shl i32 %i58_4, 15
+    %i58_r = lshr i32 %i58_4, 17
+    %i58_o = or i32 %i58_l, %i58_r
+    %r58 = add i32 %i58_o, %r57
+
+    // Step 59: g=13, s=21, K=0x4e0811a1, first=b
+    // I(%r58,%r57,%r56) = %r57 ^ (%r58 | ~%r56); b = %r58 + ROL(%r55 + I + M[13] + K[59], 21)
+    %i59_nz = xor i32 %r56, 0xFFFFFFFF
+    %i59_0 = or i32 %r58, %i59_nz
+    %i59_1 = xor i32 %r57, %i59_0
+    %i59_2 = add i32 %r55, %i59_1
+    %i59_3 = add i32 %i59_2, %w13
+    %i59_4 = add i32 %i59_3, 0x4E0811A1
+    %i59_l = shl i32 %i59_4, 21
+    %i59_r = lshr i32 %i59_4, 11
+    %i59_o = or i32 %i59_l, %i59_r
+    %r59 = add i32 %i59_o, %r58
+
+    // Step 60: g=4, s=6, K=0xf7537e82, first=a
+    // I(%r59,%r58,%r57) = %r58 ^ (%r59 | ~%r57); a = %r59 + ROL(%r56 + I + M[4] + K[60], 6)
+    %i60_nz = xor i32 %r57, 0xFFFFFFFF
+    %i60_0 = or i32 %r59, %i60_nz
+    %i60_1 = xor i32 %r58, %i60_0
+    %i60_2 = add i32 %r56, %i60_1
+    %i60_3 = add i32 %i60_2, %w4
+    %i60_4 = add i32 %i60_3, 0xF7537E82
+    %i60_l = shl i32 %i60_4, 6
+    %i60_r = lshr i32 %i60_4, 26
+    %i60_o = or i32 %i60_l, %i60_r
+    %r60 = add i32 %i60_o, %r59
+
+    // Step 61: g=11, s=10, K=0xbd3af235, first=d
+    // I(%r60,%r59,%r58) = %r59 ^ (%r60 | ~%r58); d = %r60 + ROL(%r57 + I + M[11] + K[61], 10)
+    %i61_nz = xor i32 %r58, 0xFFFFFFFF
+    %i61_0 = or i32 %r60, %i61_nz
+    %i61_1 = xor i32 %r59, %i61_0
+    %i61_2 = add i32 %r57, %i61_1
+    %i61_3 = add i32 %i61_2, %w11
+    %i61_4 = add i32 %i61_3, 0xBD3AF235
+    %i61_l = shl i32 %i61_4, 10
+    %i61_r = lshr i32 %i61_4, 22
+    %i61_o = or i32 %i61_l, %i61_r
+    %r61 = add i32 %i61_o, %r60
+
+    // Step 62: g=2, s=15, K=0x2ad7d2bb, first=c
+    // I(%r61,%r60,%r59) = %r60 ^ (%r61 | ~%r59); c = %r61 + ROL(%r58 + I + M[2] + K[62], 15)
+    %i62_nz = xor i32 %r59, 0xFFFFFFFF
+    %i62_0 = or i32 %r61, %i62_nz
+    %i62_1 = xor i32 %r60, %i62_0
+    %i62_2 = add i32 %r58, %i62_1
+    %i62_3 = add i32 %i62_2, %w2
+    %i62_4 = add i32 %i62_3, 0x2AD7D2BB
+    %i62_l = shl i32 %i62_4, 15
+    %i62_r = lshr i32 %i62_4, 17
+    %i62_o = or i32 %i62_l, %i62_r
+    %r62 = add i32 %i62_o, %r61
+
+    // Step 63: g=9, s=21, K=0xeb86d391, first=b
+    // I(%r62,%r61,%r60) = %r61 ^ (%r62 | ~%r60); b = %r62 + ROL(%r59 + I + M[9] + K[63], 21)
+    %i63_nz = xor i32 %r60, 0xFFFFFFFF
+    %i63_0 = or i32 %r62, %i63_nz
+    %i63_1 = xor i32 %r61, %i63_0
+    %i63_2 = add i32 %r59, %i63_1
+    %i63_3 = add i32 %i63_2, %w9
+    %i63_4 = add i32 %i63_3, 0xEB86D391
+    %i63_l = shl i32 %i63_4, 21
+    %i63_r = lshr i32 %i63_4, 11
+    %i63_o = or i32 %i63_l, %i63_r
+    %r63 = add i32 %i63_o, %r62
+
+    // Add original state back
+    %fa = add i32 %r60, %a0
+    %fb = add i32 %r63, %b0
+    %fc = add i32 %r62, %c0
+    %fd = add i32 %r61, %d0
+
+    // Store updated state
+    store i32 %fa, *%aptr
+    store i32 %fb, *%bptr
+    store i32 %fc, *%cptr
+    store i32 %fd, *%dptr
+    ret void
+}
+
+// Public API: compute MD5 digest of input data.
+// data: input byte array, len: length in bytes, digest: 16-byte output buffer
+fun @std_crypto_md5_compute(data: *i8, len: i32, digest: *i8) -> void {
+  @entry:
+    // Allocate hash state
+    %aptr = let i32
+    %bptr = let i32
+    %cptr = let i32
+    %dptr = let i32
+
+    // Initialize state (MD5 magic constants)
+    store i32 0x67452301, *%aptr
+    store i32 0xEFCDAB89, *%bptr
+    store i32 0x98BADCFE, *%cptr
+    store i32 0x10325476, *%dptr
+
+    // Allocate scratch buffers for padding
+    %buf1 = let [i8, 64]
+    %buf2 = let [i8, 64]
+
+    // Zero the buffers (let does NOT zero-initialize)
+    %bp1m = gep i8, *%buf1, 0
+    %bp2m = gep i8, *%buf2, 0
+    %nm64 = let i64
+    store i64 64, *%nm64
+    %nm64v = load i64, *%nm64
+    call @memset(%bp1m, 0, %nm64v)
+    call @memset(%bp2m, 0, %nm64v)
+
+    // Loop counter and offset tracking
+    %offset = let i32
+    %iptr = let i32
+    store i32 0, *%offset
+    jmp @block_cond
+
+    // Process all full 64-byte blocks
+  @block_cond:
+    %off = load i32, *%offset
+    %next_off = add i32 %off, 64
+    %has_block = sle i32 %next_off, %len
+    br %has_block, @process_block, @pad_start
+
+  @process_block:
+    %bp = gep i8, *%data, %off
+    call @std_crypto_md5_transform(%aptr, %bptr, %cptr, %dptr, %bp)
+    store i32 %next_off, *%offset
+    jmp @block_cond
+
+    // Handle padding (tail bytes + 0x80 + length)
+  @pad_start:
+    %off_val = load i32, *%offset
+    %rem = sub i32 %len, %off_val
+    %needs_two = sge i32 %rem, 56
+    br %needs_two, @pad_two_setup, @pad_one_setup
+
+    // One block case: rem < 56, all padding fits in one block
+  @pad_one_setup:
+    store i32 0, *%iptr
+    jmp @copy_cond
+
+    // Two block case: rem >= 56, need two padding blocks
+  @pad_two_setup:
+    store i32 0, *%iptr
+    jmp @copy_cond
+
+    // Copy loop: copy remaining data bytes into buf1
+  @copy_cond:
+    %ci = load i32, *%iptr
+    %copy_done = slt i32 %ci, %rem
+    br %copy_done, @copy_body, @copy_done_label
+
+  @copy_body:
+    %src_off = add i32 %off_val, %ci
+    %src_p = gep i8, *%data, %src_off
+    %byte = load i8, *%src_p
+    %dst_p = gep i8, *%buf1, %ci
+    store i8 %byte, *%dst_p
+    %ci_next = add i32 %ci, 1
+    store i32 %ci_next, *%iptr
+    jmp @copy_cond
+
+  @copy_done_label:
+    // Add 0x80 padding byte at position rem
+    %pad80_p = gep i8, *%buf1, %rem
+    store i8 0x80, *%pad80_p
+
+    // Check one-block vs two-block
+    %is_one_block = slt i32 %rem, 56
+    br %is_one_block, @process_one_block, @process_two_block_a
+
+    // One block: set length and transform
+  @process_one_block:
+    // Set bit length (len * 8) at bytes 56-63 in buf1 (little-endian)
+    %bl = mul i32 %len, 8
+    %bl_b0 = trunc i32 %bl to i8
+    %bl_s8 = lshr i32 %bl, 8
+    %bl_b1 = trunc i32 %bl_s8 to i8
+    %bl_s16 = lshr i32 %bl, 16
+    %bl_b2 = trunc i32 %bl_s16 to i8
+    %bl_s24 = lshr i32 %bl, 24
+    %bl_b3 = trunc i32 %bl_s24 to i8
+
+    %p56 = gep i8, *%buf1, 56
+    store i8 %bl_b0, *%p56
+    %p57 = gep i8, *%buf1, 57
+    store i8 %bl_b1, *%p57
+    %p58 = gep i8, *%buf1, 58
+    store i8 %bl_b2, *%p58
+    %p59 = gep i8, *%buf1, 59
+    store i8 %bl_b3, *%p59
+    // Bytes 60-63 are zero from memset above
+
+    %buf1_p = gep i8, *%buf1, 0
+    call @std_crypto_md5_transform(%aptr, %bptr, %cptr, %dptr, %buf1_p)
+    jmp @write_digest
+
+    // Two blocks: first block (data + 0x80, no length yet)
+  @process_two_block_a:
+    %buf1_p2 = gep i8, *%buf1, 0
+    call @std_crypto_md5_transform(%aptr, %bptr, %cptr, %dptr, %buf1_p2)
+
+    // Second block: zeros + length in buf2
+    %bl2 = mul i32 %len, 8
+    %bl2_b0 = trunc i32 %bl2 to i8
+    %bl2_s8 = lshr i32 %bl2, 8
+    %bl2_b1 = trunc i32 %bl2_s8 to i8
+    %bl2_s16 = lshr i32 %bl2, 16
+    %bl2_b2 = trunc i32 %bl2_s16 to i8
+    %bl2_s24 = lshr i32 %bl2, 24
+    %bl2_b3 = trunc i32 %bl2_s24 to i8
+
+    %p56_2 = gep i8, *%buf2, 56
+    store i8 %bl2_b0, *%p56_2
+    %p57_2 = gep i8, *%buf2, 57
+    store i8 %bl2_b1, *%p57_2
+    %p58_2 = gep i8, *%buf2, 58
+    store i8 %bl2_b2, *%p58_2
+    %p59_2 = gep i8, *%buf2, 59
+    store i8 %bl2_b3, *%p59_2
+    // Bytes 0-55 and 60-63 are zero from memset above
+
+    %buf2_p = gep i8, *%buf2, 0
+    call @std_crypto_md5_transform(%aptr, %bptr, %cptr, %dptr, %buf2_p)
+    jmp @write_digest
+
+    // Write final digest bytes (A, B, C, D in little-endian)
+  @write_digest:
+    %a_val = load i32, *%aptr
+    %b_val = load i32, *%bptr
+    %c_val = load i32, *%cptr
+    %d_val = load i32, *%dptr
+
+    // A bytes 0-3
+    %a_b0 = trunc i32 %a_val to i8
+    %a_s8 = lshr i32 %a_val, 8
+    %a_b1 = trunc i32 %a_s8 to i8
+    %a_s16 = lshr i32 %a_val, 16
+    %a_b2 = trunc i32 %a_s16 to i8
+    %a_s24 = lshr i32 %a_val, 24
+    %a_b3 = trunc i32 %a_s24 to i8
+
+    %da0 = gep i8, *%digest, 0
+    store i8 %a_b0, *%da0
+    %da1 = gep i8, *%digest, 1
+    store i8 %a_b1, *%da1
+    %da2 = gep i8, *%digest, 2
+    store i8 %a_b2, *%da2
+    %da3 = gep i8, *%digest, 3
+    store i8 %a_b3, *%da3
+
+    // B bytes 4-7
+    %b_b0 = trunc i32 %b_val to i8
+    %b_s8 = lshr i32 %b_val, 8
+    %b_b1 = trunc i32 %b_s8 to i8
+    %b_s16 = lshr i32 %b_val, 16
+    %b_b2 = trunc i32 %b_s16 to i8
+    %b_s24 = lshr i32 %b_val, 24
+    %b_b3 = trunc i32 %b_s24 to i8
+
+    %db0 = gep i8, *%digest, 4
+    store i8 %b_b0, *%db0
+    %db1 = gep i8, *%digest, 5
+    store i8 %b_b1, *%db1
+    %db2 = gep i8, *%digest, 6
+    store i8 %b_b2, *%db2
+    %db3 = gep i8, *%digest, 7
+    store i8 %b_b3, *%db3
+
+    // C bytes 8-11
+    %c_b0 = trunc i32 %c_val to i8
+    %c_s8 = lshr i32 %c_val, 8
+    %c_b1 = trunc i32 %c_s8 to i8
+    %c_s16 = lshr i32 %c_val, 16
+    %c_b2 = trunc i32 %c_s16 to i8
+    %c_s24 = lshr i32 %c_val, 24
+    %c_b3 = trunc i32 %c_s24 to i8
+
+    %dc0 = gep i8, *%digest, 8
+    store i8 %c_b0, *%dc0
+    %dc1 = gep i8, *%digest, 9
+    store i8 %c_b1, *%dc1
+    %dc2 = gep i8, *%digest, 10
+    store i8 %c_b2, *%dc2
+    %dc3 = gep i8, *%digest, 11
+    store i8 %c_b3, *%dc3
+
+    // D bytes 12-15
+    %d_b0 = trunc i32 %d_val to i8
+    %d_s8 = lshr i32 %d_val, 8
+    %d_b1 = trunc i32 %d_s8 to i8
+    %d_s16 = lshr i32 %d_val, 16
+    %d_b2 = trunc i32 %d_s16 to i8
+    %d_s24 = lshr i32 %d_val, 24
+    %d_b3 = trunc i32 %d_s24 to i8
+
+    %dd0 = gep i8, *%digest, 12
+    store i8 %d_b0, *%dd0
+    %dd1 = gep i8, *%digest, 13
+    store i8 %d_b1, *%dd1
+    %dd2 = gep i8, *%digest, 14
+    store i8 %d_b2, *%dd2
+    %dd3 = gep i8, *%digest, 15
+    store i8 %d_b3, *%dd3
+    ret void
+}

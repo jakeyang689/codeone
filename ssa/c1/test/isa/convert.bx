@@ -1,0 +1,83 @@
+// zext / sext / trunc across widths.
+
+extern @printf(fmt: *i8, ...) -> i32
+extern @malloc(n: i64) -> *i8
+
+fun @main() -> i32 {
+  @entry:
+    %id = let i32
+    store i32 0, *%id
+    %buf = call @malloc(8)
+    %bp = gep i8, *%buf, 0
+
+    // zext i8 255 -> 255
+    store i8 -1, *%bp
+    %v1 = load i8, *%bp
+    %z1 = zext i8 %v1 to i32
+    %c1 = eq i32 %z1, 255
+    br %c1, @t1, @fail
+  @t1:
+    store i32 1, *%id
+    // sext i8 -1 -> -1
+    %s1 = sext i8 %v1 to i32
+    %c2 = eq i32 %s1, -1
+    br %c2, @t2, @fail
+
+  @t2:
+    store i32 2, *%id
+    // zext i32 0x80000000 -> 2147483648
+    %p32 = gep i8, *%buf, 0
+    store i32 0x7FFFFFFF, *%p32
+    %v32 = load i32, *%p32
+    %z2 = zext i32 %v32 to i64
+    %c3 = eq i64 %z2, 0x7FFFFFFF
+    br %c3, @t3, @fail
+
+  @t3:
+    store i32 3, *%id
+    // sext i32 -1 -> -1
+    %p32b = gep i8, *%buf, 0
+    store i32 -1, *%p32b
+    %v32b = load i32, *%p32b
+    %s2 = sext i32 %v32b to i64
+    %c4 = eq i64 %s2, -1
+    br %c4, @t4, @fail
+
+  @t4:
+    store i32 4, *%id
+    // trunc i64 0x1234 -> i8 0x34
+    %p64 = gep i8, *%buf, 0
+    store i64 0x1234, *%p64
+    %v64 = load i64, *%p64
+    %t1v = trunc i64 %v64 to i8
+    %c5 = eq i8 %t1v, 0x34
+    br %c5, @t5, @fail
+
+  @t5:
+    store i32 5, *%id
+    // trunc i32 -1 -> i8 -1
+    %p32c = gep i8, *%buf, 0
+    store i16 -1, *%p32c
+    %v16 = load i16, *%p32c
+    %t2v = trunc i16 %v16 to i8
+    %c6 = eq i8 %t2v, -1
+    br %c6, @t6, @fail
+
+  @t6:
+    store i32 6, *%id
+    // zext i16 0xFFFF -> 65535
+    %p16 = gep i8, *%buf, 0
+    store i16 -1, *%p16
+    %v16b = load i16, *%p16
+    %z3 = zext i16 %v16b to i32
+    %c7 = eq i32 %z3, 65535
+    br %c7, @pass, @fail
+
+  @pass:
+    call @printf("PASS isa/convert\n")
+    ret i32 0
+  @fail:
+    %n = load i32, *%id
+    call @printf("FAIL isa/convert at case %d\n", %n)
+    ret i32 1
+}

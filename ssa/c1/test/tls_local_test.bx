@@ -1,0 +1,142 @@
+// TLS 1.2 Client — localhost test
+// Tests: TCP connect, TLS handshake, send, recv, close
+
+extern @printf(fmt: *i8, ...) -> i32
+extern @memset(s: *i8, c: i32, n: i64) -> *i8
+extern @putchar(c: i32) -> i32
+
+extern @net_tls12_connect(ctx: *i8, fd: i32, limbs: i32) -> i32
+extern @net_tls_send(ctx: *i8, data: *i8, len: i32) -> i32
+extern @net_tls_recv(ctx: *i8, buf: *i8, cap: i32, out_len: *i32) -> i32
+extern @net_tls_close(ctx: *i8) -> i32
+extern @net_socket_tcp() -> i32
+extern @net_socket_connect(fd: i32, port: i32) -> i32
+extern @net_socket_close(fd: i32) -> i32
+
+fun @main() -> i32 {
+  @entry:
+    %fd = let i32
+    %ctx = let [i8, 1024]
+    %ctxp = gep i8, *%ctx, 0
+    call @printf("=== TLS 1.2 Local Test ===\n")
+
+    // Step 1: Create socket
+    call @printf("[1] Socket...\n")
+    %fdv = call @net_socket_tcp()
+    store i32 %fdv, *%fd
+    %fd_ok = sge i32 %fdv, 0
+    br %fd_ok, @connect, @fail
+
+  @connect:
+    // Step 2: Connect
+    %f = load i32, *%fd
+    call @printf("[2] Connect 127.0.0.1:4433...\n")
+    %cr = call @net_socket_connect(%f, 4433)
+    %c_ok = eq i32 %cr, 0
+    br %c_ok, @hs, @fail
+
+  @hs:
+    // Step 3: TLS Handshake
+    %f2 = load i32, *%fd
+    call @printf("[3] TLS 1.2 handshake...\n")
+    call @memset(%ctxp, 0, 1024)
+    %hs_r = call @net_tls12_connect(%ctxp, %f2, 64)
+    %hs_ok = eq i32 %hs_r, 0
+    br %hs_ok, @send, @hs_fail
+
+  @hs_fail:
+    call @printf("TLS handshake FAILED\n")
+    %f3 = load i32, *%fd
+    call @net_tls_close(%ctxp)
+    call @net_socket_close(%f3)
+    call @printf("FAIL\n")
+    ret i32 1
+
+  @send:
+    // Step 4: Send HTTP request
+    call @printf("[4] Send request...\n")
+    %req = let [i8, 66]
+    %req_p = gep i8, *%req, 0
+    store i8 71, *%req_p
+    %p1 = gep i8, *%req_p, 1
+    store i8 69, *%p1
+    %p2 = gep i8, *%req_p, 2
+    store i8 84, *%p2
+    %p3 = gep i8, *%req_p, 3
+    store i8 32, *%p3
+    %p4 = gep i8, *%req_p, 4
+    store i8 47, *%p4
+    %p5 = gep i8, *%req_p, 5
+    store i8 32, *%p5
+    %p6 = gep i8, *%req_p, 6
+    store i8 72, *%p6
+    %p7 = gep i8, *%req_p, 7
+    store i8 84, *%p7
+    %p8 = gep i8, *%req_p, 8
+    store i8 84, *%p8
+    %p9 = gep i8, *%req_p, 9
+    store i8 80, *%p9
+    %p10 = gep i8, *%req_p, 10
+    store i8 47, *%p10
+    %p11 = gep i8, *%req_p, 11
+    store i8 49, *%p11
+    %p12 = gep i8, *%req_p, 12
+    store i8 46, *%p12
+    %p13 = gep i8, *%req_p, 13
+    store i8 49, *%p13
+    %p14 = gep i8, *%req_p, 14
+    store i8 13, *%p14
+    %p15 = gep i8, *%req_p, 15
+    store i8 10, *%p15
+    %p16 = gep i8, *%req_p, 16
+    store i8 13, *%p16
+    %p17 = gep i8, *%req_p, 17
+    store i8 10, *%p17
+    %sr = call @net_tls_send(%ctxp, %req_p, 18)
+    %s_ok = eq i32 %sr, 0
+    br %s_ok, @recv, @close
+
+  @recv:
+    // Step 5: Read response
+    call @printf("[5] Read response...\n")
+    %buf = let [i8, 4096]
+    %buf_p = gep i8, *%buf, 0
+    %out_len = let i32
+    %out_len_p = gep i32, *%out_len, 0
+    %rr = call @net_tls_recv(%ctxp, %buf_p, 4096, %out_len_p)
+    %r_ok = eq i32 %rr, 0
+    br %r_ok, @print, @close
+
+  @print:
+    %lenv = load i32, *%out_len_p
+    call @printf("Got %d bytes\n", %lenv)
+    %i = let i32
+    store i32 0, *%i
+    jmp @p_loop
+  @p_loop:
+    %iv = load i32, *%i
+    %more = slt i32 %iv, %lenv
+    br %more, @p_body, @close
+  @p_body:
+    %iv2 = load i32, *%i
+    %cp = gep i8, *%buf_p, %iv2
+    %c = load i8, *%cp
+    %ci = zext i8 %c to i32
+    call @putchar(%ci)
+    %next = add i32 %iv2, 1
+    store i32 %next, *%i
+    jmp @p_loop
+
+  @close:
+    %f4 = load i32, *%fd
+    call @net_tls_close(%ctxp)
+    call @net_socket_close(%f4)
+    call @printf("\nPASS\n")
+    ret i32 0
+
+  @fail:
+    call @printf("FAIL\n")
+    %f5 = load i32, *%fd
+    call @net_socket_close(%f5)
+    ret i32 1
+}

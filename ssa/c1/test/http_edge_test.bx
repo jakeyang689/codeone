@@ -1,0 +1,238 @@
+// HTTP module edge cases: malformed responses, truncation, chunked variants,
+// buffer overflows and case-insensitive header lookup.
+
+extern @printf(fmt: *i8, ...) -> i32
+extern @memcmp(a: *i8, b: *i8, n: i64) -> i32
+
+extern @net_http_parse_response(buf: *i8, len: i32, resp: *@HttpResponse) -> i32
+extern @net_http_decode_chunked(src: *i8, src_len: i32, dst: *i8, cap: i32) -> i32
+extern @net_http_header_get(buf: *i8, resp: *@HttpResponse, name: *i8, out: *i8, cap: i32) -> i32
+extern @net_http_build_get(buf: *i8, cap: i32, host: *i8, path: *i8, version: i32) -> i32
+extern @net_http_header_add(buf: *i8, cap: i32, off: i32, name: *i8, value: *i8) -> i32
+
+struct @HttpResponse {
+  @version: i32,
+  @status: i32,
+  @reason_off: i32,
+  @reason_len: i32,
+  @headers_off: i32,
+  @headers_len: i32,
+  @body_off: i32,
+  @body_len: i32,
+  @content_length: i32,
+  @chunked: i32
+}
+
+const @R1: [i8, 13] = "XYZ not http"
+const @R2: [i8, 20] = "HTTP/2.0 200 OK\r\n\r\n"
+const @R3: [i8, 16] = "HTTP/1.1 200 OK"
+const @R4: [i8, 44] = "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nabc"
+const @R5: [i8, 23] = "HTTP/1.1 200 OK\r\n\r\nabc"
+const @R6: [i8, 74] = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n"
+const @R7: [i8, 68] = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nA\r\n0123456789\r\n0\r\n\r\n"
+const @R8: [i8, 53] = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n"
+const @R9: [i8, 7] = "5\r\nhel"
+const @R10: [i8, 41] = "HTTP/1.1 200 OK\r\nCONTENT-LENGTH: 2\r\n\r\nhi"
+const @R13: [i8, 41] = "HTTP/1.1 200 OK\r\nX-Content-Length: 5\r\n\r\n"
+const @R14: [i8, 50] = "HTTP/1.1 200 OK\r\nX-Transfer-Encoding: chunked\r\n\r\n"
+const @HOST: [i8, 12] = "example.com"
+
+fun @main() -> i32 {
+  @entry:
+    %id = let i32
+    store i32 0, *%id
+    %resp = let [i32, 10]
+    %rp = gep i32, *%resp, 0
+
+    %b1 = gep i8, *@R1, 0
+    %r1 = call @net_http_parse_response(%b1, 12, %rp)
+    %r1_bad = slt i32 %r1, 0
+    br %r1_bad, @t2, @fail
+
+  @t2:
+    store i32 2, *%id
+    %b2 = gep i8, *@R2, 0
+    %r2 = call @net_http_parse_response(%b2, 19, %rp)
+    %r2_bad = slt i32 %r2, 0
+    br %r2_bad, @t3, @fail
+
+  @t3:
+    store i32 3, *%id
+    %b3 = gep i8, *@R3, 0
+    %r3 = call @net_http_parse_response(%b3, 15, %rp)
+    %r3_bad = slt i32 %r3, 0
+    br %r3_bad, @t4, @fail
+
+  @t4:
+    store i32 4, *%id
+    %b4 = gep i8, *@R4, 0
+    %r4 = call @net_http_parse_response(%b4, 43, %rp)
+    %r4_ok = eq i32 %r4, 0
+    br %r4_ok, @t4b, @fail
+  @t4b:
+    %clp = field @HttpResponse, *%rp, 8
+    %cl = load i32, *%clp
+    %blp = field @HttpResponse, *%rp, 7
+    %bl = load i32, *%blp
+    %c4a = eq i32 %cl, 100
+    %c4b = eq i32 %bl, 3
+    %ok4 = and i1 %c4a, %c4b
+    br %ok4, @t5, @fail
+
+  @t5:
+    store i32 5, *%id
+    %b5 = gep i8, *@R5, 0
+    %r5 = call @net_http_parse_response(%b5, 22, %rp)
+    %r5_ok = eq i32 %r5, 0
+    br %r5_ok, @t5b, @fail
+  @t5b:
+    %clp5 = field @HttpResponse, *%rp, 8
+    %cl5 = load i32, *%clp5
+    %blp5 = field @HttpResponse, *%rp, 7
+    %bl5 = load i32, *%blp5
+    %c5a = eq i32 %cl5, -1
+    %c5b = eq i32 %bl5, -1
+    %ok5 = and i1 %c5a, %c5b
+    br %ok5, @t6, @fail
+
+  @t6:
+    store i32 6, *%id
+    %b6 = gep i8, *@R6, 0
+    %r6 = call @net_http_parse_response(%b6, 73, %rp)
+    %r6_ok = eq i32 %r6, 0
+    br %r6_ok, @t6b, @fail
+  @t6b:
+    %ckp = field @HttpResponse, *%rp, 9
+    %ck = load i32, *%ckp
+    %ck_ok = eq i32 %ck, 1
+    br %ck_ok, @t6c, @fail
+  @t6c:
+    %bo6p = field @HttpResponse, *%rp, 6
+    %bo6 = load i32, *%bo6p
+    %src6 = gep i8, *%b6, %bo6
+    %rem6 = sub i32 73, %bo6
+    %out6 = let [i8, 64]
+    %o6 = gep i8, *%out6, 0
+    %n6 = call @net_http_decode_chunked(%src6, %rem6, %o6, 64)
+    %n6_ok = eq i32 %n6, 11
+    br %n6_ok, @t6d, @fail
+  @t6d:
+    %d6 = call @memcmp(%o6, "hello world", 11)
+    %d6_ok = eq i32 %d6, 0
+    br %d6_ok, @t7, @fail
+
+  @t7:
+    store i32 7, *%id
+    %b7 = gep i8, *@R7, 0
+    %r7 = call @net_http_parse_response(%b7, 67, %rp)
+    %r7_ok = eq i32 %r7, 0
+    br %r7_ok, @t7b, @fail
+  @t7b:
+    %bo7p = field @HttpResponse, *%rp, 6
+    %bo7 = load i32, *%bo7p
+    %src7 = gep i8, *%b7, %bo7
+    %rem7 = sub i32 67, %bo7
+    %out7 = let [i8, 64]
+    %o7 = gep i8, *%out7, 0
+    %n7 = call @net_http_decode_chunked(%src7, %rem7, %o7, 64)
+    %n7_ok = eq i32 %n7, 10
+    br %n7_ok, @t8, @fail
+
+  @t8:
+    store i32 8, *%id
+    %b8 = gep i8, *@R8, 0
+    %r8 = call @net_http_parse_response(%b8, 52, %rp)
+    %r8_ok = eq i32 %r8, 0
+    br %r8_ok, @t8b, @fail
+  @t8b:
+    %bo8p = field @HttpResponse, *%rp, 6
+    %bo8 = load i32, *%bo8p
+    %src8 = gep i8, *%b8, %bo8
+    %rem8 = sub i32 52, %bo8
+    %out8 = let [i8, 16]
+    %o8 = gep i8, *%out8, 0
+    %n8 = call @net_http_decode_chunked(%src8, %rem8, %o8, 16)
+    %n8_ok = eq i32 %n8, 0
+    br %n8_ok, @t9, @fail
+
+  @t9:
+    store i32 9, *%id
+    %b9 = gep i8, *@R9, 0
+    %out9 = let [i8, 16]
+    %o9 = gep i8, *%out9, 0
+    %n9 = call @net_http_decode_chunked(%b9, 6, %o9, 16)
+    %n9_bad = slt i32 %n9, 0
+    br %n9_bad, @t10, @fail
+
+  @t10:
+    store i32 10, *%id
+    %b10 = gep i8, *@R10, 0
+    %r10 = call @net_http_parse_response(%b10, 40, %rp)
+    %r10_ok = eq i32 %r10, 0
+    br %r10_ok, @t10b, @fail
+  @t10b:
+    %hout = let [i8, 16]
+    %hp = gep i8, *%hout, 0
+    %hl = call @net_http_header_get(%b10, %rp, "content-length", %hp, 16)
+    %hl_ok = eq i32 %hl, 1
+    br %hl_ok, @t10c, @fail
+  @t10c:
+    %hv = load i8, *%hp
+    %hv_ok = eq i8 %hv, 50
+    br %hv_ok, @t11, @fail
+
+  @t11:
+    store i32 11, *%id
+    %rb = let [i8, 8]
+    %rbp = gep i8, *%rb, 0
+    %host = gep i8, *@HOST, 0
+    %n11 = call @net_http_build_get(%rbp, 8, %host, "/", 11)
+    %n11_bad = slt i32 %n11, 0
+    br %n11_bad, @t12, @fail
+
+  @t12:
+    store i32 12, *%id
+    %hb = let [i8, 4]
+    %hbp = gep i8, *%hb, 0
+    %n12 = call @net_http_header_add(%hbp, 4, 0, "A", "B")
+    %n12_bad = slt i32 %n12, 0
+    br %n12_bad, @t13, @fail
+
+  // A header whose name merely ends with Content-Length must not match.
+  @t13:
+    store i32 13, *%id
+    %b13 = gep i8, *@R13, 0
+    %r13 = call @net_http_parse_response(%b13, 40, %rp)
+    %r13_ok = eq i32 %r13, 0
+    br %r13_ok, @t13b, @fail
+  @t13b:
+    %clp13 = field @HttpResponse, *%rp, 8
+    %cl13 = load i32, *%clp13
+    %blp13 = field @HttpResponse, *%rp, 7
+    %bl13 = load i32, *%blp13
+    %c13a = eq i32 %cl13, -1
+    %c13b = eq i32 %bl13, -1
+    %ok13 = and i1 %c13a, %c13b
+    br %ok13, @t14, @fail
+
+  // Same for a header ending with Transfer-Encoding.
+  @t14:
+    store i32 14, *%id
+    %b14 = gep i8, *@R14, 0
+    %r14 = call @net_http_parse_response(%b14, 49, %rp)
+    %r14_ok = eq i32 %r14, 0
+    br %r14_ok, @t14b, @fail
+  @t14b:
+    %ckp14 = field @HttpResponse, *%rp, 9
+    %ck14 = load i32, *%ckp14
+    %ck14_ok = eq i32 %ck14, 0
+    br %ck14_ok, @pass, @fail
+
+  @pass:
+    call @printf("PASS http_edge\n")
+    ret i32 0
+  @fail:
+    %n = load i32, *%id
+    call @printf("FAIL http_edge at case %d\n", %n)
+    ret i32 1
+}

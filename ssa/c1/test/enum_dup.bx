@@ -1,0 +1,15 @@
+// The same enum as enum_test.bx, declared again in a second translation unit.
+// Members get internal linkage, so both files can declare it without a
+// duplicate-symbol error at link time.
+
+enum @Color: i32 {
+  @Red = 0,
+  @Green = 1,
+  @Blue = 2,
+  @White = 0xFF
+}
+
+fun @enum_dup_red() -> i32 {
+@entry:
+  ret i32 @Color.Red
+}

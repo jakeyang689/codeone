@@ -1,0 +1,72 @@
+// Hex encode/decode tests. Prints "PASS hex" on success.
+
+extern @printf(fmt: *i8, ...) -> i32
+extern @strcmp(a: *i8, b: *i8) -> i32
+extern @std_text_hex_encode(data: *i8, len: i32, out: *i8, cap: i32) -> i32
+extern @std_text_hex_decode(src: *i8, src_len: i32, out: *i8,
+                            out_cap: i32, out_len: *i32) -> i32
+
+const @BYTES: [i8, 4] = [0xDE, 0xAD, 0xBE, 0xEF]
+
+fun @main() -> i32 {
+  @entry:
+    %id = let i32
+    %enc = let [i8, 32]
+    %dec = let [i8, 32]
+    %len = let i32
+    %ep = gep i8, *%enc, 0
+    %dp = gep i8, *%dec, 0
+    %bp = gep i8, *@BYTES, 0
+    %lp = gep i32, *%len, 0
+    store i32 0, *%id
+    jmp @c1
+
+  @c1:
+    store i32 1, *%id
+    %r1 = call @std_text_hex_encode(%bp, 4, %ep, 32)
+    %r1ok = eq i32 %r1, 8
+    %c1 = call @strcmp(%ep, "deadbeef")
+    %c1ok = eq i32 %c1, 0
+    %a1 = and i1 %r1ok, %c1ok
+    br %a1, @c2, @fail
+  @c2:
+    store i32 2, *%id
+    %r2 = call @std_text_hex_decode("DEADBEEF", 8, %dp, 32, %lp)
+    %l2 = load i32, *%lp
+    %r2ok = eq i32 %r2, 0
+    %l2ok = eq i32 %l2, 4
+    %b0 = load i8, *%dp
+    %b0i = zext i8 %b0 to i32
+    %b0ok = eq i32 %b0i, 222
+    %a2 = and i1 %r2ok, %l2ok
+    %b2 = and i1 %a2, %b0ok
+    br %b2, @c3, @fail
+  @c3:
+    store i32 3, *%id
+    %r3 = call @std_text_hex_decode("abc", 3, %dp, 32, %lp)
+    %r3ok = eq i32 %r3, -1
+    br %r3ok, @c4, @fail
+  @c4:
+    store i32 4, *%id
+    %r4 = call @std_text_hex_decode("zz", 2, %dp, 32, %lp)
+    %r4ok = eq i32 %r4, -1
+    br %r4ok, @c5, @fail
+  @c5:
+    store i32 5, *%id
+    %r5 = call @std_text_hex_encode(%bp, 4, %ep, 8)
+    %r5ok = eq i32 %r5, -1
+    br %r5ok, @c6, @fail
+  @c6:
+    store i32 6, *%id
+    %r6 = call @std_text_hex_decode("dead", 4, %dp, 1, %lp)
+    %r6ok = eq i32 %r6, -1
+    br %r6ok, @pass, @fail
+
+  @pass:
+    call @printf("PASS hex\n")
+    ret i32 0
+  @fail:
+    %fid = load i32, *%id
+    call @printf("FAIL hex at case %d\n", %fid)
+    ret i32 1
+}

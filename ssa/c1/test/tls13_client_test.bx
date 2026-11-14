@@ -1,0 +1,146 @@
+// TLS 1.3 client handshake test against tls13_server.py on 127.0.0.1:8801.
+//
+// Exercises the full handshake (ClientHello, ECDHE, key schedule, encrypted
+// handshake flight, CertificateVerify, Finished) and then one HTTP exchange
+// over the negotiated AES-128-GCM-SHA256 application keys.
+
+extern @printf(fmt: *i8, ...) -> i32
+extern @memcmp(a: *i8, b: *i8, n: i64) -> i32
+extern @memcpy(dst: *i8, src: *i8, n: i64) -> *i8
+
+extern @net_socket_tcp() -> i32
+extern @net_socket_connect(fd: i32, port: i32) -> i32
+extern @net_socket_close(fd: i32) -> i32
+
+extern @net_tls_init(ctx: *i8) -> void
+extern @net_tls_set_host(ctx: *i8, host: *i8, len: i32) -> void
+extern @net_tls13_connect(ctx: *i8, fd: i32, limbs: i32) -> i32
+extern @net_tls_send(ctx: *i8, data: *i8, len: i32) -> i32
+extern @net_tls_recv(ctx: *i8, buf: *i8, cap: i32, out_len: *i32) -> i32
+extern @net_tls_close(ctx: *i8) -> i32
+
+// Layouts must match net/tls/client_api.bx.
+struct @TLS12Context {
+  @fd: i32,
+  @state: i32,
+  @version: i32,
+  @key_size: i32,
+  @limbs: i32,
+  @cipher_suite: i32,
+  @client_seq: i64,
+  @server_seq: i64,
+  @client_random: [i8, 32],
+  @server_random: [i8, 32],
+  @client_write_key: [i8, 32],
+  @server_write_key: [i8, 32],
+  @client_write_iv: [i8, 12],
+  @server_write_iv: [i8, 12],
+  @pre_master_secret: [i8, 48],
+  @master_secret: [i8, 48]
+}
+
+struct @TLS13Extension {
+  @init_client_seq: i64,
+  @_pad: [i8, 24],
+  @ecdhe_private: [i8, 32],
+  @ecdhe_public_x: [i8, 32],
+  @ecdhe_public_y: [i8, 32],
+  @server_ec_x: [i8, 32],
+  @server_ec_y: [i8, 32],
+  @handshake_traffic: [i8, 48],
+  @application_traffic: [i8, 48],
+  @sni_host: [i8, 256],
+  @sni_len: i32,
+  @role: i32,
+  @trust_pool: *i8,
+  @trust_offsets: *i32,
+  @trust_lens: *i32,
+  @trust_count: i32
+}
+
+struct @TLSContext {
+  @tls12: @TLS12Context,
+  @tls13: @TLS13Extension
+}
+
+const @REQ: [i8, 55] = "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+
+fun @main() -> i32 {
+  @entry:
+    %id = let i32
+    store i32 0, *%id
+    %ctx = let @TLSContext
+    %cp = gep i8, *%ctx, 0
+    call @net_tls_init(%cp)
+    call @net_tls_set_host(%cp, "localhost", 9)
+    %fd = call @net_socket_tcp()
+    %fd_ok = sge i32 %fd, 0
+    br %fd_ok, @connect, @fail
+  @connect:
+    store i32 1, *%id
+    %cr = call @net_socket_connect(%fd, 8801)
+    %cr_ok = eq i32 %cr, 0
+    br %cr_ok, @handshake, @fail
+  @handshake:
+    store i32 2, *%id
+    %hr = call @net_tls13_connect(%cp, %fd, 64)
+    %hr_ok = eq i32 %hr, 0
+    br %hr_ok, @send, @fail
+  @send:
+    store i32 3, *%id
+    %reqp = gep i8, *@REQ, 0
+    %sr = call @net_tls_send(%cp, %reqp, 54)
+    %sr_ok = eq i32 %sr, 0
+    br %sr_ok, @recv, @fail
+  @recv:
+    store i32 4, *%id
+    %buf = let [i8, 4096]
+    %bufp = gep i8, *%buf, 0
+    %olen = let i32
+    %olenp = gep i32, *%olen, 0
+    %rr = call @net_tls_recv(%cp, %bufp, 4096, %olenp)
+    %rr_ok = eq i32 %rr, 0
+    br %rr_ok, @check, @fail
+  @check:
+    store i32 5, *%id
+    %n = load i32, *%olen
+    %n_ok = sgt i32 %n, 12
+    br %n_ok, @prefix, @fail
+  @prefix:
+    %pfx = call @memcmp(%bufp, "HTTP/1.1 200", 12)
+    %pfx_ok = eq i32 %pfx, 0
+    br %pfx_ok, @body, @fail
+  @body:
+    store i32 6, *%id
+    // Locate "hello" anywhere in the response.
+    %i = let i32
+    store i32 0, *%i
+    jmp @scan_cond
+  @scan_cond:
+    %iv = load i32, *%i
+    %lim = sub i32 %n, 5
+    %more = sle i32 %iv, %lim
+    br %more, @scan_body, @fail
+  @scan_body:
+    %iv2 = load i32, *%i
+    %sp = gep i8, *%bufp, %iv2
+    %c = call @memcmp(%sp, "hello", 5)
+    %hit = eq i32 %c, 0
+    br %hit, @close, @scan_next
+  @scan_next:
+    %iv3 = load i32, *%i
+    %nx = add i32 %iv3, 1
+    store i32 %nx, *%i
+    jmp @scan_cond
+  @close:
+    call @net_tls_close(%cp)
+    call @net_socket_close(%fd)
+    call @printf("PASS tls13_client\n")
+    ret i32 0
+  @fail:
+    %cid = load i32, *%id
+    call @net_tls_close(%cp)
+    call @net_socket_close(%fd)
+    call @printf("FAIL tls13_client at case %d\n", %cid)
+    ret i32 1
+}

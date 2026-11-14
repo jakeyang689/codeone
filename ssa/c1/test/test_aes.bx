@@ -1,0 +1,114 @@
+// AES-128 NIST Known Answer Test (SP 800-38A)
+// Key:       2b 7e 15 16 28 ae d2 a6 ab f7 15 88 09 cf 4f 3c
+// Plaintext: 6b c1 be e2 2e 40 9f 96 e9 3d 7e 11 73 93 17 2a
+// Ciphertext:3a d7 7b b4 0d 7a 36 60 a8 9e ca f3 24 66 ef 97
+
+extern @putchar(c: i32) -> i32
+extern @std_crypto_aes_encrypt(plaintext: *i8, key: *i8, ciphertext: *i8) -> void
+extern @std_crypto_aes_decrypt(ciphertext: *i8, key: *i8, plaintext: *i8) -> void
+
+const @key: [i8, 16] = [
+  0x2b, 0x7e, 0x15, 0x16, 0x28, 0xae, 0xd2, 0xa6,
+  0xab, 0xf7, 0x15, 0x88, 0x09, 0xcf, 0x4f, 0x3c
+]
+
+const @pt: [i8, 16] = [
+  0x6b, 0xc1, 0xbe, 0xe2, 0x2e, 0x40, 0x9f, 0x96,
+  0xe9, 0x3d, 0x7e, 0x11, 0x73, 0x93, 0x17, 0x2a
+]
+
+const @expected_ct: [i8, 16] = [
+  0x3a, 0xd7, 0x7b, 0xb4, 0x0d, 0x7a, 0x36, 0x60,
+  0xa8, 0x9e, 0xca, 0xf3, 0x24, 0x66, 0xef, 0x97
+]
+
+fun @main() -> i32 {
+  @entry:
+    %ct = let [i8, 16]
+    %ct_p = gep i8, *%ct, 0
+    %dec = let [i8, 16]
+    %dec_p = gep i8, *%dec, 0
+
+    // Encrypt
+    call @std_crypto_aes_encrypt(@pt, @key, %ct_p)
+
+    // Compare ciphertext with expected
+    %i = let i32
+    store i32 0, *%i
+    jmp @cmp_cond
+
+  @cmp_cond:
+    %iv = load i32, *%i
+    %more = slt i32 %iv, 16
+    br %more, @cmp_body, @cmp_done
+
+  @cmp_body:
+    %iv2 = load i32, *%i
+    %exp_p = gep i8, *@expected_ct, %iv2
+    %exp_v = load i8, *%exp_p
+    %ctp = gep i8, *%ct_p, %iv2
+    %ctv = load i8, *%ctp
+    %ok = eq i8 %exp_v, %ctv
+    br %ok, @cmp_next, @fail_enc
+
+  @cmp_next:
+    %iv3 = load i32, *%i
+    %next = add i32 %iv3, 1
+    store i32 %next, *%i
+    jmp @cmp_cond
+
+  @cmp_done:
+    // Decrypt
+    call @std_crypto_aes_decrypt(%ct_p, @key, %dec_p)
+
+    // Compare decrypted with original plaintext
+    %di = let i32
+    store i32 0, *%di
+    jmp @dec_cmp_cond
+
+  @dec_cmp_cond:
+    %div = load i32, *%di
+    %more2 = slt i32 %div, 16
+    br %more2, @dec_cmp_body, @pass
+
+  @dec_cmp_body:
+    %div2 = load i32, *%di
+    %pt_p = gep i8, *@pt, %div2
+    %pt_v = load i8, *%pt_p
+    %dep = gep i8, *%dec_p, %div2
+    %dev = load i8, *%dep
+    %ok2 = eq i8 %pt_v, %dev
+    br %ok2, @dec_cmp_next, @fail_dec
+
+  @dec_cmp_next:
+    %div3 = load i32, *%di
+    %next2 = add i32 %div3, 1
+    store i32 %next2, *%di
+    jmp @dec_cmp_cond
+
+  @pass:
+    call @putchar(80)   // 'P'
+    call @putchar(65)   // 'A'
+    call @putchar(83)   // 'S'
+    call @putchar(83)   // 'S'
+    call @putchar(10)   // '\n'
+    ret i32 0
+
+  @fail_enc:
+    // Print FAIL for encryption
+    call @putchar(70)   // 'F'
+    call @putchar(65)   // 'A'
+    call @putchar(73)   // 'I'
+    call @putchar(76)   // 'L'
+    call @putchar(10)   // '\n'
+    ret i32 1
+
+  @fail_dec:
+    // Print FAIL for decryption
+    call @putchar(70)   // 'F'
+    call @putchar(65)   // 'A'
+    call @putchar(73)   // 'I'
+    call @putchar(76)   // 'L'
+    call @putchar(10)   // '\n'
+    ret i32 2
+}

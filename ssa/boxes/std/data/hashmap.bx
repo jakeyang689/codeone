@@ -1,0 +1,688 @@
+// Hash map with byte-string keys and byte-string values.
+//
+// The caller provides at least 32 bytes of storage for the header:
+//
+//   %m = let [i8, 32]
+//   call @std_data_hashmap_init(%m, 16)
+//   call @std_data_hashmap_put(%m, "key", 3, %value, %value_len)
+//
+// Keys and values are copied into heap storage. The table uses open
+// addressing with linear probing and FNV-1a hashing; it grows (doubling) when
+// slots including tombstones reach 70% of capacity. get/slot functions return
+// the stored length while copying at most the caller's capacity.
+
+extern @malloc(n: i64) -> *i8
+extern @free(p: *i8) -> void
+extern @memcpy(dst: *i8, src: *i8, n: i64) -> *i8
+extern @memcmp(a: *i8, b: *i8, n: i64) -> i32
+extern @memset(s: *i8, c: i32, n: i64) -> *i8
+
+struct @HashMap {
+  @entries: *i8,
+  @capacity: i32,
+  @count: i32,
+  @used: i32
+}
+
+struct @MapEntry {
+  @hash: i32,
+  @key_len: i32,
+  @val_len: i32,
+  @state: i32,
+  @key: *i8,
+  @val: *i8
+}
+
+const @_MAP_EMPTY: i32 = 0
+const @_MAP_USED: i32 = 1
+const @_MAP_TOMB: i32 = 2
+const @_MAP_ENTRY_SZ: i32 = 32
+const @_MAP_MIN_CAP: i32 = 8
+
+fun @_map_entry(entries: *i8, slot: i32) -> *i8 {
+  @entry:
+    %off = mul i32 %slot, 32
+    %p = gep i8, *%entries, %off
+    ret *i8 %p
+}
+
+fun @_map_slot_entry(m: *i8, slot: i32) -> *i8 {
+  @entry:
+    %ep = field @HashMap, *%m, 0
+    %entries = load *i8, *%ep
+    %e = call @_map_entry(%entries, %slot)
+    ret *i8 %e
+}
+
+// FNV-1a 32-bit.
+fun @_map_hash(key: *i8, len: i32) -> i32 {
+  @entry:
+    %h = let i32
+    %i = let i32
+    store i32 -2128831035, *%h
+    store i32 0, *%i
+    jmp @cond
+  @cond:
+    %iv = load i32, *%i
+    %more = slt i32 %iv, %len
+    br %more, @body, @done
+  @body:
+    %p = gep i8, *%key, %iv
+    %b = load i8, *%p
+    %bi = zext i8 %b to i32
+    %hv = load i32, *%h
+    %x = xor i32 %hv, %bi
+    %m = mul i32 %x, 16777619
+    store i32 %m, *%h
+    %n = add i32 %iv, 1
+    store i32 %n, *%i
+    jmp @cond
+  @done:
+    %r = load i32, *%h
+    ret i32 %r
+}
+
+// First slot at or after hash % cap whose state is not USED.
+fun @_map_place(entries: *i8, cap: i32, h: i32) -> i32 {
+  @entry:
+    %slot = let i32
+    %s0 = urem i32 %h, %cap
+    store i32 %s0, *%slot
+    jmp @loop
+  @loop:
+    %sv = load i32, *%slot
+    %e = call @_map_entry(%entries, %sv)
+    %stp = field @MapEntry, *%e, 3
+    %st = load i32, *%stp
+    %isused = eq i32 %st, 1
+    br %isused, @next, @found
+  @next:
+    %sv2 = load i32, *%slot
+    %s1 = add i32 %sv2, 1
+    %s2 = urem i32 %s1, %cap
+    store i32 %s2, *%slot
+    jmp @loop
+  @found:
+    ret i32 %sv
+}
+
+// Slot of the matching key, or -1.
+fun @_map_find(m: *i8, h: i32, key: *i8, key_len: i32) -> i32 {
+  @entry:
+    %ep = field @HashMap, *%m, 0
+    %entries = load *i8, *%ep
+    %cp = field @HashMap, *%m, 1
+    %cap = load i32, *%cp
+    %slot = let i32
+    %s0 = urem i32 %h, %cap
+    store i32 %s0, *%slot
+    jmp @loop
+  @loop:
+    %sv = load i32, *%slot
+    %e = call @_map_entry(%entries, %sv)
+    %stp = field @MapEntry, *%e, 3
+    %st = load i32, *%stp
+    %empty = eq i32 %st, 0
+    br %empty, @miss, @chk
+  @chk:
+    %isused = eq i32 %st, 1
+    br %isused, @match, @next
+  @match:
+    %hp = field @MapEntry, *%e, 0
+    %eh = load i32, *%hp
+    %hok = eq i32 %eh, %h
+    br %hok, @len, @next
+  @len:
+    %klp = field @MapEntry, *%e, 1
+    %kl = load i32, *%klp
+    %lok = eq i32 %kl, %key_len
+    br %lok, @cmp, @next
+  @cmp:
+    %kp = field @MapEntry, *%e, 4
+    %ks = load *i8, *%kp
+    %n64 = sext i32 %key_len to i64
+    %c = call @memcmp(%ks, %key, %n64)
+    %same = eq i32 %c, 0
+    br %same, @found, @next
+  @next:
+    %sv2 = load i32, *%slot
+    %s1 = add i32 %sv2, 1
+    %s2 = urem i32 %s1, %cap
+    store i32 %s2, *%slot
+    jmp @loop
+  @found:
+    %r = load i32, *%slot
+    ret i32 %r
+  @miss:
+    ret i32 -1
+}
+
+fun @std_data_hashmap_init(m: *i8, initial_cap: i32) -> i32 {
+  @entry:
+    %neg = slt i32 %initial_cap, 0
+    br %neg, @fail, @cap
+  @cap:
+    %cap0 = let i32
+    %z = slt i32 %initial_cap, 8
+    br %z, @use_min, @use_arg
+  @use_min:
+    store i32 8, *%cap0
+    jmp @alloc
+  @use_arg:
+    store i32 %initial_cap, *%cap0
+    jmp @alloc
+  @alloc:
+    %capv = load i32, *%cap0
+    %bytes = mul i32 %capv, 32
+    %bneg = slt i32 %bytes, 0
+    br %bneg, @fail, @do
+  @do:
+    %b64 = sext i32 %bytes to i64
+    %entries = call @malloc(%b64)
+    %en = eq *i8 %entries, null
+    br %en, @fail, @zero
+  @zero:
+    call @memset(%entries, 0, %b64)
+    %ep = field @HashMap, *%m, 0
+    store *i8 %entries, *%ep
+    %cp = field @HashMap, *%m, 1
+    %capv2 = load i32, *%cap0
+    store i32 %capv2, *%cp
+    %np = field @HashMap, *%m, 2
+    store i32 0, *%np
+    %up = field @HashMap, *%m, 3
+    store i32 0, *%up
+    ret i32 0
+  @fail:
+    ret i32 -1
+}
+
+// Double the table when (used + 1) * 10 >= capacity * 7.
+fun @_map_grow(m: *i8) -> i32 {
+  @entry:
+    %cp = field @HashMap, *%m, 1
+    %cap = load i32, *%cp
+    %up = field @HashMap, *%m, 3
+    %used = load i32, *%up
+    %u1 = add i32 %used, 1
+    %lhs = mul i32 %u1, 10
+    %rhs = mul i32 %cap, 7
+    %need = sge i32 %lhs, %rhs
+    br %need, @grow, @ok
+  @grow:
+    %newcap = mul i32 %cap, 2
+    %bytes = mul i32 %newcap, 32
+    %bneg = slt i32 %bytes, 0
+    br %bneg, @fail, @alloc
+  @alloc:
+    %b64 = sext i32 %bytes to i64
+    %ne = call @malloc(%b64)
+    %nen = eq *i8 %ne, null
+    br %nen, @fail, @zero
+  @zero:
+    call @memset(%ne, 0, %b64)
+    %ep = field @HashMap, *%m, 0
+    %entries = load *i8, *%ep
+    %i = let i32
+    store i32 0, *%i
+    jmp @loop
+  @loop:
+    %iv = load i32, *%i
+    %more = slt i32 %iv, %cap
+    br %more, @body, @moved
+  @body:
+    %iv2 = load i32, *%i
+    %e = call @_map_entry(%entries, %iv2)
+    %stp = field @MapEntry, *%e, 3
+    %st = load i32, *%stp
+    %isused = eq i32 %st, 1
+    br %isused, @move, @next
+  @move:
+    %hp = field @MapEntry, *%e, 0
+    %h = load i32, *%hp
+    %ns = call @_map_place(%ne, %newcap, %h)
+    %dst = call @_map_entry(%ne, %ns)
+    call @memcpy(%dst, %e, 32)
+    jmp @next
+  @next:
+    %iv3 = load i32, *%i
+    %n = add i32 %iv3, 1
+    store i32 %n, *%i
+    jmp @loop
+  @moved:
+    call @free(%entries)
+    %ep2 = field @HashMap, *%m, 0
+    store *i8 %ne, *%ep2
+    %cp2 = field @HashMap, *%m, 1
+    store i32 %newcap, *%cp2
+    %np = field @HashMap, *%m, 2
+    %cnt = load i32, *%np
+    %up2 = field @HashMap, *%m, 3
+    store i32 %cnt, *%up2
+    jmp @ok
+  @ok:
+    ret i32 0
+  @fail:
+    ret i32 -1
+}
+
+// Insert or update. Returns 1 when inserted, 0 when updated, -1 on error.
+fun @std_data_hashmap_put(m: *i8, key: *i8, key_len: i32, val: *i8, val_len: i32) -> i32 {
+  @entry:
+    %kneg = slt i32 %key_len, 0
+    %vneg = slt i32 %val_len, 0
+    %kpos = sgt i32 %key_len, 0
+    %vpos = sgt i32 %val_len, 0
+    %kn = eq *i8 %key, null
+    %vn = eq *i8 %val, null
+    %kbad = and i1 %kn, %kpos
+    %vbad = and i1 %vn, %vpos
+    %b1 = or i1 %kneg, %vneg
+    %b2 = or i1 %kbad, %vbad
+    %bad = or i1 %b1, %b2
+    br %bad, @fail, @grow
+  @grow:
+    %g = call @_map_grow(%m)
+    %gok = eq i32 %g, 0
+    br %gok, @hash, @fail
+  @hash:
+    %h = call @_map_hash(%key, %key_len)
+    %slot = call @_map_find(%m, %h, %key, %key_len)
+    %sneg = slt i32 %slot, 0
+    br %sneg, @insert, @update
+  @update:
+    %e = call @_map_slot_entry(%m, %slot)
+    %nv = let *i8
+    %vpos2 = sgt i32 %val_len, 0
+    br %vpos2, @valloc, @vnull
+  @valloc:
+    %n64 = sext i32 %val_len to i64
+    %nb = call @malloc(%n64)
+    %nbn = eq *i8 %nb, null
+    br %nbn, @fail, @vcopy
+  @vcopy:
+    call @memcpy(%nb, %val, %n64)
+    store *i8 %nb, *%nv
+    jmp @vset
+  @vnull:
+    store *i8 null, *%nv
+    jmp @vset
+  @vset:
+    %vp = field @MapEntry, *%e, 5
+    %old = load *i8, *%vp
+    %on = eq *i8 %old, null
+    br %on, @vstore, @vfree
+  @vfree:
+    call @free(%old)
+    jmp @vstore
+  @vstore:
+    %nvp = load *i8, *%nv
+    %vp2 = field @MapEntry, *%e, 5
+    store *i8 %nvp, *%vp2
+    %vlp = field @MapEntry, *%e, 2
+    store i32 %val_len, *%vlp
+    ret i32 0
+  @insert:
+    %ep = field @HashMap, *%m, 0
+    %entries = load *i8, *%ep
+    %cp = field @HashMap, *%m, 1
+    %cap = load i32, *%cp
+    %slot2 = call @_map_place(%entries, %cap, %h)
+    %e2 = call @_map_entry(%entries, %slot2)
+    %nk = let *i8
+    %kpos2 = sgt i32 %key_len, 0
+    br %kpos2, @kalloc, @knull
+  @kalloc:
+    %k64 = sext i32 %key_len to i64
+    %kb = call @malloc(%k64)
+    %kbn = eq *i8 %kb, null
+    br %kbn, @fail, @kcopy
+  @kcopy:
+    call @memcpy(%kb, %key, %k64)
+    store *i8 %kb, *%nk
+    jmp @kdone
+  @knull:
+    store *i8 null, *%nk
+    jmp @kdone
+  @kdone:
+    %nv2 = let *i8
+    %vpos3 = sgt i32 %val_len, 0
+    br %vpos3, @valloc2, @vnull2
+  @valloc2:
+    %v64 = sext i32 %val_len to i64
+    %vb = call @malloc(%v64)
+    %vbn = eq *i8 %vb, null
+    br %vbn, @fail_key, @vcopy2
+  @vcopy2:
+    call @memcpy(%vb, %val, %v64)
+    store *i8 %vb, *%nv2
+    jmp @vdone
+  @vnull2:
+    store *i8 null, *%nv2
+    jmp @vdone
+  @vdone:
+    %stp0 = field @MapEntry, *%e2, 3
+    %oldst = load i32, *%stp0
+    %hp = field @MapEntry, *%e2, 0
+    store i32 %h, *%hp
+    %klp = field @MapEntry, *%e2, 1
+    store i32 %key_len, *%klp
+    %vlp2 = field @MapEntry, *%e2, 2
+    store i32 %val_len, *%vlp2
+    %stp = field @MapEntry, *%e2, 3
+    store i32 1, *%stp
+    %kp = field @MapEntry, *%e2, 4
+    %nkp = load *i8, *%nk
+    store *i8 %nkp, *%kp
+    %vp3 = field @MapEntry, *%e2, 5
+    %nv2p = load *i8, *%nv2
+    store *i8 %nv2p, *%vp3
+    %np = field @HashMap, *%m, 2
+    %cnt = load i32, *%np
+    %cnt1 = add i32 %cnt, 1
+    store i32 %cnt1, *%np
+    %was_empty = eq i32 %oldst, 0
+    br %was_empty, @used_inc, @inserted
+  @used_inc:
+    %up = field @HashMap, *%m, 3
+    %u = load i32, *%up
+    %u1 = add i32 %u, 1
+    store i32 %u1, *%up
+    jmp @inserted
+  @inserted:
+    ret i32 1
+  @fail_key:
+    %nkp2 = load *i8, *%nk
+    %nknull = eq *i8 %nkp2, null
+    br %nknull, @fail, @free_k
+  @free_k:
+    call @free(%nkp2)
+    jmp @fail
+  @fail:
+    ret i32 -1
+}
+
+// Copy the value for key into out (at most out_cap bytes). Returns the stored
+// value length, or -1 when the key is absent.
+fun @std_data_hashmap_get(m: *i8, key: *i8, key_len: i32, out: *i8, out_cap: i32) -> i32 {
+  @entry:
+    %h = call @_map_hash(%key, %key_len)
+    %slot = call @_map_find(%m, %h, %key, %key_len)
+    %sneg = slt i32 %slot, 0
+    br %sneg, @miss, @found
+  @found:
+    %e = call @_map_slot_entry(%m, %slot)
+    %vlp = field @MapEntry, *%e, 2
+    %vl = load i32, *%vlp
+    %capneg = slt i32 %out_cap, 0
+    br %capneg, @fail, @copy
+  @copy:
+    %copy = let i32
+    %lt = slt i32 %vl, %out_cap
+    br %lt, @use_vl, @use_cap
+  @use_vl:
+    store i32 %vl, *%copy
+    jmp @do
+  @use_cap:
+    store i32 %out_cap, *%copy
+    jmp @do
+  @do:
+    %cv = load i32, *%copy
+    %pos = sgt i32 %cv, 0
+    br %pos, @need_out, @done
+  @need_out:
+    %on = eq *i8 %out, null
+    br %on, @fail, @memcpy_v
+  @memcpy_v:
+    %vp = field @MapEntry, *%e, 5
+    %vs = load *i8, *%vp
+    %n64 = sext i32 %cv to i64
+    call @memcpy(%out, %vs, %n64)
+    jmp @done
+  @done:
+    ret i32 %vl
+  @miss:
+    ret i32 -1
+  @fail:
+    ret i32 -1
+}
+
+// Stored value length, or -1 when absent.
+fun @std_data_hashmap_get_len(m: *i8, key: *i8, key_len: i32) -> i32 {
+  @entry:
+    %h = call @_map_hash(%key, %key_len)
+    %slot = call @_map_find(%m, %h, %key, %key_len)
+    %sneg = slt i32 %slot, 0
+    br %sneg, @miss, @found
+  @found:
+    %e = call @_map_slot_entry(%m, %slot)
+    %vlp = field @MapEntry, *%e, 2
+    %vl = load i32, *%vlp
+    ret i32 %vl
+  @miss:
+    ret i32 -1
+}
+
+fun @std_data_hashmap_has(m: *i8, key: *i8, key_len: i32) -> i32 {
+  @entry:
+    %h = call @_map_hash(%key, %key_len)
+    %slot = call @_map_find(%m, %h, %key, %key_len)
+    %sneg = slt i32 %slot, 0
+    br %sneg, @no, @yes
+  @yes:
+    ret i32 1
+  @no:
+    ret i32 0
+}
+
+fun @std_data_hashmap_remove(m: *i8, key: *i8, key_len: i32) -> i32 {
+  @entry:
+    %h = call @_map_hash(%key, %key_len)
+    %slot = call @_map_find(%m, %h, %key, %key_len)
+    %sneg = slt i32 %slot, 0
+    br %sneg, @miss, @free
+  @free:
+    %e = call @_map_slot_entry(%m, %slot)
+    %kp = field @MapEntry, *%e, 4
+    %ks = load *i8, *%kp
+    %kn = eq *i8 %ks, null
+    br %kn, @free_val, @free_key
+  @free_key:
+    call @free(%ks)
+    jmp @free_val
+  @free_val:
+    %vp = field @MapEntry, *%e, 5
+    %vs = load *i8, *%vp
+    %vn = eq *i8 %vs, null
+    br %vn, @mark, @free_v
+  @free_v:
+    call @free(%vs)
+    jmp @mark
+  @mark:
+    %kp2 = field @MapEntry, *%e, 4
+    store *i8 null, *%kp2
+    %vp2 = field @MapEntry, *%e, 5
+    store *i8 null, *%vp2
+    %vlp = field @MapEntry, *%e, 2
+    store i32 0, *%vlp
+    %stp = field @MapEntry, *%e, 3
+    store i32 2, *%stp
+    %np = field @HashMap, *%m, 2
+    %cnt = load i32, *%np
+    %c1 = sub i32 %cnt, 1
+    store i32 %c1, *%np
+    ret i32 0
+  @miss:
+    ret i32 -1
+}
+
+fun @std_data_hashmap_count(m: *i8) -> i32 {
+  @entry:
+    %np = field @HashMap, *%m, 2
+    %n = load i32, *%np
+    ret i32 %n
+}
+
+fun @std_data_hashmap_capacity(m: *i8) -> i32 {
+  @entry:
+    %cp = field @HashMap, *%m, 1
+    %c = load i32, *%cp
+    ret i32 %c
+}
+
+// Key of a used slot, or -1 when the slot is empty/tombstoned/out of range.
+fun @std_data_hashmap_slot_key(m: *i8, slot: i32, out: *i8, cap: i32) -> i32 {
+  @entry:
+    %cp = field @HashMap, *%m, 1
+    %capacity = load i32, *%cp
+    %neg = slt i32 %slot, 0
+    %big = sge i32 %slot, %capacity
+    %bad = or i1 %neg, %big
+    br %bad, @miss, @entry_chk
+  @entry_chk:
+    %e = call @_map_slot_entry(%m, %slot)
+    %stp = field @MapEntry, *%e, 3
+    %st = load i32, *%stp
+    %used = eq i32 %st, 1
+    br %used, @copy, @miss
+  @copy:
+    %klp = field @MapEntry, *%e, 1
+    %kl = load i32, *%klp
+    %nz = ne i32 %kl, 0
+    br %nz, @do_copy, @done
+  @do_copy:
+    %copy = let i32
+    %lt = slt i32 %kl, %cap
+    br %lt, @use_kl, @use_cap
+  @use_kl:
+    store i32 %kl, *%copy
+    jmp @need_out
+  @use_cap:
+    store i32 %cap, *%copy
+    jmp @need_out
+  @need_out:
+    %cv = load i32, *%copy
+    %pos = sgt i32 %cv, 0
+    br %pos, @out_chk, @done
+  @out_chk:
+    %on = eq *i8 %out, null
+    br %on, @miss, @memcpy_k
+  @memcpy_k:
+    %kp = field @MapEntry, *%e, 4
+    %ks = load *i8, *%kp
+    %n64 = sext i32 %cv to i64
+    call @memcpy(%out, %ks, %n64)
+    jmp @done
+  @done:
+    ret i32 %kl
+  @miss:
+    ret i32 -1
+}
+
+// Value of a used slot, or -1 when the slot is empty/tombstoned/out of range.
+fun @std_data_hashmap_slot_value(m: *i8, slot: i32, out: *i8, cap: i32) -> i32 {
+  @entry:
+    %cp = field @HashMap, *%m, 1
+    %capacity = load i32, *%cp
+    %neg = slt i32 %slot, 0
+    %big = sge i32 %slot, %capacity
+    %bad = or i1 %neg, %big
+    br %bad, @miss, @entry_chk
+  @entry_chk:
+    %e = call @_map_slot_entry(%m, %slot)
+    %stp = field @MapEntry, *%e, 3
+    %st = load i32, *%stp
+    %used = eq i32 %st, 1
+    br %used, @copy, @miss
+  @copy:
+    %vlp = field @MapEntry, *%e, 2
+    %vl = load i32, *%vlp
+    %nz = ne i32 %vl, 0
+    br %nz, @do_copy, @done
+  @do_copy:
+    %copy = let i32
+    %lt = slt i32 %vl, %cap
+    br %lt, @use_vl, @use_cap
+  @use_vl:
+    store i32 %vl, *%copy
+    jmp @need_out
+  @use_cap:
+    store i32 %cap, *%copy
+    jmp @need_out
+  @need_out:
+    %cv = load i32, *%copy
+    %pos = sgt i32 %cv, 0
+    br %pos, @out_chk, @done
+  @out_chk:
+    %on = eq *i8 %out, null
+    br %on, @miss, @memcpy_v
+  @memcpy_v:
+    %vp = field @MapEntry, *%e, 5
+    %vs = load *i8, *%vp
+    %n64 = sext i32 %cv to i64
+    call @memcpy(%out, %vs, %n64)
+    jmp @done
+  @done:
+    ret i32 %vl
+  @miss:
+    ret i32 -1
+}
+
+fun @std_data_hashmap_free(m: *i8) -> void {
+  @entry:
+    %ep = field @HashMap, *%m, 0
+    %entries = load *i8, *%ep
+    %en = eq *i8 %entries, null
+    br %en, @reset, @init
+  @init:
+    %cp = field @HashMap, *%m, 1
+    %cap = load i32, *%cp
+    %i = let i32
+    store i32 0, *%i
+    jmp @loop
+  @loop:
+    %iv = load i32, *%i
+    %more = slt i32 %iv, %cap
+    br %more, @body, @freed
+  @body:
+    %iv2 = load i32, *%i
+    %e = call @_map_entry(%entries, %iv2)
+    %stp = field @MapEntry, *%e, 3
+    %st = load i32, *%stp
+    %used = eq i32 %st, 1
+    br %used, @free_entry, @next
+  @free_entry:
+    %kp = field @MapEntry, *%e, 4
+    %ks = load *i8, *%kp
+    %kn = eq *i8 %ks, null
+    br %kn, @fv, @fk
+  @fk:
+    call @free(%ks)
+    jmp @fv
+  @fv:
+    %vp = field @MapEntry, *%e, 5
+    %vs = load *i8, *%vp
+    %vn = eq *i8 %vs, null
+    br %vn, @next, @frv
+  @frv:
+    call @free(%vs)
+    jmp @next
+  @next:
+    %iv3 = load i32, *%i
+    %n = add i32 %iv3, 1
+    store i32 %n, *%i
+    jmp @loop
+  @freed:
+    call @free(%entries)
+    jmp @reset
+  @reset:
+    %ep2 = field @HashMap, *%m, 0
+    store *i8 null, *%ep2
+    %cp2 = field @HashMap, *%m, 1
+    store i32 0, *%cp2
+    %np = field @HashMap, *%m, 2
+    store i32 0, *%np
+    %up = field @HashMap, *%m, 3
+    store i32 0, *%up
+    ret void
+}

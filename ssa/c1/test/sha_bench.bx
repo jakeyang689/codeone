@@ -1,0 +1,36 @@
+// SHA-256 throughput benchmark.
+// Run twice to compare hardware and software paths:
+//     ./sha_bench
+//     C1_NO_HW=1 ./sha_bench
+
+extern @malloc(n: i64) -> *i8
+extern @clock() -> i64
+extern @printf(fmt: *i8, ...) -> i32
+extern @memset(s: *i8, c: i32, n: i64) -> *i8
+extern @c1_cpu_features() -> i64
+extern @std_crypto_sha256_compute(data: *i8, len: i32, digest: *i8) -> void
+
+fun @main() -> i32 {
+  @entry:
+    %feat = call @c1_cpu_features()
+    %shabit = and i64 %feat, 2
+    call @printf("cpu features: 0x%llx (SHA-256=%lld)\n", %feat, %shabit)
+
+    %total = add i32 0, 8388608
+    %data = call @malloc(8388608)
+    %digest = call @malloc(32)
+    call @memset(%data, 0x61, 8388608)
+
+    %t0 = call @clock()
+    call @std_crypto_sha256_compute(%data, %total, %digest)
+    %t1 = call @clock()
+    %us = sub i64 %t1, %t0
+    %nb = sext i32 %total to i64
+    %mbps = div i64 %nb, %us
+    call @printf("SHA-256  %lld MB/s (%lld us)\n", %mbps, %us)
+
+    // digest is written; read one byte so the call cannot be optimized away
+    %d0 = load i8, *%digest
+    call @printf("digest[0]: %d\n", %d0)
+    ret i32 0
+}

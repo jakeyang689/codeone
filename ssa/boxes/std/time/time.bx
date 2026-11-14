@@ -1,0 +1,612 @@
+// Time: wall clock, monotonic clock, and ISO 8601 (UTC) formatting/parsing.
+//
+// Timestamps are milliseconds since the Unix epoch. Formatting produces
+// "YYYY-MM-DDTHH:MM:SS.mmmZ"; parsing accepts that form with an optional
+// fractional part and either "Z" or a numeric ±HH:MM offset.
+
+extern @c1_time_now_ms() -> i64
+extern @c1_time_monotonic_ms() -> i64
+
+fun @std_time_now_ms() -> i64 {
+  @entry:
+    %t = call @c1_time_now_ms()
+    ret i64 %t
+}
+
+fun @std_time_monotonic_ms() -> i64 {
+  @entry:
+    %t = call @c1_time_monotonic_ms()
+    ret i64 %t
+}
+
+// Floor division for i64 (C division truncates toward zero).
+fun @_time_floor_div(a: i64, b: i64) -> i64 {
+  @entry:
+    %q = div i64 %a, %b
+    %r = rem i64 %a, %b
+    %rz = eq i64 %r, 0
+    br %rz, @done, @chk
+  @chk:
+    %rn = slt i64 %r, 0
+    %bn = slt i64 %b, 0
+    %diff = ne i1 %rn, %bn
+    br %diff, @dec, @done
+  @dec:
+    %q2 = sub i64 %q, 1
+    ret i64 %q2
+  @done:
+    ret i64 %q
+}
+
+// Days since 1970-01-01 for a proleptic Gregorian date (Howard Hinnant).
+fun @_time_days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+  @entry:
+    %mle2 = sle i64 %m, 2
+    %yy = let i64
+    br %mle2, @adj, @noadj
+  @adj:
+    %y1 = sub i64 %y, 1
+    store i64 %y1, *%yy
+    jmp @era
+  @noadj:
+    store i64 %y, *%yy
+    jmp @era
+  @era:
+    %yyv = load i64, *%yy
+    %era = call @_time_floor_div(%yyv, 400)
+    %era400 = mul i64 %era, 400
+    %yoe = sub i64 %yyv, %era400
+    %mgt2 = sgt i64 %m, 2
+    %mp = let i64
+    br %mgt2, @minus3, @plus9
+  @minus3:
+    %m3 = sub i64 %m, 3
+    store i64 %m3, *%mp
+    jmp @doy
+  @plus9:
+    %m9 = add i64 %m, 9
+    store i64 %m9, *%mp
+    jmp @doy
+  @doy:
+    %mpv = load i64, *%mp
+    %t1 = mul i64 153, %mpv
+    %t2 = add i64 %t1, 2
+    %t3 = div i64 %t2, 5
+    %t4 = add i64 %t3, %d
+    %doy = sub i64 %t4, 1
+    %y365 = mul i64 %yoe, 365
+    %y4 = div i64 %yoe, 4
+    %y100 = div i64 %yoe, 100
+    %a1 = add i64 %y365, %y4
+    %a2 = sub i64 %a1, %y100
+    %doe = add i64 %a2, %doy
+    %era146 = mul i64 %era, 146097
+    %s1 = add i64 %era146, %doe
+    %res = sub i64 %s1, 719468
+    ret i64 %res
+}
+
+// Civil date from days since 1970-01-01.
+fun @_time_civil_from_days(z: i64, oy: *i32, om: *i32, od: *i32) -> void {
+  @entry:
+    %z1 = add i64 %z, 719468
+    %era = call @_time_floor_div(%z1, 146097)
+    %era146 = mul i64 %era, 146097
+    %doe = sub i64 %z1, %era146
+    %doe1460 = div i64 %doe, 1460
+    %doe36524 = div i64 %doe, 36524
+    %doe146096 = div i64 %doe, 146096
+    %b1 = sub i64 %doe, %doe1460
+    %b2 = add i64 %b1, %doe36524
+    %b3 = sub i64 %b2, %doe146096
+    %yoe = div i64 %b3, 365
+    %era400 = mul i64 %era, 400
+    %y = add i64 %yoe, %era400
+    %y365 = mul i64 %yoe, 365
+    %y4 = div i64 %yoe, 4
+    %y100 = div i64 %yoe, 100
+    %c1 = add i64 %y365, %y4
+    %c2 = sub i64 %c1, %y100
+    %doy = sub i64 %doe, %c2
+    %mp1 = mul i64 5, %doy
+    %mp2 = add i64 %mp1, 2
+    %mp = div i64 %mp2, 153
+    %d1 = mul i64 153, %mp
+    %d2 = add i64 %d1, 2
+    %d3 = div i64 %d2, 5
+    %d = sub i64 %doy, %d3
+    %d4 = add i64 %d, 1
+    %mgt9 = sge i64 %mp, 10
+    %m = let i64
+    br %mgt9, @m_minus, @m_plus
+  @m_minus:
+    %mm1 = sub i64 %mp, 9
+    store i64 %mm1, *%m
+    jmp @y_adj
+  @m_plus:
+    %mm2 = add i64 %mp, 3
+    store i64 %mm2, *%m
+    jmp @y_adj
+  @y_adj:
+    %mv = load i64, *%m
+    %mle2 = sle i64 %mv, 2
+    %y2 = let i64
+    br %mle2, @y_inc, @y_set
+  @y_inc:
+    %yi = add i64 %y, 1
+    store i64 %yi, *%y2
+    jmp @store
+  @y_set:
+    store i64 %y, *%y2
+    jmp @store
+  @store:
+    %yf = load i64, *%y2
+    %y32 = trunc i64 %yf to i32
+    store i32 %y32, *%oy
+    %m32 = trunc i64 %mv to i32
+    store i32 %m32, *%om
+    %d32 = trunc i64 %d4 to i32
+    store i32 %d32, *%od
+    ret void
+}
+
+fun @_time_is_leap(y: i64) -> i32 {
+  @entry:
+    %m4 = rem i64 %y, 4
+    %m4z = eq i64 %m4, 0
+    %m100 = rem i64 %y, 100
+    %m100nz = ne i64 %m100, 0
+    %m400 = rem i64 %y, 400
+    %m400z = eq i64 %m400, 0
+    %a = and i1 %m4z, %m100nz
+    %b = or i1 %a, %m400z
+    %r = zext i1 %b to i32
+    ret i32 %r
+}
+
+fun @_time_month_days(y: i64, m: i64) -> i32 {
+  @entry:
+    %isfeb = eq i64 %m, 2
+    br %isfeb, @feb, @chk30
+  @feb:
+    %leap = call @_time_is_leap(%y)
+    %add = add i32 28, %leap
+    ret i32 %add
+  @chk30:
+    %is4 = eq i64 %m, 4
+    %is6 = eq i64 %m, 6
+    %is9 = eq i64 %m, 9
+    %is11 = eq i64 %m, 11
+    %a1 = or i1 %is4, %is6
+    %a2 = or i1 %is9, %is11
+    %a3 = or i1 %a1, %a2
+    br %a3, @thirty, @thirtyone
+  @thirty:
+    ret i32 30
+  @thirtyone:
+    ret i32 31
+}
+
+// Character/digit helpers for parsing.
+
+fun @_time_digit(c: i32) -> i32 {
+  @entry:
+    %ge = sge i32 %c, 48
+    %le = sle i32 %c, 57
+    %ok = and i1 %ge, %le
+    br %ok, @conv, @bad
+  @conv:
+    %v = sub i32 %c, 48
+    ret i32 %v
+  @bad:
+    ret i32 -1
+}
+
+fun @_time_rd2(s: *i8, len: i32, pos: i32) -> i32 {
+  @entry:
+    %end = add i32 %pos, 1
+    %fits = slt i32 %end, %len
+    br %fits, @read, @bad
+  @read:
+    %p0 = gep i8, *%s, %pos
+    %c0 = load i8, *%p0
+    %c0i = zext i8 %c0 to i32
+    %i1 = add i32 %pos, 1
+    %p1 = gep i8, *%s, %i1
+    %c1 = load i8, *%p1
+    %c1i = zext i8 %c1 to i32
+    %d0 = call @_time_digit(%c0i)
+    %d1 = call @_time_digit(%c1i)
+    %ok0 = sge i32 %d0, 0
+    %ok1 = sge i32 %d1, 0
+    %ok = and i1 %ok0, %ok1
+    br %ok, @combine, @bad
+  @combine:
+    %t = mul i32 %d0, 10
+    %v = add i32 %t, %d1
+    ret i32 %v
+  @bad:
+    ret i32 -1
+}
+
+fun @_time_rd4(s: *i8, len: i32, pos: i32) -> i32 {
+  @entry:
+    %end = add i32 %pos, 3
+    %fits = slt i32 %end, %len
+    br %fits, @read, @bad
+  @read:
+    %h1 = call @_time_rd2(%s, %len, %pos)
+    %p2 = add i32 %pos, 2
+    %h2 = call @_time_rd2(%s, %len, %p2)
+    %ok1 = sge i32 %h1, 0
+    %ok2 = sge i32 %h2, 0
+    %ok = and i1 %ok1, %ok2
+    br %ok, @combine, @bad
+  @combine:
+    %t = mul i32 %h1, 100
+    %v = add i32 %t, %h2
+    ret i32 %v
+  @bad:
+    ret i32 -1
+}
+
+fun @_time_char(s: *i8, len: i32, pos: i32, want: i8) -> i32 {
+  @entry:
+    %inb = slt i32 %pos, %len
+    br %inb, @read, @bad
+  @read:
+    %p = gep i8, *%s, %pos
+    %c = load i8, *%p
+    %eqc = eq i8 %c, %want
+    br %eqc, @ok, @bad
+  @ok:
+    ret i32 0
+  @bad:
+    ret i32 -1
+}
+
+// Write a 2-digit or 4-digit zero-padded number at out+off.
+
+fun @_time_put2(v: i32, out: *i8, off: i32) -> void {
+  @entry:
+    %t = div i32 %v, 10
+    %o = rem i32 %v, 10
+    %tch = add i32 %t, 48
+    %och = add i32 %o, 48
+    %t8 = trunc i32 %tch to i8
+    %o8 = trunc i32 %och to i8
+    %p0 = gep i8, *%out, %off
+    store i8 %t8, *%p0
+    %i1 = add i32 %off, 1
+    %p1 = gep i8, *%out, %i1
+    store i8 %o8, *%p1
+    ret void
+}
+
+fun @_time_put4(v: i32, out: *i8, off: i32) -> void {
+  @entry:
+    %th = div i32 %v, 1000
+    %r1 = rem i32 %v, 1000
+    %h = div i32 %r1, 100
+    %r2 = rem i32 %r1, 100
+    %t = div i32 %r2, 10
+    %o = rem i32 %r2, 10
+    %thc = add i32 %th, 48
+    %hc = add i32 %h, 48
+    %tc = add i32 %t, 48
+    %oc = add i32 %o, 48
+    %th8 = trunc i32 %thc to i8
+    %h8 = trunc i32 %hc to i8
+    %t8 = trunc i32 %tc to i8
+    %o8 = trunc i32 %oc to i8
+    %p0 = gep i8, *%out, %off
+    store i8 %th8, *%p0
+    %i1 = add i32 %off, 1
+    %p1 = gep i8, *%out, %i1
+    store i8 %h8, *%p1
+    %i2 = add i32 %off, 2
+    %p2 = gep i8, *%out, %i2
+    store i8 %t8, *%p2
+    %i3 = add i32 %off, 3
+    %p3 = gep i8, *%out, %i3
+    store i8 %o8, *%p3
+    ret void
+}
+
+// Format milliseconds as "YYYY-MM-DDTHH:MM:SS.mmmZ" (UTC).
+// Returns 24 on success, -1 when the buffer is too small or the year is out of
+// the supported 0000-9999 range.
+fun @std_time_format_iso8601(ms: i64, out: *i8, cap: i32) -> i32 {
+  @entry:
+    %capok = sge i32 %cap, 25
+    br %capok, @calc, @fail
+  @calc:
+    %sec = call @_time_floor_div(%ms, 1000)
+    %sec1000 = mul i64 %sec, 1000
+    %frac = sub i64 %ms, %sec1000
+    %days = call @_time_floor_div(%sec, 86400)
+    %days86400 = mul i64 %days, 86400
+    %rem = sub i64 %sec, %days86400
+    %hh = div i64 %rem, 3600
+    %r1 = rem i64 %rem, 3600
+    %mi = div i64 %r1, 60
+    %ss = rem i64 %r1, 60
+    %y = let i32
+    %mo = let i32
+    %d = let i32
+    %yp = gep i32, *%y, 0
+    %mop = gep i32, *%mo, 0
+    %dp = gep i32, *%d, 0
+    call @_time_civil_from_days(%days, %yp, %mop, %dp)
+    %yv = load i32, *%y
+    %ylo = sge i32 %yv, 0
+    %yhi = sle i32 %yv, 9999
+    %yok = and i1 %ylo, %yhi
+    br %yok, @write, @fail
+  @write:
+    %mov = load i32, *%mo
+    %dv = load i32, *%d
+    %hh32 = trunc i64 %hh to i32
+    %mi32 = trunc i64 %mi to i32
+    %ss32 = trunc i64 %ss to i32
+    %frac32 = trunc i64 %frac to i32
+    call @_time_put4(%yv, %out, 0)
+    %pd1 = gep i8, *%out, 4
+    store i8 45, *%pd1
+    call @_time_put2(%mov, %out, 5)
+    %pd2 = gep i8, *%out, 7
+    store i8 45, *%pd2
+    call @_time_put2(%dv, %out, 8)
+    %pt = gep i8, *%out, 10
+    store i8 84, *%pt
+    call @_time_put2(%hh32, %out, 11)
+    %pc1 = gep i8, *%out, 13
+    store i8 58, *%pc1
+    call @_time_put2(%mi32, %out, 14)
+    %pc2 = gep i8, *%out, 16
+    store i8 58, *%pc2
+    call @_time_put2(%ss32, %out, 17)
+    %pdot = gep i8, *%out, 19
+    store i8 46, *%pdot
+    // milliseconds, three digits
+    %mh = div i32 %frac32, 100
+    %mr1 = rem i32 %frac32, 100
+    %mt = div i32 %mr1, 10
+    %mo2 = rem i32 %mr1, 10
+    %mhc = add i32 %mh, 48
+    %mtc = add i32 %mt, 48
+    %moc = add i32 %mo2, 48
+    %mh8 = trunc i32 %mhc to i8
+    %mt8 = trunc i32 %mtc to i8
+    %mo8 = trunc i32 %moc to i8
+    %pm0 = gep i8, *%out, 20
+    store i8 %mh8, *%pm0
+    %pm1 = gep i8, *%out, 21
+    store i8 %mt8, *%pm1
+    %pm2 = gep i8, *%out, 22
+    store i8 %mo8, *%pm2
+    %pz = gep i8, *%out, 23
+    store i8 90, *%pz
+    %pn = gep i8, *%out, 24
+    store i8 0, *%pn
+    ret i32 24
+  @fail:
+    ret i32 -1
+}
+
+// Parse "YYYY-MM-DDTHH:MM:SS[.fff][Z|+HH:MM|-HH:MM]".
+// Returns 0 on success, -1 on malformed input.
+fun @std_time_parse_iso8601(s: *i8, len: i32, out_ms: *i64) -> i32 {
+  @entry:
+    %snul = eq *i8 %s, null
+    %short = slt i32 %len, 19
+    %bad0 = or i1 %snul, %short
+    br %bad0, @fail, @fields
+  @fields:
+    %y = call @_time_rd4(%s, %len, 0)
+    %mo = call @_time_rd2(%s, %len, 5)
+    %d = call @_time_rd2(%s, %len, 8)
+    %hh = call @_time_rd2(%s, %len, 11)
+    %mi = call @_time_rd2(%s, %len, 14)
+    %ss = call @_time_rd2(%s, %len, 17)
+    %c1 = call @_time_char(%s, %len, 4, 45)
+    %c2 = call @_time_char(%s, %len, 7, 45)
+    %c4 = call @_time_char(%s, %len, 13, 58)
+    %c5 = call @_time_char(%s, %len, 16, 58)
+    // separator at 10 is 'T' or ' '
+    %p10 = gep i8, *%s, 10
+    %s10 = load i8, *%p10
+    %sT = eq i8 %s10, 84
+    %sSp = eq i8 %s10, 32
+    %s10ok = or i1 %sT, %sSp
+    %yok = sge i32 %y, 0
+    %mook = sge i32 %mo, 0
+    %dok = sge i32 %d, 0
+    %hhok = sge i32 %hh, 0
+    %miok = sge i32 %mi, 0
+    %ssok = sge i32 %ss, 0
+    %c1ok = sge i32 %c1, 0
+    %c2ok = sge i32 %c2, 0
+    %c4ok = sge i32 %c4, 0
+    %c5ok = sge i32 %c5, 0
+    %a1 = and i1 %yok, %mook
+    %a2 = and i1 %dok, %hhok
+    %a3 = and i1 %miok, %ssok
+    %a4 = and i1 %c1ok, %c2ok
+    %a5 = and i1 %c4ok, %c5ok
+    %a6 = and i1 %a1, %a2
+    %a7 = and i1 %a3, %a4
+    %a8 = and i1 %a5, %s10ok
+    %b1 = and i1 %a6, %a7
+    %all = and i1 %b1, %a8
+    br %all, @fraction, @fail
+  @fraction:
+    %pos = let i32
+    %milli = let i32
+    store i32 19, *%pos
+    store i32 0, *%milli
+    %pv = load i32, *%pos
+    %inb = slt i32 %pv, %len
+    br %inb, @frac_chk, @zone
+  @frac_chk:
+    %fp = gep i8, *%s, %pv
+    %fc = load i8, *%fp
+    %isdot = eq i8 %fc, 46
+    br %isdot, @frac_start, @zone
+  @frac_start:
+    %p1 = add i32 %pv, 1
+    store i32 %p1, *%pos
+    %nd = let i32
+    store i32 0, *%nd
+    jmp @frac_loop
+  @frac_loop:
+    %fv = load i32, *%pos
+    %fin = slt i32 %fv, %len
+    br %fin, @frac_one, @frac_done
+  @frac_one:
+    %cp = gep i8, *%s, %fv
+    %cc = load i8, *%cp
+    %cci = zext i8 %cc to i32
+    %dv = call @_time_digit(%cci)
+    %isd = sge i32 %dv, 0
+    br %isd, @frac_acc, @frac_done
+  @frac_acc:
+    %ndv = load i32, *%nd
+    %lt3 = slt i32 %ndv, 3
+    br %lt3, @frac_add, @frac_skip
+  @frac_add:
+    %mv = load i32, *%milli
+    %m10 = mul i32 %mv, 10
+    %mnew = add i32 %m10, %dv
+    store i32 %mnew, *%milli
+    jmp @frac_skip
+  @frac_skip:
+    %ndv2 = load i32, *%nd
+    %ndn = add i32 %ndv2, 1
+    store i32 %ndn, *%nd
+    %fvn = load i32, *%pos
+    %fnext = add i32 %fvn, 1
+    store i32 %fnext, *%pos
+    jmp @frac_loop
+  @frac_done:
+    %ndf = load i32, *%nd
+    %has = sgt i32 %ndf, 0
+    br %has, @frac_pad, @fail
+  @frac_pad:
+    %ndf2 = load i32, *%nd
+    %lt3b = slt i32 %ndf2, 3
+    br %lt3b, @pad_one, @zone
+  @pad_one:
+    %mv2 = load i32, *%milli
+    %m10b = mul i32 %mv2, 10
+    store i32 %m10b, *%milli
+    %ndn2 = add i32 %ndf2, 1
+    store i32 %ndn2, *%nd
+    jmp @frac_pad
+  @zone:
+    %offset = let i32
+    store i32 0, *%offset
+    %zv = load i32, *%pos
+    %zin = slt i32 %zv, %len
+    br %zin, @zone_chk, @validate
+  @zone_chk:
+    %zp = gep i8, *%s, %zv
+    %zc = load i8, *%zp
+    %isZ = eq i8 %zc, 90
+    %isz = eq i8 %zc, 122
+    %iszulu = or i1 %isZ, %isz
+    br %iszulu, @zone_utc, @chk_sign
+  @zone_utc:
+    %zv1 = add i32 %zv, 1
+    store i32 %zv1, *%pos
+    jmp @validate
+  @chk_sign:
+    %isplus = eq i8 %zc, 43
+    %isminus = eq i8 %zc, 45
+    %issgn = or i1 %isplus, %isminus
+    br %issgn, @zone_off, @fail
+  @zone_off:
+    %sign = let i32
+    br %isplus, @sign_plus, @sign_minus
+  @sign_plus:
+    store i32 1, *%sign
+    jmp @zone_read
+  @sign_minus:
+    store i32 -1, *%sign
+    jmp @zone_read
+  @zone_read:
+    %zv2 = load i32, *%pos
+    %z1 = add i32 %zv2, 1
+    %oh = call @_time_rd2(%s, %len, %z1)
+    %z2 = add i32 %z1, 2
+    %zcolon = call @_time_char(%s, %len, %z2, 58)
+    %z3 = add i32 %z2, 1
+    %om = call @_time_rd2(%s, %len, %z3)
+    %ohok = sge i32 %oh, 0
+    %comok = sge i32 %zcolon, 0
+    %omok = sge i32 %om, 0
+    %zok1 = and i1 %ohok, %comok
+    %zok = and i1 %zok1, %omok
+    br %zok, @zone_range, @fail
+  @zone_range:
+    %ohhi = sle i32 %oh, 23
+    %omhi = sle i32 %om, 59
+    %rok = and i1 %ohhi, %omhi
+    br %rok, @zone_apply, @fail
+  @zone_apply:
+    %mins = mul i32 %oh, 60
+    %mtot = add i32 %mins, %om
+    %sg = load i32, *%sign
+    %secs = mul i32 %mtot, 60
+    %osigned = mul i32 %sg, %secs
+    store i32 %osigned, *%offset
+    %z4 = add i32 %z3, 2
+    store i32 %z4, *%pos
+    jmp @validate
+  @validate:
+    %pv2 = load i32, *%pos
+    %atend = eq i32 %pv2, %len
+    br %atend, @range_chk, @fail
+  @range_chk:
+    %mo_lo = sge i32 %mo, 1
+    %mo_hi = sle i32 %mo, 12
+    %mo_ok = and i1 %mo_lo, %mo_hi
+    %d_lo = sge i32 %d, 1
+    %hh_hi = sle i32 %hh, 23
+    %mi_hi = sle i32 %mi, 59
+    %ss_hi = sle i32 %ss, 59
+    %r1 = and i1 %mo_ok, %d_lo
+    %r2 = and i1 %hh_hi, %mi_hi
+    %r3 = and i1 %ss_hi, %r2
+    %rok2 = and i1 %r1, %r3
+    br %rok2, @day_chk, @fail
+  @day_chk:
+    %y64 = sext i32 %y to i64
+    %mo64 = sext i32 %mo to i64
+    %mdays = call @_time_month_days(%y64, %mo64)
+    %d_hi = sle i32 %d, %mdays
+    br %d_hi, @compute, @fail
+  @compute:
+    %d64 = sext i32 %d to i64
+    %days = call @_time_days_from_civil(%y64, %mo64, %d64)
+    %days86400 = mul i64 %days, 86400
+    %hh64 = sext i32 %hh to i64
+    %mi64 = sext i32 %mi to i64
+    %ss64 = sext i32 %ss to i64
+    %t1 = mul i64 %hh64, 3600
+    %t2 = mul i64 %mi64, 60
+    %t3 = add i64 %t1, %t2
+    %t4 = add i64 %t3, %ss64
+    %local = add i64 %days86400, %t4
+    %offv = load i32, *%offset
+    %off64 = sext i32 %offv to i64
+    %utc = sub i64 %local, %off64
+    %ms1 = mul i64 %utc, 1000
+    %mv3 = load i32, *%milli
+    %m64 = sext i32 %mv3 to i64
+    %ms = add i64 %ms1, %m64
+    store i64 %ms, *%out_ms
+    ret i32 0
+  @fail:
+    ret i32 -1
+}

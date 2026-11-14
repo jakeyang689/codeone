@@ -1,0 +1,38 @@
+// Minimal RSA-2048 benchmark (mod_pow only)
+extern @printf(fmt: *i8, ...) -> i32
+extern @std_crypto_rsa_bn_zero(r: *i32, limbs: i32) -> void
+extern @std_crypto_rsa_bn_random(r: *i32, limbs: i32) -> void
+extern @std_crypto_rsa_bn_mod_pow(r: *i32, base: *i32, exp: *i32, exp_limbs: i32, m: *i32, limbs: i32) -> void
+
+fun @main() -> i32 {
+  @e:
+    call @printf("Generating random RSA params...\n")
+    %n = let [i32, 64]
+    %base = let [i32, 64]
+    %exp = let [i32, 64]
+    %result = let [i32, 64]
+    %np = gep i32, *%n, 0
+    %bp = gep i32, *%base, 0
+    %ep = gep i32, *%exp, 0
+    %rp = gep i32, *%result, 0
+    call @std_crypto_rsa_bn_random(%np, 64)
+    call @std_crypto_rsa_bn_random(%bp, 64)
+    call @std_crypto_rsa_bn_zero(%rp, 64)
+    store i32 65537, *%ep
+    call @printf("Running mod_pow (e=65537, 10 iterations)...\n")
+    %ci = let i32
+    store i32 0, *%ci
+    jmp @c
+  @c:
+    %civ = load i32, *%ci
+    %more = slt i32 %civ, 10
+    br %more, @b, @d
+  @b:
+    call @std_crypto_rsa_bn_mod_pow(%rp, %bp, %ep, 1, %np, 64)
+    %nxt = add i32 %civ, 1
+    store i32 %nxt, *%ci
+    jmp @c
+  @d:
+    call @printf("Done.\n")
+    ret i32 0
+}

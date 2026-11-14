@@ -1,0 +1,53 @@
+// Thread creation.
+//
+// The language has no function pointers, so every thread runs the
+// application-provided entry point:
+//
+//   fun @thread_run(task_id: i32, arg: *i8) -> i32
+//
+// Dispatch on task_id inside @thread_run to run different bodies. Spawned
+// threads receive the same arg pointer that was passed to std_thread_spawn.
+
+extern @c1_thread_create(task_id: i32, arg: *i8) -> *i8
+extern @c1_thread_join(t: *i8) -> i32
+extern @c1_thread_detach(t: *i8) -> i32
+
+extern @thread_run(task_id: i32, arg: *i8) -> i32
+
+// Must match c1_task in platform/thread.c.
+struct @_ThreadTask {
+  @task_id: i32,
+  @arg: *i8
+}
+
+// Platform trampoline entry point; do not call directly.
+fun @c1_thread_entry(task: *i8) -> i32 {
+  @entry:
+    %tid_p = field @_ThreadTask, *%task, 0
+    %tid = load i32, *%tid_p
+    %arg_p = field @_ThreadTask, *%task, 1
+    %arg = load *i8, *%arg_p
+    %r = call @thread_run(%tid, %arg)
+    ret i32 0
+}
+
+// Start a thread. Returns an opaque handle, or null on failure.
+fun @std_thread_spawn(task_id: i32, arg: *i8) -> *i8 {
+  @entry:
+    %t = call @c1_thread_create(%task_id, %arg)
+    ret *i8 %t
+}
+
+// Wait for a thread to finish and free its handle.
+fun @std_thread_join(t: *i8) -> i32 {
+  @entry:
+    %r = call @c1_thread_join(%t)
+    ret i32 %r
+}
+
+// Detach a thread and free its handle; it cannot be joined afterwards.
+fun @std_thread_detach(t: *i8) -> i32 {
+  @entry:
+    %r = call @c1_thread_detach(%t)
+    ret i32 %r
+}

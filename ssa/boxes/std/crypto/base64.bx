@@ -1,0 +1,327 @@
+// Base64 encoding utilities (RFC 4648)
+// Encodes binary data to base64 text, and decodes base64 text to binary.
+
+const @_b64_chars: [i8, 65] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+
+// Encode binary data to base64 null-terminated string.
+// out must have space for ((in_len + 2) / 3) * 4 + 1 bytes.
+fun @std_crypto_b64_encode(out: *i8, data: *i8, in_len: i32) -> void {
+  @entry:
+    %iptr = let i32
+    %optr = let i32
+    store i32 0, *%iptr
+    store i32 0, *%optr
+    jmp @b64_cond
+
+  @b64_cond:
+    %i = load i32, *%iptr
+    %rem = slt i32 %i, %in_len
+    br %rem, @b64_read, @b64_nul
+
+  @b64_read:
+    %iv = load i32, *%iptr
+    // Read 3 bytes (or fewer at end)
+    %p0 = gep i8, *%data, %iv
+    %b0 = load i8, *%p0
+    %z0 = zext i8 %b0 to i32
+    %iv1 = add i32 %iv, 1
+    %have_1 = slt i32 %iv1, %in_len
+    br %have_1, @b64_b1, @b64_l1
+
+  @b64_b1:
+    %p1 = gep i8, *%data, %iv1
+    %b1 = load i8, *%p1
+    %z1 = zext i8 %b1 to i32
+    %iv2 = add i32 %iv1, 1
+    %have_2 = slt i32 %iv2, %in_len
+    br %have_2, @b64_b2, @b64_l2
+
+  @b64_b2:
+    // 3 bytes → 4 chars
+    %p2 = gep i8, *%data, %iv2
+    %b2 = load i8, *%p2
+    %z2 = zext i8 %b2 to i32
+    %tri = shl i32 %z0, 16
+    %t2 = shl i32 %z1, 8
+    %tri2 = or i32 %tri, %t2
+    %tri3 = or i32 %tri2, %z2
+    %b64_c0 = lshr i32 %tri3, 18
+    %b64_c1 = and i32 %tri3, 0x3F000
+    %b64_c1s = lshr i32 %b64_c1, 12
+    %b64_c2 = and i32 %tri3, 0xFC0
+    %b64_c2s = lshr i32 %b64_c2, 6
+    %b64_c3 = and i32 %tri3, 0x3F
+    // Emit
+    %o = load i32, *%optr
+    // c0
+    %ch0 = gep i8, *@_b64_chars, %b64_c0
+    %ch0v = load i8, *%ch0
+    %op0 = gep i8, *%out, %o
+    store i8 %ch0v, *%op0
+    // c1
+    %ch1 = gep i8, *@_b64_chars, %b64_c1s
+    %ch1v = load i8, *%ch1
+    %o1 = add i32 %o, 1
+    %op1 = gep i8, *%out, %o1
+    store i8 %ch1v, *%op1
+    // c2
+    %ch2 = gep i8, *@_b64_chars, %b64_c2s
+    %ch2v = load i8, *%ch2
+    %o2 = add i32 %o, 2
+    %op2 = gep i8, *%out, %o2
+    store i8 %ch2v, *%op2
+    // c3
+    %ch3 = gep i8, *@_b64_chars, %b64_c3
+    %ch3v = load i8, *%ch3
+    %o3 = add i32 %o, 3
+    %op3 = gep i8, *%out, %o3
+    store i8 %ch3v, *%op3
+    %o4 = add i32 %o, 4
+    store i32 %o4, *%optr
+    %iv3 = add i32 %iv, 3
+    store i32 %iv3, *%iptr
+    jmp @b64_cond
+
+  @b64_l2:
+    // 2 bytes → 3 chars + '='
+    %tri_l2 = shl i32 %z0, 16
+    %t_l2 = shl i32 %z1, 8
+    %tri_l2x = or i32 %tri_l2, %t_l2
+    %b64_l2_c0 = lshr i32 %tri_l2x, 18
+    %b64_l2_c1 = and i32 %tri_l2x, 0x3F000
+    %b64_l2_c1s = lshr i32 %b64_l2_c1, 12
+    %b64_l2_c2 = and i32 %tri_l2x, 0xFC0
+    %b64_l2_c2s = lshr i32 %b64_l2_c2, 6
+    %o_v = load i32, *%optr
+    // c0
+    %lch0 = gep i8, *@_b64_chars, %b64_l2_c0
+    %lch0v = load i8, *%lch0
+    %lop0 = gep i8, *%out, %o_v
+    store i8 %lch0v, *%lop0
+    // c1
+    %lch1 = gep i8, *@_b64_chars, %b64_l2_c1s
+    %lch1v = load i8, *%lch1
+    %lo1 = add i32 %o_v, 1
+    %lop1 = gep i8, *%out, %lo1
+    store i8 %lch1v, *%lop1
+    // c2
+    %lch2 = gep i8, *@_b64_chars, %b64_l2_c2s
+    %lch2v = load i8, *%lch2
+    %lo2 = add i32 %o_v, 2
+    %lop2 = gep i8, *%out, %lo2
+    store i8 %lch2v, *%lop2
+    // '='
+    %lo3 = add i32 %o_v, 3
+    %lop3 = gep i8, *%out, %lo3
+    store i8 61, *%lop3
+    %lo4 = add i32 %o_v, 4
+    store i32 %lo4, *%optr
+    store i32 %in_len, *%iptr
+    jmp @b64_cond
+
+  @b64_l1:
+    // 1 byte → 2 chars + '=='
+    %b64_l1_c0 = lshr i32 %z0, 2
+    %b64_l1_c1 = and i32 %z0, 3
+    %b64_l1_c1s = shl i32 %b64_l1_c1, 4
+    %o_v2 = load i32, *%optr
+    // c0
+    %l1ch0 = gep i8, *@_b64_chars, %b64_l1_c0
+    %l1ch0v = load i8, *%l1ch0
+    %l1op0 = gep i8, *%out, %o_v2
+    store i8 %l1ch0v, *%l1op0
+    // c1
+    %l1ch1 = gep i8, *@_b64_chars, %b64_l1_c1s
+    %l1ch1v = load i8, *%l1ch1
+    %l1o1 = add i32 %o_v2, 1
+    %l1op1 = gep i8, *%out, %l1o1
+    store i8 %l1ch1v, *%l1op1
+    // '='
+    %l1o2 = add i32 %o_v2, 2
+    %l1op2 = gep i8, *%out, %l1o2
+    store i8 61, *%l1op2
+    %l1o3 = add i32 %o_v2, 3
+    %l1op3 = gep i8, *%out, %l1o3
+    store i8 61, *%l1op3
+    %l1o4 = add i32 %o_v2, 4
+    store i32 %l1o4, *%optr
+    store i32 %in_len, *%iptr
+    jmp @b64_cond
+
+  @b64_nul:
+    // Null-terminate
+    %o_end = load i32, *%optr
+    %nulp = gep i8, *%out, %o_end
+    store i8 0, *%nulp
+    ret void
+}
+
+// Map one base64 character to 0-63, or -1 when it is not part of the
+// standard alphabet ('=' is handled separately).
+fun @_b64_val(c: i32) -> i32 {
+  @entry:
+    %geA = sge i32 %c, 65
+    %leZ = sle i32 %c, 90
+    %isU = and i1 %geA, %leZ
+    br %isU, @upper, @lower_chk
+  @upper:
+    %u = sub i32 %c, 65
+    ret i32 %u
+  @lower_chk:
+    %gea = sge i32 %c, 97
+    %lez = sle i32 %c, 122
+    %isL = and i1 %gea, %lez
+    br %isL, @lower, @digit_chk
+  @lower:
+    %l = sub i32 %c, 71
+    ret i32 %l
+  @digit_chk:
+    %ge0 = sge i32 %c, 48
+    %le9 = sle i32 %c, 57
+    %isD = and i1 %ge0, %le9
+    br %isD, @digit, @sym_chk
+  @digit:
+    %d = add i32 %c, 4
+    ret i32 %d
+  @sym_chk:
+    %isplus = eq i32 %c, 43
+    br %isplus, @plus, @slash_chk
+  @plus:
+    ret i32 62
+  @slash_chk:
+    %isslash = eq i32 %c, 47
+    br %isslash, @slash, @bad
+  @slash:
+    ret i32 63
+  @bad:
+    ret i32 -1
+}
+
+// Decode standard base64 (RFC 4648) into out. Whitespace is ignored so that
+// PEM bodies can be decoded directly. On success writes the byte count to
+// out_len and returns 0; returns -1 for invalid input or when out is too small.
+fun @std_crypto_b64_decode(src: *i8, src_len: i32, out: *i8,
+                           out_cap: i32, out_len: *i32) -> i32 {
+  @entry:
+    %neg1 = slt i32 %src_len, 0
+    %neg2 = slt i32 %out_cap, 0
+    %bad0 = or i1 %neg1, %neg2
+    br %bad0, @fail, @init
+  @init:
+    %acc = let i32
+    %bits = let i32
+    %o = let i32
+    %i = let i32
+    %pad = let i32
+    store i32 0, *%acc
+    store i32 0, *%bits
+    store i32 0, *%o
+    store i32 0, *%i
+    store i32 0, *%pad
+    jmp @loop
+  @loop:
+    %iv = load i32, *%i
+    %more = slt i32 %iv, %src_len
+    br %more, @one, @done
+  @one:
+    %p = gep i8, *%src, %iv
+    %c8 = load i8, *%p
+    %c = zext i8 %c8 to i32
+    %ws1 = eq i32 %c, 32
+    %ws2 = eq i32 %c, 9
+    %ws3 = eq i32 %c, 10
+    %ws4 = eq i32 %c, 13
+    %w1 = or i1 %ws1, %ws2
+    %w2 = or i1 %ws3, %ws4
+    %isws = or i1 %w1, %w2
+    br %isws, @skip, @chkpad
+  @chkpad:
+    %iseq = eq i32 %c, 61
+    br %iseq, @pad_one, @data
+  @pad_one:
+    %pv = load i32, *%pad
+    %pn = add i32 %pv, 1
+    store i32 %pn, *%pad
+    %toomany = sgt i32 %pn, 2
+    br %toomany, @fail, @skip
+  @data:
+    %pv2 = load i32, *%pad
+    %haspad = ne i32 %pv2, 0
+    br %haspad, @fail, @val
+  @val:
+    %v = call @_b64_val(%c)
+    %vneg = slt i32 %v, 0
+    br %vneg, @fail, @acc
+  @acc:
+    %a = load i32, *%acc
+    %sh = shl i32 %a, 6
+    %a2 = or i32 %sh, %v
+    store i32 %a2, *%acc
+    %b = load i32, *%bits
+    %b6 = add i32 %b, 6
+    store i32 %b6, *%bits
+    jmp @emit
+  @emit:
+    %bn = load i32, *%bits
+    %enough = sge i32 %bn, 8
+    br %enough, @outb, @skip
+  @outb:
+    %ov = load i32, *%o
+    %fits = slt i32 %ov, %out_cap
+    br %fits, @store, @fail
+  @store:
+    %bv = load i32, *%bits
+    %shift = sub i32 %bv, 8
+    %av = load i32, *%acc
+    %bytev = lshr i32 %av, %shift
+    %masked = and i32 %bytev, 255
+    %b8 = trunc i32 %masked to i8
+    %p2 = gep i8, *%out, %ov
+    store i8 %b8, *%p2
+    %on = add i32 %ov, 1
+    store i32 %on, *%o
+    %one = shl i32 1, %shift
+    %mask = sub i32 %one, 1
+    %am = and i32 %av, %mask
+    store i32 %am, *%acc
+    store i32 %shift, *%bits
+    jmp @emit
+  @skip:
+    %iv2 = load i32, *%i
+    %n = add i32 %iv2, 1
+    store i32 %n, *%i
+    jmp @loop
+  @done:
+    %pv3 = load i32, *%pad
+    %bv3 = load i32, *%bits
+    %av3 = load i32, *%acc
+    %p0 = eq i32 %pv3, 0
+    %b0 = eq i32 %bv3, 0
+    %a0 = eq i32 %av3, 0
+    %k0 = and i1 %p0, %b0
+    %k0all = and i1 %k0, %a0
+    br %k0all, @success, @chk1
+  @chk1:
+    %p1 = eq i32 %pv3, 1
+    %b1 = eq i32 %bv3, 2
+    %k1 = and i1 %p1, %b1
+    br %k1, @z1, @chk2
+  @z1:
+    %a1 = eq i32 %av3, 0
+    br %a1, @success, @fail
+  @chk2:
+    %p2v = eq i32 %pv3, 2
+    %b2 = eq i32 %bv3, 4
+    %k2 = and i1 %p2v, %b2
+    br %k2, @z2, @fail
+  @z2:
+    %a2v = eq i32 %av3, 0
+    br %a2v, @success, @fail
+  @success:
+    %of = load i32, *%o
+    store i32 %of, *%out_len
+    ret i32 0
+  @fail:
+    store i32 0, *%out_len
+    ret i32 -1
+}

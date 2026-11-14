@@ -1,0 +1,186 @@
+// Bounds and robustness tests for base-library fixes:
+//   - memops memmove in both overlap directions, memchr, memcmp
+//   - bn_from_bytes must not write past its output limbs
+//   - asn1 must reject malformed lengths instead of walking backwards
+
+extern @printf(fmt: *i8, ...) -> i32
+extern @memcmp(a: *i8, b: *i8, n: i64) -> i32
+
+extern @std_mem_memops_copy(dst: *i8, src: *i8, n: i32) -> void
+extern @std_mem_memops_set(s: *i8, c: i8, n: i32) -> void
+extern @std_mem_memops_move(dst: *i8, src: *i8, n: i32) -> void
+extern @std_mem_memops_cmp(s1: *i8, s2: *i8, n: i32) -> i32
+extern @std_mem_memops_chr(s: *i8, c: i8, n: i32) -> *i8
+
+extern @std_crypto_rsa_bn_from_bytes(r: *i32, bytes: *i8, byte_len: i32,
+                                     limbs: i32) -> void
+extern @std_crypto_rsa_bn_mod_pow(r: *i32, base: *i32, exp: *i32,
+                                  exp_limbs: i32, m: *i32, limbs: i32) -> void
+extern @std_crypto_rsa_bn_mod_pow_mont(r: *i32, base: *i32, exp: *i32,
+                                       exp_limbs: i32, n: *i32,
+                                       limbs: i32) -> void
+
+extern @asn1_read_integer(buf: *i8, off: *i32, bytes: *i8,
+                          byte_len: *i32) -> i1
+extern @asn1_find_in_seq(buf: *i8, len: i32, target_tag: i8, out_off: *i32,
+                         out_len: *i32) -> i1
+
+const @HEX: [i8, 17] = "0123456789ABCDEF"
+const @EXP1: [i8, 17] = "456789AB89ABCDEF"
+const @EXP2: [i8, 17] = "012301234567CDEF"
+
+fun @main() -> i32 {
+  @entry:
+    %buf = let [i8, 16]
+    %bufp = gep i8, *%buf, 0
+    %hexp = gep i8, *@HEX, 0
+
+    // --- memmove with dst < src (left shift) ---
+    call @std_mem_memops_copy(%bufp, %hexp, 16)
+    %src1 = gep i8, *%buf, 4
+    call @std_mem_memops_move(%bufp, %src1, 8)
+    %e1 = gep i8, *@EXP1, 0
+    %d1 = call @memcmp(%bufp, %e1, 16)
+    %d1_ok = eq i32 %d1, 0
+    br %d1_ok, @t2, @fail
+
+  // --- memmove with dst > src (right shift) ---
+  @t2:
+    call @std_mem_memops_copy(%bufp, %hexp, 16)
+    %dst2 = gep i8, *%buf, 4
+    call @std_mem_memops_move(%dst2, %bufp, 8)
+    %e2 = gep i8, *@EXP2, 0
+    %d2 = call @memcmp(%bufp, %e2, 16)
+    %d2_ok = eq i32 %d2, 0
+    br %d2_ok, @t3, @fail
+
+  // --- memchr hit and miss ---
+  @t3:
+    %p3 = call @std_mem_memops_chr(%bufp, 'C', 16)
+    %p3_null = eq *i8 %p3, null
+    br %p3_null, @fail, @t3b
+  @t3b:
+    %c3 = load i8, *%p3
+    %c3_ok = eq i8 %c3, 'C'
+    br %c3_ok, @t4, @fail
+  @t4:
+    %p4 = call @std_mem_memops_chr(%bufp, 'z', 16)
+    %p4_null = eq *i8 %p4, null
+    br %p4_null, @t5, @fail
+
+  // --- memcmp equal ---
+  @t5:
+    %e2b = gep i8, *@EXP2, 0
+    %c5 = call @std_mem_memops_cmp(%bufp, %e2b, 16)
+    %c5_ok = eq i32 %c5, 0
+    br %c5_ok, @t6, @fail
+
+  // --- bn_from_bytes must stop at the destination size ---
+  @t6:
+    %limbs = let [i32, 4]
+    %limbs_p = gep i32, *%limbs, 0
+    %canary0 = gep i32, *%limbs, 2
+    store i32 0x7F7F7F7F, *%canary0
+    %canary1 = gep i32, *%limbs, 3
+    store i32 0x2A2A2A2A, *%canary1
+    %src16 = let [i8, 16]
+    %src16p = gep i8, *%src16, 0
+    call @std_mem_memops_set(%src16p, 0xAA, 8)
+    %src_lo = gep i8, *%src16, 8
+    call @std_mem_memops_set(%src_lo, 0x11, 8)
+    call @std_crypto_rsa_bn_from_bytes(%limbs_p, %src16p, 16, 2)
+    %l0 = load i32, *%limbs_p
+    %l1p = gep i32, *%limbs, 1
+    %l1 = load i32, *%l1p
+    %c0 = load i32, *%canary0
+    %c1 = load i32, *%canary1
+    %l0_ok = eq i32 %l0, 0x11111111
+    %l1_ok = eq i32 %l1, 0x11111111
+    %c0_ok = eq i32 %c0, 0x7F7F7F7F
+    %c1_ok = eq i32 %c1, 0x2A2A2A2A
+    %b1 = and i1 %l0_ok, %l1_ok
+    %b2 = and i1 %b1, %c0_ok
+    %b3 = and i1 %b2, %c1_ok
+    br %b3, @t7, @fail
+
+  // --- asn1 rejects a malformed length ---
+  @t7:
+    %asn = let [i8, 8]
+    %asnp = gep i8, *%asn, 0
+    store i8 0x85, *%asnp
+    %off = let i32
+    store i32 0, *%off
+    %ib = let [i8, 32]
+    %ibp = gep i8, *%ib, 0
+    %ilen = let i32
+    %ilenp = gep i32, *%ilen, 0
+    %ok7 = call @asn1_read_integer(%asnp, %off, %ibp, %ilenp)
+    %ok7_i = zext i1 %ok7 to i32
+    %ok7_ok = eq i32 %ok7_i, 0
+    br %ok7_ok, @t8, @fail
+
+  @t8:
+    // Tag at 0, malformed length (5 length bytes) at 1.
+    %asn2 = let [i8, 8]
+    %asn2p = gep i8, *%asn2, 0
+    store i8 0x30, *%asn2p
+    %asn2_len = gep i8, *%asn2, 1
+    store i8 0x85, *%asn2_len
+    %o_off = let i32
+    %o_offp = gep i32, *%o_off, 0
+    %o_len = let i32
+    %o_lenp = gep i32, *%o_len, 0
+    %found = call @asn1_find_in_seq(%asn2p, 8, 0x02, %o_offp, %o_lenp)
+    %found_i = zext i1 %found to i32
+    %found_ok = eq i32 %found_i, 0
+    br %found_ok, @t9, @fail
+
+  // --- mod_pow with a zero top limb (exponent trimming) ---
+  @t9:
+    %base = let [i32, 1]
+    store i32 2, *%base
+    %exp2 = let [i32, 2]
+    store i32 10, *%exp2
+    %exp_hi = gep i32, *%exp2, 1
+    store i32 0, *%exp_hi
+    %mod = let [i32, 1]
+    store i32 97, *%mod
+    %res = let [i32, 1]
+    call @std_crypto_rsa_bn_mod_pow(%res, %base, %exp2, 2, %mod, 1)
+    %v9 = load i32, *%res
+    %ok9 = eq i32 %v9, 54
+    br %ok9, @t10, @fail
+
+  // --- a non-zero top limb must still be used: 2^(2^32+10) mod 97 = 93 ---
+  @t10:
+    store i32 1, *%exp_hi
+    call @std_crypto_rsa_bn_mod_pow(%res, %base, %exp2, 2, %mod, 1)
+    %v10 = load i32, *%res
+    %ok10 = eq i32 %v10, 93
+    br %ok10, @t11, @fail
+
+  // --- exponent 0 yields 1 ---
+  @t11:
+    store i32 0, *%exp2
+    store i32 0, *%exp_hi
+    call @std_crypto_rsa_bn_mod_pow(%res, %base, %exp2, 2, %mod, 1)
+    %v11 = load i32, *%res
+    %ok11 = eq i32 %v11, 1
+    br %ok11, @t12, @fail
+
+  // --- same through the Montgomery path ---
+  @t12:
+    store i32 10, *%exp2
+    store i32 0, *%exp_hi
+    call @std_crypto_rsa_bn_mod_pow_mont(%res, %base, %exp2, 2, %mod, 1)
+    %v12 = load i32, *%res
+    %ok12 = eq i32 %v12, 54
+    br %ok12, @pass, @fail
+
+  @pass:
+    call @printf("PASS std_bounds\n")
+    ret i32 0
+  @fail:
+    call @printf("FAIL std_bounds\n")
+    ret i32 1
+}

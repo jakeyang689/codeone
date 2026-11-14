@@ -1,0 +1,26 @@
+// Dynamic memory allocation wrappers
+
+extern @malloc(size: i64) -> *i8
+extern @free(ptr: *i8) -> void
+extern @calloc(count: i64, size: i64) -> *i8
+
+fun @std_mem_alloc_malloc(size: i32) -> *i8 {
+  @entry:
+    %sz = sext i32 %size to i64
+    %p = call @malloc(%sz)
+    ret *i8 %p
+}
+
+fun @std_mem_alloc_free(ptr: *i8) -> void {
+  @entry:
+    call @free(%ptr)
+    ret void
+}
+
+fun @std_mem_alloc_calloc(count: i32, elem_size: i32) -> *i8 {
+  @entry:
+    %c = sext i32 %count to i64
+    %s = sext i32 %elem_size to i64
+    %p = call @calloc(%c, %s)
+    ret *i8 %p
+}

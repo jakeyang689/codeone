@@ -1,0 +1,189 @@
+// HMAC test program (RFC 2202 / RFC 4231 test vectors)
+extern @putchar(c: i32) -> i32
+extern @std_crypto_hmac_md5(key: *i8, key_len: i32, data: *i8, data_len: i32, mac: *i8) -> void
+extern @std_crypto_hmac_sha1(key: *i8, key_len: i32, data: *i8, data_len: i32, mac: *i8) -> void
+extern @std_crypto_hmac_sha256(key: *i8, key_len: i32, data: *i8, data_len: i32, mac: *i8) -> void
+extern @std_crypto_hmac_sha384(key: *i8, key_len: i32, data: *i8, data_len: i32, mac: *i8) -> void
+extern @std_crypto_hmac_sha512(key: *i8, key_len: i32, data: *i8, data_len: i32, mac: *i8) -> void
+
+// RFC 2202 Test Case 2 for MD5
+// Key = "Jefe" (4 bytes), data = "what do ya want for nothing?" (28 bytes)
+const @key_jefe: [i8, 4] = [ 0x4a, 0x65, 0x66, 0x65 ]  // "Jefe"
+const @data_msg: [i8, 28] = [
+  0x77, 0x68, 0x61, 0x74, 0x20, 0x64, 0x6f, 0x20, 0x79, 0x61,
+  0x20, 0x77, 0x61, 0x6e, 0x74, 0x20, 0x66, 0x6f, 0x72, 0x20,
+  0x6e, 0x6f, 0x74, 0x68, 0x69, 0x6e, 0x67, 0x3f
+]
+
+const @expected_md5: [i8, 16] = [
+  0x75, 0x0c, 0x78, 0x3e, 0x6a, 0xb0, 0xb5, 0x03,
+  0xea, 0xa8, 0x6e, 0x31, 0x0a, 0x5d, 0xb7, 0x38
+]
+
+const @expected_sha1: [i8, 20] = [
+  0xef, 0xfc, 0xdf, 0x6a, 0xe5, 0xeb, 0x2f, 0xa2, 0xd2, 0x74,
+  0x16, 0xd5, 0xf1, 0x84, 0xdf, 0x9c, 0x25, 0x9a, 0x7c, 0x79
+]
+
+const @expected_sha256: [i8, 32] = [
+  0x5b, 0xdc, 0xc1, 0x46, 0xbf, 0x60, 0x75, 0x4e, 0x6a, 0x04,
+  0x24, 0x26, 0x08, 0x95, 0x75, 0xc7, 0x5a, 0x00, 0x3f, 0x08,
+  0x9d, 0x27, 0x39, 0x83, 0x9d, 0xec, 0x58, 0xb9, 0x64, 0xec,
+  0x38, 0x43
+]
+
+const @expected_sha384: [i8, 48] = [
+  0xaf, 0x45, 0xd2, 0xe3, 0x76, 0x48, 0x40, 0x31, 0x61, 0x7f,
+  0x78, 0xd2, 0xb5, 0x8a, 0x6b, 0x1b, 0x9c, 0x7e, 0xf4, 0x64,
+  0xf5, 0xa0, 0x1b, 0x47, 0xe4, 0x2e, 0xc3, 0x73, 0x63, 0x22,
+  0x44, 0x5e, 0x8e, 0x22, 0x40, 0xca, 0x5e, 0x69, 0xe2, 0xc7,
+  0x8b, 0x32, 0x39, 0xec, 0xfa, 0xb2, 0x16, 0x49
+]
+
+const @expected_sha512: [i8, 64] = [
+  0x16, 0x4b, 0x7a, 0x7b, 0xfc, 0xf8, 0x19, 0xe2, 0xe3, 0x95,
+  0xfb, 0xe7, 0x3b, 0x56, 0xe0, 0xa3, 0x87, 0xbd, 0x64, 0x22,
+  0x2e, 0x83, 0x1f, 0xd6, 0x10, 0x27, 0x0c, 0xd7, 0xea, 0x25,
+  0x05, 0x54, 0x97, 0x58, 0xbf, 0x75, 0xc0, 0x5a, 0x99, 0x4a,
+  0x6d, 0x03, 0x4f, 0x65, 0xf8, 0xf0, 0xe6, 0xfd, 0xca, 0xea,
+  0xb1, 0xa3, 0x4d, 0x4a, 0x6b, 0x4b, 0x63, 0x6e, 0x07, 0x0a,
+  0x38, 0xbc, 0xe7, 0x37
+]
+
+// Compare 2 arrays, return 1 if equal
+fun @cmp(a: *i8, b: *i8, len: i32) -> i1 {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @cmp_cond
+  @cmp_cond:
+    %iv = load i32, *%i
+    %more = slt i32 %iv, %len
+    br %more, @cmp_body, @cmp_eq
+  @cmp_body:
+    %iv2 = load i32, *%i
+    %ap = gep i8, *%a, %iv2
+    %av = load i8, *%ap
+    %bp = gep i8, *%b, %iv2
+    %bv = load i8, *%bp
+    %ok = eq i8 %av, %bv
+    br %ok, @cmp_next, @cmp_neq
+  @cmp_next:
+    %iv3 = load i32, *%i
+    %next = add i32 %iv3, 1
+    store i32 %next, *%i
+    jmp @cmp_cond
+  @cmp_eq: ret i1 1
+  @cmp_neq: ret i1 0
+}
+
+fun @main() -> i32 {
+  @entry:
+    // Test HMAC-MD5
+    %mac_md5 = let [i8, 16]
+    %mac_md5_p = gep i8, *%mac_md5, 0
+    call @std_crypto_hmac_md5(@key_jefe, 4, @data_msg, 28, %mac_md5_p)
+    %md5_ok = call @cmp(%mac_md5_p, @expected_md5, 16)
+    br %md5_ok, @test_sha1, @fail_md5
+
+  @test_sha1:
+    %mac_sha1 = let [i8, 20]
+    %mac_sha1_p = gep i8, *%mac_sha1, 0
+    call @std_crypto_hmac_sha1(@key_jefe, 4, @data_msg, 28, %mac_sha1_p)
+    %sha1_ok = call @cmp(%mac_sha1_p, @expected_sha1, 20)
+    br %sha1_ok, @test_sha256, @fail_sha1
+
+  @test_sha256:
+    %mac_sha = let [i8, 32]
+    %mac_sha_p = gep i8, *%mac_sha, 0
+    call @std_crypto_hmac_sha256(@key_jefe, 4, @data_msg, 28, %mac_sha_p)
+    %sha_ok = call @cmp(%mac_sha_p, @expected_sha256, 32)
+    br %sha_ok, @test_sha384, @fail_sha
+
+  @test_sha384:
+    %mac_sha384 = let [i8, 48]
+    %mac_sha384_p = gep i8, *%mac_sha384, 0
+    call @std_crypto_hmac_sha384(@key_jefe, 4, @data_msg, 28, %mac_sha384_p)
+    %sha384_ok = call @cmp(%mac_sha384_p, @expected_sha384, 48)
+    br %sha384_ok, @test_sha512, @fail_sha384
+
+  @test_sha512:
+    %mac_sha512 = let [i8, 64]
+    %mac_sha512_p = gep i8, *%mac_sha512, 0
+    call @std_crypto_hmac_sha512(@key_jefe, 4, @data_msg, 28, %mac_sha512_p)
+    %sha512_ok = call @cmp(%mac_sha512_p, @expected_sha512, 64)
+    br %sha512_ok, @pass, @fail_sha512
+
+  @pass:
+    call @putchar(80)
+    call @putchar(65)
+    call @putchar(83)
+    call @putchar(83)
+    call @putchar(10)
+    ret i32 0
+
+  @fail_md5:
+    call @putchar(77)
+    call @putchar(68)
+    call @putchar(53)
+    call @putchar(70)
+    call @putchar(65)
+    call @putchar(73)
+    call @putchar(76)
+    call @putchar(10)
+    ret i32 1
+
+  @fail_sha1:
+    call @putchar(83)
+    call @putchar(72)
+    call @putchar(65)
+    call @putchar(49)
+    call @putchar(70)
+    call @putchar(65)
+    call @putchar(73)
+    call @putchar(76)
+    call @putchar(10)
+    ret i32 2
+
+  @fail_sha:
+    call @putchar(83)
+    call @putchar(72)
+    call @putchar(65)
+    call @putchar(50)
+    call @putchar(53)
+    call @putchar(54)
+    call @putchar(70)
+    call @putchar(65)
+    call @putchar(73)
+    call @putchar(76)
+    call @putchar(10)
+    ret i32 3
+
+  @fail_sha384:
+    call @putchar(83)
+    call @putchar(72)
+    call @putchar(65)
+    call @putchar(51)
+    call @putchar(56)
+    call @putchar(52)
+    call @putchar(70)
+    call @putchar(65)
+    call @putchar(73)
+    call @putchar(76)
+    call @putchar(10)
+    ret i32 4
+
+  @fail_sha512:
+    call @putchar(83)
+    call @putchar(72)
+    call @putchar(65)
+    call @putchar(53)
+    call @putchar(49)
+    call @putchar(50)
+    call @putchar(70)
+    call @putchar(65)
+    call @putchar(73)
+    call @putchar(76)
+    call @putchar(10)
+    ret i32 5
+}

@@ -1,0 +1,156 @@
+// X.509 chain validation tests. Prints "PASS x509_chain" on success.
+
+extern @printf(fmt: *i8, ...) -> i32
+extern @std_io_file_open_read(path: *i8) -> *i8
+extern @std_io_file_read_all(fp: *i8, buf: *i8, cap: i32) -> i32
+extern @std_io_file_close(fp: *i8) -> i32
+extern @std_crypto_pem_read_cert(pem: *i8, pem_len: i32, out: *i8, out_cap: i32,
+                                 out_len: *i32) -> i32
+extern @std_crypto_pem_read_certs(pem: *i8, pem_len: i32, pool: *i8, pool_cap: i32,
+                                  offsets: *i32, lens: *i32, max_count: i32) -> i32
+extern @x509_verify_chain(leaf: *i8, leaf_len: i32,
+                          pool: *i8, offsets: *i32, lens: *i32, count: i32,
+                          roots: *i8, root_offsets: *i32, root_lens: *i32,
+                          root_count: i32, now_secs: i64, limbs: i32) -> i32
+extern @std_time_now_ms() -> i64
+
+const @LEAF_PATH = "certs/chain_leaf.pem"
+const @INTER_PATH = "certs/chain_inter.pem"
+const @ROOT_PATH = "certs/chain_root.pem"
+const @BUNDLE_PATH = "certs/chain_bundle.pem"
+
+// Read the first certificate from a PEM file into DER.
+fun @read_cert(path: *i8, out: *i8, out_cap: i32, out_len: *i32) -> i32 {
+  @entry:
+    %pem = let [i8, 16384]
+    %pp = gep i8, *%pem, 0
+    %fp = call @std_io_file_open_read(%path)
+    %fn = eq *i8 %fp, null
+    br %fn, @fail, @read
+  @read:
+    %n = call @std_io_file_read_all(%fp, %pp, 16383)
+    call @std_io_file_close(%fp)
+    %nok = sgt i32 %n, 0
+    br %nok, @dec, @fail
+  @dec:
+    %r = call @std_crypto_pem_read_cert(%pp, %n, %out, %out_cap, %out_len)
+    ret i32 %r
+  @fail:
+    ret i32 -1
+}
+
+fun @main() -> i32 {
+  @entry:
+    %id = let i32
+    store i32 0, *%id
+    %leaf = let [i8, 4096]
+    %inter = let [i8, 4096]
+    %root = let [i8, 4096]
+    %leaflen = let i32
+    %interlen = let i32
+    %rootlen = let i32
+    %lp = gep i8, *%leaf, 0
+    %ip = gep i8, *%inter, 0
+    %rp = gep i8, *%root, 0
+    %llp = gep i32, *%leaflen, 0
+    %ilp = gep i32, *%interlen, 0
+    %rlp = gep i32, *%rootlen, 0
+
+    // case 1: load the three certificates
+    store i32 1, *%id
+    %k1 = gep i8, *@LEAF_PATH, 0
+    %r1 = call @read_cert(%k1, %lp, 4096, %llp)
+    %ok1 = eq i32 %r1, 0
+    br %ok1, @c1, @fail
+  @c1:
+    %k2 = gep i8, *@INTER_PATH, 0
+    %r2v = call @read_cert(%k2, %ip, 4096, %ilp)
+    %ok2 = eq i32 %r2v, 0
+    br %ok2, @c2, @fail
+  @c2:
+    %k3 = gep i8, *@ROOT_PATH, 0
+    %r3v = call @read_cert(%k3, %rp, 4096, %rlp)
+    %ok3 = eq i32 %r3v, 0
+    br %ok3, @c3, @fail
+
+    // case 2: leaf <- intermediate <- root
+  @c3:
+    store i32 2, *%id
+    %ms = call @std_time_now_ms()
+    %now = div i64 %ms, 1000
+    %offs = let [i32, 4]
+    %lens = let [i32, 4]
+    %rofs = let [i32, 4]
+    %rlens = let [i32, 4]
+    %offs0 = gep i32, *%offs, 0
+    store i32 0, *%offs0
+    %lens0 = gep i32, *%lens, 0
+    %ilv = load i32, *%ilp
+    store i32 %ilv, *%lens0
+    %rofs0 = gep i32, *%rofs, 0
+    store i32 0, *%rofs0
+    %rlens0 = gep i32, *%rlens, 0
+    %rlv = load i32, *%rlp
+    store i32 %rlv, *%rlens0
+    %llv = load i32, *%llp
+    %v1 = call @x509_verify_chain(%lp, %llv, %ip, %offs0, %lens0, 1,
+                                  %rp, %rofs0, %rlens0, 1, %now, 64)
+    %v1ok = eq i32 %v1, 0
+    br %v1ok, @c4, @fail
+
+    // case 3: intermediate missing
+  @c4:
+    store i32 3, *%id
+    %v2 = call @x509_verify_chain(%lp, %llv, %ip, %offs0, %lens0, 0,
+                                  %rp, %rofs0, %rlens0, 1, %now, 64)
+    %v2ok = eq i32 %v2, -3
+    br %v2ok, @c5, @fail
+
+    // case 4: empty trust store
+  @c5:
+    store i32 4, *%id
+    %v3 = call @x509_verify_chain(%lp, %llv, %ip, %offs0, %lens0, 1,
+                                  %rp, %rofs0, %rlens0, 0, %now, 64)
+    %v3ok = eq i32 %v3, -3
+    br %v3ok, @c6, @fail
+
+    // case 5: 100 years later, every certificate is expired
+  @c6:
+    store i32 5, *%id
+    %now2 = add i64 %now, 3153600000
+    %v4 = call @x509_verify_chain(%lp, %llv, %ip, %offs0, %lens0, 1,
+                                  %rp, %rofs0, %rlens0, 1, %now2, 64)
+    %v4ok = eq i32 %v4, -2
+    br %v4ok, @c7, @fail
+
+    // case 6: decode a PEM bundle of three certificates
+  @c7:
+    store i32 6, *%id
+    %pem = let [i8, 16384]
+    %ppp = gep i8, *%pem, 0
+    %bp = gep i8, *@BUNDLE_PATH, 0
+    %bfp = call @std_io_file_open_read(%bp)
+    %bfn = eq *i8 %bfp, null
+    br %bfn, @fail, @bread
+  @bread:
+    %bn = call @std_io_file_read_all(%bfp, %ppp, 16383)
+    call @std_io_file_close(%bfp)
+    %pool = let [i8, 16384]
+    %poolp = gep i8, *%pool, 0
+    %boffs = let [i32, 8]
+    %blens = let [i32, 8]
+    %boffsp = gep i32, *%boffs, 0
+    %blensp = gep i32, *%blens, 0
+    %cnt = call @std_crypto_pem_read_certs(%ppp, %bn, %poolp, 16384,
+                                           %boffsp, %blensp, 8)
+    %cntok = eq i32 %cnt, 3
+    br %cntok, @pass, @fail
+
+  @pass:
+    call @printf("PASS x509_chain\n")
+    ret i32 0
+  @fail:
+    %fid = load i32, *%id
+    call @printf("FAIL x509_chain at case %d\n", %fid)
+    ret i32 1
+}

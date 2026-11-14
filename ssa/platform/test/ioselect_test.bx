@@ -1,0 +1,102 @@
+// I/O multiplexing test: server + ioselect
+
+extern @putchar(c: i32) -> i32
+
+extern @c1_socket_create(domain: i32, type: i32, protocol: i32) -> i32
+extern @c1_socket_bind(fd: i32, port: i32) -> i32
+extern @c1_socket_listen(fd: i32, backlog: i32) -> i32
+extern @c1_socket_accept(fd: i32) -> i32
+extern @c1_socket_connect_loopback(fd: i32, port: i32) -> i32
+extern @c1_socket_send(fd: i32, buf: *i8, len: i32) -> i32
+extern @c1_socket_recv(fd: i32, buf: *i8, len: i32) -> i32
+extern @c1_socket_close(fd: i32) -> i32
+
+extern @c1_ioselect_create() -> i32
+extern @c1_ioselect_add(ioselect_fd: i32, fd: i32, events: i32, ident: i32) -> i32
+extern @c1_ioselect_wait_flat(ioselect_fd: i32, buf: *i8, max: i32, timeout_ms: i32) -> i32
+extern @c1_ioselect_close(ioselect_fd: i32) -> i32
+
+const @msg: [i8, 5] = [104, 101, 108, 108, 111]
+
+fun @main() -> i32 {
+  @entry:
+    %sfd = call @c1_socket_create(2, 1, 0)
+    %neg = slt i32 %sfd, 0
+    br %neg, @fail, @s_bind
+  @s_bind:
+    %r1 = call @c1_socket_bind(%sfd, 9993)
+    %b1 = slt i32 %r1, 0
+    br %b1, @fail, @s_listen
+  @s_listen:
+    %r2 = call @c1_socket_listen(%sfd, 5)
+    %b2 = slt i32 %r2, 0
+    br %b2, @fail, @create_io
+  @create_io:
+    %kq = call @c1_ioselect_create()
+    %b3 = slt i32 %kq, 0
+    br %b3, @fail, @add_io
+  @add_io:
+    %ra = call @c1_ioselect_add(%kq, %sfd, 1, 1)
+    %b4 = slt i32 %ra, 0
+    br %b4, @fail, @cli_create
+  @cli_create:
+    %cfd = call @c1_socket_create(2, 1, 0)
+    %b5 = slt i32 %cfd, 0
+    br %b5, @fail, @connect
+  @connect:
+    %cr = call @c1_socket_connect_loopback(%cfd, 9993)
+    %b6 = slt i32 %cr, 0
+    br %b6, @fail, @wait_ev
+  @wait_ev:
+    %evbuf = let [i8, 48]
+    %ebp = gep i8, *%evbuf, 0
+    %n = call @c1_ioselect_wait_flat(%kq, %ebp, 4, 5000)
+    %b7 = slt i32 %n, 0
+    br %b7, @fail, @check_ev
+  @check_ev:
+    %got = slt i32 0, %n
+    br %got, @do_accept, @fail
+  @do_accept:
+    %acfd = call @c1_socket_accept(%sfd)
+    %b8 = slt i32 %acfd, 0
+    br %b8, @fail, @do_send
+  @do_send:
+    %mp = gep i8, *@msg, 0
+    %sent = call @c1_socket_send(%cfd, %mp, 5)
+    %b9 = slt i32 %sent, 0
+    br %b9, @fail, @do_recv
+  @do_recv:
+    %buf = let [i8, 256]
+    %bp = gep i8, *%buf, 0
+    %rn = call @c1_socket_recv(%acfd, %bp, 256)
+    %b10 = slt i32 %rn, 0
+    br %b10, @fail, @verify
+  @verify:
+    %lo = eq i32 %rn, 5
+    br %lo, @v_h, @fail
+  @v_h:
+    %p0 = gep i8, *%buf, 0
+    %c0 = load i8, *%p0
+    %c0i = zext i8 %c0 to i32
+    %h = eq i32 %c0i, 104
+    br %h, @v_o, @fail
+  @v_o:
+    %p4 = gep i8, *%buf, 4
+    %c4 = load i8, *%p4
+    %c4i = zext i8 %c4 to i32
+    %o = eq i32 %c4i, 111
+    br %o, @pass, @fail
+  @pass:
+    call @c1_socket_close(%acfd)
+    call @c1_socket_close(%cfd)
+    call @c1_ioselect_close(%kq)
+    call @c1_socket_close(%sfd)
+    call @putchar(79)
+    call @putchar(75)
+    call @putchar(10)
+    ret i32 0
+  @fail:
+    call @putchar(33)
+    call @putchar(10)
+    ret i32 1
+}

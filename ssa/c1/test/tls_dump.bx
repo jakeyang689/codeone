@@ -1,0 +1,162 @@
+// Dump server response after sending CH
+extern @printf(fmt: *i8, ...) -> i32
+extern @memset(s: *i8, c: i32, n: i64) -> *i8
+extern @putchar(c: i32) -> i32
+extern @memcpy(dst: *i8, src: *i8, n: i64) -> *i8
+extern @c1_random_buf(buf: *i8, len: i64) -> void
+
+extern @net_socket_tcp() -> i32
+extern @net_socket_connect(fd: i32, port: i32) -> i32
+extern @net_socket_send(fd: i32, buf: *i8, len: i32) -> i32
+extern @net_socket_recv(fd: i32, buf: *i8, len: i32) -> i32
+extern @net_socket_close(fd: i32) -> i32
+
+// Build raw ClientHello with extensions
+fun @build_ch(buf: *i8) -> i32 {
+  @e:
+    store i8 3, *%buf
+    %p2 = gep i8, *%buf, 1
+    store i8 3, *%p2
+    %rand = gep i8, *%buf, 2
+    %n32 = let i64
+    store i64 32, *%n32
+    %n32v = load i64, *%n32
+    call @c1_random_buf(%rand, %n32v)
+    %sid = gep i8, *%buf, 34
+    store i8 0, *%sid
+    %cs_len = gep i8, *%buf, 35
+    store i8 0, *%cs_len
+    %cs_len2 = gep i8, *%buf, 36
+    store i8 2, *%cs_len2
+    %cs = gep i8, *%buf, 37
+    store i8 0, *%cs
+    %cs2 = gep i8, *%buf, 38
+    store i8 0x9C, *%cs2
+    %comp_len = gep i8, *%buf, 39
+    store i8 1, *%comp_len
+    %comp = gep i8, *%buf, 40
+    store i8 0, *%comp
+    // Extensions length=12
+    %ext_len = gep i8, *%buf, 41
+    store i8 0, *%ext_len
+    %ext_len2 = gep i8, *%buf, 42
+    store i8 12, *%ext_len2
+    // sig_algs
+    %sa_t = gep i8, *%buf, 43
+    store i8 0, *%sa_t
+    %sa_t2 = gep i8, *%buf, 44
+    store i8 0x0D, *%sa_t2
+    %sa_l = gep i8, *%buf, 45
+    store i8 0, *%sa_l
+    %sa_l2 = gep i8, *%buf, 46
+    store i8 4, *%sa_l2
+    %sa_ll = gep i8, *%buf, 47
+    store i8 0, *%sa_ll
+    %sa_ll2 = gep i8, *%buf, 48
+    store i8 2, *%sa_ll2
+    %sa_a = gep i8, *%buf, 49
+    store i8 0x04, *%sa_a
+    %sa_a2 = gep i8, *%buf, 50
+    store i8 0x01, *%sa_a2
+    // ems
+    %ems_t = gep i8, *%buf, 51
+    store i8 0, *%ems_t
+    %ems_t2 = gep i8, *%buf, 52
+    store i8 0x17, *%ems_t2
+    %ems_l = gep i8, *%buf, 53
+    store i8 0, *%ems_l
+    %ems_l2 = gep i8, *%buf, 54
+    store i8 0, *%ems_l2
+    ret i32 55
+}
+
+fun @hexdump(buf: *i8, n: i32) -> void {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @loop
+  @loop:
+    %iv = load i32, *%i
+    %more = slt i32 %iv, %n
+    br %more, @body, @done
+  @body:
+    %iv2 = load i32, *%i
+    %p = gep i8, *%buf, %iv2
+    %b = load i8, *%p
+    %bi = zext i8 %b to i32
+    call @printf("%02x ", %bi)
+    %next = add i32 %iv2, 1
+    store i32 %next, *%i
+    %mod = and i32 %next, 15
+    %nl = eq i32 %mod, 0
+    br %nl, @brk, @loop
+  @brk:
+    call @printf("\n")
+    jmp @loop
+  @done:
+    call @printf("\n")
+    ret void
+}
+
+fun @main() -> i32 {
+  @entry:
+    call @printf("Connect...\n")
+    %fd = call @net_socket_tcp()
+    %cr = call @net_socket_connect(%fd, 4433)
+    %ok = eq i32 %cr, 0
+    br %ok, @build, @fail
+
+  @build:
+    // Build and send ClientHello record
+    %body = let [i8, 256]
+    %bodyp = gep i8, *%body, 0
+    %body_len = call @build_ch(%bodyp)
+
+    %rec = let [i8, 512]
+    %recp = gep i8, *%rec, 0
+    store i8 22, *%recp
+    %v1 = gep i8, *%recp, 1
+    store i8 3, *%v1
+    %v2 = gep i8, *%recp, 2
+    store i8 3, *%v2
+    %rec_len_p = gep i8, *%recp, 3
+    store i8 0, *%rec_len_p
+    %rec_len_p2 = gep i8, *%recp, 4
+    %total_rec_body = add i32 %body_len, 4
+    %rec_len_lo = trunc i32 %total_rec_body to i8
+    store i8 %rec_len_lo, *%rec_len_p2
+    // Handshake header
+    %hs = gep i8, *%recp, 5
+    store i8 1, *%hs
+    %hs_len = gep i8, *%recp, 6
+    store i8 0, *%hs_len
+    %hs_len2 = gep i8, *%recp, 7
+    store i8 0, *%hs_len2
+    %hs_len3 = gep i8, *%recp, 8
+    %blen8 = trunc i32 %body_len to i8
+    store i8 %blen8, *%hs_len3
+    // Copy body
+    %hs_body = gep i8, *%recp, 9
+    %blen64 = sext i32 %body_len to i64
+    call @memcpy(%hs_body, %bodyp, %blen64)
+    // Total to send
+    %total = add i32 %total_rec_body, 5
+    call @printf("Sending %d bytes CH...\n", %total)
+    %sent = call @net_socket_send(%fd, %recp, %total)
+    call @printf("Sent %d\n", %sent)
+
+    // Read response(s)
+    %resp = let [i8, 4096]
+    %respp = gep i8, *%resp, 0
+    call @memset(%respp, 0, 4096)
+    %got = call @net_socket_recv(%fd, %respp, 4096)
+    call @printf("Received %d bytes:\n", %got)
+    call @hexdump(%respp, %got)
+
+    call @net_socket_close(%fd)
+    ret i32 0
+
+  @fail:
+    call @printf("FAIL\n")
+    ret i32 1
+}

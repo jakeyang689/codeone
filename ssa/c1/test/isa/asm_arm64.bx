@@ -1,0 +1,81 @@
+// asm semantics on aarch64: register output, multiple inputs, immediate
+// input, void asm with memory and register clobbers, named operands,
+// alignstack, and a multi-output struct result.
+
+extern @printf(fmt: *i8, ...) -> i32
+
+struct @Pair64 { @lo: i64, @hi: i64 }
+
+fun @main() -> i32 {
+  @entry:
+    %id = let i32
+    store i32 0, *%id
+    %slot = let i64
+    %pair_slot = let @Pair64
+
+    // --- one output, one input ---
+    %a = add i64 20, 22
+    %r1 = asm att i64, "add $0, $1, $1", "=r,r", i64 %a
+    %c1 = eq i64 %r1, 84
+    br %c1, @t1, @fail
+
+  @t1:
+    store i32 1, *%id
+    // --- two inputs, numbered after the output ---
+    %r2 = asm att i64, "sub $0, $1, $2", "=r,r,r", i64 100, i64 58
+    %c2 = eq i64 %r2, 42
+    br %c2, @t2, @fail
+
+  @t2:
+    store i32 2, *%id
+    // --- immediate input ---
+    %r3 = asm att i64, "mov $0, $1", "=r,i", i64 7
+    %c3 = eq i64 %r3, 7
+    br %c3, @t3, @fail
+
+  @t3:
+    store i32 3, *%id
+    // --- void asm: memory clobber and register clobber ---
+    asm att void, "dmb ish", "~{memory}"
+    asm att void, "nop", "~{x9}"
+    // The barrier must not disturb the value computed before it.
+    store i64 %r3, *%slot
+    %r4 = load i64, *%slot
+    %c4 = eq i64 %r4, 7
+    br %c4, @t4, @fail
+
+  @t4:
+    store i32 4, *%id
+    // --- named operands: ${name} resolves to the input's position ---
+    %lhs = add i64 20, 0
+    %rhs = add i64 22, 0
+    %r5 = asm att i64, "add $0, ${lhs}, ${rhs}", "=r,r,r", i64 %lhs, i64 %rhs
+    %c5 = eq i64 %r5, 42
+    br %c5, @t5, @fail
+
+  @t5:
+    store i32 5, *%id
+    // --- alignstack flag ---
+    asm alignstack att void, "nop", ""
+    // --- two outputs returned through a struct ---
+    // Early-clobber outputs: both are written before the input is last read,
+    // and plain "=r" would let the allocator give $0, $1, and $2 one register.
+    %p = asm att @Pair64, "add $0, $2, #1\nadd $1, $2, #2", "=&r,=&r,r", i64 40
+    store @Pair64 %p, *%pair_slot
+    %lo_p = field @Pair64, *%pair_slot, 0
+    %hi_p = field @Pair64, *%pair_slot, 1
+    %lo = load i64, *%lo_p
+    %hi = load i64, *%hi_p
+    %clo = eq i64 %lo, 41
+    %chi = eq i64 %hi, 42
+    %cboth = and i1 %clo, %chi
+    br %cboth, @pass, @fail
+
+  @pass:
+    call @printf("PASS isa/asm_arm64\n")
+    ret i32 0
+  @fail:
+    %n = load i32, *%id
+    call @printf("FAIL isa/asm_arm64 at case %d\n", %n)
+    ret i32 1
+}

@@ -1,0 +1,162 @@
+// Test AES-256
+extern @printf(fmt: *i8, ...) -> i32
+extern @std_crypto_aes256_encrypt(plaintext: *i8, key: *i8, ciphertext: *i8) -> void
+extern @std_crypto_aes256_decrypt(ciphertext: *i8, key: *i8, plaintext: *i8) -> void
+extern @std_crypto_aes256_cbc_encrypt(plaintext: *i8, plaintext_len: i32, key: *i8, iv: *i8, ciphertext: *i8) -> void
+extern @std_crypto_aes256_cbc_decrypt(ciphertext: *i8, ciphertext_len: i32, key: *i8, iv: *i8, plaintext: *i8) -> void
+extern @std_crypto_aes256_gcm_encrypt(plaintext: *i8, pt_len: i32, aad: *i8, aad_len: i32, key: *i8, iv: *i8, ciphertext: *i8, tag: *i8) -> i32
+extern @std_crypto_aes256_gcm_decrypt(ciphertext: *i8, ct_len: i32, aad: *i8, aad_len: i32, key: *i8, iv: *i8, tag: *i8, plaintext: *i8) -> i32
+
+const @key: [i8, 32] = [
+  0x60, 0x3d, 0xeb, 0x10, 0x15, 0xca, 0x71, 0xbe,
+  0x2b, 0x73, 0xae, 0xf0, 0x85, 0x7d, 0x77, 0x81,
+  0x1f, 0x35, 0x2c, 0x07, 0x3b, 0x61, 0x08, 0xd7,
+  0x2d, 0x98, 0x10, 0xa3, 0x09, 0x14, 0xdf, 0xf4
+]
+const @pt1: [i8, 16] = [
+  0x6b, 0xc1, 0xbe, 0xe2, 0x2e, 0x40, 0x9f, 0x96,
+  0xe9, 0x3d, 0x7e, 0x11, 0x73, 0x93, 0x17, 0x2a
+]
+const @expected_ecb: [i8, 16] = [
+  0xf3, 0xee, 0xd1, 0xbd, 0xb5, 0xd2, 0xa0, 0x3c,
+  0x06, 0x4b, 0x5a, 0x7e, 0x3d, 0xb1, 0x81, 0xf8
+]
+const @iv: [i8, 16] = [
+  0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+  0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f
+]
+const @pt4: [i8, 64] = [
+  0x6b, 0xc1, 0xbe, 0xe2, 0x2e, 0x40, 0x9f, 0x96,
+  0xe9, 0x3d, 0x7e, 0x11, 0x73, 0x93, 0x17, 0x2a,
+  0xae, 0x2d, 0x8a, 0x57, 0x1e, 0x03, 0xac, 0x9c,
+  0x9e, 0xb7, 0x6f, 0xac, 0x45, 0xaf, 0x8e, 0x51,
+  0x30, 0xc8, 0x1c, 0x46, 0xa3, 0x5c, 0xe4, 0x11,
+  0xe5, 0xfb, 0xc1, 0x91, 0x1e, 0xaa, 0x01, 0x94,
+  0xc1, 0xb3, 0x25, 0x6a, 0x8e, 0x5c, 0x4a, 0x9b,
+  0xe5, 0xd5, 0x70, 0xfb, 0x2d, 0x6b, 0xf8, 0x23
+]
+const @gcm_iv: [i8, 12] = [
+  0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+  0x08, 0x09, 0x0a, 0x0b
+]
+
+fun @hex(data: *i8, len: i32) -> void {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @lpc
+  @lpc:
+    %iv = load i32, *%i
+    %dn = slt i32 %iv, %len
+    br %dn, @lpb, @lpd
+  @lpb:
+    %iv2 = load i32, *%i
+    %p = gep i8, *%data, %iv2
+    %b = load i8, *%p
+    %bz = zext i8 %b to i32
+    call @printf("%02x", %bz)
+    %nx = add i32 %iv2, 1
+    store i32 %nx, *%i
+    jmp @lpc
+  @lpd:
+    ret void
+}
+
+fun @cmp(a: *i8, b: *i8, len: i32) -> i1 {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @cc
+  @cc:
+    %iv = load i32, *%i
+    %mr = slt i32 %iv, %len
+    br %mr, @cb, @ce
+  @cb:
+    %iv2 = load i32, *%i
+    %ap = gep i8, *%a, %iv2
+    %av = load i8, *%ap
+    %bp = gep i8, *%b, %iv2
+    %bv = load i8, *%bp
+    %ok = eq i8 %av, %bv
+    br %ok, @cn, @cq
+  @cn:
+    %iv3 = load i32, *%i
+    %nx = add i32 %iv3, 1
+    store i32 %nx, *%i
+    jmp @cc
+  @ce:
+    ret i1 1
+  @cq:
+    ret i1 0
+}
+
+fun @main() -> i32 {
+  @entry:
+    %kp = gep i8, *@key, 0
+    %ct = let [i8, 16]
+    %ct_p = gep i8, *%ct, 0
+    call @std_crypto_aes256_encrypt(@pt1, %kp, %ct_p)
+    %ok = call @cmp(%ct_p, @expected_ecb, 16)
+    call @printf("ECB: ")
+    call @hex(%ct_p, 16)
+    call @printf("\n")
+    br %ok, @td, @fe
+
+  @td:
+    %pt2 = let [i8, 16]
+    %pt2_p = gep i8, *%pt2, 0
+    call @std_crypto_aes256_decrypt(%ct_p, %kp, %pt2_p)
+    %dok = call @cmp(%pt2_p, @pt1, 16)
+    call @printf("DCR: %d\n", %dok)
+    br %dok, @tc, @fd
+
+  @tc:
+    %ivp = gep i8, *@iv, 0
+    %pt4p = gep i8, *@pt4, 0
+    %ct4 = let [i8, 64]
+    %ct4_p = gep i8, *%ct4, 0
+    call @std_crypto_aes256_cbc_encrypt(%pt4p, 64, %kp, %ivp, %ct4_p)
+    call @printf("CBC: ")
+    call @hex(%ct4_p, 64)
+    call @printf("\n")
+    %pt4b = let [i8, 64]
+    %pt4b_p = gep i8, *%pt4b, 0
+    call @std_crypto_aes256_cbc_decrypt(%ct4_p, 64, %kp, %ivp, %pt4b_p)
+    %cok = call @cmp(%pt4b_p, %pt4p, 64)
+    call @printf("CBC-D: %d\n", %cok)
+    br %cok, @tg, @fc
+
+  @tg:
+    %giv = gep i8, *@gcm_iv, 0
+    %tag = let [i8, 16]
+    %tag_p = gep i8, *%tag, 0
+    call @std_crypto_aes256_gcm_encrypt(%pt4p, 64, %pt4p, 0, %kp, %giv, %ct4_p, %tag_p)
+    call @printf("GCM-CT: ")
+    call @hex(%ct4_p, 64)
+    call @printf("\n")
+    call @printf("GCM-TG: ")
+    call @hex(%tag_p, 16)
+    call @printf("\n")
+    %dec = let [i8, 64]
+    %dec_p = gep i8, *%dec, 0
+    %gok = call @std_crypto_aes256_gcm_decrypt(%ct4_p, 64, %pt4p, 0, %kp, %giv, %tag_p, %dec_p)
+    %gpt = call @cmp(%dec_p, %pt4p, 64)
+    call @printf("GCM-D: %d,%d\n", %gpt, %gok)
+    br %gpt, @pa, @fg
+
+  @pa:
+    call @printf("PASS\n")
+    ret i32 0
+  @fe:
+    call @printf("FAIL ECB\n")
+    ret i32 1
+  @fd:
+    call @printf("FAIL DEC\n")
+    ret i32 2
+  @fc:
+    call @printf("FAIL CBC\n")
+    ret i32 3
+  @fg:
+    call @printf("FAIL GCM\n")
+    ret i32 4
+}

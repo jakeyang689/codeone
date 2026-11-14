@@ -1,0 +1,211 @@
+// TLS 1.3 record layer tests over a loopback socket pair.
+//
+//   - encrypt/decrypt round trip with an inner content type
+//   - middlebox-compatibility ChangeCipherSpec records are skipped
+//   - zero padding before the inner content type is stripped
+
+extern @printf(fmt: *i8, ...) -> i32
+extern @memcmp(a: *i8, b: *i8, n: i64) -> i32
+extern @memcpy(dst: *i8, src: *i8, n: i64) -> *i8
+extern @memset(s: *i8, c: i32, n: i64) -> *i8
+
+extern @net_socket_tcp() -> i32
+extern @net_socket_bind(fd: i32, port: i32) -> i32
+extern @net_socket_listen(fd: i32) -> i32
+extern @net_socket_accept(fd: i32) -> i32
+extern @net_socket_connect(fd: i32, port: i32) -> i32
+extern @net_socket_close(fd: i32) -> i32
+extern @net_socket_send(fd: i32, buf: *i8, len: i32) -> i32
+
+extern @tls13_record_encrypt(fd: i32, seq: *i64, write_key: *i8, write_iv: *i8,
+                             key_size: i32, typ: i8, data: *i8,
+                             len: i32) -> i32
+extern @tls13_record_decrypt(fd: i32, seq: *i64, write_key: *i8, write_iv: *i8,
+                             key_size: i32, buf: *i8, buf_cap: i32,
+                             out_typ: *i8, out_len: *i32) -> i32
+extern @tls13_build_nonce(nonce: *i8, write_iv: *i8, seq_num: i64) -> void
+extern @tls13_build_aad(aad: *i8, typ: i8, ver: i16, pt_len: i32) -> void
+extern @std_crypto_aes_gcm_encrypt(plaintext: *i8, pt_len: i32, aad: *i8,
+                                   aad_len: i32, key: *i8, iv: *i8,
+                                   ciphertext: *i8, tag: *i8) -> i32
+
+fun @main() -> i32 {
+  @entry:
+    %id = let i32
+    store i32 0, *%id
+    %srv = call @net_socket_tcp()
+    %srv_ok = sge i32 %srv, 0
+    br %srv_ok, @bind, @fail
+  @bind:
+    store i32 1, *%id
+    %b0 = call @net_socket_bind(%srv, 8796)
+    %b_ok = eq i32 %b0, 0
+    br %b_ok, @listen, @fail
+  @listen:
+    store i32 2, *%id
+    %l0 = call @net_socket_listen(%srv)
+    %l_ok = eq i32 %l0, 0
+    br %l_ok, @connect, @fail
+  @connect:
+    store i32 3, *%id
+    %cli = call @net_socket_tcp()
+    %c0 = call @net_socket_connect(%cli, 8796)
+    %c_ok = eq i32 %c0, 0
+    br %c_ok, @accept, @fail
+  @accept:
+    store i32 4, *%id
+    %sock = call @net_socket_accept(%srv)
+    %s_ok = sge i32 %sock, 0
+    br %s_ok, @setup, @fail
+  @setup:
+    store i32 5, *%id
+    %key = let [i8, 16]
+    %keyp = gep i8, *%key, 0
+    call @memset(%keyp, 0x2A, 16)
+    %iv = let [i8, 12]
+    %ivp = gep i8, *%iv, 0
+    call @memset(%ivp, 0x11, 12)
+    %seqw = let i64
+    store i64 0, *%seqw
+    %seqr = let i64
+    store i64 0, *%seqr
+    %buf = let [i8, 512]
+    %bufp = gep i8, *%buf, 0
+    %typ = let i8
+    %typp = gep i8, *%typ, 0
+    %olen = let i32
+    %olenp = gep i32, *%olen, 0
+
+    // --- plain round trip, inner type 22 (handshake) ---
+    %hello = let [i8, 5]
+    %hellop = gep i8, *%hello, 0
+    call @memcpy(%hellop, "hello", 5)
+    %e1 = call @tls13_record_encrypt(%cli, %seqw, %keyp, %ivp, 16, 22, %hellop, 5)
+    %e1_ok = eq i32 %e1, 0
+    br %e1_ok, @d1, @fail
+  @d1:
+    store i32 6, *%id
+    %d1r = call @tls13_record_decrypt(%sock, %seqr, %keyp, %ivp, 16, %bufp, 512, %typp, %olenp)
+    %d1_ok = eq i32 %d1r, 0
+    br %d1_ok, @d1chk, @fail
+  @d1chk:
+    %t1 = load i8, *%typp
+    %t1_ok = eq i8 %t1, 22
+    %l1 = load i32, *%olen
+    %l1_ok = eq i32 %l1, 5
+    %c1 = call @memcmp(%bufp, %hellop, 5)
+    %c1_ok = eq i32 %c1, 0
+    %k1a = and i1 %t1_ok, %l1_ok
+    %k1b = and i1 %k1a, %c1_ok
+    br %k1b, @ccs_send, @fail
+
+  // --- a ChangeCipherSpec record must be skipped ---
+  @ccs_send:
+    store i32 7, *%id
+    %ccs = let [i8, 6]
+    %ccsp = gep i8, *%ccs, 0
+    store i8 20, *%ccsp
+    %ccs1 = gep i8, *%ccs, 1
+    store i8 3, *%ccs1
+    %ccs2 = gep i8, *%ccs, 2
+    store i8 3, *%ccs2
+    %ccs3 = gep i8, *%ccs, 3
+    store i8 0, *%ccs3
+    %ccs4 = gep i8, *%ccs, 4
+    store i8 1, *%ccs4
+    %ccs5 = gep i8, *%ccs, 5
+    store i8 1, *%ccs5
+    call @net_socket_send(%cli, %ccsp, 6)
+    %word = let [i8, 4]
+    %wordp = gep i8, *%word, 0
+    call @memcpy(%wordp, "data", 4)
+    %e2 = call @tls13_record_encrypt(%cli, %seqw, %keyp, %ivp, 16, 23, %wordp, 4)
+    %e2_ok = eq i32 %e2, 0
+    br %e2_ok, @d2, @fail
+  @d2:
+    store i32 8, *%id
+    %d2r = call @tls13_record_decrypt(%sock, %seqr, %keyp, %ivp, 16, %bufp, 512, %typp, %olenp)
+    %d2_ok = eq i32 %d2r, 0
+    br %d2_ok, @d2chk, @fail
+  @d2chk:
+    %t2 = load i8, *%typp
+    %t2_ok = eq i8 %t2, 23
+    %l2 = load i32, *%olen
+    %l2_ok = eq i32 %l2, 4
+    %c2 = call @memcmp(%bufp, "data", 4)
+    %c2_ok = eq i32 %c2, 0
+    %k2a = and i1 %t2_ok, %l2_ok
+    %k2b = and i1 %k2a, %c2_ok
+    br %k2b, @pad_build, @fail
+
+  // --- padding before the inner content type is stripped ---
+  @pad_build:
+    store i32 9, *%id
+    // plaintext = "world" || type(22) || 0x00 0x00
+    %pt = let [i8, 16]
+    %ptp = gep i8, *%pt, 0
+    call @memcpy(%ptp, "world", 5)
+    %pt5 = gep i8, *%pt, 5
+    store i8 22, *%pt5
+    %pt6 = gep i8, *%pt, 6
+    store i8 0, *%pt6
+    %pt7 = gep i8, *%pt, 7
+    store i8 0, *%pt7
+    %nonce = let [i8, 12]
+    %noncep = gep i8, *%nonce, 0
+    %seqv = load i64, *%seqw
+    call @tls13_build_nonce(%noncep, %ivp, %seqv)
+    %aad = let [i8, 5]
+    %aadp = gep i8, *%aad, 0
+    call @tls13_build_aad(%aadp, 23, 771, 24)
+    %ctbuf = let [i8, 16]
+    %ctp = gep i8, *%ctbuf, 0
+    %tag = let [i8, 16]
+    %tagp = gep i8, *%tag, 0
+    call @std_crypto_aes_gcm_encrypt(%ptp, 8, %aadp, 5, %keyp, %noncep, %ctp, %tagp)
+    // record = header(5) || ciphertext(8) || tag(16)
+    %rec = let [i8, 32]
+    %recp = gep i8, *%rec, 0
+    store i8 23, *%recp
+    %r1 = gep i8, *%rec, 1
+    store i8 3, *%r1
+    %r2 = gep i8, *%rec, 2
+    store i8 3, *%r2
+    %r3 = gep i8, *%rec, 3
+    store i8 0, *%r3
+    %r4 = gep i8, *%rec, 4
+    store i8 24, *%r4
+    %rct = gep i8, *%rec, 5
+    call @memcpy(%rct, %ctp, 8)
+    %rtag = gep i8, *%rec, 13
+    call @memcpy(%rtag, %tagp, 16)
+    %sn = call @net_socket_send(%cli, %recp, 29)
+    %sn_ok = sgt i32 %sn, 0
+    br %sn_ok, @d3, @fail
+  @d3:
+    store i32 10, *%id
+    %d3r = call @tls13_record_decrypt(%sock, %seqr, %keyp, %ivp, 16, %bufp, 512, %typp, %olenp)
+    %d3_ok = eq i32 %d3r, 0
+    br %d3_ok, @d3chk, @fail
+  @d3chk:
+    %t3 = load i8, *%typp
+    %t3_ok = eq i8 %t3, 22
+    %l3 = load i32, *%olen
+    %l3_ok = eq i32 %l3, 5
+    %c3 = call @memcmp(%bufp, "world", 5)
+    %c3_ok = eq i32 %c3, 0
+    %k3a = and i1 %t3_ok, %l3_ok
+    %k3b = and i1 %k3a, %c3_ok
+    br %k3b, @pass, @fail
+
+  @pass:
+    call @net_socket_close(%cli)
+    call @net_socket_close(%sock)
+    call @net_socket_close(%srv)
+    call @printf("PASS tls13_record\n")
+    ret i32 0
+  @fail:
+    %cid = load i32, *%id
+    call @printf("FAIL tls13_record at case %d\n", %cid)
+    ret i32 1
+}

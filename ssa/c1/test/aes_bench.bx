@@ -1,0 +1,46 @@
+// AES-128-GCM Performance Benchmark
+// Measure with: time ./test/aes_bench
+extern @memset(s: *i8, c: i32, n: i64) -> *i8
+
+extern @std_crypto_aes_gcm_encrypt(pt: *i8, pt_len: i32, aad: *i8, aad_len: i32, key: *i8, iv: *i8, ct: *i8, tag: *i8) -> i32
+
+fun @main() -> i32 {
+  @e:
+    %key = let [i8, 128]
+    %iv = let [i8, 12]
+    %aad = let [i8, 13]
+    %pt = let [i8, 65536]
+    %ct = let [i8, 65536]
+    %tag = let [i8, 16]
+
+    %kp = gep i8, *%key, 0
+    %ivp = gep i8, *%iv, 0
+    %aadp = gep i8, *%aad, 0
+    %ptp = gep i8, *%pt, 0
+    %ctp = gep i8, *%ct, 0
+    %tagp = gep i8, *%tag, 0
+
+    call @memset(%kp, 0xAB, 128)
+    call @memset(%ivp, 0xCD, 12)
+    call @memset(%aadp, 0xEF, 13)
+    call @memset(%ptp, 0x42, 65536)
+
+    // Warmup
+    call @std_crypto_aes_gcm_encrypt(%ptp, 65536, %aadp, 13, %kp, %ivp, %ctp, %tagp)
+
+    // 1000 iterations
+    %ci = let i32
+    store i32 0, *%ci
+    jmp @cond
+  @cond:
+    %civ = load i32, *%ci
+    %more = slt i32 %civ, 1000
+    br %more, @body, @done
+  @body:
+    call @std_crypto_aes_gcm_encrypt(%ptp, 65536, %aadp, 13, %kp, %ivp, %ctp, %tagp)
+    %next = add i32 %civ, 1
+    store i32 %next, *%ci
+    jmp @cond
+  @done:
+    ret i32 0
+}

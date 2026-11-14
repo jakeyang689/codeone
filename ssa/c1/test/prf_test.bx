@@ -1,0 +1,69 @@
+// PRF known-answer test
+extern @putchar(c: i32) -> i32
+extern @memcpy(dst: *i8, src: *i8, n: i64) -> *i8
+
+extern @std_crypto_tls12_prf_sha256(secret: *i8, secret_len: i32,
+                                    seed: *i8, seed_len: i32,
+                                    out_len: i32, out: *i8) -> void
+
+const @key_v: [i8, 4] = [74, 101, 102, 101]  // "Jefe"
+const @data_v: [i8, 28] = [119,104,97,116,32,100,111,32,121,97,32,119,97,110,116,32,102,111,114,32,110,111,116,104,105,110,103,63]
+
+fun @hex_byte(b: i8) -> void {
+  @e:
+    %bi = zext i8 %b to i32
+    %hi = lshr i32 %bi, 4
+    %lo = and i32 %bi, 15
+    %hch = add i32 %hi, 48
+    %h_gt9 = sgt i32 %hi, 9
+    br %h_gt9, @h_adj, @h_w
+  @h_adj:
+    %hch2 = add i32 %hch, 39
+    jmp @h_w
+  @h_w:
+    %hch_v = phi [%hch, @e], [%hch2, @h_adj]
+    call @putchar(%hch_v)
+    %lch = add i32 %lo, 48
+    %l_gt9 = sgt i32 %lo, 9
+    br %l_gt9, @l_adj, @l_w
+  @l_adj:
+    %lch2 = add i32 %lch, 39
+    jmp @l_w
+  @l_w:
+    %lch_v = phi [%lch, @h_w], [%lch2, @l_adj]
+    call @putchar(%lch_v)
+    ret void
+}
+
+fun @hex_dump(p: *i8, n: i32) -> void {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @hd_cond
+  @hd_cond:
+    %iv = load i32, *%i
+    %more = slt i32 %iv, %n
+    br %more, @hd_body, @hd_done
+  @hd_body:
+    %iv2 = load i32, *%i
+    %bp = gep i8, *%p, %iv2
+    %b = load i8, *%bp
+    call @hex_byte(%b)
+    %next = add i32 %iv2, 1
+    store i32 %next, *%i
+    jmp @hd_cond
+  @hd_done:
+    ret void
+}
+
+fun @main() -> i32 {
+  @entry:
+    %kp = gep i8, *@key_v, 0
+    %dp = gep i8, *@data_v, 0
+    %out = let [i8, 32]
+    %out_p = gep i8, *%out, 0
+    call @std_crypto_tls12_prf_sha256(%kp, 4, %dp, 28, 32, %out_p)
+    call @hex_dump(%out_p, 32)
+    call @putchar(10)
+    ret i32 0
+}

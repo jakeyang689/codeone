@@ -1,0 +1,54 @@
+# macOS
+.DS_Store
+
+# Claude Code local settings (the shared team config is settings.json)
+.claude/settings.local.json
+
+# Release archives are uploaded to GitHub Releases, never committed
+/release/*.tar.*
+
+# Build artifacts
+/toolchain/
+/build/
+*.o
+*.a
+a.out
+*.cmap
+
+# Third-party sources: archives and extracted trees are prepared by
+# tools/setup-thirdparty.sh from the manifest
+/thirdparty/*
+!/thirdparty/packages.conf
+
+# Generated files: private keys, certificates and temp files — never commit
+*.key
+*.pub
+*.crt
+/ssa/c1/tmp_gen.txt
+/ssa/c1/rsa_key_hex.txt
+
+# ssa/c1: keep sources only, drop compiled binaries
+/ssa/c1/*
+!/ssa/c1/Makefile
+!/ssa/c1/*.c
+!/ssa/c1/*.h
+!/ssa/c1/*.sh
+!/ssa/c1/test/
+
+# ssa/c1/test: .bx/.c/.py/.sh are sources; files without an extension are
+# executables
+/ssa/c1/test/*
+!/ssa/c1/test/*.bx
+!/ssa/c1/test/*.c
+!/ssa/c1/test/*.py
+!/ssa/c1/test/*.sh
+!/ssa/c1/test/isa/
+!/ssa/c1/test/isa/*.bx
+!/ssa/c1/test/certs/
+!/ssa/c1/test/certs/*.der
+!/ssa/c1/test/certs/*.pem
+!/ssa/c1/test/certs/*.key
+
+# Test executables
+/ssa/test/test_ssa
+/ssa/test/codec_test/test_codec

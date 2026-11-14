@@ -1,0 +1,205 @@
+// TLS 1.2 PRF (Pseudo-Random Function) — RFC 5246 §5
+// P_hash(secret, seed) = HMAC_hash(secret, A(1) || seed) ||
+//                         HMAC_hash(secret, A(2) || seed) || ...
+// where A(0) = seed, A(i) = HMAC_hash(secret, A(i-1))
+//
+// Key derivations:
+//   master_secret = PRF(pre_master_secret, "master secret", ClientHello.random + ServerHello.random)[0..47]
+//   key_block     = PRF(master_secret, "key expansion", ServerRandom + ClientRandom)
+//   finished      = PRF(master_secret, label, SHA256(handshake_messages))[0..11]
+
+extern @memcpy(dst: *i8, src: *i8, n: i64) -> *i8
+extern @std_crypto_hmac_sha256(key: *i8, key_len: i32, data: *i8, data_len: i32, mac: *i8) -> void
+
+
+// ============================================================
+// P_SHA256 — TLS PRF using HMAC-SHA256
+// ============================================================
+// A(0) = seed
+// A(i) = HMAC-SHA256(secret, A(i-1))
+// output += HMAC-SHA256(secret, A(i) || seed)
+
+fun @std_crypto_tls12_prf_sha256(secret: *i8, secret_len: i32,
+                                 seed: *i8, seed_len: i32,
+                                 out_len: i32, out: *i8) -> void {
+  @entry:
+    %no_output = sle i32 %out_len, 0
+    br %no_output, @prf_done, @prf_init
+
+  @prf_init:
+    // a_prev stores A(i-1), initially A(0) = seed
+    %a_prev = let [i8, 256]
+    %a_prev_p = gep i8, *%a_prev, 0
+    %seed_len_64 = sext i32 %seed_len to i64
+    call @memcpy(%a_prev_p, %seed, %seed_len_64)
+
+    // a_prev_len tracks length of A(i-1) — starts at seed_len, becomes 32 after first iteration
+    %a_len = let i32
+    store i32 %seed_len, *%a_len
+
+    // a_current stores A(i) output from HMAC (always 32 bytes)
+    %a_current = let [i8, 32]
+    %a_current_p = gep i8, *%a_current, 0
+
+    // HMAC input buffer: A(i) || seed
+    %input = let [i8, 256]
+    %input_p = gep i8, *%input, 0
+
+    // Output state
+    %out_pos = let i32
+    store i32 0, *%out_pos
+    %remaining = let i32
+    store i32 %out_len, *%remaining
+    jmp @prf_loop
+
+  @prf_loop:
+    %rem = load i32, *%remaining
+    %has_more = sgt i32 %rem, 0
+    br %has_more, @prf_iter, @prf_done
+
+  @prf_iter:
+    // A(i) = HMAC-SHA256(secret, A(i-1))
+    %al = load i32, *%a_len
+    call @std_crypto_hmac_sha256(%secret, %secret_len, %a_prev_p, %al, %a_current_p)
+
+    // Build HMAC input: A_current (32 bytes) || seed (seed_len bytes)
+    %n32 = let i64
+    store i64 32, *%n32
+    %n32v = load i64, *%n32
+    call @memcpy(%input_p, %a_current_p, %n32v)
+    %seed_off = gep i8, *%input_p, 32
+    %seed_len_64b = sext i32 %seed_len to i64
+    call @memcpy(%seed_off, %seed, %seed_len_64b)
+
+    // HMAC-SHA256(secret, A_current || seed) -> block
+    %input_total = add i32 32, %seed_len
+    %block = let [i8, 32]
+    %block_p = gep i8, *%block, 0
+    call @std_crypto_hmac_sha256(%secret, %secret_len, %input_p, %input_total, %block_p)
+
+    // Copy output: min(32, remaining) bytes
+    %rem_v = load i32, *%remaining
+    %out_v = load i32, *%out_pos
+    %full = sge i32 %rem_v, 32
+    br %full, @copy_full, @copy_part
+
+  @copy_full:
+    %dst = gep i8, *%out, %out_v
+    call @memcpy(%dst, %block_p, %n32v)
+    %new_rem = sub i32 %rem_v, 32
+    %new_pos = add i32 %out_v, 32
+    store i32 %new_rem, *%remaining
+    store i32 %new_pos, *%out_pos
+
+    // a_prev = a_current, a_len = 32 for next iteration
+    call @memcpy(%a_prev_p, %a_current_p, %n32v)
+    store i32 32, *%a_len
+    jmp @prf_loop
+
+  @copy_part:
+    %rem_64 = sext i32 %rem_v to i64
+    %dst2 = gep i8, *%out, %out_v
+    call @memcpy(%dst2, %block_p, %rem_64)
+    store i32 0, *%remaining
+    jmp @prf_loop
+
+  @prf_done: ret void
+}
+
+
+// ============================================================
+// TLS 1.2 Master Secret Derivation
+// ============================================================
+// master_secret = PRF(pre_master_secret, "master secret", ClientHello.random + ServerHello.random)[0..47]
+
+fun @std_crypto_tls12_master_secret_sha256(pre_master: *i8, pre_master_len: i32,
+                                            client_random: *i8, server_random: *i8,
+                                            master_secret: *i8) -> void {
+  @entry:
+    // Build seed = client_random(32) || server_random(32)
+    %seed = let [i8, 64]
+    %seed_p = gep i8, *%seed, 0
+    %n32 = let i64
+    store i64 32, *%n32
+    %n32v = load i64, *%n32
+    call @memcpy(%seed_p, %client_random, %n32v)
+    %server_off = gep i8, *%seed_p, 32
+    call @memcpy(%server_off, %server_random, %n32v)
+
+    call @std_crypto_tls12_prf_sha256(%pre_master, %pre_master_len, %seed_p, 64, 48, %master_secret)
+    ret void
+}
+
+
+// ============================================================
+// TLS 1.2 Key Block Derivation
+// ============================================================
+// key_block = PRF(master_secret, "key expansion", ServerRandom + ClientRandom)
+// Cipher suite key block sizes:
+//   AES-128-GCM: 16 (client write key) + 16 (server write key) + 4 (client IV) + 4 (server IV) = 40
+//   AES-256-GCM: 32 + 32 + 4 + 4 = 72
+
+fun @std_crypto_tls12_key_block_sha256(master_secret: *i8,
+                                        server_random: *i8, client_random: *i8,
+                                        key_block_len: i32, key_block: *i8) -> void {
+  @entry:
+    // Build seed = server_random(32) || client_random(32)
+    %seed = let [i8, 64]
+    %seed_p = gep i8, *%seed, 0
+    %n32 = let i64
+    store i64 32, *%n32
+    %n32v = load i64, *%n32
+    call @memcpy(%seed_p, %server_random, %n32v)
+    %client_off = gep i8, *%seed_p, 32
+    call @memcpy(%client_off, %client_random, %n32v)
+
+    call @std_crypto_tls12_prf_sha256(%master_secret, 48, %seed_p, 64, %key_block_len, %key_block)
+    ret void
+}
+
+
+// ============================================================
+// TLS 1.2 Finished Verify Data
+// ============================================================
+// verify_data = PRF(master_secret, label, SHA256(handshake_messages))[0..11]
+// label = "client finished" or "server finished"
+// Output: 12-byte verify_data
+
+const @_tls12_label_client_finished: [i8, 15] = [99, 108, 105, 101, 110, 116, 32, 102, 105, 110, 105, 115, 104, 101, 100]
+const @_tls12_label_server_finished: [i8, 15] = [115, 101, 114, 118, 101, 114, 32, 102, 105, 110, 105, 115, 104, 101, 100]
+
+fun @std_crypto_tls12_finished_sha256(master_secret: *i8,
+                                       handshake_hash: *i8,
+                                       is_client: i1,
+                                       verify_data: *i8) -> void {
+  @entry:
+    %seed = let [i8, 47]
+    %seed_p = gep i8, *%seed, 0
+    %n15 = let i64
+    store i64 15, *%n15
+    %n15v = load i64, *%n15
+
+    br %is_client, @copy_client, @copy_server
+
+  @copy_client:
+    %cl_p = gep i8, *@_tls12_label_client_finished, 0
+    call @memcpy(%seed_p, %cl_p, %n15v)
+    %hash_off_c = gep i8, *%seed_p, 15
+    %n32c = let i64
+    store i64 32, *%n32c
+    %n32cv = load i64, *%n32c
+    call @memcpy(%hash_off_c, %handshake_hash, %n32cv)
+    call @std_crypto_tls12_prf_sha256(%master_secret, 48, %seed_p, 47, 12, %verify_data)
+    ret void
+
+  @copy_server:
+    %sv_p = gep i8, *@_tls12_label_server_finished, 0
+    call @memcpy(%seed_p, %sv_p, %n15v)
+    %hash_off_s = gep i8, *%seed_p, 15
+    %n32s = let i64
+    store i64 32, *%n32s
+    %n32sv = load i64, *%n32s
+    call @memcpy(%hash_off_s, %handshake_hash, %n32sv)
+    call @std_crypto_tls12_prf_sha256(%master_secret, 48, %seed_p, 47, 12, %verify_data)
+    ret void
+}

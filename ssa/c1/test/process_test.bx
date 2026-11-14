@@ -1,0 +1,34 @@
+// Environment and shell helpers. Prints "PASS process" on success.
+
+extern @printf(fmt: *i8, ...) -> i32
+extern @std_process_getenv(name: *i8) -> *i8
+extern @std_process_system(cmd: *i8) -> i32
+
+const @MISSING = "__C1_SURELY_NOT_SET__"
+
+fun @main() -> i32 {
+  @entry:
+    %path = call @std_process_getenv("PATH")
+    %pathok = ne *i8 %path, null
+    br %pathok, @c2, @fail
+  @c2:
+    %mp = gep i8, *@MISSING, 0
+    %miss = call @std_process_getenv(%mp)
+    %missok = eq *i8 %miss, null
+    br %missok, @c3, @fail
+  @c3:
+    %st = call @std_process_system("true")
+    %stok = eq i32 %st, 0
+    br %stok, @c4, @fail
+  @c4:
+    %sf = call @std_process_system("false")
+    %sfok = ne i32 %sf, 0
+    br %sfok, @pass, @fail
+
+  @pass:
+    call @printf("PASS process\n")
+    ret i32 0
+  @fail:
+    call @printf("FAIL process\n")
+    ret i32 1
+}

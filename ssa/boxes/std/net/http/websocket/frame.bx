@@ -1,0 +1,430 @@
+// RFC 6455 frame encoding and decoding — pure SSA, no I/O.
+//
+// Clients must mask every frame; servers must not. Masking is explicit:
+// net_ws_build_frame takes a masked flag and only reads key when it is set.
+
+// Frame opcodes (RFC 6455 §5.2).
+enum @WsOpcode: i32 {
+  @Continuation = 0,
+  @Text = 1,
+  @Binary = 2,
+  @Close = 8,
+  @Ping = 9,
+  @Pong = 10
+}
+
+// Filled by net_ws_parse_frame. Offsets are relative to the input buffer;
+// header_len includes the 4-byte mask key when the frame is masked.
+struct @WsFrame {
+  @fin: i32,
+  @opcode: i32,
+  @masked: i32,
+  @payload_off: i32,
+  @payload_len: i32,
+  @header_len: i32
+}
+
+fun @_ws_set_need(out: *i32, v: i32) -> void {
+  @entry:
+    %is_null = eq *i32 %out, null
+    br %is_null, @done, @set
+  @set:
+    store i32 %v, *%out
+    jmp @done
+  @done:
+    ret void
+}
+
+// XOR len bytes of payload with the 4-byte key, in place.
+fun @net_ws_mask(payload: *i8, len: i32, key: *i8) -> void {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @cond
+  @cond:
+    %iv = load i32, *%i
+    %more = slt i32 %iv, %len
+    br %more, @body, @done
+  @body:
+    %iv2 = load i32, *%i
+    %ki = and i32 %iv2, 3
+    %kp = gep i8, *%key, %ki
+    %k = load i8, *%kp
+    %pp = gep i8, *%payload, %iv2
+    %c = load i8, *%pp
+    %x = xor i8 %c, %k
+    store i8 %x, *%pp
+    %nx = add i32 %iv2, 1
+    store i32 %nx, *%i
+    jmp @cond
+  @done:
+    ret void
+}
+
+// Build one frame into buf. key is a 4-byte masking key and is only read when
+// masked != 0. Returns the frame size, or -1 if it does not fit or the
+// opcode/length combination is invalid.
+fun @net_ws_build_frame(buf: *i8, cap: i32, opcode: i32, payload: *i8,
+                        len: i32, fin: i32, masked: i32, key: *i8) -> i32 {
+  @entry:
+    %neg = slt i32 %len, 0
+    br %neg, @fail, @op_chk
+  @op_chk:
+    %op_nn = sge i32 %opcode, 0
+    %op_low = sle i32 %opcode, @WsOpcode.Binary
+    %op_h0 = sge i32 %opcode, @WsOpcode.Close
+    %op_h1 = sle i32 %opcode, @WsOpcode.Pong
+    %op_high = and i1 %op_h0, %op_h1
+    %op_any = or i1 %op_low, %op_high
+    %op_ok = and i1 %op_nn, %op_any
+    br %op_ok, @ctrl_chk, @fail
+  @ctrl_chk:
+    %is_ctrl = sge i32 %opcode, @WsOpcode.Close
+    br %is_ctrl, @ctrl_len, @len_hdr
+  @ctrl_len:
+    %cl_ok = sle i32 %len, 125
+    %cf_ok = eq i32 %fin, 1
+    %c_ok = and i1 %cl_ok, %cf_ok
+    br %c_ok, @len_hdr, @fail
+  @len_hdr:
+    // Header is 2 bytes, plus 2 for 16-bit lengths, plus 6 more for 64-bit.
+    %mid = sge i32 %len, 126
+    %huge = sge i32 %len, 65536
+    %midz = zext i1 %mid to i32
+    %hugez = zext i1 %huge to i32
+    %m2 = mul i32 %midz, 2
+    %m6 = mul i32 %hugez, 6
+    %h0 = add i32 2, %m2
+    %hdr = add i32 %h0, %m6
+    %masked_b = ne i32 %masked, 0
+    %mz = zext i1 %masked_b to i32
+    %madd = shl i32 %mz, 2
+    %hdr_all = add i32 %hdr, %madd
+    %need = add i32 %hdr_all, %len
+    %over = sgt i32 %need, %cap
+    br %over, @fail, @w0
+  @w0:
+    %finb = and i32 %fin, 1
+    %fb = shl i32 %finb, 7
+    %b0v = or i32 %fb, %opcode
+    %b0c = trunc i32 %b0v to i8
+    store i8 %b0c, *%buf
+    %small = slt i32 %len, 126
+    br %small, @w7, @w_ext
+  @w7:
+    %mb = shl i32 %mz, 7
+    %b1v = or i32 %mb, %len
+    %b1c = trunc i32 %b1v to i8
+    %p1 = gep i8, *%buf, 1
+    store i8 %b1c, *%p1
+    jmp @hdr_done
+  @w_ext:
+    %is64 = sge i32 %len, 65536
+    br %is64, @w64, @w16
+  @w16:
+    %mb16 = shl i32 %mz, 7
+    %b1v16 = or i32 %mb16, 126
+    %b1c16 = trunc i32 %b1v16 to i8
+    %p1b = gep i8, *%buf, 1
+    store i8 %b1c16, *%p1b
+    %hi = lshr i32 %len, 8
+    %hi8 = trunc i32 %hi to i8
+    %p2 = gep i8, *%buf, 2
+    store i8 %hi8, *%p2
+    %lo = and i32 %len, 255
+    %lo8 = trunc i32 %lo to i8
+    %p3 = gep i8, *%buf, 3
+    store i8 %lo8, *%p3
+    jmp @hdr_done
+  @w64:
+    %mb64 = shl i32 %mz, 7
+    %b1v64 = or i32 %mb64, 127
+    %b1c64 = trunc i32 %b1v64 to i8
+    %p1c = gep i8, *%buf, 1
+    store i8 %b1c64, *%p1c
+    // Lengths are capped at 2^32-1, so the high four bytes are zero.
+    %z2 = gep i8, *%buf, 2
+    store i8 0, *%z2
+    %z3 = gep i8, *%buf, 3
+    store i8 0, *%z3
+    %z4 = gep i8, *%buf, 4
+    store i8 0, *%z4
+    %z5 = gep i8, *%buf, 5
+    store i8 0, *%z5
+    %b6 = lshr i32 %len, 24
+    %b6c = trunc i32 %b6 to i8
+    %p6 = gep i8, *%buf, 6
+    store i8 %b6c, *%p6
+    %b7 = lshr i32 %len, 16
+    %b7c = trunc i32 %b7 to i8
+    %p7 = gep i8, *%buf, 7
+    store i8 %b7c, *%p7
+    %b8 = lshr i32 %len, 8
+    %b8c = trunc i32 %b8 to i8
+    %p8 = gep i8, *%buf, 8
+    store i8 %b8c, *%p8
+    %b9c = trunc i32 %len to i8
+    %p9 = gep i8, *%buf, 9
+    store i8 %b9c, *%p9
+    jmp @hdr_done
+  @hdr_done:
+    br %masked_b, @wkey, @wpayload_init
+  @wkey:
+    %kp = gep i8, *%buf, %hdr
+    %k0 = load i8, *%key
+    store i8 %k0, *%kp
+    %h1 = add i32 %hdr, 1
+    %kp1 = gep i8, *%buf, %h1
+    %k1p = gep i8, *%key, 1
+    %k1 = load i8, *%k1p
+    store i8 %k1, *%kp1
+    %h2 = add i32 %hdr, 2
+    %kp2 = gep i8, *%buf, %h2
+    %k2p = gep i8, *%key, 2
+    %k2 = load i8, *%k2p
+    store i8 %k2, *%kp2
+    %h3 = add i32 %hdr, 3
+    %kp3 = gep i8, *%buf, %h3
+    %k3p = gep i8, *%key, 3
+    %k3 = load i8, *%k3p
+    store i8 %k3, *%kp3
+    jmp @wpayload_init
+  @wpayload_init:
+    %pay = add i32 %hdr, %madd
+    %i = let i32
+    store i32 0, *%i
+    jmp @cp_cond
+  @cp_cond:
+    %iv = load i32, *%i
+    %more = slt i32 %iv, %len
+    br %more, @cp_body, @done
+  @cp_body:
+    %iv2 = load i32, *%i
+    %sp = gep i8, *%payload, %iv2
+    %c = load i8, *%sp
+    br %masked_b, @cp_mask, @cp_plain
+  @cp_mask:
+    %ki = and i32 %iv2, 3
+    %kip = gep i8, *%key, %ki
+    %kk = load i8, *%kip
+    %xc = xor i8 %c, %kk
+    %dp = add i32 %pay, %iv2
+    %dpp = gep i8, *%buf, %dp
+    store i8 %xc, *%dpp
+    jmp @cp_next
+  @cp_plain:
+    %dp2 = add i32 %pay, %iv2
+    %dpp2 = gep i8, *%buf, %dp2
+    store i8 %c, *%dpp2
+    jmp @cp_next
+  @cp_next:
+    %iv3 = load i32, *%i
+    %nx = add i32 %iv3, 1
+    store i32 %nx, *%i
+    jmp @cp_cond
+  @done:
+    ret i32 %need
+  @fail:
+    ret i32 -1
+}
+
+// Parse a frame from buf.
+//
+// Returns:
+//    0  frame fully buffered; f is valid
+//   -1  more bytes needed; out_need (when non-NULL) receives the number of
+//       bytes required for the header, or for the whole frame once the header
+//       has been parsed
+//   -2  protocol error (reserved bits, bad opcode, bad control frame, length
+//       above 2^31-1)
+fun @net_ws_parse_frame(buf: *i8, len: i32, f: *@WsFrame,
+                        out_need: *i32) -> i32 {
+  @entry:
+    %short = slt i32 %len, 2
+    br %short, @need_hdr, @b0
+  @need_hdr:
+    call @_ws_set_need(%out_need, 14)
+    ret i32 -1
+  @b0:
+    %p0 = gep i8, *%buf, 0
+    %b0 = load i8, *%p0
+    %b0z = zext i8 %b0 to i32
+    %rsv = and i32 %b0z, 112
+    %bad_rsv = ne i32 %rsv, 0
+    br %bad_rsv, @error, @op_chk
+  @op_chk:
+    %op = and i32 %b0z, 15
+    %op_low = sle i32 %op, @WsOpcode.Binary
+    %op_h0 = sge i32 %op, @WsOpcode.Close
+    %op_h1 = sle i32 %op, @WsOpcode.Pong
+    %op_high = and i1 %op_h0, %op_h1
+    %op_ok = or i1 %op_low, %op_high
+    br %op_ok, @b1, @error
+  @b1:
+    %fin_v = lshr i32 %b0z, 7
+    %fin_p = field @WsFrame, *%f, 0
+    store i32 %fin_v, *%fin_p
+    %op_p = field @WsFrame, *%f, 1
+    store i32 %op, *%op_p
+    %p1 = gep i8, *%buf, 1
+    %b1 = load i8, *%p1
+    %b1z = zext i8 %b1 to i32
+    %mask_v = lshr i32 %b1z, 7
+    %mask_p = field @WsFrame, *%f, 2
+    store i32 %mask_v, *%mask_p
+    %len7 = and i32 %b1z, 127
+    %is126 = eq i32 %len7, 126
+    br %is126, @l126, @chk127
+  @chk127:
+    %is127 = eq i32 %len7, 127
+    br %is127, @l127, @l7
+  @l7:
+    jmp @join
+  @l126:
+    %need4 = slt i32 %len, 4
+    br %need4, @more4, @l126b
+  @more4:
+    call @_ws_set_need(%out_need, 4)
+    ret i32 -1
+  @l126b:
+    %q2 = gep i8, *%buf, 2
+    %c2 = load i8, *%q2
+    %q3 = gep i8, *%buf, 3
+    %c3 = load i8, *%q3
+    %v2 = zext i8 %c2 to i32
+    %v3 = zext i8 %c3 to i32
+    %shv = shl i32 %v2, 8
+    %plen16 = or i32 %shv, %v3
+    jmp @join
+  @l127:
+    %need10 = slt i32 %len, 10
+    br %need10, @more10, @l127b
+  @more10:
+    call @_ws_set_need(%out_need, 10)
+    ret i32 -1
+  @l127b:
+    // Lengths above 2^31-1 are rejected: the high four bytes must be zero.
+    %r2 = gep i8, *%buf, 2
+    %d2 = load i8, *%r2
+    %r3 = gep i8, *%buf, 3
+    %d3 = load i8, *%r3
+    %r4 = gep i8, *%buf, 4
+    %d4 = load i8, *%r4
+    %r5 = gep i8, *%buf, 5
+    %d5 = load i8, *%r5
+    %h2 = zext i8 %d2 to i32
+    %h3 = zext i8 %d3 to i32
+    %h4 = zext i8 %d4 to i32
+    %h5 = zext i8 %d5 to i32
+    %hz1 = or i32 %h2, %h3
+    %hz2 = or i32 %h4, %h5
+    %hz = or i32 %hz1, %hz2
+    %too_big = ne i32 %hz, 0
+    br %too_big, @error, @l127lo
+  @l127lo:
+    %r6 = gep i8, *%buf, 6
+    %d6 = load i8, *%r6
+    %r7 = gep i8, *%buf, 7
+    %d7 = load i8, *%r7
+    %r8 = gep i8, *%buf, 8
+    %d8 = load i8, *%r8
+    %r9 = gep i8, *%buf, 9
+    %d9 = load i8, *%r9
+    %l6 = zext i8 %d6 to i32
+    %l7v = zext i8 %d7 to i32
+    %l8 = zext i8 %d8 to i32
+    %l9 = zext i8 %d9 to i32
+    %s1 = shl i32 %l6, 24
+    %s2 = shl i32 %l7v, 16
+    %s3 = shl i32 %l8, 8
+    %o1 = or i32 %s1, %s2
+    %o2 = or i32 %o1, %s3
+    %plen64 = or i32 %o2, %l9
+    jmp @join
+  @join:
+    %plen = phi i32 [ %len7, @l7 ], [ %plen16, @l126b ], [ %plen64, @l127lo ]
+    %hdr = phi i32 [ 2, @l7 ], [ 4, @l126b ], [ 10, @l127lo ]
+    %plen_neg = slt i32 %plen, 0
+    br %plen_neg, @error, @ctrl
+  @ctrl:
+    %is_ctrl = sge i32 %op, @WsOpcode.Close
+    br %is_ctrl, @ctrl_chk, @store_fields
+  @ctrl_chk:
+    %cl = sle i32 %plen, 125
+    %cf = eq i32 %fin_v, 1
+    %cok = and i1 %cl, %cf
+    br %cok, @store_fields, @error
+  @store_fields:
+    %extra = shl i32 %mask_v, 2
+    %hdr_all = add i32 %hdr, %extra
+    %total = add i32 %hdr_all, %plen
+    %po_p = field @WsFrame, *%f, 3
+    store i32 %hdr_all, *%po_p
+    %pl_p = field @WsFrame, *%f, 4
+    store i32 %plen, *%pl_p
+    %hl_p = field @WsFrame, *%f, 5
+    store i32 %hdr_all, *%hl_p
+    %over = sgt i32 %total, %len
+    br %over, @need_total, @ok
+  @need_total:
+    call @_ws_set_need(%out_need, %total)
+    ret i32 -1
+  @ok:
+    ret i32 0
+  @error:
+    ret i32 -2
+}
+
+// Remove the mask from a parsed frame's payload, in place.
+fun @net_ws_unmask_frame(buf: *i8, f: *@WsFrame) -> void {
+  @entry:
+    %mask_p = field @WsFrame, *%f, 2
+    %masked = load i32, *%mask_p
+    %mb = ne i32 %masked, 0
+    br %mb, @do, @done
+  @do:
+    %off_p = field @WsFrame, *%f, 3
+    %off = load i32, *%off_p
+    %keyoff = sub i32 %off, 4
+    %key = gep i8, *%buf, %keyoff
+    %pay = gep i8, *%buf, %off
+    %len_p = field @WsFrame, *%f, 4
+    %plen = load i32, *%len_p
+    call @net_ws_mask(%pay, %plen, %key)
+    jmp @done
+  @done:
+    ret void
+}
+
+// Read the 2-byte close code from a close payload. Returns 0 when absent.
+fun @net_ws_close_code(payload: *i8, len: i32) -> i32 {
+  @entry:
+    %short = slt i32 %len, 2
+    br %short, @none, @read
+  @read:
+    %p0 = gep i8, *%payload, 0
+    %c0 = load i8, *%p0
+    %p1 = gep i8, *%payload, 1
+    %c1 = load i8, *%p1
+    %z0 = zext i8 %c0 to i32
+    %z1 = zext i8 %c1 to i32
+    %s0 = shl i32 %z0, 8
+    %v = or i32 %s0, %z1
+    ret i32 %v
+  @none:
+    ret i32 0
+}
+
+// Write a 2-byte close code into buf.
+fun @net_ws_put_close_code(buf: *i8, code: i32) -> void {
+  @entry:
+    %hi = lshr i32 %code, 8
+    %hi8 = trunc i32 %hi to i8
+    %p0 = gep i8, *%buf, 0
+    store i8 %hi8, *%p0
+    %lo = and i32 %code, 255
+    %lo8 = trunc i32 %lo to i8
+    %p1 = gep i8, *%buf, 1
+    store i8 %lo8, *%p1
+    ret void
+}

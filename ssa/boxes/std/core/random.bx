@@ -1,0 +1,13 @@
+// Cryptographically secure random bytes.
+//
+// macOS: arc4random_buf, Linux: getrandom (see platform/random.c).
+
+extern @c1_random_buf(buf: *i8, len: i64) -> void
+
+// Fill buf with len cryptographically secure random bytes.
+fun @std_core_random_bytes(buf: *i8, len: i32) -> void {
+  @entry:
+    %len64 = sext i32 %len to i64
+    call @c1_random_buf(%buf, %len64)
+    ret void
+}

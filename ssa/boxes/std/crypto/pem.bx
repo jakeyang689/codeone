@@ -1,0 +1,824 @@
+// PEM file encoding for RSA keys (PKCS#1 DER + Base64)
+// Generates PEM files compatible with OpenSSL.
+
+extern @fopen(path: *i8, mode: *i8) -> *i8
+extern @fwrite(buf: *i8, size: i64, count: i64, fp: *i8) -> i64
+extern @fclose(fp: *i8) -> i32
+extern @std_crypto_b64_encode(out: *i8, data: *i8, in_len: i32) -> void
+extern @std_crypto_b64_decode(src: *i8, src_len: i32, out: *i8, out_cap: i32, out_len: *i32) -> i32
+extern @std_crypto_rsa_bn_to_bytes(bytes: *i8, a: *i32, byte_len: i32, limbs: i32) -> void
+extern @std_crypto_rsa_bn_from_bytes(r: *i32, bytes: *i8, byte_len: i32, limbs: i32) -> void
+extern @memcmp(a: *i8, b: *i8, n: i64) -> i32
+
+// ASN.1 tags used when converting a PKCS#8 key to PKCS#1.
+enum @Asn1Tag: i8 {
+  @OctetString = 0x04,
+  @Sequence = 0x30
+}
+
+// Find actual big-endian byte length of a big number (excluding leading zeros)
+fun @std_crypto_pem_bn_bytes(bn: *i32, limbs: i32) -> i32 {
+  @entry:
+    %last = sub i32 %limbs, 1
+    %iptr = let i32
+    store i32 %last, *%iptr
+    jmp @bb_cond
+  @bb_cond:
+    %i = load i32, *%iptr
+    %neg = slt i32 %i, 0
+    br %neg, @bb_zero, @bb_body
+  @bb_body:
+    %iv = load i32, *%iptr
+    %lp = gep i32, *%bn, %iv
+    %lv = load i32, *%lp
+    %nz = ne i32 %lv, 0
+    br %nz, @bb_scan_limb, @bb_next
+  @bb_next:
+    %iv2 = sub i32 %iv, 1
+    store i32 %iv2, *%iptr
+    jmp @bb_cond
+  @bb_scan_limb:
+    %limb_val = load i32, *%lp
+    %jptr = let i32
+    store i32 0, *%jptr
+    jmp @bs_cond
+  @bs_cond:
+    %j = load i32, *%jptr
+    %j4 = slt i32 %j, 4
+    br %j4, @bs_body, @bs_done
+  @bs_body:
+    %jv = load i32, *%jptr
+    %sh = sub i32 3, %jv
+    %sh2 = shl i32 %sh, 3
+    %byte_val = lshr i32 %limb_val, %sh2
+    %byte_i8 = trunc i32 %byte_val to i8
+    %nz2 = eq i8 %byte_i8, 0
+    br %nz2, @bs_next, @bs_done
+  @bs_next:
+    %jv2 = add i32 %jv, 1
+    store i32 %jv2, *%jptr
+    jmp @bs_cond
+  @bs_done:
+    %jv3 = load i32, *%jptr
+    %byte_in_limb = sub i32 4, %jv3
+    %limb_off = mul i32 %iv, 4
+    %total = add i32 %limb_off, %byte_in_limb
+    ret i32 %total
+  @bb_zero:
+    ret i32 1
+}
+
+// Encode a DER INTEGER at buf[off], return new offset
+// Handles 0x prefix when high bit is set
+
+// Write DER length at buf[off], return new offset
+// Handles 1-byte (len<128) and 3-byte (0x82+len16) forms
+fun @der_write_len(buf: *i8, off: i32, len_val: i32) -> i32 {
+  @entry:
+    %big = sge i32 %len_val, 128
+    br %big, @wl_long, @wl_short
+  @wl_short:
+    %p0 = gep i8, *%buf, %off
+    %len8 = trunc i32 %len_val to i8
+    store i8 %len8, *%p0
+    %ret1 = add i32 %off, 1
+    ret i32 %ret1
+  @wl_long:
+    %p1 = gep i8, *%buf, %off
+    store i8 0x82, *%p1
+    %len_hi = lshr i32 %len_val, 8
+    %off1 = add i32 %off, 1
+    %p2 = gep i8, *%buf, %off1
+    %hi8 = trunc i32 %len_hi to i8
+    store i8 %hi8, *%p2
+    %off2 = add i32 %off, 2
+    %p3 = gep i8, *%buf, %off2
+    %lo8 = trunc i32 %len_val to i8
+    store i8 %lo8, *%p3
+    %ret3 = add i32 %off, 3
+    ret i32 %ret3
+}
+
+fun @std_crypto_pem_der_seq(buf: *i8, off: i32, content_len: i32) -> i32 {
+  @entry:
+    %p0 = gep i8, *%buf, %off
+    store i8 0x30, *%p0
+    %off1 = add i32 %off, 1
+    %ret = call @der_write_len(%buf, %off1, %content_len)
+    ret i32 %ret
+}
+
+fun @std_crypto_pem_der_int(buf: *i8, off: i32, bn: *i32, limbs: i32) -> i32 {
+  @entry:
+    %byte_len = call @std_crypto_pem_bn_bytes(%bn, %limbs)
+    %full_len = mul i32 %limbs, 4
+    %temp = let [i8, 1024]
+    %tp = gep i8, *%temp, 0
+    call @std_crypto_rsa_bn_to_bytes(%tp, %bn, %full_len, %limbs)
+    %skip = sub i32 %full_len, %byte_len
+    %top_p = gep i8, *%temp, %skip
+    %top = load i8, *%top_p
+    %top_i = zext i8 %top to i32
+    %high = and i32 %top_i, 0x80
+    %need0 = ne i32 %high, 0
+    %need0_i32 = zext i1 %need0 to i32
+    %p0 = gep i8, *%buf, %off
+    store i8 0x02, *%p0
+    %len_off = add i32 %off, 1
+    %actual = add i32 %byte_len, %need0_i32
+    %after_len = call @der_write_len(%buf, %len_off, %actual)
+    %wo = let i32
+    store i32 %after_len, *%wo
+    br %need0, @wz, @wb
+  @wz:
+    %wo0 = load i32, *%wo
+    %pz = gep i8, *%buf, %wo0
+    store i8 0, *%pz
+    %wo1 = add i32 %wo0, 1
+    store i32 %wo1, *%wo
+    jmp @wb
+  @wb:
+    %ci = let i32
+    store i32 %skip, *%ci
+    jmp @wbc
+  @wbc:
+    %civ = load i32, *%ci
+    %done = slt i32 %civ, %full_len
+    br %done, @wbb, @wend
+  @wbb:
+    %civ2 = load i32, *%ci
+    %src = gep i8, *%temp, %civ2
+    %sv = load i8, *%src
+    %wov = load i32, *%wo
+    %dst = gep i8, *%buf, %wov
+    store i8 %sv, *%dst
+    %wov2 = add i32 %wov, 1
+    store i32 %wov2, *%wo
+    %civ3 = add i32 %civ2, 1
+    store i32 %civ3, *%ci
+    jmp @wbc
+  @wend:
+    %final = load i32, *%wo
+    ret i32 %final
+}
+
+// Write base64 text to file with 64-char line wrapping
+fun @pem_b64_lines(fp: *i8, b64: *i8) -> void {
+  @entry:
+    %iptr = let i32
+    store i32 0, *%iptr
+    jmp @pl_cond
+  @pl_cond:
+    %i = load i32, *%iptr
+    %bp = gep i8, *%b64, %i
+    %ch = load i8, *%bp
+    %nul = eq i8 %ch, 0
+    br %nul, @pl_done, @pl_check_64
+  @pl_check_64:
+    %iv = load i32, *%iptr
+    %mod64 = and i32 %iv, 63
+    %at_64 = eq i32 %mod64, 0
+    br %at_64, @pl_newline, @pl_write_char
+  @pl_newline:
+    %iv2 = load i32, *%iptr
+    %nz = ne i32 %iv2, 0
+    br %nz, @pl_write_nl, @pl_write_char
+  @pl_write_nl:
+    call @fwrite("\n", 1, 1, %fp)
+    jmp @pl_write_char
+  @pl_write_char:
+    %iv3 = load i32, *%iptr
+    %bp2 = gep i8, *%b64, %iv3
+    %ch2 = load i8, *%bp2
+    %buf8 = let [i8, 1]
+    %bp_buf = gep i8, *%buf8, 0
+    store i8 %ch2, *%bp_buf
+    call @fwrite(%bp_buf, 1, 1, %fp)
+    %iv4 = add i32 %iv3, 1
+    store i32 %iv4, *%iptr
+    jmp @pl_cond
+  @pl_done:
+    call @fwrite("\n", 1, 1, %fp)
+    ret void
+}
+
+// Check if top byte of bn has high bit set (requires 0x00 prefix in DER INTEGER)
+fun @bn_needs_zero_prefix(bn: *i32, limbs: i32) -> i1 {
+  @entry:
+    %full_len = mul i32 %limbs, 4
+    %temp = let [i8, 1024]
+    %tp = gep i8, *%temp, 0
+    call @std_crypto_rsa_bn_to_bytes(%tp, %bn, %full_len, %limbs)
+    %byte_len = call @std_crypto_pem_bn_bytes(%bn, %limbs)
+    %skip = sub i32 %full_len, %byte_len
+    %top_p = gep i8, *%temp, %skip
+    %top = load i8, *%top_p
+    %top_i = zext i8 %top to i32
+    %high = and i32 %top_i, 0x80
+    %need = ne i32 %high, 0
+    ret i1 %need
+}
+
+// Compute exact DER INTEGER size = tag(1) + length_field + value
+fun @der_int_size(bn: *i32, limbs: i32) -> i32 {
+  @entry:
+    %need0 = call @bn_needs_zero_prefix(%bn, %limbs)
+    %need0_i32 = zext i1 %need0 to i32
+    %byte_len = call @std_crypto_pem_bn_bytes(%bn, %limbs)
+    %actual_len = add i32 %byte_len, %need0_i32
+    // Length field size: <128 → 1, ≥128 → 3
+    %big = sge i32 %actual_len, 128
+    %lenfield = let i32
+    store i32 1, *%lenfield
+    br %big, @dis_long, @dis_end
+  @dis_long:
+    store i32 3, *%lenfield
+    jmp @dis_end
+  @dis_end:
+    %lf = load i32, *%lenfield
+    %size = add i32 1, %lf
+    %size2 = add i32 %size, %actual_len
+    ret i32 %size2
+}
+
+// Write RSA public key PEM: SEQUENCE { n, e }
+fun @std_crypto_pem_write_rsa_pub(fp: *i8, n: *i32, e: *i32, limbs: i32) -> void {
+  @entry:
+    %n_sz = call @der_int_size(%n, %limbs)
+    %e_sz = call @der_int_size(%e, %limbs)
+    %content = add i32 %n_sz, %e_sz
+    %der_buf = let [i8, 4096]
+    %db = gep i8, *%der_buf, 0
+    %off1 = call @std_crypto_pem_der_seq(%db, 0, %content)
+    %off2 = call @std_crypto_pem_der_int(%db, %off1, %n, %limbs)
+    %off3 = call @std_crypto_pem_der_int(%db, %off2, %e, %limbs)
+    // Base64
+    %b64_buf = let [i8, 4096]
+    %b64p = gep i8, *%b64_buf, 0
+    call @std_crypto_b64_encode(%b64p, %db, %off3)
+    // Write PEM
+    call @fwrite("-----BEGIN RSA PUBLIC KEY-----\n", 1, 31, %fp)
+    call @pem_b64_lines(%fp, %b64p)
+    call @fwrite("-----END RSA PUBLIC KEY-----\n", 1, 29, %fp)
+    ret void
+}
+
+// Write RSA private key PEM: SEQUENCE { v, n, e, d, p, q }
+fun @std_crypto_pem_write_rsa_priv(fp: *i8, n: *i32, e: *i32, d: *i32, p: *i32, q: *i32, limbs: i32) -> void {
+  @entry:
+    %v_sz = add i32 3, 0  // version INTEGER: 02 01 00 = 3 bytes
+    %n_sz = call @der_int_size(%n, %limbs)
+    %e_sz = call @der_int_size(%e, %limbs)
+    %d_sz = call @der_int_size(%d, %limbs)
+    %p_sz = call @der_int_size(%p, %limbs)
+    %q_sz = call @der_int_size(%q, %limbs)
+    %c1 = add i32 %v_sz, %n_sz
+    %c2 = add i32 %c1, %e_sz
+    %c3 = add i32 %c2, %d_sz
+    %c4 = add i32 %c3, %p_sz
+    %content = add i32 %c4, %q_sz
+    %der_buf = let [i8, 4096]
+    %db = gep i8, *%der_buf, 0
+    %off1 = call @std_crypto_pem_der_seq(%db, 0, %content)
+    // Version = INTEGER 0: 02 01 00
+    %pv = gep i8, *%der_buf, %off1
+    store i8 0x02, *%pv
+    %off1a = add i32 %off1, 1
+    %pv2 = gep i8, *%der_buf, %off1a
+    store i8 1, *%pv2
+    %off1b = add i32 %off1, 2
+    %pv3 = gep i8, *%der_buf, %off1b
+    store i8 0, *%pv3
+    %ver_end = add i32 %off1, 3
+    %off2 = call @std_crypto_pem_der_int(%db, %ver_end, %n, %limbs)
+    %off3 = call @std_crypto_pem_der_int(%db, %off2, %e, %limbs)
+    %off4 = call @std_crypto_pem_der_int(%db, %off3, %d, %limbs)
+    %off5 = call @std_crypto_pem_der_int(%db, %off4, %p, %limbs)
+    %off6 = call @std_crypto_pem_der_int(%db, %off5, %q, %limbs)
+    // Base64 + PEM
+    %b64_buf = let [i8, 4096]
+    %b64p = gep i8, *%b64_buf, 0
+    call @std_crypto_b64_encode(%b64p, %db, %off6)
+    call @fwrite("-----BEGIN RSA PRIVATE KEY-----\n", 1, 32, %fp)
+    call @pem_b64_lines(%fp, %b64p)
+    call @fwrite("-----END RSA PRIVATE KEY-----\n", 1, 30, %fp)
+    ret void
+}
+
+// ===== PEM reading and private-key parsing =====
+
+const @_PEM_BEGIN: [i8, 6] = [66, 69, 71, 73, 78, 32]   // "BEGIN "
+const @_PEM_CERT_LABEL = "CERTIFICATE"
+const @_PEM_RSA_PRIV_LABEL = "RSA PRIVATE KEY"
+const @_PEM_PRIV_LABEL = "PRIVATE KEY"
+
+// Index of needle in buf[start..len), or -1.
+fun @_pem_find_str(buf: *i8, len: i32, start: i32,
+                   needle: *i8, nlen: i32) -> i32 {
+  @entry:
+    %i = let i32
+    store i32 %start, *%i
+    %limit = sub i32 %len, %nlen
+    jmp @cond
+  @cond:
+    %iv = load i32, *%i
+    %more = sle i32 %iv, %limit
+    br %more, @one, @notfound
+  @one:
+    %p = gep i8, *%buf, %iv
+    %n64 = sext i32 %nlen to i64
+    %c = call @memcmp(%p, %needle, %n64)
+    %z = eq i32 %c, 0
+    br %z, @found, @next
+  @next:
+    %iv2 = load i32, *%i
+    %n = add i32 %iv2, 1
+    store i32 %n, *%i
+    jmp @cond
+  @found:
+    %r = load i32, *%i
+    ret i32 %r
+  @notfound:
+    ret i32 -1
+}
+
+// Index of ch in buf[start..len), or -1.
+fun @_pem_find_char(buf: *i8, len: i32, start: i32, ch: i8) -> i32 {
+  @entry:
+    %i = let i32
+    store i32 %start, *%i
+    jmp @cond
+  @cond:
+    %iv = load i32, *%i
+    %more = slt i32 %iv, %len
+    br %more, @one, @notfound
+  @one:
+    %p = gep i8, *%buf, %iv
+    %c = load i8, *%p
+    %eqc = eq i8 %c, %ch
+    br %eqc, @found, @next
+  @next:
+    %iv2 = load i32, *%i
+    %n = add i32 %iv2, 1
+    store i32 %n, *%i
+    jmp @cond
+  @found:
+    %r = load i32, *%i
+    ret i32 %r
+  @notfound:
+    ret i32 -1
+}
+
+// Decode the first PEM block whose label matches label (or any block when
+// label_len is 0) into out. Returns 0 on success, -1 when not found or the
+// output buffer is too small.
+fun @std_crypto_pem_find(pem: *i8, pem_len: i32,
+                         label: *i8, label_len: i32,
+                         out: *i8, out_cap: i32, out_len: *i32) -> i32 {
+  @entry:
+    %off = let i32
+    store i32 0, *%off
+    jmp @loop
+  @loop:
+    %op = gep i8, *@_PEM_BEGIN, 0
+    %ov = load i32, *%off
+    %b = call @_pem_find_str(%pem, %pem_len, %ov, %op, 6)
+    %bn = slt i32 %b, 0
+    br %bn, @fail, @label
+  @label:
+    %ls = add i32 %b, 6
+    %le = call @_pem_find_char(%pem, %pem_len, %ls, '-')
+    %leneg = slt i32 %le, 0
+    br %leneg, @fail, @cmp
+  @cmp:
+    %alen = sub i32 %le, %ls
+    %any = eq i32 %label_len, 0
+    br %any, @data, @cmp_len
+  @cmp_len:
+    %lenok = eq i32 %alen, %label_len
+    br %lenok, @cmp_bytes, @skip
+  @cmp_bytes:
+    %lp = gep i8, *%pem, %ls
+    %n64 = sext i32 %label_len to i64
+    %c = call @memcmp(%lp, %label, %n64)
+    %same = eq i32 %c, 0
+    br %same, @data, @skip
+  @skip:
+    store i32 %le, *%off
+    jmp @loop
+  @data:
+    %nl = call @_pem_find_char(%pem, %pem_len, %le, 10)
+    %nln = slt i32 %nl, 0
+    br %nln, @fail, @datastart
+  @datastart:
+    %ds = add i32 %nl, 1
+    %de = call @_pem_find_char(%pem, %pem_len, %ds, '-')
+    %den = slt i32 %de, 0
+    br %den, @fail, @decode
+  @decode:
+    %src = gep i8, *%pem, %ds
+    %sl = sub i32 %de, %ds
+    %r = call @std_crypto_b64_decode(%src, %sl, %out, %out_cap, %out_len)
+    ret i32 %r
+  @fail:
+    ret i32 -1
+}
+
+// Read a DER length at *offp; advances past the length field.
+fun @_pem_der_len(buf: *i8, len: i32, offp: *i32, outp: *i32) -> i32 {
+  @entry:
+    %ov = load i32, *%offp
+    %inb = slt i32 %ov, %len
+    br %inb, @b0, @fail
+  @b0:
+    %bp = gep i8, *%buf, %ov
+    %b0 = load i8, *%bp
+    %b0i = zext i8 %b0 to i32
+    %short = slt i32 %b0i, 128
+    br %short, @short_len, @long_len
+  @short_len:
+    %ov1 = add i32 %ov, 1
+    store i32 %ov1, *%offp
+    store i32 %b0i, *%outp
+    ret i32 0
+  @long_len:
+    %n = and i32 %b0i, 127
+    %nzero = eq i32 %n, 0
+    %nbig = sgt i32 %n, 3
+    %bad = or i1 %nzero, %nbig
+    br %bad, @fail, @long_body
+  @long_body:
+    %start = add i32 %ov, 1
+    %end = add i32 %start, %n
+    %fits = sle i32 %end, %len
+    br %fits, @long_init, @fail
+  @long_init:
+    %i = let i32
+    %acc = let i32
+    store i32 0, *%i
+    store i32 0, *%acc
+    jmp @long_cond
+  @long_cond:
+    %iv = load i32, *%i
+    %n2 = and i32 %b0i, 127
+    %more = slt i32 %iv, %n2
+    br %more, @long_one, @long_done
+  @long_one:
+    %iv2 = load i32, *%i
+    %p = add i32 %start, %iv2
+    %pp = gep i8, *%buf, %p
+    %bv = load i8, *%pp
+    %bvi = zext i8 %bv to i32
+    %accv = load i32, *%acc
+    %acc1 = shl i32 %accv, 8
+    %acc2 = or i32 %acc1, %bvi
+    store i32 %acc2, *%acc
+    %ix = add i32 %iv2, 1
+    store i32 %ix, *%i
+    jmp @long_cond
+  @long_done:
+    %accf = load i32, *%acc
+    store i32 %accf, *%outp
+    %n3 = and i32 %b0i, 127
+    %newoff = add i32 %start, %n3
+    store i32 %newoff, *%offp
+    ret i32 0
+  @fail:
+    ret i32 -1
+}
+
+// Skip one DER TLV at *offp.
+fun @_pem_der_skip(buf: *i8, len: i32, offp: *i32) -> i32 {
+  @entry:
+    %ov = load i32, *%offp
+    %inb = slt i32 %ov, %len
+    br %inb, @hdr, @fail
+  @hdr:
+    %one = add i32 %ov, 1
+    store i32 %one, *%offp
+    %l = let i32
+    %r = call @_pem_der_len(%buf, %len, %offp, %l)
+    %ok = eq i32 %r, 0
+    br %ok, @adv, @fail
+  @adv:
+    %lv = load i32, *%l
+    %ov2 = load i32, *%offp
+    %end = add i32 %ov2, %lv
+    %fits = sle i32 %end, %len
+    br %fits, @store, @fail
+  @store:
+    store i32 %end, *%offp
+    ret i32 0
+  @fail:
+    ret i32 -1
+}
+
+// Read a DER INTEGER at *offp into a big integer; advances *offp.
+fun @_pem_der_int(buf: *i8, len: i32, offp: *i32, bn: *i32, limbs: i32) -> i32 {
+  @entry:
+    %ov = load i32, *%offp
+    %inb = slt i32 %ov, %len
+    br %inb, @tag, @fail
+  @tag:
+    %tp = gep i8, *%buf, %ov
+    %t = load i8, *%tp
+    %is_int = eq i8 %t, 2
+    br %is_int, @l, @fail
+  @l:
+    %one = add i32 %ov, 1
+    store i32 %one, *%offp
+    %lv = let i32
+    %r = call @_pem_der_len(%buf, %len, %offp, %lv)
+    %ok = eq i32 %r, 0
+    br %ok, @bounds, @fail
+  @bounds:
+    %lv2 = load i32, *%lv
+    %dstart = load i32, *%offp
+    %dend = add i32 %dstart, %lv2
+    %fits = sle i32 %dend, %len
+    br %fits, @trim_init, @fail
+  @trim_init:
+    %s = let i32
+    %n = let i32
+    store i32 %dstart, *%s
+    store i32 %lv2, *%n
+    jmp @trim_cond
+  @trim_cond:
+    %nv = load i32, *%n
+    %gz = sgt i32 %nv, 0
+    br %gz, @trim_one, @trim_done
+  @trim_one:
+    %sv = load i32, *%s
+    %sp = gep i8, *%buf, %sv
+    %sb = load i8, *%sp
+    %zero = eq i8 %sb, 0
+    br %zero, @trim_next, @trim_done
+  @trim_next:
+    %sv2 = load i32, *%s
+    %sn = add i32 %sv2, 1
+    store i32 %sn, *%s
+    %nv2 = load i32, *%n
+    %nn = sub i32 %nv2, 1
+    store i32 %nn, *%n
+    jmp @trim_cond
+  @trim_done:
+    %nv3 = load i32, *%n
+    %maxb = shl i32 %limbs, 2
+    %too = sgt i32 %nv3, %maxb
+    br %too, @fail, @copy
+  @copy:
+    %sv3 = load i32, *%s
+    %dp = gep i8, *%buf, %sv3
+    %nv4 = load i32, *%n
+    call @std_crypto_rsa_bn_from_bytes(%bn, %dp, %nv4, %limbs)
+    %lv3 = load i32, *%lv
+    %doff = load i32, *%offp
+    %newoff = add i32 %doff, %lv3
+    store i32 %newoff, *%offp
+    ret i32 0
+  @fail:
+    ret i32 -1
+}
+
+// Read n, e, d from a PKCS#1 RSAPrivateKey body, positioned after version.
+fun @_pem_parse_pkcs1_body(buf: *i8, len: i32, offp: *i32,
+                           n: *i32, e: *i32, d: *i32, limbs: i32) -> i32 {
+  @entry:
+    %r1 = call @_pem_der_int(%buf, %len, %offp, %n, %limbs)
+    %ok1 = eq i32 %r1, 0
+    br %ok1, @read_e, @fail
+  @read_e:
+    %r2 = call @_pem_der_int(%buf, %len, %offp, %e, %limbs)
+    %ok2 = eq i32 %r2, 0
+    br %ok2, @read_d, @fail
+  @read_d:
+    %r3 = call @_pem_der_int(%buf, %len, %offp, %d, %limbs)
+    ret i32 %r3
+  @fail:
+    ret i32 -1
+}
+
+// Parse a PKCS#1 or PKCS#8 DER RSA private key into n, e, d.
+fun @_pem_parse_rsa_priv(buf: *i8, len: i32,
+                         n: *i32, e: *i32, d: *i32, limbs: i32) -> i32 {
+  @entry:
+    %off = let i32
+    store i32 0, *%off
+    %first = load i8, *%buf
+    %is_seq = eq i8 %first, @Asn1Tag.Sequence
+    br %is_seq, @seq, @fail
+  @seq:
+    store i32 1, *%off
+    %sl = let i32
+    %r1 = call @_pem_der_len(%buf, %len, %off, %sl)
+    %ok1 = eq i32 %r1, 0
+    br %ok1, @ver, @fail
+  @ver:
+    %r2 = call @_pem_der_skip(%buf, %len, %off)
+    %ok2 = eq i32 %r2, 0
+    br %ok2, @peek, @fail
+  @peek:
+    %ov = load i32, *%off
+    %pk = gep i8, *%buf, %ov
+    %pt = load i8, *%pk
+    %is_alg = eq i8 %pt, @Asn1Tag.Sequence
+    br %is_alg, @pkcs8_alg, @pkcs1
+  @pkcs8_alg:
+    %r3 = call @_pem_der_skip(%buf, %len, %off)
+    %ok3 = eq i32 %r3, 0
+    br %ok3, @octet, @fail
+  @octet:
+    %ov2 = load i32, *%off
+    %op2 = gep i8, *%buf, %ov2
+    %ot = load i8, *%op2
+    %is_oct = eq i8 %ot, @Asn1Tag.OctetString
+    br %is_oct, @octet_len, @fail
+  @octet_len:
+    %one = add i32 %ov2, 1
+    store i32 %one, *%off
+    %ol = let i32
+    %r4 = call @_pem_der_len(%buf, %len, %off, %ol)
+    %ok4 = eq i32 %r4, 0
+    br %ok4, @inner, @fail
+  @inner:
+    %ov3 = load i32, *%off
+    %ip = gep i8, *%buf, %ov3
+    %it = load i8, *%ip
+    %is_seq2 = eq i8 %it, @Asn1Tag.Sequence
+    br %is_seq2, @inner_seq, @fail
+  @inner_seq:
+    %one2 = add i32 %ov3, 1
+    store i32 %one2, *%off
+    %il = let i32
+    %r5 = call @_pem_der_len(%buf, %len, %off, %il)
+    %ok5 = eq i32 %r5, 0
+    br %ok5, @inner_ver, @fail
+  @inner_ver:
+    %r6 = call @_pem_der_skip(%buf, %len, %off)
+    %ok6 = eq i32 %r6, 0
+    br %ok6, @inner_body, @fail
+  @inner_body:
+    %r7 = call @_pem_parse_pkcs1_body(%buf, %len, %off, %n, %e, %d, %limbs)
+    ret i32 %r7
+  @pkcs1:
+    %r8 = call @_pem_parse_pkcs1_body(%buf, %len, %off, %n, %e, %d, %limbs)
+    ret i32 %r8
+  @fail:
+    ret i32 -1
+}
+
+// Decode a CERTIFICATE PEM block into DER.
+fun @std_crypto_pem_read_cert(pem: *i8, pem_len: i32,
+                              out: *i8, out_cap: i32, out_len: *i32) -> i32 {
+  @entry:
+    %lp = gep i8, *@_PEM_CERT_LABEL, 0
+    %r = call @std_crypto_pem_find(%pem, %pem_len, %lp, 11,
+                                   %out, %out_cap, %out_len)
+    ret i32 %r
+}
+
+// Like std_crypto_pem_find, but starts at `start` and reports where the
+// decoded block ends in next_out, so a bundle can be walked block by block.
+fun @std_crypto_pem_find_from(pem: *i8, pem_len: i32, start: i32,
+                              label: *i8, label_len: i32,
+                              out: *i8, out_cap: i32, out_len: *i32,
+                              next_out: *i32) -> i32 {
+  @entry:
+    %off = let i32
+    store i32 %start, *%off
+    jmp @loop
+  @loop:
+    %op = gep i8, *@_PEM_BEGIN, 0
+    %ov = load i32, *%off
+    %b = call @_pem_find_str(%pem, %pem_len, %ov, %op, 6)
+    %bn = slt i32 %b, 0
+    br %bn, @fail, @label
+  @label:
+    %ls = add i32 %b, 6
+    %le = call @_pem_find_char(%pem, %pem_len, %ls, '-')
+    %leneg = slt i32 %le, 0
+    br %leneg, @fail, @cmp
+  @cmp:
+    %alen = sub i32 %le, %ls
+    %any = eq i32 %label_len, 0
+    br %any, @data, @cmp_len
+  @cmp_len:
+    %lenok = eq i32 %alen, %label_len
+    br %lenok, @cmp_bytes, @skip
+  @cmp_bytes:
+    %lp = gep i8, *%pem, %ls
+    %n64 = sext i32 %label_len to i64
+    %c = call @memcmp(%lp, %label, %n64)
+    %same = eq i32 %c, 0
+    br %same, @data, @skip
+  @skip:
+    store i32 %le, *%off
+    jmp @loop
+  @data:
+    %nl = call @_pem_find_char(%pem, %pem_len, %le, 10)
+    %nln = slt i32 %nl, 0
+    br %nln, @fail, @datastart
+  @datastart:
+    %ds = add i32 %nl, 1
+    %de = call @_pem_find_char(%pem, %pem_len, %ds, '-')
+    %den = slt i32 %de, 0
+    br %den, @fail, @decode
+  @decode:
+    %src = gep i8, *%pem, %ds
+    %sl = sub i32 %de, %ds
+    %r = call @std_crypto_b64_decode(%src, %sl, %out, %out_cap, %out_len)
+    %rok = eq i32 %r, 0
+    br %rok, @set_next, @fail
+  @set_next:
+    %nxt = add i32 %de, 1
+    store i32 %nxt, *%next_out
+    ret i32 %r
+  @fail:
+    ret i32 -1
+}
+
+// Decode every CERTIFICATE block in a PEM bundle.
+// Certificates are written back-to-back into pool; offsets[i] and lens[i]
+// describe certificate i. Returns the number of certificates decoded, or -1
+// when the pool or the max_count limit is exceeded.
+fun @std_crypto_pem_read_certs(pem: *i8, pem_len: i32,
+                               pool: *i8, pool_cap: i32,
+                               offsets: *i32, lens: *i32, max_count: i32) -> i32 {
+  @entry:
+    %count = let i32
+    %used = let i32
+    %start = let i32
+    store i32 0, *%count
+    store i32 0, *%used
+    store i32 0, *%start
+    jmp @cond
+  @cond:
+    %c = load i32, *%count
+    %full = sge i32 %c, %max_count
+    br %full, @done, @try
+  @try:
+    %u = load i32, *%used
+    %dst = gep i8, *%pool, %u
+    %cap = sub i32 %pool_cap, %u
+    %cap_ok = sgt i32 %cap, 0
+    br %cap_ok, @find, @fail
+  @find:
+    %declen = let i32
+    %next = let i32
+    %dlp = gep i32, *%declen, 0
+    %nxp = gep i32, *%next, 0
+    %lp = gep i8, *@_PEM_CERT_LABEL, 0
+    %st = load i32, *%start
+    %r = call @std_crypto_pem_find_from(%pem, %pem_len, %st,
+                                        %lp, 11, %dst, %cap, %dlp, %nxp)
+    %ok = eq i32 %r, 0
+    br %ok, @record, @done
+  @record:
+    %ci = load i32, *%count
+    %offp = gep i32, *%offsets, %ci
+    %uv = load i32, *%used
+    store i32 %uv, *%offp
+    %lenp = gep i32, *%lens, %ci
+    %dlv = load i32, *%declen
+    store i32 %dlv, *%lenp
+    %unu = add i32 %uv, %dlv
+    store i32 %unu, *%used
+    %nxv = load i32, *%next
+    store i32 %nxv, *%start
+    %cinc = add i32 %ci, 1
+    store i32 %cinc, *%count
+    jmp @cond
+  @done:
+    %cr = load i32, *%count
+    ret i32 %cr
+  @fail:
+    ret i32 -1
+}
+
+// Read an RSA private key from a PEM buffer, accepting both
+// "RSA PRIVATE KEY" (PKCS#1) and "PRIVATE KEY" (PKCS#8).
+// Returns 0 on success, -1 on failure.
+fun @std_crypto_pem_read_rsa_private(pem: *i8, pem_len: i32,
+                                     n: *i32, e: *i32, d: *i32,
+                                     limbs: i32) -> i32 {
+  @entry:
+    %der = let [i8, 8192]
+    %dp = gep i8, *%der, 0
+    %dlen = let i32
+    %dlp = gep i32, *%dlen, 0
+    %l1 = gep i8, *@_PEM_RSA_PRIV_LABEL, 0
+    %r1 = call @std_crypto_pem_find(%pem, %pem_len, %l1, 15, %dp, 8192, %dlp)
+    %ok1 = eq i32 %r1, 0
+    br %ok1, @parse, @try8
+  @try8:
+    %l2 = gep i8, *@_PEM_PRIV_LABEL, 0
+    %r2 = call @std_crypto_pem_find(%pem, %pem_len, %l2, 11, %dp, 8192, %dlp)
+    %ok2 = eq i32 %r2, 0
+    br %ok2, @parse, @fail
+  @parse:
+    %dv = load i32, *%dlp
+    %pr = call @_pem_parse_rsa_priv(%dp, %dv, %n, %e, %d, %limbs)
+    ret i32 %pr
+  @fail:
+    ret i32 -1
+}

@@ -1,0 +1,75 @@
+// URL encode/decode test
+
+extern @putchar(c: i32) -> i32
+
+extern @net_url_encode(input: *i8, len: i32, output: *i8) -> i32
+extern @net_url_decode(input: *i8, len: i32, output: *i8) -> i32
+
+const @input_str: [i8, 12] = "hello world"
+const @decoded_enc: [i8, 14] = "hello%20world"
+
+fun @main() -> i32 {
+  @entry:
+    // Encode "hello world" (11 bytes) -> "hello+world" (11 bytes)
+    %buf1 = let [i8, 64]
+    %bp1 = gep i8, *%buf1, 0
+    %inp = gep i8, *@input_str, 0
+    %n1 = call @net_url_encode(%inp, 11, %bp1)
+    %el = eq i32 %n1, 11
+    br %el, @e1, @fail
+  @e1:
+    %p0 = gep i8, *%buf1, 0
+    %c0 = load i8, *%p0
+    %c0v = zext i8 %c0 to i32
+    %ih = eq i32 %c0v, 104
+    br %ih, @e2, @fail
+  @e2:
+    %p5 = gep i8, *%buf1, 5
+    %c5 = load i8, *%p5
+    %c5v = zext i8 %c5 to i32
+    %ip = eq i32 %c5v, 43
+    br %ip, @e3, @fail
+  @e3:
+    %p10 = gep i8, *%buf1, 10
+    %c10 = load i8, *%p10
+    %c10v = zext i8 %c10 to i32
+    %id = eq i32 %c10v, 100
+    br %id, @d_test, @fail
+
+  @d_test:
+    // Decode "hello%20world" (13 bytes) -> "hello world" (11 bytes)
+    %buf2 = let [i8, 64]
+    %bp2 = gep i8, *%buf2, 0
+    %dinp = gep i8, *@decoded_enc, 0
+    %n2 = call @net_url_decode(%dinp, 13, %bp2)
+    %dl = eq i32 %n2, 11
+    br %dl, @d1, @fail
+  @d1:
+    %dp0 = gep i8, *%buf2, 0
+    %dc0 = load i8, *%dp0
+    %dc0v = zext i8 %dc0 to i32
+    %dih = eq i32 %dc0v, 104
+    br %dih, @d2, @fail
+  @d2:
+    %dp5 = gep i8, *%buf2, 5
+    %dc5 = load i8, *%dp5
+    %dc5v = zext i8 %dc5 to i32
+    %disp = eq i32 %dc5v, 32
+    br %disp, @d3, @fail
+  @d3:
+    %dp10 = gep i8, *%buf2, 10
+    %dc10 = load i8, *%dp10
+    %dc10v = zext i8 %dc10 to i32
+    %did = eq i32 %dc10v, 100
+    br %did, @pass, @fail
+
+  @pass:
+    call @putchar(79)
+    call @putchar(75)
+    call @putchar(10)
+    ret i32 0
+  @fail:
+    call @putchar(33)
+    call @putchar(10)
+    ret i32 1
+}

@@ -1,0 +1,179 @@
+// End-to-end WebSocket client test against ws_server.py on 127.0.0.1:8766.
+//
+// Covers the opening handshake, text and binary echo, fragmented replies with
+// an interleaved ping (auto-pong), a 20000-byte message in both directions,
+// and the closing handshake.
+
+extern @printf(fmt: *i8, ...) -> i32
+extern @memcmp(a: *i8, b: *i8, n: i64) -> i32
+
+extern @net_ws_open(w: *@WsClient, host: *i8, host_len: i32, port: i32,
+                    use_tls: i32, path: *i8) -> i32
+extern @net_ws_send_text(w: *@WsClient, s: *i8, len: i32) -> i32
+extern @net_ws_send_binary(w: *@WsClient, data: *i8, len: i32) -> i32
+extern @net_ws_send_close(w: *@WsClient, code: i32, reason: *i8,
+                          reason_len: i32) -> i32
+extern @net_ws_recv(w: *@WsClient, dst: *i8, cap: i32, out_len: *i32) -> i32
+extern @net_ws_close_code_of(w: *@WsClient) -> i32
+extern @net_ws_destroy(w: *@WsClient) -> i32
+
+// Layouts must match websocket/client.bx.
+struct @HttpClient {
+  @fd: i32,
+  @use_tls: i32,
+  @ctx: [i8, 1024]
+}
+
+struct @WsClient {
+  @http: @HttpClient,
+  @rx: [i8, 32768],
+  @rx_len: i32,
+  @rx_off: i32,
+  @state: i32,
+  @close_code: i32
+}
+
+const @HOST: [i8, 10] = "127.0.0.1"
+const @PATH: [i8, 6] = "/chat"
+const @HELLO: [i8, 6] = "hello"
+const @EXP_HELLO: [i8, 11] = "echo:hello"
+const @FRAG: [i8, 5] = "frag"
+const @EXP_FRAG: [i8, 19] = "fragmented-message"
+const @BYE: [i8, 4] = "bye"
+const @PASS: [i8, 6] = "PASS\n"
+const @FAIL: [i8, 12] = "FAIL: echo\n"
+
+fun @main() -> i32 {
+  @entry:
+    %w = let @WsClient
+    %hostp = gep i8, *@HOST, 0
+    %pathp = gep i8, *@PATH, 0
+    %r = call @net_ws_open(%w, %hostp, 9, 8766, 0, %pathp)
+    %r_ok = eq i32 %r, 0
+    br %r_ok, @send_hello, @fail
+  @send_hello:
+    %hmsg = gep i8, *@HELLO, 0
+    %s1 = call @net_ws_send_text(%w, %hmsg, 5)
+    %s1_ok = eq i32 %s1, 0
+    br %s1_ok, @recv_hello, @fail_close
+  @recv_hello:
+    %buf = let [i8, 20000]
+    %bufp = gep i8, *%buf, 0
+    %olen = let i32
+    %olp = gep i32, *%olen, 0
+    %op1 = call @net_ws_recv(%w, %bufp, 20000, %olp)
+    %op1_ok = eq i32 %op1, 1
+    %l1 = load i32, *%olen
+    %l1_ok = eq i32 %l1, 10
+    %c1 = and i1 %op1_ok, %l1_ok
+    br %c1, @cmp_hello, @fail_close
+  @cmp_hello:
+    %exp = gep i8, *@EXP_HELLO, 0
+    %d1 = call @memcmp(%bufp, %exp, 10)
+    %d1_ok = eq i32 %d1, 0
+    br %d1_ok, @send_bin, @fail_close
+
+  @send_bin:
+    %bin = let [i8, 4]
+    %binp = gep i8, *%bin, 0
+    store i8 1, *%binp
+    %bb1 = gep i8, *%bin, 1
+    store i8 2, *%bb1
+    %bb2 = gep i8, *%bin, 2
+    store i8 3, *%bb2
+    %bb3 = gep i8, *%bin, 3
+    store i8 255, *%bb3
+    %s2 = call @net_ws_send_binary(%w, %binp, 4)
+    %s2_ok = eq i32 %s2, 0
+    br %s2_ok, @recv_bin, @fail_close
+  @recv_bin:
+    %op2 = call @net_ws_recv(%w, %bufp, 20000, %olp)
+    %op2_ok = eq i32 %op2, 2
+    %l2 = load i32, *%olen
+    %l2_ok = eq i32 %l2, 4
+    %c2 = and i1 %op2_ok, %l2_ok
+    br %c2, @cmp_bin, @fail_close
+  @cmp_bin:
+    %d2 = call @memcmp(%bufp, %binp, 4)
+    %d2_ok = eq i32 %d2, 0
+    br %d2_ok, @send_frag, @fail_close
+
+  @send_frag:
+    %fp = gep i8, *@FRAG, 0
+    %s3 = call @net_ws_send_text(%w, %fp, 4)
+    %s3_ok = eq i32 %s3, 0
+    br %s3_ok, @recv_frag, @fail_close
+  @recv_frag:
+    %op3 = call @net_ws_recv(%w, %bufp, 20000, %olp)
+    %op3_ok = eq i32 %op3, 1
+    %l3 = load i32, *%olen
+    %l3_ok = eq i32 %l3, 18
+    %c3 = and i1 %op3_ok, %l3_ok
+    br %c3, @cmp_frag, @fail_close
+  @cmp_frag:
+    %expf = gep i8, *@EXP_FRAG, 0
+    %d3 = call @memcmp(%bufp, %expf, 18)
+    %d3_ok = eq i32 %d3, 0
+    br %d3_ok, @big_init, @fail_close
+
+  @big_init:
+    %big = let [i8, 20000]
+    %bigp = gep i8, *%big, 0
+    %i = let i32
+    store i32 0, *%i
+    jmp @big_cond
+  @big_cond:
+    %iv = load i32, *%i
+    %more = slt i32 %iv, 20000
+    br %more, @big_fill, @big_send
+  @big_fill:
+    %iv2 = load i32, *%i
+    %bp = gep i8, *%big, %iv2
+    %bv = and i32 %iv2, 255
+    %bc = trunc i32 %bv to i8
+    store i8 %bc, *%bp
+    %nx = add i32 %iv2, 1
+    store i32 %nx, *%i
+    jmp @big_cond
+  @big_send:
+    %s4 = call @net_ws_send_binary(%w, %bigp, 20000)
+    %s4_ok = eq i32 %s4, 0
+    br %s4_ok, @big_recv, @fail_close
+  @big_recv:
+    %op4 = call @net_ws_recv(%w, %bufp, 20000, %olp)
+    %op4_ok = eq i32 %op4, 2
+    %l4 = load i32, *%olen
+    %l4_ok = eq i32 %l4, 20000
+    %c4 = and i1 %op4_ok, %l4_ok
+    br %c4, @big_cmp, @fail_close
+  @big_cmp:
+    %d4 = call @memcmp(%bufp, %bigp, 20000)
+    %d4_ok = eq i32 %d4, 0
+    br %d4_ok, @do_close, @fail_close
+
+  @do_close:
+    %byp = gep i8, *@BYE, 0
+    %sc = call @net_ws_send_close(%w, 1000, %byp, 3)
+    %sc_ok = eq i32 %sc, 0
+    br %sc_ok, @recv_close, @fail_close
+  @recv_close:
+    %op5 = call @net_ws_recv(%w, %bufp, 20000, %olp)
+    %op5_ok = eq i32 %op5, 8
+    %cc = call @net_ws_close_code_of(%w)
+    %cc_ok = eq i32 %cc, 1000
+    %c5 = and i1 %op5_ok, %cc_ok
+    br %c5, @ok, @fail_close
+
+  @ok:
+    call @net_ws_destroy(%w)
+    %pm = gep i8, *@PASS, 0
+    call @printf(%pm)
+    ret i32 0
+  @fail_close:
+    call @net_ws_destroy(%w)
+    jmp @fail
+  @fail:
+    %fm = gep i8, *@FAIL, 0
+    call @printf(%fm)
+    ret i32 1
+}

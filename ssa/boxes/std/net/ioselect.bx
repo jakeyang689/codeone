@@ -1,0 +1,49 @@
+// I/O multiplexing extern declarations for boxes/std/net/ioselect.bx
+
+extern @c1_ioselect_create() -> i32
+extern @c1_ioselect_add(ioselect_fd: i32, fd: i32, events: i32, ident: i32) -> i32
+extern @c1_ioselect_del(ioselect_fd: i32, fd: i32) -> i32
+extern @c1_ioselect_wait_flat(ioselect_fd: i32, buf: *i8, max: i32, timeout_ms: i32) -> i32
+extern @c1_ioselect_close(ioselect_fd: i32) -> i32
+
+// Wrapper: create
+fun @net_ioselect_create() -> i32 {
+  @entry:
+    %fd = call @c1_ioselect_create()
+    ret i32 %fd
+}
+
+// Wrapper: add fd for read events (events=1)
+fun @net_ioselect_add_read(ioselect_fd: i32, fd: i32, ident: i32) -> i32 {
+  @entry:
+    %r = call @c1_ioselect_add(%ioselect_fd, %fd, 1, %ident)
+    ret i32 %r
+}
+
+// Wrapper: add fd for write events (events=2)
+fun @net_ioselect_add_write(ioselect_fd: i32, fd: i32, ident: i32) -> i32 {
+  @entry:
+    %r = call @c1_ioselect_add(%ioselect_fd, %fd, 2, %ident)
+    ret i32 %r
+}
+
+// Wrapper: delete fd
+fun @net_ioselect_del(ioselect_fd: i32, fd: i32) -> i32 {
+  @entry:
+    %r = call @c1_ioselect_del(%ioselect_fd, %fd)
+    ret i32 %r
+}
+
+// Wrapper: wait (returns count, results in buf as [ident,fd,events] triples)
+fun @net_ioselect_wait(ioselect_fd: i32, buf: *i8, max: i32, timeout_ms: i32) -> i32 {
+  @entry:
+    %n = call @c1_ioselect_wait_flat(%ioselect_fd, %buf, %max, %timeout_ms)
+    ret i32 %n
+}
+
+// Wrapper: close
+fun @net_ioselect_close(ioselect_fd: i32) -> i32 {
+  @entry:
+    %r = call @c1_ioselect_close(%ioselect_fd)
+    ret i32 %r
+}

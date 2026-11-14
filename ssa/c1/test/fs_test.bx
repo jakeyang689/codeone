@@ -1,0 +1,179 @@
+// Filesystem tests against a per-process temporary directory.
+// Prints "PASS fs" on success.
+
+extern @printf(fmt: *i8, ...) -> i32
+extern @snprintf(buf: *i8, size: i64, fmt: *i8, ...) -> i32
+extern @getpid() -> i32
+extern @std_io_fs_exists(path: *i8) -> i32
+extern @std_io_fs_is_file(path: *i8) -> i32
+extern @std_io_fs_is_dir(path: *i8) -> i32
+extern @std_io_fs_size(path: *i8) -> i64
+extern @std_io_fs_mtime(path: *i8) -> i64
+extern @std_io_fs_mkdir(path: *i8) -> i32
+extern @std_io_fs_remove(path: *i8) -> i32
+extern @std_io_fs_rename(src: *i8, dst: *i8) -> i32
+extern @std_io_fs_opendir(path: *i8) -> *i8
+extern @std_io_fs_readdir(dir: *i8, name: *i8, cap: i32) -> i32
+extern @std_io_fs_closedir(dir: *i8) -> i32
+extern @std_io_file_open_write(path: *i8) -> *i8
+extern @std_io_file_write(fp: *i8, buf: *i8, count: i32) -> i64
+extern @std_io_file_close(fp: *i8) -> i32
+
+fun @main() -> i32 {
+  @entry:
+    %id = let i32
+    %dir = let [i8, 128]
+    %f1 = let [i8, 192]
+    %f2 = let [i8, 192]
+    %ren = let [i8, 192]
+    %name = let [i8, 128]
+    %cnt = let i32
+    %dirp = gep i8, *%dir, 0
+    %f1p = gep i8, *%f1, 0
+    %f2p = gep i8, *%f2, 0
+    %renp = gep i8, *%ren, 0
+    %namep = gep i8, *%name, 0
+    store i32 0, *%id
+    %pid = call @getpid()
+    %dn = call @snprintf(%dirp, 128, "/tmp/codeone_fs_test_%d", %pid)
+    %n1 = call @snprintf(%f1p, 192, "%s/a.txt", %dirp)
+    %n2 = call @snprintf(%f2p, 192, "%s/b.txt", %dirp)
+    %n3 = call @snprintf(%renp, 192, "%s/renamed.txt", %dirp)
+
+    // best-effort cleanup from a previous failed run
+    call @std_io_fs_remove(%f1p)
+    call @std_io_fs_remove(%f2p)
+    call @std_io_fs_remove(%renp)
+    call @std_io_fs_remove(%dirp)
+    jmp @c1
+
+  @c1:
+    store i32 1, *%id
+    %mk = call @std_io_fs_mkdir(%dirp)
+    %mkok = eq i32 %mk, 0
+    br %mkok, @c2, @fail
+  @c2:
+    store i32 2, *%id
+    %isd = call @std_io_fs_is_dir(%dirp)
+    %ex = call @std_io_fs_exists(%dirp)
+    %isf = call @std_io_fs_is_file(%dirp)
+    %a = eq i32 %isd, 1
+    %b = eq i32 %ex, 1
+    %c = eq i32 %isf, 0
+    %ab = and i1 %a, %b
+    %abc = and i1 %ab, %c
+    br %abc, @c3, @fail
+
+    // create a.txt with "hello"
+  @c3:
+    store i32 3, *%id
+    %fp1 = call @std_io_file_open_write(%f1p)
+    %f1n = eq *i8 %fp1, null
+    br %f1n, @fail, @w1
+  @w1:
+    %wv = call @std_io_file_write(%fp1, "hello", 5)
+    call @std_io_file_close(%fp1)
+    %wok = eq i64 %wv, 5
+    br %wok, @c4, @fail
+  @c4:
+    store i32 4, *%id
+    %ex1 = call @std_io_fs_exists(%f1p)
+    %if1 = call @std_io_fs_is_file(%f1p)
+    %sz1 = call @std_io_fs_size(%f1p)
+    %mt1 = call @std_io_fs_mtime(%f1p)
+    %k1 = eq i32 %ex1, 1
+    %k2 = eq i32 %if1, 1
+    %k3 = eq i64 %sz1, 5
+    %k4 = sgt i64 %mt1, 0
+    %k12 = and i1 %k1, %k2
+    %k34 = and i1 %k3, %k4
+    %kall = and i1 %k12, %k34
+    br %kall, @c5, @fail
+
+    // rename a.txt -> renamed.txt
+  @c5:
+    store i32 5, *%id
+    %rn = call @std_io_fs_rename(%f1p, %renp)
+    %rnok = eq i32 %rn, 0
+    br %rnok, @c6, @fail
+  @c6:
+    store i32 6, *%id
+    %old = call @std_io_fs_exists(%f1p)
+    %new = call @std_io_fs_exists(%renp)
+    %o_ok = eq i32 %old, 0
+    %n_ok = eq i32 %new, 1
+    %r_ok = and i1 %o_ok, %n_ok
+    br %r_ok, @c7, @fail
+
+    // create b.txt and list the directory
+  @c7:
+    store i32 7, *%id
+    %fp2 = call @std_io_file_open_write(%f2p)
+    %f2n = eq *i8 %fp2, null
+    br %f2n, @fail, @w2
+  @w2:
+    %wv2 = call @std_io_file_write(%fp2, "world", 5)
+    call @std_io_file_close(%fp2)
+    %wok2 = eq i64 %wv2, 5
+    br %wok2, @c8, @fail
+  @c8:
+    store i32 8, *%id
+    %dh = call @std_io_fs_opendir(%dirp)
+    %dhn = eq *i8 %dh, null
+    br %dhn, @fail, @dinit
+  @dinit:
+    store i32 0, *%cnt
+    %szp = gep i8, *%name, 0
+    jmp @dloop
+  @dloop:
+    %rr = call @std_io_fs_readdir(%dh, %namep, 128)
+    %end = eq i32 %rr, 0
+    br %end, @dclosed, @dchk
+  @dchk:
+    %neg = slt i32 %rr, 0
+    br %neg, @dfail, @dinc
+  @dinc:
+    %cv = load i32, *%cnt
+    %cn = add i32 %cv, 1
+    store i32 %cn, *%cnt
+    jmp @dloop
+  @dclosed:
+    %cf = load i32, *%cnt
+    %cok = eq i32 %cf, 2
+    %cl = call @std_io_fs_closedir(%dh)
+    %clok = eq i32 %cl, 0
+    %allc = and i1 %cok, %clok
+    br %allc, @c9, @fail
+  @dfail:
+    call @std_io_fs_closedir(%dh)
+    jmp @fail
+
+    // missing path queries and cleanup
+  @c9:
+    store i32 9, *%id
+    %msz = call @std_io_fs_size(%f1p)
+    %mszok = eq i64 %msz, -1
+    br %mszok, @c10, @fail
+  @c10:
+    store i32 10, *%id
+    %rm1 = call @std_io_fs_remove(%renp)
+    %rm2 = call @std_io_fs_remove(%f2p)
+    %rm3 = call @std_io_fs_remove(%dirp)
+    %s1 = add i32 %rm1, %rm2
+    %s2 = add i32 %s1, %rm3
+    %rmok = eq i32 %s2, 0
+    br %rmok, @c11, @fail
+  @c11:
+    store i32 11, *%id
+    %gone = call @std_io_fs_exists(%dirp)
+    %goneok = eq i32 %gone, 0
+    br %goneok, @pass, @fail
+
+  @pass:
+    call @printf("PASS fs\n")
+    ret i32 0
+  @fail:
+    %fid = load i32, *%id
+    call @printf("FAIL fs at case %d\n", %fid)
+    ret i32 1
+}

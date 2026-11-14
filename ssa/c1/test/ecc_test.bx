@@ -1,0 +1,224 @@
+// ECC test: key generation, ECDSA sign/verify, ECDH
+// Compile:
+//   cd ssa/c1
+//   ./c1 test/ecc_test.bx boxes/std/crypto/ecc.bx boxes/std/crypto/rsa.bx \
+//     -o test/ecc_test -L ../platform -l platform -O2
+//   ./test/ecc_test
+
+extern @std_crypto_ecc_generate_keypair(priv: *i32, pub_x: *i32, pub_y: *i32) -> void
+extern @std_crypto_ecc_sign(priv: *i32, hash: *i8, r: *i32, s: *i32) -> void
+extern @std_crypto_ecc_verify(pub_x: *i32, pub_y: *i32, hash: *i8, r: *i32, s: *i32) -> i1
+extern @std_crypto_ecc_ecdh(priv: *i32, peer_x: *i32, peer_y: *i32, secret_x: *i32) -> void
+
+extern @std_crypto_rsa_bn_zero(r: *i32, limbs: i32) -> void
+extern @std_crypto_rsa_bn_copy(r: *i32, a: *i32, limbs: i32) -> void
+extern @std_crypto_rsa_bn_is_zero(a: *i32, limbs: i32) -> i1
+extern @std_crypto_rsa_bn_cmp(a: *i32, b: *i32, limbs: i32) -> i32
+extern @std_crypto_rsa_bn_mod_mul(r: *i32, a: *i32, b: *i32, m: *i32, limbs: i32) -> void
+extern @std_crypto_rsa_bn_mod(r: *i32, a: *i32, a_limbs: i32, m: *i32, m_limbs: i32) -> void
+extern @std_crypto_rsa_bn_add(r: *i32, a: *i32, b: *i32, limbs: i32) -> i32
+extern @std_crypto_rsa_bn_sub(r: *i32, a: *i32, b: *i32, limbs: i32) -> i32
+
+extern @memset(s: *i8, c: i32, n: i64) -> *i8
+extern @printf(fmt: *i8, ...) -> i32
+
+const @TEST_P: [i32, 8] = [ -977, -2, -1, -1, -1, -1, -1, -1 ]
+// NOTE: Use literal 8 directly - const i32 in calls passes address, not value
+
+// Check if point (x, y) is on secp256k1: y^2 = x^3 + 7 mod p
+// Returns 1 = on curve
+fun @check_on_curve(x: *i32, y: *i32) -> i1 {
+  @entry:
+    %lhs = let [i32, 8]
+    %lhs_p = gep i32, *%lhs, 0
+    %rhs = let [i32, 8]
+    %rhs_p = gep i32, *%rhs, 0
+    %t = let [i32, 8]
+    %t_p = gep i32, *%t, 0
+
+    // lhs = y^2 mod p
+    call @std_crypto_rsa_bn_mod_mul(%lhs_p, %y, %y, @TEST_P, 8)
+
+    // rhs = x^3 + 7 mod p
+    call @std_crypto_rsa_bn_mod_mul(%rhs_p, %x, %x, @TEST_P, 8)
+    call @std_crypto_rsa_bn_mod_mul(%rhs_p, %rhs_p, %x, @TEST_P, 8)
+    call @std_crypto_rsa_bn_zero(%t_p, 8)
+    %p0 = gep i32, *%t, 0
+    store i32 7, *%p0
+    call @std_crypto_rsa_bn_add(%rhs_p, %rhs_p, %t_p, 8)
+    %c = call @std_crypto_rsa_bn_cmp(%rhs_p, @TEST_P, 8)
+    %ge = sge i32 %c, 0
+    br %ge, @rhs_sub, @check_eq
+
+  @rhs_sub:
+    call @std_crypto_rsa_bn_sub(%rhs_p, %rhs_p, @TEST_P, 8)
+    jmp @check_eq
+
+  @check_eq:
+    %cmp = call @std_crypto_rsa_bn_cmp(%lhs_p, %rhs_p, 8)
+    %eq = eq i32 %cmp, 0
+    ret i1 %eq
+}
+
+// Test 1: generate key and verify pub key is on curve
+fun @test_keygen() -> i32 {
+  @entry:
+    %priv = let [i32, 8]
+    %priv_p = gep i32, *%priv, 0
+    %pub_x = let [i32, 8]
+    %pub_x_p = gep i32, *%pub_x, 0
+    %pub_y = let [i32, 8]
+    %pub_y_p = gep i32, *%pub_y, 0
+
+    call @std_crypto_ecc_generate_keypair(%priv_p, %pub_x_p, %pub_y_p)
+    %pz = call @std_crypto_rsa_bn_is_zero(%priv_p, 8)
+    br %pz, @fail1, @curve_chk
+
+  @curve_chk:
+    %oc = call @check_on_curve(%pub_x_p, %pub_y_p)
+    br %oc, @pass1, @fail1
+
+  @pass1:
+    ret i32 0
+
+  @fail1:
+    ret i32 1
+}
+
+// Test 2: ECDSA sign + verify round-trip
+fun @test_sign_verify() -> i32 {
+  @entry:
+    %priv = let [i32, 8]
+    %priv_p = gep i32, *%priv, 0
+    %pub_x = let [i32, 8]
+    %pub_x_p = gep i32, *%pub_x, 0
+    %pub_y = let [i32, 8]
+    %pub_y_p = gep i32, *%pub_y, 0
+    %r = let [i32, 8]
+    %r_p = gep i32, *%r, 0
+    %s = let [i32, 8]
+    %s_p = gep i32, *%s, 0
+
+    // Fixed 32-byte "hash"
+    %hash = let [i8, 32]
+    %hash_p = gep i8, *%hash, 0
+    call @memset(%hash_p, 0, 32)
+    %h0 = gep i8, *%hash, 0
+    store i8 0x2C, *%h0
+    %h1 = gep i8, *%hash, 1
+    store i8 0xF4, *%h1
+    %h2 = gep i8, *%hash, 2
+    store i8 0x7D, *%h2
+    %h3 = gep i8, *%hash, 3
+    store i8 0xF8, *%h3
+    %h4 = gep i8, *%hash, 4
+    store i8 0x51, *%h4
+    %h5 = gep i8, *%hash, 5
+    store i8 0x41, *%h5
+    %h6 = gep i8, *%hash, 6
+    store i8 0xE5, *%h6
+    %h7 = gep i8, *%hash, 7
+    store i8 0x30, *%h7
+    %h8 = gep i8, *%hash, 8
+    store i8 0xFC, *%h8
+    %h9 = gep i8, *%hash, 9
+    store i8 0x38, *%h9
+    %h10 = gep i8, *%hash, 10
+    store i8 0xF0, *%h10
+    %h11 = gep i8, *%hash, 11
+    store i8 0x9D, *%h11
+
+    call @std_crypto_ecc_generate_keypair(%priv_p, %pub_x_p, %pub_y_p)
+
+    // Sign
+    call @std_crypto_ecc_sign(%priv_p, %hash_p, %r_p, %s_p)
+
+    // Verify with correct key
+    %v1 = call @std_crypto_ecc_verify(%pub_x_p, %pub_y_p, %hash_p, %r_p, %s_p)
+    br %v1, @verify_wrong, @fail2
+
+  @verify_wrong:
+    // Verify with different key should fail
+    %p2 = let [i32, 8]
+    %p2p = gep i32, *%p2, 0
+    %x2 = let [i32, 8]
+    %x2p = gep i32, *%x2, 0
+    %y2 = let [i32, 8]
+    %y2p = gep i32, *%y2, 0
+    call @std_crypto_ecc_generate_keypair(%p2p, %x2p, %y2p)
+    %v2 = call @std_crypto_ecc_verify(%x2p, %y2p, %hash_p, %r_p, %s_p)
+    %must_fail = eq i1 %v2, 0
+    br %must_fail, @pass2, @fail2
+
+  @pass2:
+    ret i32 0
+
+  @fail2:
+    ret i32 1
+}
+
+// Test 3: ECDH shared secret consistency
+fun @test_ecdh() -> i32 {
+  @entry:
+    // Alice's keypair
+    %ap = let [i32, 8]
+    %app = gep i32, *%ap, 0
+    %ax = let [i32, 8]
+    %axp = gep i32, *%ax, 0
+    %ay = let [i32, 8]
+    %ayp = gep i32, *%ay, 0
+    call @std_crypto_ecc_generate_keypair(%app, %axp, %ayp)
+
+    // Bob's keypair
+    %bp = let [i32, 8]
+    %bpp = gep i32, *%bp, 0
+    %bx = let [i32, 8]
+    %bxp = gep i32, *%bx, 0
+    %by = let [i32, 8]
+    %byp = gep i32, *%by, 0
+    call @std_crypto_ecc_generate_keypair(%bpp, %bxp, %byp)
+
+    // Shared secrets
+    %sa = let [i32, 8]
+    %sap = gep i32, *%sa, 0
+    %sb = let [i32, 8]
+    %sbp = gep i32, *%sb, 0
+
+    call @std_crypto_ecc_ecdh(%app, %bxp, %byp, %sap)
+    call @std_crypto_ecc_ecdh(%bpp, %axp, %ayp, %sbp)
+
+    %cmp = call @std_crypto_rsa_bn_cmp(%sap, %sbp, 8)
+    %eq = eq i32 %cmp, 0
+    br %eq, @pass3, @fail3
+
+  @pass3:
+    ret i32 0
+
+  @fail3:
+    ret i32 1
+}
+
+fun @main() -> i32 {
+  @entry:
+    %t1 = call @test_keygen()
+    %t1z = eq i32 %t1, 0
+    br %t1z, @t2, @fail_main
+
+  @t2:
+    %t2r = call @test_sign_verify()
+    %t2z = eq i32 %t2r, 0
+    br %t2z, @t3, @fail_main
+
+  @t3:
+    %t3r = call @test_ecdh()
+    %t3z = eq i32 %t3r, 0
+    br %t3z, @pass_main, @fail_main
+
+  @pass_main:
+    call @printf("PASS\n", 0, 0, 0)
+    ret i32 0
+
+  @fail_main:
+    call @printf("FAIL\n", 0, 0, 0)
+    ret i32 1
+}

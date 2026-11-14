@@ -1,0 +1,26 @@
+# {{PROJECT_NAME}} — codeone application
+
+C1       ?= {{CODEONE_HOME}}/bin/c1
+BOXES    ?= {{CODEONE_HOME}}/boxes/std
+PLATFORM ?= -L {{CODEONE_HOME}}/lib -l platform
+OPT      ?= -O2
+
+APP  := {{ARTIFACT}}
+# All .bx files in this directory are compiled together. Add a module by
+# creating <module>.bx here; no Makefile change is needed.
+SRCS := $(wildcard *.bx)
+# Standard-library boxes used by the app, e.g.: LIBS += $(BOXES)/io/print.bx
+LIBS :=
+
+.PHONY: all run clean
+
+all: $(APP)
+
+$(APP): $(SRCS)
+	$(C1) $(SRCS) $(LIBS) $(PLATFORM) $(OPT) -o $(APP)
+
+run: $(APP)
+	./$(APP)
+
+clean:
+	rm -f $(APP) *.o

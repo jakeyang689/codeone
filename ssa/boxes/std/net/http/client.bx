@@ -1,0 +1,317 @@
+// High-level HTTP client: open a connection (optionally over TLS), send a
+// request and read the whole response.
+//
+// Depends on socket.bx and, for HTTPS, on the TLS stack.
+
+extern @memset(s: *i8, c: i32, n: i64) -> *i8
+
+extern @std_text_str_find_ci(buf: *i8, start: i32, end: i32, needle: *i8) -> i32
+
+extern @net_socket_tcp() -> i32
+extern @net_socket_connect_ip(fd: i32, ip: *i8, port: i32) -> i32
+extern @net_socket_close(fd: i32) -> i32
+extern @net_socket_send(fd: i32, buf: *i8, len: i32) -> i32
+extern @net_socket_recv(fd: i32, buf: *i8, len: i32) -> i32
+extern @net_dns_resolve(hostname: *i8, addr_buf: *i8, addr_buf_len: i32) -> i32
+
+extern @net_tls13_connect(ctx: *i8, fd: i32, limbs: i32) -> i32
+extern @net_tls12_connect(ctx: *i8, fd: i32, limbs: i32) -> i32
+extern @net_tls_set_host(ctx: *i8, host: *i8, len: i32) -> void
+extern @net_tls_set_trust(ctx: *i8, pool: *i8, offsets: *i32, lens: *i32,
+                          count: i32) -> void
+extern @net_tls_send(ctx: *i8, data: *i8, len: i32) -> i32
+extern @net_tls_recv(ctx: *i8, buf: *i8, cap: i32, out_len: *i32) -> i32
+extern @net_tls_close(ctx: *i8) -> i32
+
+struct @HttpClient {
+  @fd: i32,
+  @use_tls: i32,
+  @ctx: [i8, 1024]
+}
+
+// Connect to host:port. use_tls != 0 performs a TLS handshake using host as
+// the SNI name: TLS 1.3 is tried first and the connection falls back to
+// TLS 1.2 on a fresh socket if the server does not negotiate 1.3.
+// Returns 0 on success, -1 on failure.
+fun @net_http_client_open(host: *i8, host_len: i32, port: i32, use_tls: i32,
+                          c: *@HttpClient) -> i32 {
+  @entry:
+    %r = call @_http_client_open(%host, %host_len, %port, %use_tls, %c,
+                                 null, null, null, 0)
+    ret i32 %r
+}
+
+// Same as net_http_client_open, but the server certificate chain must be
+// signed by one of the count trust anchors described by pool/offsets/lens
+// (see net_tls_set_trust).
+fun @net_http_client_open_trusted(host: *i8, host_len: i32, port: i32, use_tls: i32,
+                                  c: *@HttpClient, pool: *i8, offsets: *i32,
+                                  lens: *i32, count: i32) -> i32 {
+  @entry:
+    %r = call @_http_client_open(%host, %host_len, %port, %use_tls, %c,
+                                 %pool, %offsets, %lens, %count)
+    ret i32 %r
+}
+
+fun @_http_client_open(host: *i8, host_len: i32, port: i32, use_tls: i32,
+                       c: *@HttpClient, pool: *i8, offsets: *i32,
+                       lens: *i32, count: i32) -> i32 {
+  @entry:
+    %fd_p = field @HttpClient, *%c, 0
+    %tls_p = field @HttpClient, *%c, 1
+    store i32 %use_tls, *%tls_p
+    %addr = let [i8, 64]
+    %ap = gep i8, *%addr, 0
+    %rd = call @net_dns_resolve(%host, %ap, 64)
+    %dns_ok = eq i32 %rd, 0
+    br %dns_ok, @sock, @fail
+
+  @sock:
+    %fd = call @net_socket_tcp()
+    %fd_ok = sge i32 %fd, 0
+    br %fd_ok, @conn, @fail
+
+  @conn:
+    %cr = call @net_socket_connect_ip(%fd, %ap, %port)
+    %c_ok = eq i32 %cr, 0
+    br %c_ok, @store, @conn_fail
+
+  @store:
+    store i32 %fd, *%fd_p
+    %want_tls = eq i32 %use_tls, 1
+    br %want_tls, @tls, @done
+
+  @tls:
+    %ctxp = field @HttpClient, *%c, 2
+    %cp = gep i8, *%ctxp, 0
+    call @memset(%cp, 0, 1024)
+    call @net_tls_set_host(%cp, %host, %host_len)
+    call @net_tls_set_trust(%cp, %pool, %offsets, %lens, %count)
+    %hs13 = call @net_tls13_connect(%cp, %fd, 64)
+    %hs13_ok = eq i32 %hs13, 0
+    br %hs13_ok, @done, @fallback
+
+  // The server did not complete TLS 1.3; reconnect and use TLS 1.2.
+  @fallback:
+    call @net_socket_close(%fd)
+    %fd2 = call @net_socket_tcp()
+    %fd2_ok = sge i32 %fd2, 0
+    br %fd2_ok, @reconn, @fail
+  @reconn:
+    %cr2 = call @net_socket_connect_ip(%fd2, %ap, %port)
+    %cr2_ok = eq i32 %cr2, 0
+    br %cr2_ok, @tls12, @reconn_fail
+  @tls12:
+    store i32 %fd2, *%fd_p
+    call @memset(%cp, 0, 1024)
+    call @net_tls_set_host(%cp, %host, %host_len)
+    call @net_tls_set_trust(%cp, %pool, %offsets, %lens, %count)
+    %hs = call @net_tls12_connect(%cp, %fd2, 64)
+    %hs_ok = eq i32 %hs, 0
+    br %hs_ok, @done, @tls_fail2
+
+  @tls_fail2:
+    call @net_socket_close(%fd2)
+    ret i32 -1
+
+  @reconn_fail:
+    call @net_socket_close(%fd2)
+    ret i32 -1
+
+  @conn_fail:
+    call @net_socket_close(%fd)
+    ret i32 -1
+
+  @done:
+    ret i32 0
+
+  @fail:
+    ret i32 -1
+}
+
+// Send len bytes. Returns 0 on success, -1 on failure.
+fun @net_http_client_send(c: *@HttpClient, data: *i8, len: i32) -> i32 {
+  @entry:
+    %tls_p = field @HttpClient, *%c, 1
+    %tls = load i32, *%tls_p
+    %is_tls = eq i32 %tls, 1
+    br %is_tls, @tls_path, @plain
+  @tls_path:
+    %ctxp = field @HttpClient, *%c, 2
+    %cp = gep i8, *%ctxp, 0
+    %r = call @net_tls_send(%cp, %data, %len)
+    ret i32 %r
+  @plain:
+    %fd_p = field @HttpClient, *%c, 0
+    %fd = load i32, *%fd_p
+    %off = let i32
+    store i32 0, *%off
+    %neg = slt i32 %len, 0
+    br %neg, @fail, @loop
+  @loop:
+    %ov = load i32, *%off
+    %rem = sub i32 %len, %ov
+    %done = sle i32 %rem, 0
+    br %done, @ok, @send
+  @send:
+    %ov2 = load i32, *%off
+    %dp = gep i8, *%data, %ov2
+    %n = call @net_socket_send(%fd, %dp, %rem)
+    %bad = sle i32 %n, 0
+    br %bad, @fail, @adv
+  @adv:
+    %ov3 = load i32, *%off
+    %no = add i32 %ov3, %n
+    store i32 %no, *%off
+    jmp @loop
+  @ok:
+    ret i32 0
+  @fail:
+    ret i32 -1
+}
+
+// Read one chunk. Returns 0 when out_len was filled, -1 when the peer closed
+// or an error occurred.
+fun @net_http_client_recv(c: *@HttpClient, buf: *i8, cap: i32,
+                          out_len: *i32) -> i32 {
+  @entry:
+    %tls_p = field @HttpClient, *%c, 1
+    %tls = load i32, *%tls_p
+    %is_tls = eq i32 %tls, 1
+    br %is_tls, @tls_path, @plain
+  @tls_path:
+    %ctxp = field @HttpClient, *%c, 2
+    %cp = gep i8, *%ctxp, 0
+    %r = call @net_tls_recv(%cp, %buf, %cap, %out_len)
+    ret i32 %r
+  @plain:
+    %fd_p = field @HttpClient, *%c, 0
+    %fd = load i32, *%fd_p
+    %n = call @net_socket_recv(%fd, %buf, %cap)
+    %bad = sle i32 %n, 0
+    br %bad, @eof, @ok
+  @ok:
+    store i32 %n, *%out_len
+    ret i32 0
+  @eof:
+    store i32 0, *%out_len
+    ret i32 -1
+}
+
+// Read until the end of the HTTP header block ("\r\n\r\n") is buffered.
+// On success out_len receives the bytes buffered; anything after the head is
+// left in buf so callers that switch protocols (WebSocket) can consume it.
+// Returns 0 on success, -1 on EOF, error, or if cap is too small.
+fun @net_http_client_read_head(c: *@HttpClient, buf: *i8, cap: i32,
+                               out_len: *i32) -> i32 {
+  @entry:
+    %total = let i32
+    store i32 0, *%total
+    %got = let i32
+    %gp = gep i32, *%got, 0
+    jmp @loop
+  @loop:
+    %tv = load i32, *%total
+    %end = call @std_text_str_find_ci(%buf, 0, %tv, "\r\n\r\n")
+    %have = sge i32 %end, 0
+    br %have, @ok, @need_more
+  @need_more:
+    %tv2 = load i32, *%total
+    %room = sub i32 %cap, %tv2
+    %full = slt i32 %room, 512
+    br %full, @fail, @recv
+  @recv:
+    %tv3 = load i32, *%total
+    %dst = gep i8, *%buf, %tv3
+    %r = call @net_http_client_recv(%c, %dst, %room, %gp)
+    %r_bad = slt i32 %r, 0
+    br %r_bad, @fail, @acc
+  @acc:
+    %g = load i32, *%gp
+    %zero = eq i32 %g, 0
+    br %zero, @fail, @add
+  @add:
+    %tv4 = load i32, *%total
+    %nt = add i32 %tv4, %g
+    store i32 %nt, *%total
+    jmp @loop
+  @ok:
+    %tv5 = load i32, *%total
+    store i32 %tv5, *%out_len
+    ret i32 0
+  @fail:
+    ret i32 -1
+}
+
+// Close the connection.
+fun @net_http_client_close(c: *@HttpClient) -> i32 {
+  @entry:
+    %tls_p = field @HttpClient, *%c, 1
+    %tls = load i32, *%tls_p
+    %is_tls = eq i32 %tls, 1
+    br %is_tls, @tls_path, @plain
+  @tls_path:
+    %ctxp = field @HttpClient, *%c, 2
+    %cp = gep i8, *%ctxp, 0
+    call @net_tls_close(%cp)
+    jmp @plain
+  @plain:
+    %fd_p = field @HttpClient, *%c, 0
+    %fd = load i32, *%fd_p
+    %r = call @net_socket_close(%fd)
+    ret i32 %r
+}
+
+// One-shot request: connect, send, read the whole response, close.
+// Returns the number of response bytes, or -1 on failure.
+fun @net_http_request(host: *i8, host_len: i32, port: i32, use_tls: i32,
+                      req: *i8, req_len: i32, resp: *i8, resp_cap: i32) -> i32 {
+  @entry:
+    %c = let [i8, 1092]
+    %cp = gep i8, *%c, 0
+    %ro = call @net_http_client_open(%host, %host_len, %port, %use_tls, %cp)
+    %open_ok = eq i32 %ro, 0
+    br %open_ok, @send, @fail
+  @send:
+    %sr = call @net_http_client_send(%cp, %req, %req_len)
+    %send_ok = eq i32 %sr, 0
+    br %send_ok, @recv_init, @close_fail
+  @recv_init:
+    %total = let i32
+    store i32 0, *%total
+    %got = let i32
+    %gp = gep i32, *%got, 0
+    jmp @loop
+  @loop:
+    %tv = load i32, *%total
+    %left = sub i32 %resp_cap, %tv
+    %full = slt i32 %left, 512
+    br %full, @finish, @recv_one
+  @recv_one:
+    %tv2 = load i32, *%total
+    %dst = gep i8, *%resp, %tv2
+    %r = call @net_http_client_recv(%cp, %dst, %left, %gp)
+    %r_bad = slt i32 %r, 0
+    br %r_bad, @finish, @acc
+  @acc:
+    %g = load i32, *%gp
+    %zero = eq i32 %g, 0
+    br %zero, @finish, @add
+  @add:
+    %tv3 = load i32, *%total
+    %nt = add i32 %tv3, %g
+    store i32 %nt, *%total
+    jmp @loop
+  @finish:
+    call @net_http_client_close(%cp)
+    %n = load i32, *%total
+    %none = eq i32 %n, 0
+    br %none, @fail, @ok
+  @ok:
+    ret i32 %n
+  @close_fail:
+    call @net_http_client_close(%cp)
+    ret i32 -1
+  @fail:
+    ret i32 -1
+}

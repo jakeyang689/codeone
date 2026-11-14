@@ -1,0 +1,34 @@
+// Process environment helpers (ISO C: getenv/exit/system).
+//
+// Command-line arguments are passed directly to the entry point:
+//
+//   fun @main(argc: i32, argv: **i8) -> i32
+//
+// Use std_process_system only with trusted command strings; it runs the
+// platform shell.
+
+extern @getenv(name: *i8) -> *i8
+extern @exit(code: i32) -> void
+extern @system(cmd: *i8) -> i32
+
+// Value of an environment variable, or null when it is not set.
+fun @std_process_getenv(name: *i8) -> *i8 {
+  @entry:
+    %v = call @getenv(%name)
+    ret *i8 %v
+}
+
+// Terminate the process with the given status.
+fun @std_process_exit(code: i32) -> void {
+  @entry:
+    call @exit(%code)
+    ret void
+}
+
+// Run a shell command; returns the C system() status (0 on success) or -1
+// when the shell itself could not be started.
+fun @std_process_system(cmd: *i8) -> i32 {
+  @entry:
+    %r = call @system(%cmd)
+    ret i32 %r
+}

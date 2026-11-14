@@ -1,0 +1,79 @@
+// RSASSA-PSS signing round trip. Prints "PASS rsa_pss_sign" on success.
+
+extern @printf(fmt: *i8, ...) -> i32
+extern @std_io_file_open_read(path: *i8) -> *i8
+extern @std_io_file_read_all(fp: *i8, buf: *i8, cap: i32) -> i32
+extern @std_io_file_close(fp: *i8) -> i32
+extern @std_crypto_pem_read_rsa_private(pem: *i8, pem_len: i32,
+                                        n: *i32, e: *i32, d: *i32,
+                                        limbs: i32) -> i32
+extern @std_crypto_sha256_compute(data: *i8, len: i32, digest: *i8) -> void
+extern @std_crypto_rsa_sign_pss_sha256(hash: *i8, d: *i32, n: *i32,
+                                       limbs: i32, signature: *i8) -> i32
+extern @std_crypto_rsa_verify_pss_sha256(hash: *i8, sig: *i8, sig_len: i32,
+                                         e: *i32, e_limbs: i32,
+                                         n: *i32, limbs: i32) -> i1
+
+const @KEY_PATH = "certs/tls13.key"
+
+fun @main() -> i32 {
+  @entry:
+    %id = let i32
+    %pem = let [i8, 8192]
+    %n = let [i32, 64]
+    %e = let [i32, 64]
+    %d = let [i32, 64]
+    %hash = let [i8, 32]
+    %sig = let [i8, 512]
+    %pp = gep i8, *%pem, 0
+    %np = gep i32, *%n, 0
+    %ep = gep i32, *%e, 0
+    %dp = gep i32, *%d, 0
+    %hp = gep i8, *%hash, 0
+    %sp = gep i8, *%sig, 0
+    store i32 0, *%id
+    jmp @c1
+
+  @c1:
+    store i32 1, *%id
+    %kp = gep i8, *@KEY_PATH, 0
+    %fp = call @std_io_file_open_read(%kp)
+    %fn = eq *i8 %fp, null
+    br %fn, @fail, @read
+  @read:
+    %n8 = call @std_io_file_read_all(%fp, %pp, 8191)
+    call @std_io_file_close(%fp)
+    %nok = sgt i32 %n8, 0
+    br %nok, @c2, @fail
+  @c2:
+    store i32 2, *%id
+    %r2 = call @std_crypto_pem_read_rsa_private(%pp, %n8, %np, %ep, %dp, 64)
+    %ok2 = eq i32 %r2, 0
+    br %ok2, @c3, @fail
+  @c3:
+    store i32 3, *%id
+    call @std_crypto_sha256_compute("message", 7, %hp)
+    %r3 = call @std_crypto_rsa_sign_pss_sha256(%hp, %dp, %np, 64, %sp)
+    %ok3 = eq i32 %r3, 0
+    br %ok3, @c4, @fail
+  @c4:
+    store i32 4, *%id
+    %v4 = call @std_crypto_rsa_verify_pss_sha256(%hp, %sp, 256, %ep, 64, %np, 64)
+    br %v4, @c5, @fail
+  @c5:
+    store i32 5, *%id
+    %b0 = load i8, *%sp
+    %xb = xor i8 %b0, 1
+    store i8 %xb, *%sp
+    %v5 = call @std_crypto_rsa_verify_pss_sha256(%hp, %sp, 256, %ep, 64, %np, 64)
+    %bad = eq i1 %v5, false
+    br %bad, @pass, @fail
+
+  @pass:
+    call @printf("PASS rsa_pss_sign\n")
+    ret i32 0
+  @fail:
+    %fid = load i32, *%id
+    call @printf("FAIL rsa_pss_sign at case %d\n", %fid)
+    ret i32 1
+}

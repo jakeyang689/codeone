@@ -1,0 +1,22 @@
+// Entry-point arguments: fun @main(argc: i32, argv: **i8).
+// Prints "PASS argv" on success.
+
+extern @printf(fmt: *i8, ...) -> i32
+
+fun @main(argc: i32, argv: **i8) -> i32 {
+  @entry:
+    %cok = sge i32 %argc, 1
+    br %cok, @chk, @fail
+  @chk:
+    %p = gep *i8, *%argv, 0
+    %v = load *i8, *%p
+    %vn = ne *i8 %v, null
+    br %vn, @pass, @fail
+
+  @pass:
+    call @printf("PASS argv\n")
+    ret i32 0
+  @fail:
+    call @printf("FAIL argv\n")
+    ret i32 1
+}

@@ -1,0 +1,89 @@
+// Platform socket abstraction for boxes/std/net/socket.bx
+
+// Core socket externs (from libplatform.a)
+extern @c1_socket_create(domain: i32, type: i32, protocol: i32) -> i32
+extern @c1_socket_bind(fd: i32, port: i32) -> i32
+extern @c1_socket_listen(fd: i32, backlog: i32) -> i32
+extern @c1_socket_accept(fd: i32) -> i32
+extern @c1_socket_connect(fd: i32, ip: *i8, port: i32) -> i32
+extern @c1_socket_connect_loopback(fd: i32, port: i32) -> i32
+extern @c1_socket_send(fd: i32, buf: *i8, len: i32) -> i32
+extern @c1_socket_recv(fd: i32, buf: *i8, len: i32) -> i32
+extern @c1_socket_close(fd: i32) -> i32
+extern @c1_socket_set_nonblock(fd: i32) -> i32
+
+// TCP socket (AF_INET=2, SOCK_STREAM=1, protocol=0)
+fun @net_socket_tcp() -> i32 {
+  @entry:
+    %fd = call @c1_socket_create(2, 1, 0)
+    ret i32 %fd
+}
+
+// Bind to port
+fun @net_socket_bind(fd: i32, port: i32) -> i32 {
+  @entry:
+    %r = call @c1_socket_bind(%fd, %port)
+    ret i32 %r
+}
+
+// Listen with backlog 5
+fun @net_socket_listen(fd: i32) -> i32 {
+  @entry:
+    %r = call @c1_socket_listen(%fd, 5)
+    ret i32 %r
+}
+
+// Accept
+fun @net_socket_accept(fd: i32) -> i32 {
+  @entry:
+    %cfd = call @c1_socket_accept(%fd)
+    ret i32 %cfd
+}
+
+// Connect to 127.0.0.1:port
+fun @net_socket_connect(fd: i32, port: i32) -> i32 {
+  @entry:
+    %r = call @c1_socket_connect_loopback(%fd, %port)
+    ret i32 %r
+}
+
+// Connect to arbitrary IPv4 address (dotted-quad string like "93.184.216.34")
+fun @net_socket_connect_ip(fd: i32, ip: *i8, port: i32) -> i32 {
+  @entry:
+    %r = call @c1_socket_connect(%fd, %ip, %port)
+    ret i32 %r
+}
+
+// ---- DNS resolution (from libplatform.a) ----
+// c1_dns_resolve: resolve hostname to IPv4 dotted-quad string
+// Returns 0 on success, -1 on error. addr_buf must be at least 16 bytes.
+extern @c1_dns_resolve(hostname: *i8, addr_buf: *i8, addr_buf_len: i32) -> i32
+
+// net_dns_resolve: resolve hostname to IPv4 address string
+// Returns 0 on success, -1 on error
+fun @net_dns_resolve(hostname: *i8, addr_buf: *i8, addr_buf_len: i32) -> i32 {
+  @entry:
+    %r = call @c1_dns_resolve(%hostname, %addr_buf, %addr_buf_len)
+    ret i32 %r
+}
+
+// Send data
+fun @net_socket_send(fd: i32, buf: *i8, len: i32) -> i32 {
+  @entry:
+    %r = call @c1_socket_send(%fd, %buf, %len)
+    ret i32 %r
+}
+
+// Recv data
+fun @net_socket_recv(fd: i32, buf: *i8, len: i32) -> i32 {
+  @entry:
+    %r = call @c1_socket_recv(%fd, %buf, %len)
+    ret i32 %r
+}
+
+// Close
+fun @net_socket_close(fd: i32) -> i32 {
+  @entry:
+    %r = call @c1_socket_close(%fd)
+    ret i32 %r
+}

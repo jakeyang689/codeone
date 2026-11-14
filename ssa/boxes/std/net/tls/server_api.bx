@@ -1,0 +1,467 @@
+// TLS server public API.
+//
+// net_tls_server_accept performs a TLS 1.2 handshake (RSA key exchange,
+// AES-128-GCM, SHA-256) on an already-accepted TCP connection. The caller
+// allocates the same context used by the client API (CTX_SZ bytes).
+//
+// cert and key may be PEM or DER. PEM input uses the first block in the file.
+// The key is a PKCS#1 RSAPrivateKey or PKCS#8 PrivateKeyInfo holding an RSA
+// key, and must match the certificate.
+
+extern @memcpy(dst: *i8, src: *i8, n: i64) -> *i8
+extern @std_crypto_rsa_bn_from_bytes(r: *i32, bytes: *i8, byte_len: i32, limbs: i32) -> void
+extern @tls12_server_hs(ctx: *i8, fd: i32, cert: *i8, cert_len: i32,
+                        rsa_n: *i32, rsa_d: *i32, limbs: i32) -> i32
+
+// ASN.1 tags used when converting a PKCS#8 key to PKCS#1.
+enum @Asn1Tag: i8 {
+  @OctetString = 0x04,
+  @Sequence = 0x30
+}
+
+// Map one base64 character to its 6-bit value: 0-63, 64 for '=', -1 invalid.
+fun @_srv_b64_val(c: i32) -> i32 {
+  @entry:
+    %geA = sge i32 %c, 65
+    %leZ = sle i32 %c, 90
+    %isU = and i1 %geA, %leZ
+    br %isU, @upper, @lower_chk
+  @upper:
+    %u = sub i32 %c, 65
+    ret i32 %u
+  @lower_chk:
+    %gea = sge i32 %c, 97
+    %lez = sle i32 %c, 122
+    %isL = and i1 %gea, %lez
+    br %isL, @lower, @digit_chk
+  @lower:
+    %l = sub i32 %c, 71
+    ret i32 %l
+  @digit_chk:
+    %ge0 = sge i32 %c, 48
+    %le9 = sle i32 %c, 57
+    %isD = and i1 %ge0, %le9
+    br %isD, @digit, @sym_chk
+  @digit:
+    %d = sub i32 %c, 48
+    %d2 = add i32 %d, 52
+    ret i32 %d2
+  @sym_chk:
+    %isplus = eq i32 %c, 43
+    br %isplus, @plus, @slash_chk
+  @plus:
+    ret i32 62
+  @slash_chk:
+    %isslash = eq i32 %c, 47
+    br %isslash, @slash, @eq_chk
+  @slash:
+    ret i32 63
+  @eq_chk:
+    %iseq = eq i32 %c, 61
+    br %iseq, @pad, @bad
+  @pad:
+    ret i32 64
+  @bad:
+    ret i32 -1
+}
+
+// Decode a PEM body (first block) or copy raw DER.
+fun @_srv_pem_decode(pem: *i8, pem_len: i32, out: *i8, out_cap: i32, out_len: *i32) -> i32 {
+  @entry:
+    %len_ok = sgt i32 %pem_len, 0
+    br %len_ok, @first, @fail
+  @first:
+    %f = load i8, *%pem
+    %is_pem = eq i8 %f, 45
+    br %is_pem, @find_nl, @der_copy
+  @der_copy:
+    %fits = sle i32 %pem_len, %out_cap
+    br %fits, @der_do, @fail
+  @der_do:
+    %n64 = sext i32 %pem_len to i64
+    call @memcpy(%out, %pem, %n64)
+    store i32 %pem_len, *%out_len
+    ret i32 0
+  @find_nl:
+    %i = let i32
+    store i32 0, *%i
+    jmp @nl_cond
+  @nl_cond:
+    %iv = load i32, *%i
+    %more = slt i32 %iv, %pem_len
+    br %more, @nl_one, @fail
+  @nl_one:
+    %pp = gep i8, *%pem, %iv
+    %c = load i8, *%pp
+    %is_nl = eq i8 %c, 10
+    br %is_nl, @nl_done, @nl_next
+  @nl_next:
+    %iv2 = load i32, *%i
+    %n1 = add i32 %iv2, 1
+    store i32 %n1, *%i
+    jmp @nl_cond
+  @nl_done:
+    %iv3 = load i32, *%i
+    %start = add i32 %iv3, 1
+    store i32 %start, *%i
+    %acc = let i32
+    %bits = let i32
+    %o = let i32
+    store i32 0, *%acc
+    store i32 0, *%bits
+    store i32 0, *%o
+    jmp @dec_cond
+  @dec_cond:
+    %iv4 = load i32, *%i
+    %more2 = slt i32 %iv4, %pem_len
+    br %more2, @dec_one, @dec_done
+  @dec_one:
+    %p2 = gep i8, *%pem, %iv4
+    %c2 = load i8, *%p2
+    %c2i = zext i8 %c2 to i32
+    %is_dash = eq i8 %c2, 45
+    br %is_dash, @dec_done, @dec_val
+  @dec_val:
+    %v = call @_srv_b64_val(%c2i)
+    %is_pad = eq i32 %v, 64
+    br %is_pad, @dec_done, @dec_chk
+  @dec_chk:
+    %bad = slt i32 %v, 0
+    br %bad, @dec_skip, @dec_acc
+  @dec_acc:
+    %accv = load i32, *%acc
+    %acc1 = shl i32 %accv, 6
+    %acc2 = or i32 %acc1, %v
+    store i32 %acc2, *%acc
+    %bv = load i32, *%bits
+    %bv6 = add i32 %bv, 6
+    store i32 %bv6, *%bits
+    jmp @dec_emit
+  @dec_emit:
+    %bv2 = load i32, *%bits
+    %enough = sge i32 %bv2, 8
+    br %enough, @dec_out, @dec_skip
+  @dec_out:
+    %bv3 = load i32, *%bits
+    %shift = sub i32 %bv3, 8
+    %accv2 = load i32, *%acc
+    %bytev = lshr i32 %accv2, %shift
+    %masked = and i32 %bytev, 255
+    %byte8 = trunc i32 %masked to i8
+    %ov = load i32, *%o
+    %cap_ok = slt i32 %ov, %out_cap
+    br %cap_ok, @dec_store, @fail
+  @dec_store:
+    %op = gep i8, *%out, %ov
+    store i8 %byte8, *%op
+    %ov1 = add i32 %ov, 1
+    store i32 %ov1, *%o
+    %one = shl i32 1, %shift
+    %mask = sub i32 %one, 1
+    %accm = and i32 %accv2, %mask
+    store i32 %accm, *%acc
+    store i32 %shift, *%bits
+    jmp @dec_skip
+  @dec_skip:
+    %iv5 = load i32, *%i
+    %n2 = add i32 %iv5, 1
+    store i32 %n2, *%i
+    jmp @dec_cond
+  @dec_done:
+    %of = load i32, *%o
+    store i32 %of, *%out_len
+    ret i32 0
+  @fail:
+    ret i32 -1
+}
+
+// Read a DER length at *offp; advances *offp past the length field.
+fun @_srv_der_len(der: *i8, der_len: i32, offp: *i32, outp: *i32) -> i32 {
+  @entry:
+    %ov = load i32, *%offp
+    %in = slt i32 %ov, %der_len
+    br %in, @b0, @fail
+  @b0:
+    %bp = gep i8, *%der, %ov
+    %b0 = load i8, *%bp
+    %b0i = zext i8 %b0 to i32
+    %short = slt i32 %b0i, 128
+    br %short, @short_len, @long_len
+  @short_len:
+    %ov1 = add i32 %ov, 1
+    store i32 %ov1, *%offp
+    store i32 %b0i, *%outp
+    ret i32 0
+  @long_len:
+    %n = and i32 %b0i, 127
+    %nzero = eq i32 %n, 0
+    %nbig = sgt i32 %n, 3
+    %bad = or i1 %nzero, %nbig
+    br %bad, @fail, @long_body
+  @long_body:
+    %start = add i32 %ov, 1
+    %end = add i32 %start, %n
+    %fits = sle i32 %end, %der_len
+    br %fits, @long_init, @fail
+  @long_init:
+    %i = let i32
+    %acc = let i32
+    store i32 0, *%i
+    store i32 0, *%acc
+    jmp @long_cond
+  @long_cond:
+    %iv = load i32, *%i
+    %n2 = and i32 %b0i, 127
+    %more = slt i32 %iv, %n2
+    br %more, @long_one, @long_done
+  @long_one:
+    %iv2 = load i32, *%i
+    %p = add i32 %start, %iv2
+    %pp = gep i8, *%der, %p
+    %bv = load i8, *%pp
+    %bvi = zext i8 %bv to i32
+    %accv = load i32, *%acc
+    %acc1 = shl i32 %accv, 8
+    %acc2 = or i32 %acc1, %bvi
+    store i32 %acc2, *%acc
+    %ix = add i32 %iv2, 1
+    store i32 %ix, *%i
+    jmp @long_cond
+  @long_done:
+    %accf = load i32, *%acc
+    store i32 %accf, *%outp
+    %n3 = and i32 %b0i, 127
+    %newoff = add i32 %start, %n3
+    store i32 %newoff, *%offp
+    ret i32 0
+  @fail:
+    ret i32 -1
+}
+
+// Skip one complete DER TLV at *offp.
+fun @_srv_der_skip(der: *i8, der_len: i32, offp: *i32) -> i32 {
+  @entry:
+    %ov = load i32, *%offp
+    %in = slt i32 %ov, %der_len
+    br %in, @hdr, @fail
+  @hdr:
+    %one = add i32 %ov, 1
+    store i32 %one, *%offp
+    %l = let i32
+    %r = call @_srv_der_len(%der, %der_len, %offp, %l)
+    %ok = eq i32 %r, 0
+    br %ok, @adv, @fail
+  @adv:
+    %lv = load i32, *%l
+    %ov2 = load i32, *%offp
+    %end = add i32 %ov2, %lv
+    %fits = sle i32 %end, %der_len
+    br %fits, @store, @fail
+  @store:
+    store i32 %end, *%offp
+    ret i32 0
+  @fail:
+    ret i32 -1
+}
+
+// Read a DER INTEGER at *offp into a big integer; advances *offp.
+fun @_srv_der_int_bn(der: *i8, der_len: i32, offp: *i32, bn: *i32, limbs: i32) -> i32 {
+  @entry:
+    %ov = load i32, *%offp
+    %in = slt i32 %ov, %der_len
+    br %in, @tag, @fail
+  @tag:
+    %tp = gep i8, *%der, %ov
+    %t = load i8, *%tp
+    %is_int = eq i8 %t, 2
+    br %is_int, @len, @fail
+  @len:
+    %one = add i32 %ov, 1
+    store i32 %one, *%offp
+    %l = let i32
+    %r = call @_srv_der_len(%der, %der_len, %offp, %l)
+    %ok = eq i32 %r, 0
+    br %ok, @bounds, @fail
+  @bounds:
+    %lv = load i32, *%l
+    %dstart = load i32, *%offp
+    %dend = add i32 %dstart, %lv
+    %fits = sle i32 %dend, %der_len
+    br %fits, @trim_init, @fail
+  @trim_init:
+    %s = let i32
+    %n = let i32
+    store i32 %dstart, *%s
+    store i32 %lv, *%n
+    jmp @trim_cond
+  @trim_cond:
+    %nv = load i32, *%n
+    %gz = sgt i32 %nv, 0
+    br %gz, @trim_one, @trim_done
+  @trim_one:
+    %sv = load i32, *%s
+    %sp = gep i8, *%der, %sv
+    %sb = load i8, *%sp
+    %zero = eq i8 %sb, 0
+    br %zero, @trim_next, @trim_done
+  @trim_next:
+    %sv2 = load i32, *%s
+    %sn = add i32 %sv2, 1
+    store i32 %sn, *%s
+    %nv2 = load i32, *%n
+    %nn = sub i32 %nv2, 1
+    store i32 %nn, *%n
+    jmp @trim_cond
+  @trim_done:
+    %nv3 = load i32, *%n
+    %maxb = shl i32 %limbs, 2
+    %too = sgt i32 %nv3, %maxb
+    br %too, @fail, @copy
+  @copy:
+    %sv3 = load i32, *%s
+    %dp = gep i8, *%der, %sv3
+    %nv4 = load i32, *%n
+    call @std_crypto_rsa_bn_from_bytes(%bn, %dp, %nv4, %limbs)
+    %lv2 = load i32, *%l
+    %doff = load i32, *%offp
+    %newoff = add i32 %doff, %lv2
+    store i32 %newoff, *%offp
+    ret i32 0
+  @fail:
+    ret i32 -1
+}
+
+// Parse PKCS#1 RSAPrivateKey starting at its SEQUENCE body:
+// version(already consumed by the caller), n, e, d.
+fun @_srv_parse_pkcs1(der: *i8, der_len: i32, offp: *i32,
+                      n_bn: *i32, d_bn: *i32, limbs: i32) -> i32 {
+  @entry:
+    %e_bn = let [i32, 128]
+    %ep = gep i32, *%e_bn, 0
+    %r1 = call @_srv_der_int_bn(%der, %der_len, %offp, %n_bn, %limbs)
+    %ok1 = eq i32 %r1, 0
+    br %ok1, @read_e, @fail
+  @read_e:
+    %r2 = call @_srv_der_int_bn(%der, %der_len, %offp, %ep, 128)
+    %ok2 = eq i32 %r2, 0
+    br %ok2, @read_d, @fail
+  @read_d:
+    %r3 = call @_srv_der_int_bn(%der, %der_len, %offp, %d_bn, %limbs)
+    ret i32 %r3
+  @fail:
+    ret i32 -1
+}
+
+// Parse a PKCS#1 or PKCS#8 DER RSA private key into n and d.
+fun @_srv_parse_rsa_priv(der: *i8, der_len: i32, n_bn: *i32, d_bn: *i32, limbs: i32) -> i32 {
+  @entry:
+    %off = let i32
+    store i32 0, *%off
+    %first = load i8, *%der
+    %is_seq = eq i8 %first, @Asn1Tag.Sequence
+    br %is_seq, @seq, @fail
+  @seq:
+    store i32 1, *%off
+    %sl = let i32
+    %r1 = call @_srv_der_len(%der, %der_len, %off, %sl)
+    %ok1 = eq i32 %r1, 0
+    br %ok1, @ver, @fail
+  @ver:
+    %r2 = call @_srv_der_skip(%der, %der_len, %off)
+    %ok2 = eq i32 %r2, 0
+    br %ok2, @peek, @fail
+  @peek:
+    %ov = load i32, *%off
+    %pk = gep i8, *%der, %ov
+    %pt = load i8, *%pk
+    %is_alg = eq i8 %pt, @Asn1Tag.Sequence
+    br %is_alg, @pkcs8_alg, @pkcs1
+  @pkcs8_alg:
+    %r3 = call @_srv_der_skip(%der, %der_len, %off)
+    %ok3 = eq i32 %r3, 0
+    br %ok3, @octet, @fail
+  @octet:
+    %ov2 = load i32, *%off
+    %op = gep i8, *%der, %ov2
+    %ot = load i8, *%op
+    %is_oct = eq i8 %ot, @Asn1Tag.OctetString
+    br %is_oct, @octet_len, @fail
+  @octet_len:
+    %one = add i32 %ov2, 1
+    store i32 %one, *%off
+    %olen = let i32
+    %r4 = call @_srv_der_len(%der, %der_len, %off, %olen)
+    %ok4 = eq i32 %r4, 0
+    br %ok4, @inner, @fail
+  @inner:
+    %ov3 = load i32, *%off
+    %ip = gep i8, *%der, %ov3
+    %it = load i8, *%ip
+    %is_seq2 = eq i8 %it, @Asn1Tag.Sequence
+    br %is_seq2, @inner_seq, @fail
+  @inner_seq:
+    %one2 = add i32 %ov3, 1
+    store i32 %one2, *%off
+    %ilen = let i32
+    %r5 = call @_srv_der_len(%der, %der_len, %off, %ilen)
+    %ok5 = eq i32 %r5, 0
+    br %ok5, @inner_ver, @fail
+  @inner_ver:
+    %r6 = call @_srv_der_skip(%der, %der_len, %off)
+    %ok6 = eq i32 %r6, 0
+    br %ok6, @inner_parse, @fail
+  @inner_parse:
+    %r7 = call @_srv_parse_pkcs1(%der, %der_len, %off, %n_bn, %d_bn, %limbs)
+    ret i32 %r7
+  @pkcs1:
+    %r8 = call @_srv_parse_pkcs1(%der, %der_len, %off, %n_bn, %d_bn, %limbs)
+    ret i32 %r8
+  @fail:
+    ret i32 -1
+}
+
+// Perform a TLS 1.2 server handshake on an accepted connection.
+// cert: DER certificate (or PEM, first block).
+// key:  PKCS#1 / PKCS#8 RSA private key (or PEM).
+fun @net_tls_server_accept(ctx: *i8, fd: i32,
+                           cert: *i8, cert_len: i32,
+                           key: *i8, key_len: i32,
+                           limbs: i32) -> i32 {
+  @entry:
+    %der_cert = let [i8, 8192]
+    %dc = gep i8, *%der_cert, 0
+    %dc_len = let i32
+    %dcp = gep i32, *%dc_len, 0
+    // Converted keys use 512-byte integer buffers.
+    %l_hi = sle i32 %limbs, 128
+    %l_lo = sgt i32 %limbs, 0
+    %l_ok = and i1 %l_hi, %l_lo
+    br %l_ok, @dec_cert, @fail
+  @dec_cert:
+    %r1 = call @_srv_pem_decode(%cert, %cert_len, %dc, 8192, %dcp)
+    %ok1 = eq i32 %r1, 0
+    br %ok1, @key_dec, @fail
+  @key_dec:
+    %der_key = let [i8, 4096]
+    %dk = gep i8, *%der_key, 0
+    %dk_len = let i32
+    %dkp = gep i32, *%dk_len, 0
+    %r2 = call @_srv_pem_decode(%key, %key_len, %dk, 4096, %dkp)
+    %ok2 = eq i32 %r2, 0
+    br %ok2, @key_parse, @fail
+  @key_parse:
+    %n_bn = let [i32, 128]
+    %d_bn = let [i32, 128]
+    %np = gep i32, *%n_bn, 0
+    %dp = gep i32, *%d_bn, 0
+    %klen = load i32, *%dkp
+    %r3 = call @_srv_parse_rsa_priv(%dk, %klen, %np, %dp, %limbs)
+    %ok3 = eq i32 %r3, 0
+    br %ok3, @handshake, @fail
+  @handshake:
+    %clen2 = load i32, *%dcp
+    %r4 = call @tls12_server_hs(%ctx, %fd, %dc, %clen2, %np, %dp, %limbs)
+    ret i32 %r4
+  @fail:
+    ret i32 -1
+}

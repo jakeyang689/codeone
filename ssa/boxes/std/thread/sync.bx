@@ -1,0 +1,118 @@
+// Synchronization primitives and scheduling helpers.
+//
+// Handles are opaque pointers returned by the platform layer. Most operations
+// return 0 on success and -1 on failure. Two exceptions:
+//   std_thread_mutex_trylock   0 = acquired, 1 = already held, -1 = error
+//   std_thread_cond_timedwait  0 = signalled, 1 = timed out, -1 = error
+
+extern @c1_mutex_create() -> *i8
+extern @c1_mutex_lock(m: *i8) -> i32
+extern @c1_mutex_trylock(m: *i8) -> i32
+extern @c1_mutex_unlock(m: *i8) -> i32
+extern @c1_mutex_destroy(m: *i8) -> i32
+
+extern @c1_cond_create() -> *i8
+extern @c1_cond_wait(c: *i8, m: *i8) -> i32
+extern @c1_cond_timedwait(c: *i8, m: *i8, ms: i32) -> i32
+extern @c1_cond_signal(c: *i8) -> i32
+extern @c1_cond_broadcast(c: *i8) -> i32
+extern @c1_cond_destroy(c: *i8) -> i32
+
+extern @c1_thread_yield() -> void
+extern @c1_thread_sleep_ms(ms: i32) -> void
+extern @c1_thread_self() -> i64
+extern @c1_cpu_count() -> i32
+
+fun @std_thread_mutex_new() -> *i8 {
+  @entry:
+    %m = call @c1_mutex_create()
+    ret *i8 %m
+}
+
+fun @std_thread_mutex_lock(m: *i8) -> i32 {
+  @entry:
+    %r = call @c1_mutex_lock(%m)
+    ret i32 %r
+}
+
+// Try to acquire the mutex without blocking. Returns 0 if acquired,
+// 1 if another thread holds it, -1 on error.
+fun @std_thread_mutex_trylock(m: *i8) -> i32 {
+  @entry:
+    %r = call @c1_mutex_trylock(%m)
+    ret i32 %r
+}
+
+fun @std_thread_mutex_unlock(m: *i8) -> i32 {
+  @entry:
+    %r = call @c1_mutex_unlock(%m)
+    ret i32 %r
+}
+
+fun @std_thread_mutex_free(m: *i8) -> i32 {
+  @entry:
+    %r = call @c1_mutex_destroy(%m)
+    ret i32 %r
+}
+
+fun @std_thread_cond_new() -> *i8 {
+  @entry:
+    %c = call @c1_cond_create()
+    ret *i8 %c
+}
+
+fun @std_thread_cond_wait(c: *i8, m: *i8) -> i32 {
+  @entry:
+    %r = call @c1_cond_wait(%c, %m)
+    ret i32 %r
+}
+
+// Wait until signalled or until ms milliseconds elapse. Returns 0 if
+// signalled, 1 on timeout, -1 on error. The mutex is held again on return.
+fun @std_thread_cond_timedwait(c: *i8, m: *i8, ms: i32) -> i32 {
+  @entry:
+    %r = call @c1_cond_timedwait(%c, %m, %ms)
+    ret i32 %r
+}
+
+fun @std_thread_cond_signal(c: *i8) -> i32 {
+  @entry:
+    %r = call @c1_cond_signal(%c)
+    ret i32 %r
+}
+
+fun @std_thread_cond_broadcast(c: *i8) -> i32 {
+  @entry:
+    %r = call @c1_cond_broadcast(%c)
+    ret i32 %r
+}
+
+fun @std_thread_cond_free(c: *i8) -> i32 {
+  @entry:
+    %r = call @c1_cond_destroy(%c)
+    ret i32 %r
+}
+
+fun @std_thread_yield() -> void {
+  @entry:
+    call @c1_thread_yield()
+    ret void
+}
+
+fun @std_thread_sleep_ms(ms: i32) -> void {
+  @entry:
+    call @c1_thread_sleep_ms(%ms)
+    ret void
+}
+
+fun @std_thread_self() -> i64 {
+  @entry:
+    %id = call @c1_thread_self()
+    ret i64 %id
+}
+
+fun @std_thread_cpu_count() -> i32 {
+  @entry:
+    %n = call @c1_cpu_count()
+    ret i32 %n
+}

@@ -1,0 +1,55 @@
+// RSA roundtrip test: encrypt + decrypt with known key
+// n=9797(0x2645), e=7, d=2743(0x0AB7), m=42 → c=3123 → m2=42
+
+extern @putchar(c: i32) -> i32
+extern @std_crypto_rsa_encrypt(c: *i32, m: *i32, e_key: *i32, n_mod: *i32, limbs: i32) -> void
+extern @std_crypto_rsa_decrypt(m: *i32, c: *i32, d_key: *i32, n_mod: *i32, limbs: i32) -> void
+extern @std_crypto_rsa_bn_zero(r: *i32, limbs: i32) -> void
+
+fun @main() -> i32 {
+  @entry:
+    // key_n = 9797 = 0x2645
+    %key_n = let [i32, 4]
+    call @std_crypto_rsa_bn_zero(%key_n, 4)
+    %kn0 = gep i32, *%key_n, 0
+    store i32 0x00002645, *%kn0
+
+    // key_e = 7
+    %key_e = let [i32, 4]
+    call @std_crypto_rsa_bn_zero(%key_e, 4)
+    %ke0 = gep i32, *%key_e, 0
+    store i32 7, *%ke0
+
+    // key_d = 2743 = 0x0AB7
+    %key_d = let [i32, 4]
+    call @std_crypto_rsa_bn_zero(%key_d, 4)
+    %kd0 = gep i32, *%key_d, 0
+    store i32 0x00000AB7, *%kd0
+
+    // msg = 42
+    %msg = let [i32, 4]
+    call @std_crypto_rsa_bn_zero(%msg, 4)
+    %mp0 = gep i32, *%msg, 0
+    store i32 42, *%mp0
+
+    // Buffers
+    %ciph = let [i32, 4]
+    %dec = let [i32, 4]
+    call @std_crypto_rsa_bn_zero(%ciph, 4)
+    call @std_crypto_rsa_bn_zero(%dec, 4)
+
+    // Encrypt then decrypt
+    call @std_crypto_rsa_encrypt(%ciph, %msg, %key_e, %key_n, 4)
+    call @std_crypto_rsa_decrypt(%dec, %ciph, %key_d, %key_n, 4)
+
+    // Check dec = 42
+    %dp0 = gep i32, *%dec, 0
+    %dv = load i32, *%dp0
+    %ok = eq i32 %dv, 42
+    br %ok, @pass, @fail
+
+  @pass:
+    ret i32 0
+  @fail:
+    ret i32 1
+}

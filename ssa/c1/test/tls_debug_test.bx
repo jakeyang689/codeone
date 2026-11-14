@@ -1,0 +1,158 @@
+// TLS 1.2 Debug test - trace each handshake step
+extern @printf(fmt: *i8, ...) -> i32
+extern @memset(s: *i8, c: i32, n: i64) -> *i8
+extern @putchar(c: i32) -> i32
+
+// TLS internal step functions
+extern @tls12_step_ch(ctx: *i8, fd: i32, tx: *i8, tx_off: *i32) -> i32
+extern @tls12_step_sh(fd: i32, buf: *i8, cap: i32, sr: *i8, cs: *i16, tx: *i8, tx_off: *i32) -> i32
+extern @tls12_step_cert(fd: i32, buf: *i8, cap: i32, rn: *i32, re: *i32, li: i32, tx: *i8, tx_off: *i32) -> i32
+extern @tls12_step_shd(fd: i32, buf: *i8, cap: i32, tx: *i8, tx_off: *i32) -> i32
+extern @tls12_step_cke(ctx: *i8, fd: i32, rn: *i32, re: *i32, li: i32, tx: *i8, tx_off: *i32) -> i32
+extern @tls12_step_ccs_derive(ctx: *i8, fd: i32) -> i32
+extern @tls12_step_finished(ctx: *i8, fd: i32, tx: *i8, tx_len: i32) -> i32
+extern @tls12_step_verify(ctx: *i8, fd: i32, buf: *i8, cap: i32) -> i32
+
+// Socket + record layer
+extern @net_socket_tcp() -> i32
+extern @net_socket_connect(fd: i32, port: i32) -> i32
+extern @net_socket_close(fd: i32) -> i32
+
+extern @tls_write_record(fd: i32, typ: i8, ver: i16, data: *i8, len: i32) -> i32
+extern @ctx_set32(ctx: *i8, off: i32, v: i32) -> void
+extern @ctx_set64(ctx: *i8, off: i32, v: i64) -> void
+
+// Struct access for context init
+struct @TLS12Context {
+  @fd: i32, @state: i32, @version: i32, @key_size: i32, @limbs: i32, @cipher_suite: i32,
+  @client_seq: i64, @server_seq: i64,
+  @client_random: [i8, 32], @server_random: [i8, 32],
+  @client_write_key: [i8, 32], @server_write_key: [i8, 32],
+  @client_write_iv: [i8, 12], @server_write_iv: [i8, 12],
+  @pre_master_secret: [i8, 48], @master_secret: [i8, 48]
+}
+struct @TLSContext {
+  @tls12: @TLS12Context
+}
+
+// Re-export low-level ch12 for direct call
+extern @ch12(ctx: *i8, buf: *i8, cap: i32, olen: *i32) -> i32
+
+fun @main() -> i32 {
+  @entry:
+    // Allocate ctx with @TLSContext struct
+    %ctx = let @TLSContext
+    %t12 = field @TLSContext, *%ctx, 0
+    call @memset(%ctx, 0, 576)
+
+    call @printf("=== TLS 1.2 Debug ===\n")
+
+    // Connect socket
+    %fd = call @net_socket_tcp()
+    %fd_ok = sge i32 %fd, 0
+    br %fd_ok, @do_connect, @fail
+
+  @do_connect:
+    call @printf("[0] Connect 4433...\n")
+    %cr = call @net_socket_connect(%fd, 4433)
+    %c_ok = eq i32 %cr, 0
+    br %c_ok, @init_ctx, @fail
+
+  @init_ctx:
+    call @printf("[init] Context...\n")
+    // Init context fields
+    %fd_p = field @TLS12Context, *%t12, 0
+    store i32 %fd, *%fd_p
+    %ver_p = field @TLS12Context, *%t12, 2
+    store i32 771, *%ver_p
+    %ks_p = field @TLS12Context, *%t12, 3
+    store i32 16, *%ks_p
+    %lm_p = field @TLS12Context, *%t12, 4
+    store i32 64, *%lm_p
+    %cs_p = field @TLS12Context, *%t12, 6
+    store i64 0, *%cs_p
+    %ss_p = field @TLS12Context, *%t12, 7
+    store i64 0, *%ss_p
+    %tx = let [i8, 4096]
+    %txp = gep i8, *%tx, 0
+    %tx_off = let i32
+    store i32 0, *%tx_off
+
+    // Step 1: CH
+    call @printf("[1] ClientHello...\n")
+    %r1 = call @ch12(%ctx, %txp, 512, %tx_off)
+    call @printf("  ch12 returned %d, off=%d\n", %r1, %tx_off_load)
+    %tx_off_load = load i32, *%tx_off
+    br %r1, @fail, @step1_send
+
+  @step1_send:
+    // Send CH as handshake record type=22
+    call @printf("  sending %d bytes...\n", %tx_off_load)
+    %r_send = call @tls_write_record(%fd, 22, 771, %txp, %tx_off_load)
+    call @printf("  write_record=%d\n", %r_send)
+    br %r_send, @fail, @step2
+
+  @step2:
+    call @printf("[2] ServerHello...\n")
+    %buf = let [i8, 4096]
+    %bp = gep i8, *%buf, 0
+    %sr_arr = field @TLS12Context, *%t12, 9
+    %sr = gep i8, *%sr_arr, 0
+    %cs_val = let i16
+    %csp = gep i16, *%cs_val, 0
+    store i32 4, *%tx_off  // reset for transcript (we'll redo properly later)
+    %r2 = call @tls12_step_sh(%fd, %bp, 4096, %sr, %csp, %txp, %tx_off)
+    call @printf("  step_sh=%d\n", %r2)
+    br %r2, @fail, @step3
+
+  @step3:
+    call @printf("[3] Certificate...\n")
+    %rn = let [i32, 64]
+    %re = let [i32, 64]
+    %rnp = gep i32, *%rn, 0
+    %rep = gep i32, *%re, 0
+    %r3 = call @tls12_step_cert(%fd, %bp, 4096, %rnp, %rep, 64, %txp, %tx_off)
+    call @printf("  step_cert=%d\n", %r3)
+    br %r3, @fail, @step4
+
+  @step4:
+    call @printf("[4] ServerHelloDone...\n")
+    %r4 = call @tls12_step_shd(%fd, %bp, 4096, %txp, %tx_off)
+    call @printf("  step_shd=%d\n", %r4)
+    br %r4, @fail, @step5
+
+  @step5:
+    call @printf("[5] CKE...\n")
+    %r5 = call @tls12_step_cke(%ctx, %fd, %rnp, %rep, 64, %txp, %tx_off)
+    call @printf("  step_cke=%d\n", %r5)
+    br %r5, @fail, @step6
+
+  @step6:
+    call @printf("[6] CCS+Derive...\n")
+    %r6 = call @tls12_step_ccs_derive(%ctx, %fd)
+    call @printf("  step_ccs=%d\n", %r6)
+    br %r6, @fail, @step7
+
+  @step7:
+    call @printf("[7] Finished...\n")
+    %txlen = load i32, *%tx_off
+    %r7 = call @tls12_step_finished(%ctx, %fd, %txp, %txlen)
+    call @printf("  step_fin=%d\n", %r7)
+    br %r7, @fail, @step8
+
+  @step8:
+    call @printf("[8] Verify...\n")
+    %r8 = call @tls12_step_verify(%ctx, %fd, %bp, 4096)
+    call @printf("  step_vfy=%d\n", %r8)
+    br %r8, @fail, @pass
+
+  @pass:
+    call @printf("PASS\n")
+    call @net_socket_close(%fd)
+    ret i32 0
+
+  @fail:
+    call @printf("FAIL at step\n")
+    call @net_socket_close(%fd)
+    ret i32 1
+}

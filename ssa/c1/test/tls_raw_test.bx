@@ -1,0 +1,176 @@
+// Raw TLS ClientHello test - send CH, print server response
+extern @printf(fmt: *i8, ...) -> i32
+extern @memset(s: *i8, c: i32, n: i64) -> *i8
+extern @putchar(c: i32) -> i32
+
+extern @net_socket_tcp() -> i32
+extern @net_socket_connect(fd: i32, port: i32) -> i32
+extern @net_socket_send(fd: i32, buf: *i8, len: i32) -> i32
+extern @net_socket_recv(fd: i32, buf: *i8, len: i32) -> i32
+extern @net_socket_close(fd: i32) -> i32
+extern @c1_random_buf(buf: *i8, len: i64) -> void
+extern @memcpy(dst: *i8, src: *i8, n: i64) -> *i8
+
+fun @main() -> i32 {
+  @entry:
+    %fd = call @net_socket_tcp()
+    call @printf("Socket=%d\n", %fd)
+    %cr = call @net_socket_connect(%fd, 4433)
+    call @printf("Connect=%d\n", %cr)
+    %err = slt i32 %cr, 0
+    br %err, @fail, @build_ch
+
+  @build_ch:
+    // Build a raw ClientHello per TLS spec
+    // Record header: type=22, version=0x0303, length=...
+    %rec = let [i8, 512]
+    %rp = gep i8, *%rec, 0
+    store i8 22, *%rp     // content_type = handshake
+    %p1 = gep i8, *%rp, 1
+    store i8 3, *%p1      // version hi
+    %p2 = gep i8, *%rp, 2
+    store i8 3, *%p2      // version lo
+    // We'll fill length later
+
+    // Handshake: type=1 (ClientHello)
+    %hs = gep i8, *%rp, 5
+    store i8 1, *%hs      // handshake type = ClientHello
+    // Handshake length at offset 6-8 - fill later
+
+    // ClientHello body at offset 9
+    %body = gep i8, *%rp, 9
+    // Legacy version: 0x0303
+    store i8 3, *%body
+    %b2 = gep i8, *%body, 1
+    store i8 3, *%b2
+    // Random (32 bytes)
+    %rand = gep i8, *%body, 2
+    %n32 = let i64
+    store i64 32, *%n32
+    %n32v = load i64, *%n32
+    call @c1_random_buf(%rand, %n32v)
+    // Session ID length = 0
+    %sid = gep i8, *%body, 34
+    store i8 0, *%sid
+    // Cipher suites length = 2
+    %cs_len = gep i8, *%body, 35
+    store i8 0, *%cs_len
+    %cs_len2 = gep i8, *%body, 36
+    store i8 2, *%cs_len2
+    // TLS_RSA_WITH_AES_128_GCM_SHA256 = 0x009C
+    %cs = gep i8, *%body, 37
+    store i8 0, *%cs
+    %cs2 = gep i8, *%body, 38
+    store i8 0x9C, *%cs2
+    // Compression methods
+    %comp_len = gep i8, *%body, 39
+    store i8 1, *%comp_len
+    %comp = gep i8, *%body, 40
+    store i8 0, *%comp
+
+    // Extensions: sig_algs (8 bytes) + ems (4 bytes) = 12 bytes
+    %ext_len = gep i8, *%body, 41
+    store i8 0, *%ext_len
+    %ext_len2 = gep i8, *%body, 42
+    store i8 12, *%ext_len2
+    // sig_algs type=0x000D
+    %sa_t = gep i8, *%body, 43
+    store i8 0, *%sa_t
+    %sa_t2 = gep i8, *%body, 44
+    store i8 0x0D, *%sa_t2
+    // sig_algs len=4, list_len=2, algo=0x0401
+    %sa_l = gep i8, *%body, 45
+    store i8 0, *%sa_l
+    %sa_l2 = gep i8, *%body, 46
+    store i8 4, *%sa_l2
+    %sa_ll = gep i8, *%body, 47
+    store i8 0, *%sa_ll
+    %sa_ll2 = gep i8, *%body, 48
+    store i8 2, *%sa_ll2
+    %sa_a = gep i8, *%body, 49
+    store i8 0x04, *%sa_a
+    %sa_a2 = gep i8, *%body, 50
+    store i8 0x01, *%sa_a2
+    // ems type=0x0017, len=0
+    %ems_t = gep i8, *%body, 51
+    store i8 0, *%ems_t
+    %ems_t2 = gep i8, *%body, 52
+    store i8 0x17, *%ems_t2
+    %ems_l = gep i8, *%body, 53
+    store i8 0, *%ems_l
+    %ems_l2 = gep i8, *%body, 54
+    store i8 0, *%ems_l2
+
+    // Total body = 55 bytes
+    // Fill in handshake length (55 at offset 6-8)
+    %hl0 = gep i8, *%rp, 6
+    store i8 0, *%hl0
+    %hl1 = gep i8, *%rp, 7
+    store i8 0, *%hl1
+    %hl2 = gep i8, *%rp, 8
+    store i8 55, *%hl2
+
+    // Total record body = 4 (handshake header) + 55 = 59
+    // Fill in record length at offset 3-4
+    %rl0 = gep i8, *%rp, 3
+    store i8 0, *%rl0
+    %rl1 = gep i8, *%rp, 4
+    store i8 59, *%rl1
+
+    // Total bytes to send = 5 (record header) + 4 (handshake header) + 55 = 64
+    call @printf("Sending 64 bytes...\n")
+    %sent = call @net_socket_send(%fd, %rp, 64)
+    call @printf("Sent %d bytes\n", %sent)
+    %s_err = slt i32 %sent, 1
+    br %s_err, @fail, @read
+
+  @read:
+    // Read response
+    %resp = let [i8, 4096]
+    %respp = gep i8, *%resp, 0
+    call @memset(%respp, 0, 4096)
+    %got = call @net_socket_recv(%fd, %respp, 4096)
+    call @printf("Received %d bytes:\n", %got)
+    %recv_err = slt i32 %got, 1
+    br %recv_err, @done, @hexdump
+
+  @hexdump:
+    %i = let i32
+    store i32 0, *%i
+    jmp @h_loop
+  @h_loop:
+    %iv = load i32, *%i
+    %more = slt i32 %iv, %got
+    %limit = slt i32 %iv, 128
+    %show = and i1 %more, %limit
+    br %show, @h_byte, @h_end
+  @h_byte:
+    %iv2 = load i32, *%i
+    %cp = gep i8, *%respp, %iv2
+    %c = load i8, *%cp
+    %ci = zext i8 %c to i32
+    call @printf("%02x ", %ci)
+    %next = add i32 %iv2, 1
+    %mod = and i32 %next, 15
+    %nl = eq i32 %mod, 0
+    br %nl, @newline, @h_next
+  @newline:
+    call @printf("\n")
+    jmp @h_next
+  @h_next:
+    store i32 %next, *%i
+    jmp @h_loop
+  @h_end:
+    call @printf("\n")
+    jmp @done
+
+  @done:
+    call @net_socket_close(%fd)
+    call @printf("Done\n")
+    ret i32 0
+  @fail:
+    call @printf("FAIL\n")
+    call @net_socket_close(%fd)
+    ret i32 1
+
+}

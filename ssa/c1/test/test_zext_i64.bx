@@ -1,0 +1,13 @@
+extern @putchar(c: i32) -> i32
+fun @main() -> i32 {
+  @entry:
+    %b1 = trunc i32 128 to i8
+    %bi = zext i8 %b1 to i64
+    %s = shl i64 %bi, 56
+    %result = lshr i64 %s, 56
+    %r = trunc i64 %result to i8
+    %ri = zext i8 %r to i32
+    call @putchar(%ri)
+    call @putchar(10)
+    ret i32 0
+}

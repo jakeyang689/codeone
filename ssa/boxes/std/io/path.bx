@@ -1,0 +1,391 @@
+// POSIX-style path helpers (pure SSA, no platform dependency).
+//
+// Functions that return a path component write it NUL-terminated into the
+// caller's buffer and return the length, or -1 when the buffer is too small.
+// Inputs and outputs must not overlap.
+
+extern @memcpy(dst: *i8, src: *i8, n: i64) -> *i8
+
+fun @_path_len(s: *i8) -> i32 {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @cond
+  @cond:
+    %iv = load i32, *%i
+    %p = gep i8, *%s, %iv
+    %c = load i8, *%p
+    %nz = ne i8 %c, 0
+    br %nz, @next, @done
+  @next:
+    %in = add i32 %iv, 1
+    store i32 %in, *%i
+    jmp @cond
+  @done:
+    %r = load i32, *%i
+    ret i32 %r
+}
+
+fun @_path_copy_range(s: *i8, start: i32, end: i32, out: *i8, cap: i32) -> i32 {
+  @entry:
+    %len = sub i32 %end, %start
+    %need = add i32 %len, 1
+    %fits = sle i32 %need, %cap
+    br %fits, @copy, @fail
+  @copy:
+    %src = gep i8, *%s, %start
+    %n64 = sext i32 %len to i64
+    call @memcpy(%out, %src, %n64)
+    %zp = gep i8, *%out, %len
+    store i8 0, *%zp
+    ret i32 %len
+  @fail:
+    ret i32 -1
+}
+
+fun @_path_empty(out: *i8, cap: i32) -> i32 {
+  @entry:
+    %has = sgt i32 %cap, 0
+    br %has, @write, @fail
+  @write:
+    store i8 0, *%out
+    ret i32 0
+  @fail:
+    ret i32 -1
+}
+
+// Last component of path; "/" for an all-slash path, "." for "".
+fun @std_io_path_basename(path: *i8, out: *i8, cap: i32) -> i32 {
+  @entry:
+    %len = call @_path_len(%path)
+    %end = let i32
+    store i32 %len, *%end
+    jmp @strip
+  @strip:
+    %ev = load i32, *%end
+    %gt = sgt i32 %ev, 0
+    br %gt, @strip_one, @after_strip
+  @strip_one:
+    %ev2 = load i32, *%end
+    %i = sub i32 %ev2, 1
+    %p = gep i8, *%path, %i
+    %c = load i8, *%p
+    %isslash = eq i8 %c, 47
+    br %isslash, @strip_dec, @after_strip
+  @strip_dec:
+    %ev3 = load i32, *%end
+    %d = sub i32 %ev3, 1
+    store i32 %d, *%end
+    jmp @strip
+  @after_strip:
+    %ef = load i32, *%end
+    %iszero = eq i32 %ef, 0
+    br %iszero, @all_slash, @scan
+  @all_slash:
+    %lz = eq i32 %len, 0
+    br %lz, @empty, @root
+  @empty:
+    %r1 = call @_path_copy_range(".", 0, 1, %out, %cap)
+    ret i32 %r1
+  @root:
+    %r2 = call @_path_copy_range("/", 0, 1, %out, %cap)
+    ret i32 %r2
+  @scan:
+    %start = let i32
+    %ef2 = load i32, *%end
+    store i32 %ef2, *%start
+    jmp @scan_cond
+  @scan_cond:
+    %sv = load i32, *%start
+    %gt0 = sgt i32 %sv, 0
+    br %gt0, @scan_one, @copy
+  @scan_one:
+    %sv2 = load i32, *%start
+    %si = sub i32 %sv2, 1
+    %sp = gep i8, *%path, %si
+    %sc = load i8, *%sp
+    %sl = eq i8 %sc, 47
+    br %sl, @copy, @scan_dec
+  @scan_dec:
+    %sv3 = load i32, *%start
+    %sd = sub i32 %sv3, 1
+    store i32 %sd, *%start
+    jmp @scan_cond
+  @copy:
+    %sf = load i32, *%start
+    %ef3 = load i32, *%end
+    %r3 = call @_path_copy_range(%path, %sf, %ef3, %out, %cap)
+    ret i32 %r3
+}
+
+// Directory part of path; "." when there is no slash.
+fun @std_io_path_dirname(path: *i8, out: *i8, cap: i32) -> i32 {
+  @entry:
+    %len = call @_path_len(%path)
+    %end = let i32
+    store i32 %len, *%end
+    jmp @strip
+  @strip:
+    %ev = load i32, *%end
+    %gt = sgt i32 %ev, 0
+    br %gt, @strip_one, @after_strip
+  @strip_one:
+    %ev2 = load i32, *%end
+    %i = sub i32 %ev2, 1
+    %p = gep i8, *%path, %i
+    %c = load i8, *%p
+    %isslash = eq i8 %c, 47
+    br %isslash, @strip_dec, @after_strip
+  @strip_dec:
+    %ev3 = load i32, *%end
+    %d = sub i32 %ev3, 1
+    store i32 %d, *%end
+    jmp @strip
+  @after_strip:
+    %ef = load i32, *%end
+    %iszero = eq i32 %ef, 0
+    br %iszero, @all_slash, @find
+  @all_slash:
+    %lz = eq i32 %len, 0
+    br %lz, @dot, @root
+  @dot:
+    %r1 = call @_path_copy_range(".", 0, 1, %out, %cap)
+    ret i32 %r1
+  @root:
+    %r2 = call @_path_copy_range("/", 0, 1, %out, %cap)
+    ret i32 %r2
+  @find:
+    %cur = let i32
+    %ef2 = load i32, *%end
+    store i32 %ef2, *%cur
+    jmp @find_cond
+  @find_cond:
+    %cv = load i32, *%cur
+    %gt0 = sgt i32 %cv, 0
+    br %gt0, @find_one, @none
+  @find_one:
+    %cv2 = load i32, *%cur
+    %ci = sub i32 %cv2, 1
+    %cp = gep i8, *%path, %ci
+    %cc = load i8, *%cp
+    %sl = eq i8 %cc, 47
+    br %sl, @found, @find_dec
+  @find_dec:
+    %cv3 = load i32, *%cur
+    %cd = sub i32 %cv3, 1
+    store i32 %cd, *%cur
+    jmp @find_cond
+  @found:
+    %cv4 = load i32, *%cur
+    %slash = sub i32 %cv4, 1
+    %dend = let i32
+    store i32 %slash, *%dend
+    jmp @trim
+  @trim:
+    %dv = load i32, *%dend
+    %gt1 = sgt i32 %dv, 1
+    br %gt1, @trim_one, @trim_done
+  @trim_one:
+    %dv2 = load i32, *%dend
+    %di = sub i32 %dv2, 1
+    %dp = gep i8, *%path, %di
+    %dc = load i8, *%dp
+    %dsl = eq i8 %dc, 47
+    br %dsl, @trim_dec, @trim_done
+  @trim_dec:
+    %dv3 = load i32, *%dend
+    %dd = sub i32 %dv3, 1
+    store i32 %dd, *%dend
+    jmp @trim
+  @trim_done:
+    %df = load i32, *%dend
+    %dzero = eq i32 %df, 0
+    br %dzero, @to_root, @copy
+  @to_root:
+    %r3 = call @_path_copy_range("/", 0, 1, %out, %cap)
+    ret i32 %r3
+  @copy:
+    %r4 = call @_path_copy_range(%path, 0, %df, %out, %cap)
+    ret i32 %r4
+  @none:
+    %r5 = call @_path_copy_range(".", 0, 1, %out, %cap)
+    ret i32 %r5
+}
+
+// Extension of the basename without the dot; empty when there is none.
+fun @std_io_path_extension(path: *i8, out: *i8, cap: i32) -> i32 {
+  @entry:
+    %len = call @_path_len(%path)
+    %end = let i32
+    store i32 %len, *%end
+    jmp @strip
+  @strip:
+    %ev = load i32, *%end
+    %gt = sgt i32 %ev, 0
+    br %gt, @strip_one, @start
+  @strip_one:
+    %ev2 = load i32, *%end
+    %i = sub i32 %ev2, 1
+    %p = gep i8, *%path, %i
+    %c = load i8, *%p
+    %isslash = eq i8 %c, 47
+    br %isslash, @strip_dec, @start
+  @strip_dec:
+    %ev3 = load i32, *%end
+    %d = sub i32 %ev3, 1
+    store i32 %d, *%end
+    jmp @strip
+  @start:
+    %start = let i32
+    %ef = load i32, *%end
+    store i32 %ef, *%start
+    jmp @scan_cond
+  @scan_cond:
+    %sv = load i32, *%start
+    %gt0 = sgt i32 %sv, 0
+    br %gt0, @scan_one, @find_dot_init
+  @scan_one:
+    %sv2 = load i32, *%start
+    %si = sub i32 %sv2, 1
+    %sp = gep i8, *%path, %si
+    %sc = load i8, *%sp
+    %sl = eq i8 %sc, 47
+    br %sl, @find_dot_init, @scan_dec
+  @scan_dec:
+    %sv3 = load i32, *%start
+    %sd = sub i32 %sv3, 1
+    store i32 %sd, *%start
+    jmp @scan_cond
+  @find_dot_init:
+    %dot = let i32
+    store i32 -1, *%dot
+    %k = let i32
+    %sf = load i32, *%start
+    store i32 %sf, *%k
+    jmp @find_cond
+  @find_cond:
+    %kv = load i32, *%k
+    %ef2 = load i32, *%end
+    %more = slt i32 %kv, %ef2
+    br %more, @find_one, @find_done
+  @find_one:
+    %kv2 = load i32, *%k
+    %kp = gep i8, *%path, %kv2
+    %kc = load i8, *%kp
+    %isdot = eq i8 %kc, 46
+    br %isdot, @set_dot, @find_next
+  @set_dot:
+    %kv3 = load i32, *%k
+    store i32 %kv3, *%dot
+    jmp @find_next
+  @find_next:
+    %kv4 = load i32, *%k
+    %kn = add i32 %kv4, 1
+    store i32 %kn, *%k
+    jmp @find_cond
+  @find_done:
+    %dv = load i32, *%dot
+    %nodon = slt i32 %dv, 0
+    br %nodon, @empty, @chk_edge
+  @chk_edge:
+    %dv2 = load i32, *%dot
+    %sf2 = load i32, *%start
+    %at_start = sle i32 %dv2, %sf2
+    br %at_start, @empty, @chk_last
+  @chk_last:
+    %ef3 = load i32, *%end
+    %last = sub i32 %ef3, 1
+    %dv3 = load i32, *%dot
+    %is_last = eq i32 %dv3, %last
+    br %is_last, @empty, @copy
+  @copy:
+    %dv4 = load i32, *%dot
+    %from = add i32 %dv4, 1
+    %ef4 = load i32, *%end
+    %r = call @_path_copy_range(%path, %from, %ef4, %out, %cap)
+    ret i32 %r
+  @empty:
+    %re = call @_path_empty(%out, %cap)
+    ret i32 %re
+}
+
+// Join two paths; an absolute second path replaces the first.
+fun @std_io_path_join(a: *i8, b: *i8, out: *i8, cap: i32) -> i32 {
+  @entry:
+    %alen = call @_path_len(%a)
+    %blen = call @_path_len(%b)
+    %babs = call @std_io_path_is_absolute(%b)
+    br %babs, @copy_b, @chk_a
+  @copy_b:
+    %r1 = call @_path_copy_range(%b, 0, %blen, %out, %cap)
+    ret i32 %r1
+  @chk_a:
+    %az = eq i32 %alen, 0
+    br %az, @copy_b, @chk_b
+  @chk_b:
+    %bz = eq i32 %blen, 0
+    br %bz, @copy_a, @need
+  @copy_a:
+    %r2 = call @_path_copy_range(%a, 0, %alen, %out, %cap)
+    ret i32 %r2
+  @need:
+    %ai = sub i32 %alen, 1
+    %ap = gep i8, *%a, %ai
+    %ac = load i8, *%ap
+    %aslash = eq i8 %ac, 47
+    %sep = let i32
+    br %aslash, @no_sep, @with_sep
+  @no_sep:
+    store i32 0, *%sep
+    jmp @calc
+  @with_sep:
+    store i32 1, *%sep
+    jmp @calc
+  @calc:
+    %sv = load i32, *%sep
+    %base = add i32 %alen, %blen
+    %needn = add i32 %base, %sv
+    %need1 = add i32 %needn, 1
+    %fits = sle i32 %need1, %cap
+    br %fits, @write, @fail
+  @write:
+    %n64 = sext i32 %alen to i64
+    call @memcpy(%out, %a, %n64)
+    %off = let i32
+    store i32 %alen, *%off
+    %sv2 = load i32, *%sep
+    %hass = eq i32 %sv2, 1
+    br %hass, @add_sep, @copy_b2
+  @add_sep:
+    %offv = load i32, *%off
+    %sp = gep i8, *%out, %offv
+    store i8 47, *%sp
+    %offn = add i32 %offv, 1
+    store i32 %offn, *%off
+    jmp @copy_b2
+  @copy_b2:
+    %off2 = load i32, *%off
+    %dst = gep i8, *%out, %off2
+    %bn64 = sext i32 %blen to i64
+    call @memcpy(%dst, %b, %bn64)
+    %end = add i32 %off2, %blen
+    %zp = gep i8, *%out, %end
+    store i8 0, *%zp
+    ret i32 %end
+  @fail:
+    ret i32 -1
+}
+
+fun @std_io_path_is_absolute(path: *i8) -> i1 {
+  @entry:
+    %len = call @_path_len(%path)
+    %gt = sgt i32 %len, 0
+    br %gt, @chk, @no
+  @chk:
+    %p = gep i8, *%path, 0
+    %c = load i8, *%p
+    %sl = eq i8 %c, 47
+    ret i1 %sl
+  @no:
+    ret i1 false
+}

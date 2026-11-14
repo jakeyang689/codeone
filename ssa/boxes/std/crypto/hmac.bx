@@ -1,0 +1,2277 @@
+// HMAC (Hash-based Message Authentication Code)
+// RFC 2104: HMAC(K, m) = H((K' XOR opad) || H((K' XOR ipad) || m))
+// Supports HMAC-MD5 (16-byte), HMAC-SHA1 (20-byte), HMAC-SHA256 (32-byte),
+// HMAC-SHA384 (48-byte), and HMAC-SHA512 (64-byte)
+
+extern @memset(s: *i8, c: i32, n: i64) -> *i8
+extern @memcpy(dst: *i8, src: *i8, n: i64) -> *i8
+extern @std_crypto_md5_transform(aptr: *i32, bptr: *i32, cptr: *i32, dptr: *i32, block: *i8) -> void
+extern @std_crypto_md5_compute(data: *i8, len: i32, digest: *i8) -> void
+extern @std_crypto_sha1_transform(aptr: *i32, bptr: *i32, cptr: *i32, dptr: *i32, eptr: *i32, block: *i8) -> void
+extern @std_crypto_sha1_compute(data: *i8, len: i32, digest: *i8) -> void
+extern @std_crypto_sha256_transform(aptr: *i32, bptr: *i32, cptr: *i32, dptr: *i32,
+                                     eptr: *i32, fptr: *i32, gptr: *i32, hptr: *i32,
+                                     block: *i8) -> void
+extern @std_crypto_sha256_compute(data: *i8, len: i32, digest: *i8) -> void
+extern @std_crypto_sha384_compute(data: *i8, len: i32, digest: *i8) -> void
+extern @std_crypto_sha512_transform(aptr: *i64, bptr: *i64, cptr: *i64, dptr: *i64,
+                                     eptr: *i64, fptr: *i64, gptr: *i64, hptr: *i64,
+                                     block: *i8) -> void
+extern @std_crypto_sha512_compute(data: *i8, len: i32, digest: *i8) -> void
+
+
+// ============================================================
+// Internal helpers
+// ============================================================
+
+// hmac_prepare_padded_key: produce K' in padded_key (64 bytes)
+// If key_len > 64: K' = H(key) zero-padded to 64 bytes (through use_sha256 flag)
+// If key_len <= 64: copy key, zero-pad to 64
+fun @_hmac_prepare_padded_key(key: *i8, key_len: i32, padded_key: *i8) -> void {
+  @entry:
+    %need_hash = sgt i32 %key_len, 64
+    br %need_hash, @hash_key, @copy_pad
+
+  @hash_key:
+    // Hash key with MD5 (16 bytes digest, zero-padded to 64)
+    %tmp = let [i8, 32]   // 32 bytes for SHA256 digest
+    %tmp_p = gep i8, *%tmp, 0
+    call @std_crypto_md5_compute(%key, %key_len, %tmp_p)
+    // Copy 16 bytes of digest
+    %ci = let i32
+    store i32 0, *%ci
+    jmp @hkc_cond
+
+  @hkc_cond:
+    %civ = load i32, *%ci
+    %more = slt i32 %civ, 16
+    br %more, @hkc_body, @hkc_pad
+
+  @hkc_body:
+    %civ2 = load i32, *%ci
+    %sp = gep i8, *%tmp_p, %civ2
+    %sv = load i8, *%sp
+    %dp = gep i8, *%padded_key, %civ2
+    store i8 %sv, *%dp
+    %next = add i32 %civ2, 1
+    store i32 %next, *%ci
+    jmp @hkc_cond
+
+  @hkc_pad:
+    // Zero-pad bytes 16..63
+    %pi = let i32
+    store i32 16, *%pi
+    jmp @hkzp_cond
+
+  @hkzp_cond:
+    %piv = load i32, *%pi
+    %more_p = slt i32 %piv, 64
+    br %more_p, @hkzp_body, @kp_done
+
+  @hkzp_body:
+    %piv2 = load i32, *%pi
+    %pp = gep i8, *%padded_key, %piv2
+    store i8 0, *%pp
+    %next_p = add i32 %piv2, 1
+    store i32 %next_p, *%pi
+    jmp @hkzp_cond
+
+  @copy_pad:
+    // Copy key_bytes to padded_key, zero rest
+    %cpi = let i32
+    store i32 0, *%cpi
+    jmp @cpk_cond
+
+  @cpk_cond:
+    %cpiv = load i32, *%cpi
+    %more_c = slt i32 %cpiv, %key_len
+    br %more_c, @cpk_body, @cpk_zp
+
+  @cpk_body:
+    %cpiv2 = load i32, *%cpi
+    %sp2 = gep i8, *%key, %cpiv2
+    %sv2 = load i8, *%sp2
+    %dp2 = gep i8, *%padded_key, %cpiv2
+    store i8 %sv2, *%dp2
+    %next_c = add i32 %cpiv2, 1
+    store i32 %next_c, *%cpi
+    jmp @cpk_cond
+
+  @cpk_zp:
+    // Zero-pad remaining bytes
+    %zp = let i32
+    store i32 %key_len, *%zp
+    jmp @cpzp_cond
+
+  @cpzp_cond:
+    %zpv = load i32, *%zp
+    %more_zp = slt i32 %zpv, 64
+    br %more_zp, @cpzp_body, @kp_done
+
+  @cpzp_body:
+    %zpv2 = load i32, *%zp
+    %zpp = gep i8, *%padded_key, %zpv2
+    store i8 0, *%zpp
+    %next_zp = add i32 %zpv2, 1
+    store i32 %next_zp, *%zp
+    jmp @cpzp_cond
+
+  @kp_done: ret void
+}
+
+// hmac_prepare_padded_key_sha256: prepare K' with SHA256 (32-byte digest, zero-padded to 64)
+fun @_hmac_prepare_padded_key_sha256(key: *i8, key_len: i32, padded_key: *i8) -> void {
+  @entry:
+    %need_hash = sgt i32 %key_len, 64
+    br %need_hash, @hash_key_sh, @copy_pad_sh
+
+  @hash_key_sh:
+    %tmp = let [i8, 32]
+    %tmp_p = gep i8, *%tmp, 0
+    call @std_crypto_sha256_compute(%key, %key_len, %tmp_p)
+    // Copy 32 bytes of digest
+    %ci = let i32
+    store i32 0, *%ci
+    jmp @hkc_cond_sh
+
+  @hkc_cond_sh:
+    %civ = load i32, *%ci
+    %more = slt i32 %civ, 32
+    br %more, @hkc_body_sh, @hkc_pad_sh
+
+  @hkc_body_sh:
+    %civ2 = load i32, *%ci
+    %sp = gep i8, *%tmp_p, %civ2
+    %sv = load i8, *%sp
+    %dp = gep i8, *%padded_key, %civ2
+    store i8 %sv, *%dp
+    %next = add i32 %civ2, 1
+    store i32 %next, *%ci
+    jmp @hkc_cond_sh
+
+  @hkc_pad_sh:
+    %pi = let i32
+    store i32 32, *%pi
+    jmp @hkzp_cond_sh
+
+  @hkzp_cond_sh:
+    %piv = load i32, *%pi
+    %more_p = slt i32 %piv, 64
+    br %more_p, @hkzp_body_sh, @kp_done_sh
+
+  @hkzp_body_sh:
+    %piv2 = load i32, *%pi
+    %pp = gep i8, *%padded_key, %piv2
+    store i8 0, *%pp
+    %next_p = add i32 %piv2, 1
+    store i32 %next_p, *%pi
+    jmp @hkzp_cond_sh
+
+  @copy_pad_sh:
+    %cpi = let i32
+    store i32 0, *%cpi
+    jmp @cpk_cond_sh
+
+  @cpk_cond_sh:
+    %cpiv = load i32, *%cpi
+    %more_c = slt i32 %cpiv, %key_len
+    br %more_c, @cpk_body_sh, @cpk_zp_sh
+
+  @cpk_body_sh:
+    %cpiv2 = load i32, *%cpi
+    %sp2 = gep i8, *%key, %cpiv2
+    %sv2 = load i8, *%sp2
+    %dp2 = gep i8, *%padded_key, %cpiv2
+    store i8 %sv2, *%dp2
+    %next_c = add i32 %cpiv2, 1
+    store i32 %next_c, *%cpi
+    jmp @cpk_cond_sh
+
+  @cpk_zp_sh:
+    %zp = let i32
+    store i32 %key_len, *%zp
+    jmp @cpzp_cond_sh
+
+  @cpzp_cond_sh:
+    %zpv = load i32, *%zp
+    %more_zp = slt i32 %zpv, 64
+    br %more_zp, @cpzp_body_sh, @kp_done_sh
+
+  @cpzp_body_sh:
+    %zpv2 = load i32, *%zp
+    %zpp = gep i8, *%padded_key, %zpv2
+    store i8 0, *%zpp
+    %next_zp = add i32 %zpv2, 1
+    store i32 %next_zp, *%zp
+    jmp @cpzp_cond_sh
+
+  @kp_done_sh: ret void
+}
+
+// hmac_xor: xor 64-byte padded_key with pad_byte -> xored_key
+fun @_hmac_xor(padded_key: *i8, pad: i8, xored: *i8) -> void {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @xr_cond
+
+  @xr_cond:
+    %iv = load i32, *%i
+    %more = slt i32 %iv, 64
+    br %more, @xr_body, @xr_done
+
+  @xr_body:
+    %iv2 = load i32, *%i
+    %kp = gep i8, *%padded_key, %iv2
+    %kv = load i8, *%kp
+    %xv = xor i8 %kv, %pad
+    %xp = gep i8, *%xored, %iv2
+    store i8 %xv, *%xp
+    %next = add i32 %iv2, 1
+    store i32 %next, *%i
+    jmp @xr_cond
+
+  @xr_done: ret void
+}
+
+
+// ============================================================
+// HMAC-SHA256
+// ============================================================
+
+// hmac_sha256_process_data: process all full 64-byte blocks of data
+// into the hash state (already initialized and with ipad_key block processed).
+fun @_hmac_sha256_process_blocks(aptr: *i32, bptr: *i32, cptr: *i32, dptr: *i32,
+                                  eptr: *i32, fptr: *i32, gptr: *i32, hptr: *i32,
+                                  data: *i8, data_len: i32) -> i32 {
+  @entry:
+    %offset = let i32
+    store i32 0, *%offset
+    jmp @hp_cond
+
+  @hp_cond:
+    %off = load i32, *%offset
+    %next = add i32 %off, 64
+    %has_block = sle i32 %next, %data_len
+    br %has_block, @hp_body, @hp_done
+
+  @hp_body:
+    %off2 = load i32, *%offset
+    %bp = gep i8, *%data, %off2
+    call @std_crypto_sha256_transform(%aptr, %bptr, %cptr, %dptr, %eptr, %fptr, %gptr, %hptr, %bp)
+    %off2_next = add i32 %off2, 64
+    store i32 %off2_next, *%offset
+    jmp @hp_cond
+
+  @hp_done:
+    %off_val = load i32, *%offset
+    ret i32 %off_val
+}
+
+// hmac_sha256_finalize: pad and finalize SHA256 digest
+// total_len = total bytes hashed (64 + data_len for inner, 64 + digest_len for outer)
+fun @_hmac_sha256_pad(aptr: *i32, bptr: *i32, cptr: *i32, dptr: *i32,
+                       eptr: *i32, fptr: *i32, gptr: *i32, hptr: *i32,
+                       tail_data: *i8, tail_len: i32, total_len: i32, digest: *i8) -> void {
+  @entry:
+    %buf1 = let [i8, 64]
+    %buf2 = let [i8, 64]
+    %buf1_p = gep i8, *%buf1, 0
+    %buf2_p = gep i8, *%buf2, 0
+    %nm64 = let i64
+    store i64 64, *%nm64
+    %nm64v = load i64, *%nm64
+    call @memset(%buf1_p, 0, %nm64v)
+    call @memset(%buf2_p, 0, %nm64v)
+
+    // Copy tail bytes
+    %ci = let i32
+    store i32 0, *%ci
+    jmp @pf_copy_cond
+
+  @pf_copy_cond:
+    %civ = load i32, *%ci
+    %more = slt i32 %civ, %tail_len
+    br %more, @pf_copy_body, @pf_copy_done
+
+  @pf_copy_body:
+    %civ2 = load i32, *%ci
+    %sp = gep i8, *%tail_data, %civ2
+    %sv = load i8, *%sp
+    %dp = gep i8, *%buf1, %civ2
+    store i8 %sv, *%dp
+    %next = add i32 %civ2, 1
+    store i32 %next, *%ci
+    jmp @pf_copy_cond
+
+  @pf_copy_done:
+    // 0x80 padding
+    %pad80_p = gep i8, *%buf1, %tail_len
+    store i8 0x80, *%pad80_p
+
+    // Total bits in big-endian
+    %bl = mul i32 %total_len, 8
+    %bl7 = and i32 %bl, 0xff
+    %bl_b7 = trunc i32 %bl7 to i8
+    %bl15 = lshr i32 %bl, 8
+    %bl_b6 = trunc i32 %bl15 to i8
+    %bl23 = lshr i32 %bl, 16
+    %bl_b5 = trunc i32 %bl23 to i8
+    %bl31 = lshr i32 %bl, 24
+    %bl_b4 = trunc i32 %bl31 to i8
+
+    %needs_two = sge i32 %tail_len, 56
+    br %needs_two, @pf_two, @pf_one
+
+  @pf_one:
+    // Bit length at bytes 60-63 in big-endian
+    %p63 = gep i8, *%buf1, 63
+    store i8 %bl_b7, *%p63
+    %p62 = gep i8, *%buf1, 62
+    store i8 %bl_b6, *%p62
+    %p61 = gep i8, *%buf1, 61
+    store i8 %bl_b5, *%p61
+    %p60 = gep i8, *%buf1, 60
+    store i8 %bl_b4, *%p60
+
+    call @std_crypto_sha256_transform(%aptr, %bptr, %cptr, %dptr, %eptr, %fptr, %gptr, %hptr, %buf1_p)
+    jmp @pf_write
+
+  @pf_two:
+    // Two padding blocks
+    call @std_crypto_sha256_transform(%aptr, %bptr, %cptr, %dptr, %eptr, %fptr, %gptr, %hptr, %buf1_p)
+
+    // Second block: zeros + length at last 8 bytes
+    %p63_2 = gep i8, *%buf2, 63
+    store i8 %bl_b7, *%p63_2
+    %p62_2 = gep i8, *%buf2, 62
+    store i8 %bl_b6, *%p62_2
+    %p61_2 = gep i8, *%buf2, 61
+    store i8 %bl_b5, *%p61_2
+    %p60_2 = gep i8, *%buf2, 60
+    store i8 %bl_b4, *%p60_2
+
+    call @std_crypto_sha256_transform(%aptr, %bptr, %cptr, %dptr, %eptr, %fptr, %gptr, %hptr, %buf2_p)
+    jmp @pf_write
+
+  @pf_write:
+    // Write digest (big-endian, 8 words -> 32 bytes)
+    %av = load i32, *%aptr
+    %bv = load i32, *%bptr
+    %cv = load i32, *%cptr
+    %dv = load i32, *%dptr
+    %ev = load i32, *%eptr
+    %fv = load i32, *%fptr
+    %gv = load i32, *%gptr
+    %hv = load i32, *%hptr
+
+    // Word 0 (bytes 0-3) big-endian
+    %a_b0 = lshr i32 %av, 24
+    %a_v0 = trunc i32 %a_b0 to i8
+    %a_b1 = lshr i32 %av, 16
+    %a_v1 = trunc i32 %a_b1 to i8
+    %a_b2 = lshr i32 %av, 8
+    %a_v2 = trunc i32 %a_b2 to i8
+    %a_v3 = trunc i32 %av to i8
+
+    %d0 = gep i8, *%digest, 0
+    %d1 = gep i8, *%digest, 1
+    %d2 = gep i8, *%digest, 2
+    %d3 = gep i8, *%digest, 3
+    store i8 %a_v0, *%d0
+    store i8 %a_v1, *%d1
+    store i8 %a_v2, *%d2
+    store i8 %a_v3, *%d3
+
+    // Word 1 (bytes 4-7)
+    %b_b0 = lshr i32 %bv, 24
+    %b_v0 = trunc i32 %b_b0 to i8
+    %b_b1 = lshr i32 %bv, 16
+    %b_v1 = trunc i32 %b_b1 to i8
+    %b_b2 = lshr i32 %bv, 8
+    %b_v2 = trunc i32 %b_b2 to i8
+    %b_v3 = trunc i32 %bv to i8
+
+    %d4 = gep i8, *%digest, 4
+    %d5 = gep i8, *%digest, 5
+    %d6 = gep i8, *%digest, 6
+    %d7 = gep i8, *%digest, 7
+    store i8 %b_v0, *%d4
+    store i8 %b_v1, *%d5
+    store i8 %b_v2, *%d6
+    store i8 %b_v3, *%d7
+
+    // Word 2 (bytes 8-11)
+    %c_b0 = lshr i32 %cv, 24
+    %c_v0 = trunc i32 %c_b0 to i8
+    %c_b1 = lshr i32 %cv, 16
+    %c_v1 = trunc i32 %c_b1 to i8
+    %c_b2 = lshr i32 %cv, 8
+    %c_v2 = trunc i32 %c_b2 to i8
+    %c_v3 = trunc i32 %cv to i8
+
+    %d8  = gep i8, *%digest, 8
+    %d9  = gep i8, *%digest, 9
+    %d10 = gep i8, *%digest, 10
+    %d11 = gep i8, *%digest, 11
+    store i8 %c_v0, *%d8
+    store i8 %c_v1, *%d9
+    store i8 %c_v2, *%d10
+    store i8 %c_v3, *%d11
+
+    // Word 3 (bytes 12-15)
+    %d_b0 = lshr i32 %dv, 24
+    %d_v0 = trunc i32 %d_b0 to i8
+    %d_b1 = lshr i32 %dv, 16
+    %d_v1 = trunc i32 %d_b1 to i8
+    %d_b2 = lshr i32 %dv, 8
+    %d_v2 = trunc i32 %d_b2 to i8
+    %d_v3 = trunc i32 %dv to i8
+
+    %d12 = gep i8, *%digest, 12
+    %d13 = gep i8, *%digest, 13
+    %d14 = gep i8, *%digest, 14
+    %d15 = gep i8, *%digest, 15
+    store i8 %d_v0, *%d12
+    store i8 %d_v1, *%d13
+    store i8 %d_v2, *%d14
+    store i8 %d_v3, *%d15
+
+    // Word 4 (bytes 16-19)
+    %e_b0 = lshr i32 %ev, 24
+    %e_v0 = trunc i32 %e_b0 to i8
+    %e_b1 = lshr i32 %ev, 16
+    %e_v1 = trunc i32 %e_b1 to i8
+    %e_b2 = lshr i32 %ev, 8
+    %e_v2 = trunc i32 %e_b2 to i8
+    %e_v3 = trunc i32 %ev to i8
+
+    %d16 = gep i8, *%digest, 16
+    %d17 = gep i8, *%digest, 17
+    %d18 = gep i8, *%digest, 18
+    %d19 = gep i8, *%digest, 19
+    store i8 %e_v0, *%d16
+    store i8 %e_v1, *%d17
+    store i8 %e_v2, *%d18
+    store i8 %e_v3, *%d19
+
+    // Word 5 (bytes 20-23)
+    %f_b0 = lshr i32 %fv, 24
+    %f_v0 = trunc i32 %f_b0 to i8
+    %f_b1 = lshr i32 %fv, 16
+    %f_v1 = trunc i32 %f_b1 to i8
+    %f_b2 = lshr i32 %fv, 8
+    %f_v2 = trunc i32 %f_b2 to i8
+    %f_v3 = trunc i32 %fv to i8
+
+    %d20 = gep i8, *%digest, 20
+    %d21 = gep i8, *%digest, 21
+    %d22 = gep i8, *%digest, 22
+    %d23 = gep i8, *%digest, 23
+    store i8 %f_v0, *%d20
+    store i8 %f_v1, *%d21
+    store i8 %f_v2, *%d22
+    store i8 %f_v3, *%d23
+
+    // Word 6 (bytes 24-27)
+    %g_b0 = lshr i32 %gv, 24
+    %g_v0 = trunc i32 %g_b0 to i8
+    %g_b1 = lshr i32 %gv, 16
+    %g_v1 = trunc i32 %g_b1 to i8
+    %g_b2 = lshr i32 %gv, 8
+    %g_v2 = trunc i32 %g_b2 to i8
+    %g_v3 = trunc i32 %gv to i8
+
+    %d24 = gep i8, *%digest, 24
+    %d25 = gep i8, *%digest, 25
+    %d26 = gep i8, *%digest, 26
+    %d27 = gep i8, *%digest, 27
+    store i8 %g_v0, *%d24
+    store i8 %g_v1, *%d25
+    store i8 %g_v2, *%d26
+    store i8 %g_v3, *%d27
+
+    // Word 7 (bytes 28-31)
+    %h_b0 = lshr i32 %hv, 24
+    %h_v0 = trunc i32 %h_b0 to i8
+    %h_b1 = lshr i32 %hv, 16
+    %h_v1 = trunc i32 %h_b1 to i8
+    %h_b2 = lshr i32 %hv, 8
+    %h_v2 = trunc i32 %h_b2 to i8
+    %h_v3 = trunc i32 %hv to i8
+
+    %d28 = gep i8, *%digest, 28
+    %d29 = gep i8, *%digest, 29
+    %d30 = gep i8, *%digest, 30
+    %d31 = gep i8, *%digest, 31
+    store i8 %h_v0, *%d28
+    store i8 %h_v1, *%d29
+    store i8 %h_v2, *%d30
+    store i8 %h_v3, *%d31
+    ret void
+}
+
+
+// Public: HMAC-SHA256 (32-byte output)
+fun @std_crypto_hmac_sha256(key: *i8, key_len: i32, data: *i8, data_len: i32, mac: *i8) -> void {
+  @entry:
+    %padded_key = let [i8, 64]
+    %padded_key_p = gep i8, *%padded_key, 0
+    %ipad_key = let [i8, 64]
+    %ipad_key_p = gep i8, *%ipad_key, 0
+    %opad_key = let [i8, 64]
+    %opad_key_p = gep i8, *%opad_key, 0
+
+    // Step 1: Prepare K'
+    call @_hmac_prepare_padded_key_sha256(%key, %key_len, %padded_key_p)
+
+    // Step 2: XOR with ipad/opad
+    call @_hmac_xor(%padded_key_p, 0x36, %ipad_key_p)
+    call @_hmac_xor(%padded_key_p, 0x5c, %opad_key_p)
+
+    // Step 3: Inner hash SHA256(ipad_key || data)
+    // Allocate 8 i32 hash state
+    %a = let i32
+    %b = let i32
+    %c = let i32
+    %d = let i32
+    %e = let i32
+    %f = let i32
+    %g = let i32
+    %h = let i32
+
+    // Initialize state (SHA-256 magic constants)
+    store i32 0x6A09E667, *%a
+    store i32 0xBB67AE85, *%b
+    store i32 0x3C6EF372, *%c
+    store i32 0xA54FF53A, *%d
+    store i32 0x510E527F, *%e
+    store i32 0x9B05688C, *%f
+    store i32 0x1F83D9AB, *%g
+    store i32 0x5BE0CD19, *%h
+
+    // Process ipad_key as first block
+    call @std_crypto_sha256_transform(%a, %b, %c, %d, %e, %f, %g, %h, %ipad_key_p)
+
+    // Process all full blocks of data
+    %off = call @_hmac_sha256_process_blocks(%a, %b, %c, %d, %e, %f, %g, %h, %data, %data_len)
+
+    // Compute tail position/digest
+    %tail_len = sub i32 %data_len, %off
+    %total_inner = add i32 64, %data_len
+
+    %inner_digest = let [i8, 32]
+    %inner_p = gep i8, *%inner_digest, 0
+
+    // Pad and finalize inner hash
+    %tail_p = gep i8, *%data, %off
+    call @_hmac_sha256_pad(%a, %b, %c, %d, %e, %f, %g, %h, %tail_p, %tail_len, %total_inner, %inner_p)
+
+    // Step 4: Outer hash SHA256(opad_key || inner_digest)
+    // Re-init state
+        store i32 0x6A09E667, *%a
+    store i32 0xBB67AE85, *%b
+    store i32 0x3C6EF372, *%c
+    store i32 0xA54FF53A, *%d
+    store i32 0x510E527F, *%e
+    store i32 0x9B05688C, *%f
+    store i32 0x1F83D9AB, *%g
+    store i32 0x5BE0CD19, *%h
+
+    call @std_crypto_sha256_transform(%a, %b, %c, %d, %e, %f, %g, %h, %opad_key_p)
+
+    // inner_digest is 32 bytes, no full blocks to process
+    %total_outer = add i32 64, 32
+    call @_hmac_sha256_pad(%a, %b, %c, %d, %e, %f, %g, %h, %inner_p, 32, %total_outer, %mac)
+    ret void
+}
+
+
+// ============================================================
+// HMAC-MD5
+// ============================================================
+
+// hmac_md5_process_blocks: process all full 64-byte blocks of data
+fun @_hmac_md5_process_blocks(aptr: *i32, bptr: *i32, cptr: *i32, dptr: *i32,
+                               data: *i8, data_len: i32) -> i32 {
+  @entry:
+    %offset = let i32
+    store i32 0, *%offset
+    jmp @hmp_cond
+
+  @hmp_cond:
+    %off = load i32, *%offset
+    %next = add i32 %off, 64
+    %has_block = sle i32 %next, %data_len
+    br %has_block, @hmp_body, @hmp_done
+
+  @hmp_body:
+    %off2 = load i32, *%offset
+    %bp = gep i8, *%data, %off2
+    call @std_crypto_md5_transform(%aptr, %bptr, %cptr, %dptr, %bp)
+    %off2_next = add i32 %off2, 64
+    store i32 %off2_next, *%offset
+    jmp @hmp_cond
+
+  @hmp_done:
+    %off_val = load i32, *%offset
+    ret i32 %off_val
+}
+
+// hmac_md5_finalize: MD5 pad + finalize (little-endian length)
+fun @_hmac_md5_pad(aptr: *i32, bptr: *i32, cptr: *i32, dptr: *i32,
+                    tail_data: *i8, tail_len: i32, total_len: i32, digest: *i8) -> void {
+  @entry:
+    %buf1 = let [i8, 64]
+    %buf2 = let [i8, 64]
+    %buf1_p = gep i8, *%buf1, 0
+    %buf2_p = gep i8, *%buf2, 0
+    %nm64 = let i64
+    store i64 64, *%nm64
+    %nm64v = load i64, *%nm64
+    call @memset(%buf1_p, 0, %nm64v)
+    call @memset(%buf2_p, 0, %nm64v)
+
+    // Copy tail bytes
+    %ci = let i32
+    store i32 0, *%ci
+    jmp @m5_copy_cond
+
+  @m5_copy_cond:
+    %civ = load i32, *%ci
+    %more = slt i32 %civ, %tail_len
+    br %more, @m5_copy_body, @m5_copy_done
+
+  @m5_copy_body:
+    %civ2 = load i32, *%ci
+    %sp = gep i8, *%tail_data, %civ2
+    %sv = load i8, *%sp
+    %dp = gep i8, *%buf1, %civ2
+    store i8 %sv, *%dp
+    %next = add i32 %civ2, 1
+    store i32 %next, *%ci
+    jmp @m5_copy_cond
+
+  @m5_copy_done:
+    // 0x80 padding byte
+    %pad80_p = gep i8, *%buf1, %tail_len
+    store i8 0x80, *%pad80_p
+
+    // Bit length in little-endian
+    %bl = mul i32 %total_len, 8
+    %bl_b0 = trunc i32 %bl to i8
+    %bl_s8 = lshr i32 %bl, 8
+    %bl_b1 = trunc i32 %bl_s8 to i8
+    %bl_s16 = lshr i32 %bl, 16
+    %bl_b2 = trunc i32 %bl_s16 to i8
+    %bl_s24 = lshr i32 %bl, 24
+    %bl_b3 = trunc i32 %bl_s24 to i8
+
+    %needs_two = sge i32 %tail_len, 56
+    br %needs_two, @m5_two, @m5_one
+
+  @m5_one:
+    // One padding block: length bytes at position 56-59
+    %p56 = gep i8, *%buf1, 56
+    store i8 %bl_b0, *%p56
+    %p57 = gep i8, *%buf1, 57
+    store i8 %bl_b1, *%p57
+    %p58 = gep i8, *%buf1, 58
+    store i8 %bl_b2, *%p58
+    %p59 = gep i8, *%buf1, 59
+    store i8 %bl_b3, *%p59
+
+    call @std_crypto_md5_transform(%aptr, %bptr, %cptr, %dptr, %buf1_p)
+    jmp @m5_write
+
+  @m5_two:
+    // First padding block (data + 0x80, no length)
+    call @std_crypto_md5_transform(%aptr, %bptr, %cptr, %dptr, %buf1_p)
+
+    // Second block: zeros + length
+    %p56_2 = gep i8, *%buf2, 56
+    store i8 %bl_b0, *%p56_2
+    %p57_2 = gep i8, *%buf2, 57
+    store i8 %bl_b1, *%p57_2
+    %p58_2 = gep i8, *%buf2, 58
+    store i8 %bl_b2, *%p58_2
+    %p59_2 = gep i8, *%buf2, 59
+    store i8 %bl_b3, *%p59_2
+
+    call @std_crypto_md5_transform(%aptr, %bptr, %cptr, %dptr, %buf2_p)
+    jmp @m5_write
+
+  @m5_write:
+    // Write digest (A, B, C, D in little-endian → 16 bytes)
+    %av = load i32, *%aptr
+    %bv = load i32, *%bptr
+    %cv = load i32, *%cptr
+    %dv = load i32, *%dptr
+
+    // A bytes 0-3
+    %a_b0 = trunc i32 %av to i8
+    %a_s8 = lshr i32 %av, 8
+    %a_b1 = trunc i32 %a_s8 to i8
+    %a_s16 = lshr i32 %av, 16
+    %a_b2 = trunc i32 %a_s16 to i8
+    %a_s24 = lshr i32 %av, 24
+    %a_b3 = trunc i32 %a_s24 to i8
+
+    %d0 = gep i8, *%digest, 0
+    store i8 %a_b0, *%d0
+    %d1 = gep i8, *%digest, 1
+    store i8 %a_b1, *%d1
+    %d2 = gep i8, *%digest, 2
+    store i8 %a_b2, *%d2
+    %d3 = gep i8, *%digest, 3
+    store i8 %a_b3, *%d3
+
+    // B bytes 4-7
+    %b_b0 = trunc i32 %bv to i8
+    %b_s8 = lshr i32 %bv, 8
+    %b_b1 = trunc i32 %b_s8 to i8
+    %b_s16 = lshr i32 %bv, 16
+    %b_b2 = trunc i32 %b_s16 to i8
+    %b_s24 = lshr i32 %bv, 24
+    %b_b3 = trunc i32 %b_s24 to i8
+
+    %d4 = gep i8, *%digest, 4
+    store i8 %b_b0, *%d4
+    %d5 = gep i8, *%digest, 5
+    store i8 %b_b1, *%d5
+    %d6 = gep i8, *%digest, 6
+    store i8 %b_b2, *%d6
+    %d7 = gep i8, *%digest, 7
+    store i8 %b_b3, *%d7
+
+    // C bytes 8-11
+    %c_b0 = trunc i32 %cv to i8
+    %c_s8 = lshr i32 %cv, 8
+    %c_b1 = trunc i32 %c_s8 to i8
+    %c_s16 = lshr i32 %cv, 16
+    %c_b2 = trunc i32 %c_s16 to i8
+    %c_s24 = lshr i32 %cv, 24
+    %c_b3 = trunc i32 %c_s24 to i8
+
+    %d8  = gep i8, *%digest, 8
+    store i8 %c_b0, *%d8
+    %d9  = gep i8, *%digest, 9
+    store i8 %c_b1, *%d9
+    %d10 = gep i8, *%digest, 10
+    store i8 %c_b2, *%d10
+    %d11 = gep i8, *%digest, 11
+    store i8 %c_b3, *%d11
+
+    // D bytes 12-15
+    %d_b0 = trunc i32 %dv to i8
+    %d_s8 = lshr i32 %dv, 8
+    %d_b1 = trunc i32 %d_s8 to i8
+    %d_s16 = lshr i32 %dv, 16
+    %d_b2 = trunc i32 %d_s16 to i8
+    %d_s24 = lshr i32 %dv, 24
+    %d_b3 = trunc i32 %d_s24 to i8
+
+    %d12 = gep i8, *%digest, 12
+    store i8 %d_b0, *%d12
+    %d13 = gep i8, *%digest, 13
+    store i8 %d_b1, *%d13
+    %d14 = gep i8, *%digest, 14
+    store i8 %d_b2, *%d14
+    %d15 = gep i8, *%digest, 15
+    store i8 %d_b3, *%d15
+    ret void
+}
+
+
+// ============================================================
+// HMAC-SHA1 (20-byte output, 64-byte blocks)
+// ============================================================
+
+// hmac_sha1_prepare_padded_key: prepare K' for SHA-1 (20-byte digest, zero-padded to 64)
+fun @_hmac_prepare_padded_key_sha1(key: *i8, key_len: i32, padded_key: *i8) -> void {
+  @entry:
+    %need_hash = sgt i32 %key_len, 64
+    br %need_hash, @h1_hash_key, @h1_copy_pad
+
+  @h1_hash_key:
+    %tmp = let [i8, 20]
+    %tmp_p = gep i8, *%tmp, 0
+    call @std_crypto_sha1_compute(%key, %key_len, %tmp_p)
+    %ci = let i32
+    store i32 0, *%ci
+    jmp @h1kc_cond
+
+  @h1kc_cond:
+    %civ = load i32, *%ci
+    %more = slt i32 %civ, 20
+    br %more, @h1kc_body, @h1kc_pad
+
+  @h1kc_body:
+    %civ2 = load i32, *%ci
+    %sp = gep i8, *%tmp_p, %civ2
+    %sv = load i8, *%sp
+    %dp = gep i8, *%padded_key, %civ2
+    store i8 %sv, *%dp
+    %next = add i32 %civ2, 1
+    store i32 %next, *%ci
+    jmp @h1kc_cond
+
+  @h1kc_pad:
+    %pi = let i32
+    store i32 20, *%pi
+    jmp @h1zp_cond
+
+  @h1zp_cond:
+    %piv = load i32, *%pi
+    %more_p = slt i32 %piv, 64
+    br %more_p, @h1zp_body, @h1kp_done
+
+  @h1zp_body:
+    %piv2 = load i32, *%pi
+    %pp = gep i8, *%padded_key, %piv2
+    store i8 0, *%pp
+    %next_p = add i32 %piv2, 1
+    store i32 %next_p, *%pi
+    jmp @h1zp_cond
+
+  @h1_copy_pad:
+    %cpi = let i32
+    store i32 0, *%cpi
+    jmp @h1cp_cond
+
+  @h1cp_cond:
+    %cpiv = load i32, *%cpi
+    %more_c = slt i32 %cpiv, %key_len
+    br %more_c, @h1cp_body, @h1cp_zp
+
+  @h1cp_body:
+    %cpiv2 = load i32, *%cpi
+    %sp2 = gep i8, *%key, %cpiv2
+    %sv2 = load i8, *%sp2
+    %dp2 = gep i8, *%padded_key, %cpiv2
+    store i8 %sv2, *%dp2
+    %next_c = add i32 %cpiv2, 1
+    store i32 %next_c, *%cpi
+    jmp @h1cp_cond
+
+  @h1cp_zp:
+    %zp = let i32
+    store i32 %key_len, *%zp
+    jmp @h1zp2_cond
+
+  @h1zp2_cond:
+    %zpv = load i32, *%zp
+    %more_zp = slt i32 %zpv, 64
+    br %more_zp, @h1zp2_body, @h1kp_done
+
+  @h1zp2_body:
+    %zpv2 = load i32, *%zp
+    %zpp = gep i8, *%padded_key, %zpv2
+    store i8 0, *%zpp
+    %next_zp = add i32 %zpv2, 1
+    store i32 %next_zp, *%zp
+    jmp @h1zp2_cond
+
+  @h1kp_done: ret void
+}
+
+// hmac_sha1_process_blocks: process all full 64-byte blocks into SHA-1 state (5 words)
+fun @_hmac_sha1_process_blocks(aptr: *i32, bptr: *i32, cptr: *i32, dptr: *i32, eptr: *i32,
+                                data: *i8, data_len: i32) -> i32 {
+  @entry:
+    %offset = let i32
+    store i32 0, *%offset
+    jmp @h1p_cond
+
+  @h1p_cond:
+    %off = load i32, *%offset
+    %next = add i32 %off, 64
+    %has_block = sle i32 %next, %data_len
+    br %has_block, @h1p_body, @h1p_done
+
+  @h1p_body:
+    %off2 = load i32, *%offset
+    %bp = gep i8, *%data, %off2
+    call @std_crypto_sha1_transform(%aptr, %bptr, %cptr, %dptr, %eptr, %bp)
+    %off2_next = add i32 %off2, 64
+    store i32 %off2_next, *%offset
+    jmp @h1p_cond
+
+  @h1p_done:
+    %off_val = load i32, *%offset
+    ret i32 %off_val
+}
+
+// hmac_sha1_pad: pad and finalize SHA-1 digest (20 bytes)
+fun @_hmac_sha1_pad(aptr: *i32, bptr: *i32, cptr: *i32, dptr: *i32, eptr: *i32,
+                     tail_data: *i8, tail_len: i32, total_len: i32, digest: *i8) -> void {
+  @entry:
+    %buf1 = let [i8, 64]
+    %buf2 = let [i8, 64]
+    %buf1_p = gep i8, *%buf1, 0
+    %buf2_p = gep i8, *%buf2, 0
+    %nm64 = let i64
+    store i64 64, *%nm64
+    %nm64v = load i64, *%nm64
+    call @memset(%buf1_p, 0, %nm64v)
+    call @memset(%buf2_p, 0, %nm64v)
+
+    %ci = let i32
+    store i32 0, *%ci
+    jmp @h1f_copy_cond
+
+  @h1f_copy_cond:
+    %civ = load i32, *%ci
+    %more = slt i32 %civ, %tail_len
+    br %more, @h1f_copy_body, @h1f_copy_done
+
+  @h1f_copy_body:
+    %civ2 = load i32, *%ci
+    %sp = gep i8, *%tail_data, %civ2
+    %sv = load i8, *%sp
+    %dp = gep i8, *%buf1, %civ2
+    store i8 %sv, *%dp
+    %next = add i32 %civ2, 1
+    store i32 %next, *%ci
+    jmp @h1f_copy_cond
+
+  @h1f_copy_done:
+    %pad80_p = gep i8, *%buf1, %tail_len
+    store i8 0x80, *%pad80_p
+
+    // Bit length (big-endian 64-bit at bytes 56-63)
+    %bl = mul i32 %total_len, 8
+    %bl_b7 = and i32 %bl, 0xff
+    %bl_v7 = trunc i32 %bl_b7 to i8
+    %bl_s8 = lshr i32 %bl, 8
+    %bl_b6 = and i32 %bl_s8, 0xff
+    %bl_v6 = trunc i32 %bl_b6 to i8
+    %bl_s16 = lshr i32 %bl, 16
+    %bl_b5 = and i32 %bl_s16, 0xff
+    %bl_v5 = trunc i32 %bl_b5 to i8
+    %bl_s24 = lshr i32 %bl, 24
+    %bl_b4 = and i32 %bl_s24, 0xff
+    %bl_v4 = trunc i32 %bl_b4 to i8
+
+    %needs_two = sge i32 %tail_len, 56
+    br %needs_two, @h1f_two, @h1f_one
+
+  @h1f_one:
+    // Bytes 56-59 = zeros (high 32 bits of 64-bit length), bytes 60-63 = bit length
+    %p56 = gep i8, *%buf1, 56
+    store i8 0, *%p56
+    %p57 = gep i8, *%buf1, 57
+    store i8 0, *%p57
+    %p58 = gep i8, *%buf1, 58
+    store i8 0, *%p58
+    %p59 = gep i8, *%buf1, 59
+    store i8 0, *%p59
+    %p60 = gep i8, *%buf1, 60
+    store i8 %bl_v4, *%p60
+    %p61 = gep i8, *%buf1, 61
+    store i8 %bl_v5, *%p61
+    %p62 = gep i8, *%buf1, 62
+    store i8 %bl_v6, *%p62
+    %p63 = gep i8, *%buf1, 63
+    store i8 %bl_v7, *%p63
+
+    call @std_crypto_sha1_transform(%aptr, %bptr, %cptr, %dptr, %eptr, %buf1_p)
+    jmp @h1f_write
+
+  @h1f_two:
+    call @std_crypto_sha1_transform(%aptr, %bptr, %cptr, %dptr, %eptr, %buf1_p)
+
+    %p60_2 = gep i8, *%buf2, 60
+    store i8 %bl_v4, *%p60_2
+    %p61_2 = gep i8, *%buf2, 61
+    store i8 %bl_v5, *%p61_2
+    %p62_2 = gep i8, *%buf2, 62
+    store i8 %bl_v6, *%p62_2
+    %p63_2 = gep i8, *%buf2, 63
+    store i8 %bl_v7, *%p63_2
+
+    call @std_crypto_sha1_transform(%aptr, %bptr, %cptr, %dptr, %eptr, %buf2_p)
+    jmp @h1f_write
+
+  @h1f_write:
+    // Write 5 words (big-endian) = 20 bytes
+    %av = load i32, *%aptr
+    %bv = load i32, *%bptr
+    %cv = load i32, *%cptr
+    %dv = load i32, *%dptr
+    %ev = load i32, *%eptr
+
+    // A bytes 0-3
+    %a_b0 = lshr i32 %av, 24
+    %a_v0 = trunc i32 %a_b0 to i8
+    %a_b1 = lshr i32 %av, 16
+    %a_v1 = trunc i32 %a_b1 to i8
+    %a_b2 = lshr i32 %av, 8
+    %a_v2 = trunc i32 %a_b2 to i8
+    %a_v3 = trunc i32 %av to i8
+    %d0 = gep i8, *%digest, 0
+    store i8 %a_v0, *%d0
+    %d1 = gep i8, *%digest, 1
+    store i8 %a_v1, *%d1
+    %d2 = gep i8, *%digest, 2
+    store i8 %a_v2, *%d2
+    %d3 = gep i8, *%digest, 3
+    store i8 %a_v3, *%d3
+
+    // B bytes 4-7
+    %b_b0 = lshr i32 %bv, 24
+    %b_v0 = trunc i32 %b_b0 to i8
+    %b_b1 = lshr i32 %bv, 16
+    %b_v1 = trunc i32 %b_b1 to i8
+    %b_b2 = lshr i32 %bv, 8
+    %b_v2 = trunc i32 %b_b2 to i8
+    %b_v3 = trunc i32 %bv to i8
+    %d4 = gep i8, *%digest, 4
+    store i8 %b_v0, *%d4
+    %d5 = gep i8, *%digest, 5
+    store i8 %b_v1, *%d5
+    %d6 = gep i8, *%digest, 6
+    store i8 %b_v2, *%d6
+    %d7 = gep i8, *%digest, 7
+    store i8 %b_v3, *%d7
+
+    // C bytes 8-11
+    %c_b0 = lshr i32 %cv, 24
+    %c_v0 = trunc i32 %c_b0 to i8
+    %c_b1 = lshr i32 %cv, 16
+    %c_v1 = trunc i32 %c_b1 to i8
+    %c_b2 = lshr i32 %cv, 8
+    %c_v2 = trunc i32 %c_b2 to i8
+    %c_v3 = trunc i32 %cv to i8
+    %d8 = gep i8, *%digest, 8
+    store i8 %c_v0, *%d8
+    %d9 = gep i8, *%digest, 9
+    store i8 %c_v1, *%d9
+    %d10 = gep i8, *%digest, 10
+    store i8 %c_v2, *%d10
+    %d11 = gep i8, *%digest, 11
+    store i8 %c_v3, *%d11
+
+    // D bytes 12-15
+    %d_b0 = lshr i32 %dv, 24
+    %d_v0 = trunc i32 %d_b0 to i8
+    %d_b1 = lshr i32 %dv, 16
+    %d_v1 = trunc i32 %d_b1 to i8
+    %d_b2 = lshr i32 %dv, 8
+    %d_v2 = trunc i32 %d_b2 to i8
+    %d_v3 = trunc i32 %dv to i8
+    %d12 = gep i8, *%digest, 12
+    store i8 %d_v0, *%d12
+    %d13 = gep i8, *%digest, 13
+    store i8 %d_v1, *%d13
+    %d14 = gep i8, *%digest, 14
+    store i8 %d_v2, *%d14
+    %d15 = gep i8, *%digest, 15
+    store i8 %d_v3, *%d15
+
+    // E bytes 16-19
+    %e_b0 = lshr i32 %ev, 24
+    %e_v0 = trunc i32 %e_b0 to i8
+    %e_b1 = lshr i32 %ev, 16
+    %e_v1 = trunc i32 %e_b1 to i8
+    %e_b2 = lshr i32 %ev, 8
+    %e_v2 = trunc i32 %e_b2 to i8
+    %e_v3 = trunc i32 %ev to i8
+    %d16 = gep i8, *%digest, 16
+    store i8 %e_v0, *%d16
+    %d17 = gep i8, *%digest, 17
+    store i8 %e_v1, *%d17
+    %d18 = gep i8, *%digest, 18
+    store i8 %e_v2, *%d18
+    %d19 = gep i8, *%digest, 19
+    store i8 %e_v3, *%d19
+    ret void
+}
+
+// Public: HMAC-SHA1 (20-byte output)
+fun @std_crypto_hmac_sha1(key: *i8, key_len: i32, data: *i8, data_len: i32, mac: *i8) -> void {
+  @entry:
+    %padded_key = let [i8, 64]
+    %padded_key_p = gep i8, *%padded_key, 0
+    %ipad_key = let [i8, 64]
+    %ipad_key_p = gep i8, *%ipad_key, 0
+    %opad_key = let [i8, 64]
+    %opad_key_p = gep i8, *%opad_key, 0
+
+    call @_hmac_prepare_padded_key_sha1(%key, %key_len, %padded_key_p)
+    call @_hmac_xor(%padded_key_p, 0x36, %ipad_key_p)
+    call @_hmac_xor(%padded_key_p, 0x5c, %opad_key_p)
+
+    // Inner SHA1(ipad_key || data)
+    %a = let i32
+    %b = let i32
+    %c = let i32
+    %d = let i32
+    %e = let i32
+
+    store i32 0x67452301, *%a
+    store i32 0xEFCDAB89, *%b
+    store i32 0x98BADCFE, *%c
+    store i32 0x10325476, *%d
+    store i32 0xC3D2E1F0, *%e
+
+    call @std_crypto_sha1_transform(%a, %b, %c, %d, %e, %ipad_key_p)
+    %off = call @_hmac_sha1_process_blocks(%a, %b, %c, %d, %e, %data, %data_len)
+
+    %tail_len = sub i32 %data_len, %off
+    %total_inner = add i32 64, %data_len
+    %inner_digest = let [i8, 20]
+    %inner_p = gep i8, *%inner_digest, 0
+    %tail_p = gep i8, *%data, %off
+    call @_hmac_sha1_pad(%a, %b, %c, %d, %e, %tail_p, %tail_len, %total_inner, %inner_p)
+
+    // Outer SHA1(opad_key || inner_digest)
+    store i32 0x67452301, *%a
+    store i32 0xEFCDAB89, *%b
+    store i32 0x98BADCFE, *%c
+    store i32 0x10325476, *%d
+    store i32 0xC3D2E1F0, *%e
+
+    call @std_crypto_sha1_transform(%a, %b, %c, %d, %e, %opad_key_p)
+    %total_outer = add i32 64, 20
+    call @_hmac_sha1_pad(%a, %b, %c, %d, %e, %inner_p, 20, %total_outer, %mac)
+    ret void
+}
+
+
+// ============================================================
+// HMAC-SHA512 (64-byte output, 128-byte blocks)
+// HMAC-SHA384 (48-byte output, 128-byte blocks)
+// ============================================================
+
+// xor 128 bytes
+fun @_hmac_xor_128(padded_key: *i8, pad: i8, xored: *i8) -> void {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @xr128_cond
+
+  @xr128_cond:
+    %iv = load i32, *%i
+    %more = slt i32 %iv, 128
+    br %more, @xr128_body, @xr128_done
+
+  @xr128_body:
+    %iv2 = load i32, *%i
+    %kp = gep i8, *%padded_key, %iv2
+    %kv = load i8, *%kp
+    %xv = xor i8 %kv, %pad
+    %xp = gep i8, *%xored, %iv2
+    store i8 %xv, *%xp
+    %next = add i32 %iv2, 1
+    store i32 %next, *%i
+    jmp @xr128_cond
+
+  @xr128_done: ret void
+}
+
+// hmac_sha512_prepare_padded_key: prepare K' (SHA-512, 64-byte digest, zero-padded to 128)
+fun @_hmac_prepare_padded_key_sha512(key: *i8, key_len: i32, padded_key: *i8) -> void {
+  @entry:
+    %need_hash = sgt i32 %key_len, 128
+    br %need_hash, @h512_hash_key, @h512_copy_pad
+
+  @h512_hash_key:
+    %tmp = let [i8, 64]
+    %tmp_p = gep i8, *%tmp, 0
+    call @std_crypto_sha512_compute(%key, %key_len, %tmp_p)
+    %ci = let i32
+    store i32 0, *%ci
+    jmp @h512kc_cond
+
+  @h512kc_cond:
+    %civ = load i32, *%ci
+    %more = slt i32 %civ, 64
+    br %more, @h512kc_body, @h512kc_pad
+
+  @h512kc_body:
+    %civ2 = load i32, *%ci
+    %sp = gep i8, *%tmp_p, %civ2
+    %sv = load i8, *%sp
+    %dp = gep i8, *%padded_key, %civ2
+    store i8 %sv, *%dp
+    %next = add i32 %civ2, 1
+    store i32 %next, *%ci
+    jmp @h512kc_cond
+
+  @h512kc_pad:
+    %pi = let i32
+    store i32 64, *%pi
+    jmp @h512zp_cond
+
+  @h512zp_cond:
+    %piv = load i32, *%pi
+    %more_p = slt i32 %piv, 128
+    br %more_p, @h512zp_body, @h512kp_done
+
+  @h512zp_body:
+    %piv2 = load i32, *%pi
+    %pp = gep i8, *%padded_key, %piv2
+    store i8 0, *%pp
+    %next_p = add i32 %piv2, 1
+    store i32 %next_p, *%pi
+    jmp @h512zp_cond
+
+  @h512_copy_pad:
+    %cpi = let i32
+    store i32 0, *%cpi
+    jmp @h512cp_cond
+
+  @h512cp_cond:
+    %cpiv = load i32, *%cpi
+    %more_c = slt i32 %cpiv, %key_len
+    br %more_c, @h512cp_body, @h512cp_zp
+
+  @h512cp_body:
+    %cpiv2 = load i32, *%cpi
+    %sp2 = gep i8, *%key, %cpiv2
+    %sv2 = load i8, *%sp2
+    %dp2 = gep i8, *%padded_key, %cpiv2
+    store i8 %sv2, *%dp2
+    %next_c = add i32 %cpiv2, 1
+    store i32 %next_c, *%cpi
+    jmp @h512cp_cond
+
+  @h512cp_zp:
+    %zp = let i32
+    store i32 %key_len, *%zp
+    jmp @h512zp2_cond
+
+  @h512zp2_cond:
+    %zpv = load i32, *%zp
+    %more_zp = slt i32 %zpv, 128
+    br %more_zp, @h512zp2_body, @h512kp_done
+
+  @h512zp2_body:
+    %zpv2 = load i32, *%zp
+    %zpp = gep i8, *%padded_key, %zpv2
+    store i8 0, *%zpp
+    %next_zp = add i32 %zpv2, 1
+    store i32 %next_zp, *%zp
+    jmp @h512zp2_cond
+
+  @h512kp_done: ret void
+}
+
+// hmac_sha384_prepare_padded_key: prepare K' (SHA-384, 48-byte digest, zero-padded to 128)
+fun @_hmac_prepare_padded_key_sha384(key: *i8, key_len: i32, padded_key: *i8) -> void {
+  @entry:
+    %need_hash = sgt i32 %key_len, 128
+    br %need_hash, @h384_hash_key, @h384_copy_pad
+
+  @h384_hash_key:
+    %tmp = let [i8, 48]
+    %tmp_p = gep i8, *%tmp, 0
+    call @std_crypto_sha384_compute(%key, %key_len, %tmp_p)
+    %ci = let i32
+    store i32 0, *%ci
+    jmp @h384kc_cond
+
+  @h384kc_cond:
+    %civ = load i32, *%ci
+    %more = slt i32 %civ, 48
+    br %more, @h384kc_body, @h384kc_pad
+
+  @h384kc_body:
+    %civ2 = load i32, *%ci
+    %sp = gep i8, *%tmp_p, %civ2
+    %sv = load i8, *%sp
+    %dp = gep i8, *%padded_key, %civ2
+    store i8 %sv, *%dp
+    %next = add i32 %civ2, 1
+    store i32 %next, *%ci
+    jmp @h384kc_cond
+
+  @h384kc_pad:
+    %pi = let i32
+    store i32 48, *%pi
+    jmp @h384zp_cond
+
+  @h384zp_cond:
+    %piv = load i32, *%pi
+    %more_p = slt i32 %piv, 128
+    br %more_p, @h384zp_body, @h384kp_done
+
+  @h384zp_body:
+    %piv2 = load i32, *%pi
+    %pp = gep i8, *%padded_key, %piv2
+    store i8 0, *%pp
+    %next_p = add i32 %piv2, 1
+    store i32 %next_p, *%pi
+    jmp @h384zp_cond
+
+  @h384_copy_pad:
+    %cpi = let i32
+    store i32 0, *%cpi
+    jmp @h384cp_cond
+
+  @h384cp_cond:
+    %cpiv = load i32, *%cpi
+    %more_c = slt i32 %cpiv, %key_len
+    br %more_c, @h384cp_body, @h384cp_zp
+
+  @h384cp_body:
+    %cpiv2 = load i32, *%cpi
+    %sp2 = gep i8, *%key, %cpiv2
+    %sv2 = load i8, *%sp2
+    %dp2 = gep i8, *%padded_key, %cpiv2
+    store i8 %sv2, *%dp2
+    %next_c = add i32 %cpiv2, 1
+    store i32 %next_c, *%cpi
+    jmp @h384cp_cond
+
+  @h384cp_zp:
+    %zp = let i32
+    store i32 %key_len, *%zp
+    jmp @h384zp2_cond
+
+  @h384zp2_cond:
+    %zpv = load i32, *%zp
+    %more_zp = slt i32 %zpv, 128
+    br %more_zp, @h384zp2_body, @h384kp_done
+
+  @h384zp2_body:
+    %zpv2 = load i32, *%zp
+    %zpp = gep i8, *%padded_key, %zpv2
+    store i8 0, *%zpp
+    %next_zp = add i32 %zpv2, 1
+    store i32 %next_zp, *%zp
+    jmp @h384zp2_cond
+
+  @h384kp_done: ret void
+}
+
+// hmac_sha512_process_blocks: process all full 128-byte blocks (shared by SHA-384 and SHA-512)
+fun @_hmac_sha512_process_blocks(aptr: *i64, bptr: *i64, cptr: *i64, dptr: *i64,
+                                  eptr: *i64, fptr: *i64, gptr: *i64, hptr: *i64,
+                                  data: *i8, data_len: i32) -> i32 {
+  @entry:
+    %offset = let i32
+    store i32 0, *%offset
+    jmp @h512bp_cond
+
+  @h512bp_cond:
+    %off = load i32, *%offset
+    %next = add i32 %off, 128
+    %has_block = sle i32 %next, %data_len
+    br %has_block, @h512bp_body, @h512bp_done
+
+  @h512bp_body:
+    %off2 = load i32, *%offset
+    %bp = gep i8, *%data, %off2
+    call @std_crypto_sha512_transform(%aptr, %bptr, %cptr, %dptr, %eptr, %fptr, %gptr, %hptr, %bp)
+    %off2_next = add i32 %off2, 128
+    store i32 %off2_next, *%offset
+    jmp @h512bp_cond
+
+  @h512bp_done:
+    %off_val = load i32, *%offset
+    ret i32 %off_val
+}
+
+// hmac_sha512_pad: SHA-512 pad + finalize (64-byte digest)
+fun @_hmac_sha512_pad(aptr: *i64, bptr: *i64, cptr: *i64, dptr: *i64,
+                       eptr: *i64, fptr: *i64, gptr: *i64, hptr: *i64,
+                       tail_data: *i8, tail_len: i32, total_len: i32, digest: *i8) -> void {
+  @entry:
+    %buf1 = let [i8, 128]
+    %buf2 = let [i8, 128]
+    %buf1_p = gep i8, *%buf1, 0
+    %buf2_p = gep i8, *%buf2, 0
+    %nm128 = let i64
+    store i64 128, *%nm128
+    %nm128v = load i64, *%nm128
+    call @memset(%buf1_p, 0, %nm128v)
+    call @memset(%buf2_p, 0, %nm128v)
+
+    %ci = let i32
+    store i32 0, *%ci
+    jmp @h512f_copy_cond
+
+  @h512f_copy_cond:
+    %civ = load i32, *%ci
+    %more = slt i32 %civ, %tail_len
+    br %more, @h512f_copy_body, @h512f_copy_done
+
+  @h512f_copy_body:
+    %civ2 = load i32, *%ci
+    %sp = gep i8, *%tail_data, %civ2
+    %sv = load i8, *%sp
+    %dp = gep i8, *%buf1, %civ2
+    store i8 %sv, *%dp
+    %next = add i32 %civ2, 1
+    store i32 %next, *%ci
+    jmp @h512f_copy_cond
+
+  @h512f_copy_done:
+    %pad80_p = gep i8, *%buf1, %tail_len
+    store i8 0x80, *%pad80_p
+
+    // 128-bit big-endian bit length at bytes 112-127
+    %len64 = zext i32 %total_len to i64
+    %bl = mul i64 %len64, 8
+    %bl_s56 = lshr i64 %bl, 56
+    %bl_b56 = trunc i64 %bl_s56 to i8
+    %bl_s48 = lshr i64 %bl, 48
+    %bl_b48 = trunc i64 %bl_s48 to i8
+    %bl_s40 = lshr i64 %bl, 40
+    %bl_b40 = trunc i64 %bl_s40 to i8
+    %bl_s32 = lshr i64 %bl, 32
+    %bl_b32 = trunc i64 %bl_s32 to i8
+    %bl_s24 = lshr i64 %bl, 24
+    %bl_b24 = trunc i64 %bl_s24 to i8
+    %bl_s16 = lshr i64 %bl, 16
+    %bl_b16 = trunc i64 %bl_s16 to i8
+    %bl_s8 = lshr i64 %bl, 8
+    %bl_b8 = trunc i64 %bl_s8 to i8
+    %bl_b0 = trunc i64 %bl to i8
+
+    %needs_two = sge i32 %tail_len, 112
+    br %needs_two, @h512f_two, @h512f_one
+
+  @h512f_one:
+    %p112 = gep i8, *%buf1, 112
+    store i8 0, *%p112
+    %p113 = gep i8, *%buf1, 113
+    store i8 0, *%p113
+    %p114 = gep i8, *%buf1, 114
+    store i8 0, *%p114
+    %p115 = gep i8, *%buf1, 115
+    store i8 0, *%p115
+    %p116 = gep i8, *%buf1, 116
+    store i8 0, *%p116
+    %p117 = gep i8, *%buf1, 117
+    store i8 0, *%p117
+    %p118 = gep i8, *%buf1, 118
+    store i8 0, *%p118
+    %p119 = gep i8, *%buf1, 119
+    store i8 0, *%p119
+    %p120 = gep i8, *%buf1, 120
+    store i8 %bl_b56, *%p120
+    %p121 = gep i8, *%buf1, 121
+    store i8 %bl_b48, *%p121
+    %p122 = gep i8, *%buf1, 122
+    store i8 %bl_b40, *%p122
+    %p123 = gep i8, *%buf1, 123
+    store i8 %bl_b32, *%p123
+    %p124 = gep i8, *%buf1, 124
+    store i8 %bl_b24, *%p124
+    %p125 = gep i8, *%buf1, 125
+    store i8 %bl_b16, *%p125
+    %p126 = gep i8, *%buf1, 126
+    store i8 %bl_b8, *%p126
+    %p127 = gep i8, *%buf1, 127
+    store i8 %bl_b0, *%p127
+
+    call @std_crypto_sha512_transform(%aptr, %bptr, %cptr, %dptr, %eptr, %fptr, %gptr, %hptr, %buf1_p)
+    jmp @h512f_write
+
+  @h512f_two:
+    call @std_crypto_sha512_transform(%aptr, %bptr, %cptr, %dptr, %eptr, %fptr, %gptr, %hptr, %buf1_p)
+
+    %p120_2 = gep i8, *%buf2, 120
+    store i8 %bl_b56, *%p120_2
+    %p121_2 = gep i8, *%buf2, 121
+    store i8 %bl_b48, *%p121_2
+    %p122_2 = gep i8, *%buf2, 122
+    store i8 %bl_b40, *%p122_2
+    %p123_2 = gep i8, *%buf2, 123
+    store i8 %bl_b32, *%p123_2
+    %p124_2 = gep i8, *%buf2, 124
+    store i8 %bl_b24, *%p124_2
+    %p125_2 = gep i8, *%buf2, 125
+    store i8 %bl_b16, *%p125_2
+    %p126_2 = gep i8, *%buf2, 126
+    store i8 %bl_b8, *%p126_2
+    %p127_2 = gep i8, *%buf2, 127
+    store i8 %bl_b0, *%p127_2
+
+    call @std_crypto_sha512_transform(%aptr, %bptr, %cptr, %dptr, %eptr, %fptr, %gptr, %hptr, %buf2_p)
+    jmp @h512f_write
+
+  @h512f_write:
+    // Write 8 i64 big-endian = 64 bytes
+    %av = load i64, *%aptr
+    %bv = load i64, *%bptr
+    %cv = load i64, *%cptr
+    %dv = load i64, *%dptr
+    %ev = load i64, *%eptr
+    %fv = load i64, *%fptr
+    %gv = load i64, *%gptr
+    %hv = load i64, *%hptr
+
+    %a_s56 = lshr i64 %av, 56
+    %a_b0 = trunc i64 %a_s56 to i8
+    %a_s48 = lshr i64 %av, 48
+    %a_b1 = trunc i64 %a_s48 to i8
+    %a_s40 = lshr i64 %av, 40
+    %a_b2 = trunc i64 %a_s40 to i8
+    %a_s32 = lshr i64 %av, 32
+    %a_b3 = trunc i64 %a_s32 to i8
+    %a_s24 = lshr i64 %av, 24
+    %a_b4 = trunc i64 %a_s24 to i8
+    %a_s16 = lshr i64 %av, 16
+    %a_b5 = trunc i64 %a_s16 to i8
+    %a_s8 = lshr i64 %av, 8
+    %a_b6 = trunc i64 %a_s8 to i8
+    %a_b7 = trunc i64 %av to i8
+    %d0 = gep i8, *%digest, 0
+    store i8 %a_b0, *%d0
+    %d1 = gep i8, *%digest, 1
+    store i8 %a_b1, *%d1
+    %d2 = gep i8, *%digest, 2
+    store i8 %a_b2, *%d2
+    %d3 = gep i8, *%digest, 3
+    store i8 %a_b3, *%d3
+    %d4 = gep i8, *%digest, 4
+    store i8 %a_b4, *%d4
+    %d5 = gep i8, *%digest, 5
+    store i8 %a_b5, *%d5
+    %d6 = gep i8, *%digest, 6
+    store i8 %a_b6, *%d6
+    %d7 = gep i8, *%digest, 7
+    store i8 %a_b7, *%d7
+
+    // B
+    %b_s56 = lshr i64 %bv, 56
+    %b_b0 = trunc i64 %b_s56 to i8
+    %b_s48 = lshr i64 %bv, 48
+    %b_b1 = trunc i64 %b_s48 to i8
+    %b_s40 = lshr i64 %bv, 40
+    %b_b2 = trunc i64 %b_s40 to i8
+    %b_s32 = lshr i64 %bv, 32
+    %b_b3 = trunc i64 %b_s32 to i8
+    %b_s24 = lshr i64 %bv, 24
+    %b_b4 = trunc i64 %b_s24 to i8
+    %b_s16 = lshr i64 %bv, 16
+    %b_b5 = trunc i64 %b_s16 to i8
+    %b_s8 = lshr i64 %bv, 8
+    %b_b6 = trunc i64 %b_s8 to i8
+    %b_b7 = trunc i64 %bv to i8
+    %d8  = gep i8, *%digest, 8
+    store i8 %b_b0, *%d8
+    %d9  = gep i8, *%digest, 9
+    store i8 %b_b1, *%d9
+    %d10 = gep i8, *%digest, 10
+    store i8 %b_b2, *%d10
+    %d11 = gep i8, *%digest, 11
+    store i8 %b_b3, *%d11
+    %d12 = gep i8, *%digest, 12
+    store i8 %b_b4, *%d12
+    %d13 = gep i8, *%digest, 13
+    store i8 %b_b5, *%d13
+    %d14 = gep i8, *%digest, 14
+    store i8 %b_b6, *%d14
+    %d15 = gep i8, *%digest, 15
+    store i8 %b_b7, *%d15
+
+    // C
+    %c_s56 = lshr i64 %cv, 56
+    %c_b0 = trunc i64 %c_s56 to i8
+    %c_s48 = lshr i64 %cv, 48
+    %c_b1 = trunc i64 %c_s48 to i8
+    %c_s40 = lshr i64 %cv, 40
+    %c_b2 = trunc i64 %c_s40 to i8
+    %c_s32 = lshr i64 %cv, 32
+    %c_b3 = trunc i64 %c_s32 to i8
+    %c_s24 = lshr i64 %cv, 24
+    %c_b4 = trunc i64 %c_s24 to i8
+    %c_s16 = lshr i64 %cv, 16
+    %c_b5 = trunc i64 %c_s16 to i8
+    %c_s8 = lshr i64 %cv, 8
+    %c_b6 = trunc i64 %c_s8 to i8
+    %c_b7 = trunc i64 %cv to i8
+    %d16 = gep i8, *%digest, 16
+    store i8 %c_b0, *%d16
+    %d17 = gep i8, *%digest, 17
+    store i8 %c_b1, *%d17
+    %d18 = gep i8, *%digest, 18
+    store i8 %c_b2, *%d18
+    %d19 = gep i8, *%digest, 19
+    store i8 %c_b3, *%d19
+    %d20 = gep i8, *%digest, 20
+    store i8 %c_b4, *%d20
+    %d21 = gep i8, *%digest, 21
+    store i8 %c_b5, *%d21
+    %d22 = gep i8, *%digest, 22
+    store i8 %c_b6, *%d22
+    %d23 = gep i8, *%digest, 23
+    store i8 %c_b7, *%d23
+
+    // D
+    %d_s56 = lshr i64 %dv, 56
+    %d_b0 = trunc i64 %d_s56 to i8
+    %d_s48 = lshr i64 %dv, 48
+    %d_b1 = trunc i64 %d_s48 to i8
+    %d_s40 = lshr i64 %dv, 40
+    %d_b2 = trunc i64 %d_s40 to i8
+    %d_s32 = lshr i64 %dv, 32
+    %d_b3 = trunc i64 %d_s32 to i8
+    %d_s24 = lshr i64 %dv, 24
+    %d_b4 = trunc i64 %d_s24 to i8
+    %d_s16 = lshr i64 %dv, 16
+    %d_b5 = trunc i64 %d_s16 to i8
+    %d_s8 = lshr i64 %dv, 8
+    %d_b6 = trunc i64 %d_s8 to i8
+    %d_b7 = trunc i64 %dv to i8
+    %d24 = gep i8, *%digest, 24
+    store i8 %d_b0, *%d24
+    %d25 = gep i8, *%digest, 25
+    store i8 %d_b1, *%d25
+    %d26 = gep i8, *%digest, 26
+    store i8 %d_b2, *%d26
+    %d27 = gep i8, *%digest, 27
+    store i8 %d_b3, *%d27
+    %d28 = gep i8, *%digest, 28
+    store i8 %d_b4, *%d28
+    %d29 = gep i8, *%digest, 29
+    store i8 %d_b5, *%d29
+    %d30 = gep i8, *%digest, 30
+    store i8 %d_b6, *%d30
+    %d31 = gep i8, *%digest, 31
+    store i8 %d_b7, *%d31
+
+    // E
+    %e_s56 = lshr i64 %ev, 56
+    %e_b0 = trunc i64 %e_s56 to i8
+    %e_s48 = lshr i64 %ev, 48
+    %e_b1 = trunc i64 %e_s48 to i8
+    %e_s40 = lshr i64 %ev, 40
+    %e_b2 = trunc i64 %e_s40 to i8
+    %e_s32 = lshr i64 %ev, 32
+    %e_b3 = trunc i64 %e_s32 to i8
+    %e_s24 = lshr i64 %ev, 24
+    %e_b4 = trunc i64 %e_s24 to i8
+    %e_s16 = lshr i64 %ev, 16
+    %e_b5 = trunc i64 %e_s16 to i8
+    %e_s8 = lshr i64 %ev, 8
+    %e_b6 = trunc i64 %e_s8 to i8
+    %e_b7 = trunc i64 %ev to i8
+    %d32 = gep i8, *%digest, 32
+    store i8 %e_b0, *%d32
+    %d33 = gep i8, *%digest, 33
+    store i8 %e_b1, *%d33
+    %d34 = gep i8, *%digest, 34
+    store i8 %e_b2, *%d34
+    %d35 = gep i8, *%digest, 35
+    store i8 %e_b3, *%d35
+    %d36 = gep i8, *%digest, 36
+    store i8 %e_b4, *%d36
+    %d37 = gep i8, *%digest, 37
+    store i8 %e_b5, *%d37
+    %d38 = gep i8, *%digest, 38
+    store i8 %e_b6, *%d38
+    %d39 = gep i8, *%digest, 39
+    store i8 %e_b7, *%d39
+
+    // F
+    %f_s56 = lshr i64 %fv, 56
+    %f_b0 = trunc i64 %f_s56 to i8
+    %f_s48 = lshr i64 %fv, 48
+    %f_b1 = trunc i64 %f_s48 to i8
+    %f_s40 = lshr i64 %fv, 40
+    %f_b2 = trunc i64 %f_s40 to i8
+    %f_s32 = lshr i64 %fv, 32
+    %f_b3 = trunc i64 %f_s32 to i8
+    %f_s24 = lshr i64 %fv, 24
+    %f_b4 = trunc i64 %f_s24 to i8
+    %f_s16 = lshr i64 %fv, 16
+    %f_b5 = trunc i64 %f_s16 to i8
+    %f_s8 = lshr i64 %fv, 8
+    %f_b6 = trunc i64 %f_s8 to i8
+    %f_b7 = trunc i64 %fv to i8
+    %d40 = gep i8, *%digest, 40
+    store i8 %f_b0, *%d40
+    %d41 = gep i8, *%digest, 41
+    store i8 %f_b1, *%d41
+    %d42 = gep i8, *%digest, 42
+    store i8 %f_b2, *%d42
+    %d43 = gep i8, *%digest, 43
+    store i8 %f_b3, *%d43
+    %d44 = gep i8, *%digest, 44
+    store i8 %f_b4, *%d44
+    %d45 = gep i8, *%digest, 45
+    store i8 %f_b5, *%d45
+    %d46 = gep i8, *%digest, 46
+    store i8 %f_b6, *%d46
+    %d47 = gep i8, *%digest, 47
+    store i8 %f_b7, *%d47
+
+    // G
+    %g_s56 = lshr i64 %gv, 56
+    %g_b0 = trunc i64 %g_s56 to i8
+    %g_s48 = lshr i64 %gv, 48
+    %g_b1 = trunc i64 %g_s48 to i8
+    %g_s40 = lshr i64 %gv, 40
+    %g_b2 = trunc i64 %g_s40 to i8
+    %g_s32 = lshr i64 %gv, 32
+    %g_b3 = trunc i64 %g_s32 to i8
+    %g_s24 = lshr i64 %gv, 24
+    %g_b4 = trunc i64 %g_s24 to i8
+    %g_s16 = lshr i64 %gv, 16
+    %g_b5 = trunc i64 %g_s16 to i8
+    %g_s8 = lshr i64 %gv, 8
+    %g_b6 = trunc i64 %g_s8 to i8
+    %g_b7 = trunc i64 %gv to i8
+    %d48 = gep i8, *%digest, 48
+    store i8 %g_b0, *%d48
+    %d49 = gep i8, *%digest, 49
+    store i8 %g_b1, *%d49
+    %d50 = gep i8, *%digest, 50
+    store i8 %g_b2, *%d50
+    %d51 = gep i8, *%digest, 51
+    store i8 %g_b3, *%d51
+    %d52 = gep i8, *%digest, 52
+    store i8 %g_b4, *%d52
+    %d53 = gep i8, *%digest, 53
+    store i8 %g_b5, *%d53
+    %d54 = gep i8, *%digest, 54
+    store i8 %g_b6, *%d54
+    %d55 = gep i8, *%digest, 55
+    store i8 %g_b7, *%d55
+
+    // H
+    %h_s56 = lshr i64 %hv, 56
+    %h_b0 = trunc i64 %h_s56 to i8
+    %h_s48 = lshr i64 %hv, 48
+    %h_b1 = trunc i64 %h_s48 to i8
+    %h_s40 = lshr i64 %hv, 40
+    %h_b2 = trunc i64 %h_s40 to i8
+    %h_s32 = lshr i64 %hv, 32
+    %h_b3 = trunc i64 %h_s32 to i8
+    %h_s24 = lshr i64 %hv, 24
+    %h_b4 = trunc i64 %h_s24 to i8
+    %h_s16 = lshr i64 %hv, 16
+    %h_b5 = trunc i64 %h_s16 to i8
+    %h_s8 = lshr i64 %hv, 8
+    %h_b6 = trunc i64 %h_s8 to i8
+    %h_b7 = trunc i64 %hv to i8
+    %d56 = gep i8, *%digest, 56
+    store i8 %h_b0, *%d56
+    %d57 = gep i8, *%digest, 57
+    store i8 %h_b1, *%d57
+    %d58 = gep i8, *%digest, 58
+    store i8 %h_b2, *%d58
+    %d59 = gep i8, *%digest, 59
+    store i8 %h_b3, *%d59
+    %d60 = gep i8, *%digest, 60
+    store i8 %h_b4, *%d60
+    %d61 = gep i8, *%digest, 61
+    store i8 %h_b5, *%d61
+    %d62 = gep i8, *%digest, 62
+    store i8 %h_b6, *%d62
+    %d63 = gep i8, *%digest, 63
+    store i8 %h_b7, *%d63
+    ret void
+}
+
+// hmac_sha384_pad: SHA-384 pad + finalize (48-byte digest - first 6 of 8 i64)
+fun @_hmac_sha384_pad(aptr: *i64, bptr: *i64, cptr: *i64, dptr: *i64,
+                       eptr: *i64, fptr: *i64, gptr: *i64, hptr: *i64,
+                       tail_data: *i8, tail_len: i32, total_len: i32, digest: *i8) -> void {
+  @entry:
+    %buf1 = let [i8, 128]
+    %buf2 = let [i8, 128]
+    %buf1_p = gep i8, *%buf1, 0
+    %buf2_p = gep i8, *%buf2, 0
+    %nm128 = let i64
+    store i64 128, *%nm128
+    %nm128v = load i64, *%nm128
+    call @memset(%buf1_p, 0, %nm128v)
+    call @memset(%buf2_p, 0, %nm128v)
+
+    %ci = let i32
+    store i32 0, *%ci
+    jmp @h384f_copy_cond
+
+  @h384f_copy_cond:
+    %civ = load i32, *%ci
+    %more = slt i32 %civ, %tail_len
+    br %more, @h384f_copy_body, @h384f_copy_done
+
+  @h384f_copy_body:
+    %civ2 = load i32, *%ci
+    %sp = gep i8, *%tail_data, %civ2
+    %sv = load i8, *%sp
+    %dp = gep i8, *%buf1, %civ2
+    store i8 %sv, *%dp
+    %next = add i32 %civ2, 1
+    store i32 %next, *%ci
+    jmp @h384f_copy_cond
+
+  @h384f_copy_done:
+    %pad80_p = gep i8, *%buf1, %tail_len
+    store i8 0x80, *%pad80_p
+
+    %len64 = zext i32 %total_len to i64
+    %bl = mul i64 %len64, 8
+    %bl_s56 = lshr i64 %bl, 56
+    %bl_b56 = trunc i64 %bl_s56 to i8
+    %bl_s48 = lshr i64 %bl, 48
+    %bl_b48 = trunc i64 %bl_s48 to i8
+    %bl_s40 = lshr i64 %bl, 40
+    %bl_b40 = trunc i64 %bl_s40 to i8
+    %bl_s32 = lshr i64 %bl, 32
+    %bl_b32 = trunc i64 %bl_s32 to i8
+    %bl_s24 = lshr i64 %bl, 24
+    %bl_b24 = trunc i64 %bl_s24 to i8
+    %bl_s16 = lshr i64 %bl, 16
+    %bl_b16 = trunc i64 %bl_s16 to i8
+    %bl_s8 = lshr i64 %bl, 8
+    %bl_b8 = trunc i64 %bl_s8 to i8
+    %bl_b0 = trunc i64 %bl to i8
+
+    %needs_two = sge i32 %tail_len, 112
+    br %needs_two, @h384f_two, @h384f_one
+
+  @h384f_one:
+    %p112 = gep i8, *%buf1, 112
+    store i8 0, *%p112
+    %p113 = gep i8, *%buf1, 113
+    store i8 0, *%p113
+    %p114 = gep i8, *%buf1, 114
+    store i8 0, *%p114
+    %p115 = gep i8, *%buf1, 115
+    store i8 0, *%p115
+    %p116 = gep i8, *%buf1, 116
+    store i8 0, *%p116
+    %p117 = gep i8, *%buf1, 117
+    store i8 0, *%p117
+    %p118 = gep i8, *%buf1, 118
+    store i8 0, *%p118
+    %p119 = gep i8, *%buf1, 119
+    store i8 0, *%p119
+    %p120 = gep i8, *%buf1, 120
+    store i8 %bl_b56, *%p120
+    %p121 = gep i8, *%buf1, 121
+    store i8 %bl_b48, *%p121
+    %p122 = gep i8, *%buf1, 122
+    store i8 %bl_b40, *%p122
+    %p123 = gep i8, *%buf1, 123
+    store i8 %bl_b32, *%p123
+    %p124 = gep i8, *%buf1, 124
+    store i8 %bl_b24, *%p124
+    %p125 = gep i8, *%buf1, 125
+    store i8 %bl_b16, *%p125
+    %p126 = gep i8, *%buf1, 126
+    store i8 %bl_b8, *%p126
+    %p127 = gep i8, *%buf1, 127
+    store i8 %bl_b0, *%p127
+
+    call @std_crypto_sha512_transform(%aptr, %bptr, %cptr, %dptr, %eptr, %fptr, %gptr, %hptr, %buf1_p)
+    jmp @h384f_write
+
+  @h384f_two:
+    call @std_crypto_sha512_transform(%aptr, %bptr, %cptr, %dptr, %eptr, %fptr, %gptr, %hptr, %buf1_p)
+
+    %p120_2 = gep i8, *%buf2, 120
+    store i8 %bl_b56, *%p120_2
+    %p121_2 = gep i8, *%buf2, 121
+    store i8 %bl_b48, *%p121_2
+    %p122_2 = gep i8, *%buf2, 122
+    store i8 %bl_b40, *%p122_2
+    %p123_2 = gep i8, *%buf2, 123
+    store i8 %bl_b32, *%p123_2
+    %p124_2 = gep i8, *%buf2, 124
+    store i8 %bl_b24, *%p124_2
+    %p125_2 = gep i8, *%buf2, 125
+    store i8 %bl_b16, *%p125_2
+    %p126_2 = gep i8, *%buf2, 126
+    store i8 %bl_b8, *%p126_2
+    %p127_2 = gep i8, *%buf2, 127
+    store i8 %bl_b0, *%p127_2
+
+    call @std_crypto_sha512_transform(%aptr, %bptr, %cptr, %dptr, %eptr, %fptr, %gptr, %hptr, %buf2_p)
+    jmp @h384f_write
+
+  @h384f_write:
+    // Write first 6 i64 (A through F) = 48 bytes
+    %av = load i64, *%aptr
+    %bv = load i64, *%bptr
+    %cv = load i64, *%cptr
+    %dv = load i64, *%dptr
+    %ev = load i64, *%eptr
+    %fv = load i64, *%fptr
+
+    %a_s56 = lshr i64 %av, 56
+    %a_b0 = trunc i64 %a_s56 to i8
+    %a_s48 = lshr i64 %av, 48
+    %a_b1 = trunc i64 %a_s48 to i8
+    %a_s40 = lshr i64 %av, 40
+    %a_b2 = trunc i64 %a_s40 to i8
+    %a_s32 = lshr i64 %av, 32
+    %a_b3 = trunc i64 %a_s32 to i8
+    %a_s24 = lshr i64 %av, 24
+    %a_b4 = trunc i64 %a_s24 to i8
+    %a_s16 = lshr i64 %av, 16
+    %a_b5 = trunc i64 %a_s16 to i8
+    %a_s8 = lshr i64 %av, 8
+    %a_b6 = trunc i64 %a_s8 to i8
+    %a_b7 = trunc i64 %av to i8
+    %d0 = gep i8, *%digest, 0
+    store i8 %a_b0, *%d0
+    %d1 = gep i8, *%digest, 1
+    store i8 %a_b1, *%d1
+    %d2 = gep i8, *%digest, 2
+    store i8 %a_b2, *%d2
+    %d3 = gep i8, *%digest, 3
+    store i8 %a_b3, *%d3
+    %d4 = gep i8, *%digest, 4
+    store i8 %a_b4, *%d4
+    %d5 = gep i8, *%digest, 5
+    store i8 %a_b5, *%d5
+    %d6 = gep i8, *%digest, 6
+    store i8 %a_b6, *%d6
+    %d7 = gep i8, *%digest, 7
+    store i8 %a_b7, *%d7
+
+    // B
+    %b_s56 = lshr i64 %bv, 56
+    %b_b0 = trunc i64 %b_s56 to i8
+    %b_s48 = lshr i64 %bv, 48
+    %b_b1 = trunc i64 %b_s48 to i8
+    %b_s40 = lshr i64 %bv, 40
+    %b_b2 = trunc i64 %b_s40 to i8
+    %b_s32 = lshr i64 %bv, 32
+    %b_b3 = trunc i64 %b_s32 to i8
+    %b_s24 = lshr i64 %bv, 24
+    %b_b4 = trunc i64 %b_s24 to i8
+    %b_s16 = lshr i64 %bv, 16
+    %b_b5 = trunc i64 %b_s16 to i8
+    %b_s8 = lshr i64 %bv, 8
+    %b_b6 = trunc i64 %b_s8 to i8
+    %b_b7 = trunc i64 %bv to i8
+    %d8  = gep i8, *%digest, 8
+    store i8 %b_b0, *%d8
+    %d9  = gep i8, *%digest, 9
+    store i8 %b_b1, *%d9
+    %d10 = gep i8, *%digest, 10
+    store i8 %b_b2, *%d10
+    %d11 = gep i8, *%digest, 11
+    store i8 %b_b3, *%d11
+    %d12 = gep i8, *%digest, 12
+    store i8 %b_b4, *%d12
+    %d13 = gep i8, *%digest, 13
+    store i8 %b_b5, *%d13
+    %d14 = gep i8, *%digest, 14
+    store i8 %b_b6, *%d14
+    %d15 = gep i8, *%digest, 15
+    store i8 %b_b7, *%d15
+
+    // C
+    %c_s56 = lshr i64 %cv, 56
+    %c_b0 = trunc i64 %c_s56 to i8
+    %c_s48 = lshr i64 %cv, 48
+    %c_b1 = trunc i64 %c_s48 to i8
+    %c_s40 = lshr i64 %cv, 40
+    %c_b2 = trunc i64 %c_s40 to i8
+    %c_s32 = lshr i64 %cv, 32
+    %c_b3 = trunc i64 %c_s32 to i8
+    %c_s24 = lshr i64 %cv, 24
+    %c_b4 = trunc i64 %c_s24 to i8
+    %c_s16 = lshr i64 %cv, 16
+    %c_b5 = trunc i64 %c_s16 to i8
+    %c_s8 = lshr i64 %cv, 8
+    %c_b6 = trunc i64 %c_s8 to i8
+    %c_b7 = trunc i64 %cv to i8
+    %d16 = gep i8, *%digest, 16
+    store i8 %c_b0, *%d16
+    %d17 = gep i8, *%digest, 17
+    store i8 %c_b1, *%d17
+    %d18 = gep i8, *%digest, 18
+    store i8 %c_b2, *%d18
+    %d19 = gep i8, *%digest, 19
+    store i8 %c_b3, *%d19
+    %d20 = gep i8, *%digest, 20
+    store i8 %c_b4, *%d20
+    %d21 = gep i8, *%digest, 21
+    store i8 %c_b5, *%d21
+    %d22 = gep i8, *%digest, 22
+    store i8 %c_b6, *%d22
+    %d23 = gep i8, *%digest, 23
+    store i8 %c_b7, *%d23
+
+    // D
+    %d_s56 = lshr i64 %dv, 56
+    %d_b0 = trunc i64 %d_s56 to i8
+    %d_s48 = lshr i64 %dv, 48
+    %d_b1 = trunc i64 %d_s48 to i8
+    %d_s40 = lshr i64 %dv, 40
+    %d_b2 = trunc i64 %d_s40 to i8
+    %d_s32 = lshr i64 %dv, 32
+    %d_b3 = trunc i64 %d_s32 to i8
+    %d_s24 = lshr i64 %dv, 24
+    %d_b4 = trunc i64 %d_s24 to i8
+    %d_s16 = lshr i64 %dv, 16
+    %d_b5 = trunc i64 %d_s16 to i8
+    %d_s8 = lshr i64 %dv, 8
+    %d_b6 = trunc i64 %d_s8 to i8
+    %d_b7 = trunc i64 %dv to i8
+    %d24 = gep i8, *%digest, 24
+    store i8 %d_b0, *%d24
+    %d25 = gep i8, *%digest, 25
+    store i8 %d_b1, *%d25
+    %d26 = gep i8, *%digest, 26
+    store i8 %d_b2, *%d26
+    %d27 = gep i8, *%digest, 27
+    store i8 %d_b3, *%d27
+    %d28 = gep i8, *%digest, 28
+    store i8 %d_b4, *%d28
+    %d29 = gep i8, *%digest, 29
+    store i8 %d_b5, *%d29
+    %d30 = gep i8, *%digest, 30
+    store i8 %d_b6, *%d30
+    %d31 = gep i8, *%digest, 31
+    store i8 %d_b7, *%d31
+
+    // E
+    %e_s56 = lshr i64 %ev, 56
+    %e_b0 = trunc i64 %e_s56 to i8
+    %e_s48 = lshr i64 %ev, 48
+    %e_b1 = trunc i64 %e_s48 to i8
+    %e_s40 = lshr i64 %ev, 40
+    %e_b2 = trunc i64 %e_s40 to i8
+    %e_s32 = lshr i64 %ev, 32
+    %e_b3 = trunc i64 %e_s32 to i8
+    %e_s24 = lshr i64 %ev, 24
+    %e_b4 = trunc i64 %e_s24 to i8
+    %e_s16 = lshr i64 %ev, 16
+    %e_b5 = trunc i64 %e_s16 to i8
+    %e_s8 = lshr i64 %ev, 8
+    %e_b6 = trunc i64 %e_s8 to i8
+    %e_b7 = trunc i64 %ev to i8
+    %d32 = gep i8, *%digest, 32
+    store i8 %e_b0, *%d32
+    %d33 = gep i8, *%digest, 33
+    store i8 %e_b1, *%d33
+    %d34 = gep i8, *%digest, 34
+    store i8 %e_b2, *%d34
+    %d35 = gep i8, *%digest, 35
+    store i8 %e_b3, *%d35
+    %d36 = gep i8, *%digest, 36
+    store i8 %e_b4, *%d36
+    %d37 = gep i8, *%digest, 37
+    store i8 %e_b5, *%d37
+    %d38 = gep i8, *%digest, 38
+    store i8 %e_b6, *%d38
+    %d39 = gep i8, *%digest, 39
+    store i8 %e_b7, *%d39
+
+    // F
+    %f_s56 = lshr i64 %fv, 56
+    %f_b0 = trunc i64 %f_s56 to i8
+    %f_s48 = lshr i64 %fv, 48
+    %f_b1 = trunc i64 %f_s48 to i8
+    %f_s40 = lshr i64 %fv, 40
+    %f_b2 = trunc i64 %f_s40 to i8
+    %f_s32 = lshr i64 %fv, 32
+    %f_b3 = trunc i64 %f_s32 to i8
+    %f_s24 = lshr i64 %fv, 24
+    %f_b4 = trunc i64 %f_s24 to i8
+    %f_s16 = lshr i64 %fv, 16
+    %f_b5 = trunc i64 %f_s16 to i8
+    %f_s8 = lshr i64 %fv, 8
+    %f_b6 = trunc i64 %f_s8 to i8
+    %f_b7 = trunc i64 %fv to i8
+    %d40 = gep i8, *%digest, 40
+    store i8 %f_b0, *%d40
+    %d41 = gep i8, *%digest, 41
+    store i8 %f_b1, *%d41
+    %d42 = gep i8, *%digest, 42
+    store i8 %f_b2, *%d42
+    %d43 = gep i8, *%digest, 43
+    store i8 %f_b3, *%d43
+    %d44 = gep i8, *%digest, 44
+    store i8 %f_b4, *%d44
+    %d45 = gep i8, *%digest, 45
+    store i8 %f_b5, *%d45
+    %d46 = gep i8, *%digest, 46
+    store i8 %f_b6, *%d46
+    %d47 = gep i8, *%digest, 47
+    store i8 %f_b7, *%d47
+    ret void
+}
+
+// Public: HMAC-SHA512 (64-byte output)
+fun @std_crypto_hmac_sha512(key: *i8, key_len: i32, data: *i8, data_len: i32, mac: *i8) -> void {
+  @entry:
+    %padded_key = let [i8, 128]
+    %padded_key_p = gep i8, *%padded_key, 0
+    %ipad_key = let [i8, 128]
+    %ipad_key_p = gep i8, *%ipad_key, 0
+    %opad_key = let [i8, 128]
+    %opad_key_p = gep i8, *%opad_key, 0
+
+    call @_hmac_prepare_padded_key_sha512(%key, %key_len, %padded_key_p)
+    call @_hmac_xor_128(%padded_key_p, 0x36, %ipad_key_p)
+    call @_hmac_xor_128(%padded_key_p, 0x5c, %opad_key_p)
+
+    // Inner SHA512(ipad_key || data)
+    %a = let i64
+    %b = let i64
+    %c = let i64
+    %d = let i64
+    %e = let i64
+    %f = let i64
+    %g = let i64
+    %h = let i64
+
+    store i64 0x6A09E667F3BCC908, *%a
+    store i64 -4942790177534073029, *%b
+    store i64 0x3C6EF372FE94F82B, *%c
+    store i64 -6534734903238641935, *%d
+    store i64 0x510E527FADE682D1, *%e
+    store i64 -7276294671716946913, *%f
+    store i64 0x1F83D9ABFB41BD6B, *%g
+    store i64 0x5BE0CD19137E2179, *%h
+
+    call @std_crypto_sha512_transform(%a, %b, %c, %d, %e, %f, %g, %h, %ipad_key_p)
+    %off = call @_hmac_sha512_process_blocks(%a, %b, %c, %d, %e, %f, %g, %h, %data, %data_len)
+
+    %tail_len = sub i32 %data_len, %off
+    %total_inner = add i32 128, %data_len
+    %inner_digest = let [i8, 64]
+    %inner_p = gep i8, *%inner_digest, 0
+    %tail_p = gep i8, *%data, %off
+    call @_hmac_sha512_pad(%a, %b, %c, %d, %e, %f, %g, %h, %tail_p, %tail_len, %total_inner, %inner_p)
+
+    // Outer SHA512(opad_key || inner_digest)
+    store i64 0x6A09E667F3BCC908, *%a
+    store i64 -4942790177534073029, *%b
+    store i64 0x3C6EF372FE94F82B, *%c
+    store i64 -6534734903238641935, *%d
+    store i64 0x510E527FADE682D1, *%e
+    store i64 -7276294671716946913, *%f
+    store i64 0x1F83D9ABFB41BD6B, *%g
+    store i64 0x5BE0CD19137E2179, *%h
+
+    call @std_crypto_sha512_transform(%a, %b, %c, %d, %e, %f, %g, %h, %opad_key_p)
+    %total_outer = add i32 128, 64
+    call @_hmac_sha512_pad(%a, %b, %c, %d, %e, %f, %g, %h, %inner_p, 64, %total_outer, %mac)
+    ret void
+}
+
+// Public: HMAC-SHA384 (48-byte output)
+fun @std_crypto_hmac_sha384(key: *i8, key_len: i32, data: *i8, data_len: i32, mac: *i8) -> void {
+  @entry:
+    %padded_key = let [i8, 128]
+    %padded_key_p = gep i8, *%padded_key, 0
+    %ipad_key = let [i8, 128]
+    %ipad_key_p = gep i8, *%ipad_key, 0
+    %opad_key = let [i8, 128]
+    %opad_key_p = gep i8, *%opad_key, 0
+
+    call @_hmac_prepare_padded_key_sha384(%key, %key_len, %padded_key_p)
+    call @_hmac_xor_128(%padded_key_p, 0x36, %ipad_key_p)
+    call @_hmac_xor_128(%padded_key_p, 0x5c, %opad_key_p)
+
+    // Inner SHA384(ipad_key || data)
+    %a = let i64
+    %b = let i64
+    %c = let i64
+    %d = let i64
+    %e = let i64
+    %f = let i64
+    %g = let i64
+    %h = let i64
+
+    store i64 -3766243637369397544, *%a
+    store i64 0x629A292A367CD507, *%b
+    store i64 -7973340178411365097, *%c
+    store i64 0x152FECD8F70E5939, *%d
+    store i64 0x67332667FFC00B31, *%e
+    store i64 -8163818279084223215, *%f
+    store i64 -2662702644619276377, *%g
+    store i64 0x47B5481DBEFA4FA4, *%h
+
+    call @std_crypto_sha512_transform(%a, %b, %c, %d, %e, %f, %g, %h, %ipad_key_p)
+    %off = call @_hmac_sha512_process_blocks(%a, %b, %c, %d, %e, %f, %g, %h, %data, %data_len)
+
+    %tail_len = sub i32 %data_len, %off
+    %total_inner = add i32 128, %data_len
+    %inner_digest = let [i8, 48]
+    %inner_p = gep i8, *%inner_digest, 0
+    %tail_p = gep i8, *%data, %off
+    call @_hmac_sha384_pad(%a, %b, %c, %d, %e, %f, %g, %h, %tail_p, %tail_len, %total_inner, %inner_p)
+
+    // Outer SHA384(opad_key || inner_digest)
+    store i64 -3766243637369397544, *%a
+    store i64 0x629A292A367CD507, *%b
+    store i64 -7973340178411365097, *%c
+    store i64 0x152FECD8F70E5939, *%d
+    store i64 0x67332667FFC00B31, *%e
+    store i64 -8163818279084223215, *%f
+    store i64 -2662702644619276377, *%g
+    store i64 0x47B5481DBEFA4FA4, *%h
+
+    call @std_crypto_sha512_transform(%a, %b, %c, %d, %e, %f, %g, %h, %opad_key_p)
+    %total_outer = add i32 128, 48
+    call @_hmac_sha384_pad(%a, %b, %c, %d, %e, %f, %g, %h, %inner_p, 48, %total_outer, %mac)
+    ret void
+}
+
+
+// Public: HMAC-MD5 (16-byte output)
+fun @std_crypto_hmac_md5(key: *i8, key_len: i32, data: *i8, data_len: i32, mac: *i8) -> void {
+  @entry:
+    %padded_key = let [i8, 64]
+    %padded_key_p = gep i8, *%padded_key, 0
+    %ipad_key = let [i8, 64]
+    %ipad_key_p = gep i8, *%ipad_key, 0
+    %opad_key = let [i8, 64]
+    %opad_key_p = gep i8, *%opad_key, 0
+
+    // Step 1: Prepare K'
+    call @_hmac_prepare_padded_key(%key, %key_len, %padded_key_p)
+
+    // Step 2: XOR with ipad/opad
+    call @_hmac_xor(%padded_key_p, 0x36, %ipad_key_p)
+    call @_hmac_xor(%padded_key_p, 0x5c, %opad_key_p)
+
+    // Step 3: Inner hash MD5(ipad_key || data)
+    %a = let i32
+    %b = let i32
+    %c = let i32
+    %d = let i32
+
+    // Initialize MD5 state
+    store i32 0x67452301, *%a
+    store i32 0xEFCDAB89, *%b
+    store i32 0x98BADCFE, *%c
+    store i32 0x10325476, *%d
+
+    // Process ipad_key as first block
+    call @std_crypto_md5_transform(%a, %b, %c, %d, %ipad_key_p)
+
+    // Process all full blocks of data
+    %off = call @_hmac_md5_process_blocks(%a, %b, %c, %d, %data, %data_len)
+
+    // Tail and total length
+    %tail_len = sub i32 %data_len, %off
+    %total_inner = add i32 64, %data_len
+
+    %inner_digest = let [i8, 16]
+    %inner_p = gep i8, *%inner_digest, 0
+
+    // Pad and finalize inner hash
+    %tail_p = gep i8, *%data, %off
+    call @_hmac_md5_pad(%a, %b, %c, %d, %tail_p, %tail_len, %total_inner, %inner_p)
+
+    // Step 4: Outer hash MD5(opad_key || inner_digest)
+    store i32 0x67452301, *%a
+    store i32 0xEFCDAB89, *%b
+    store i32 0x98BADCFE, *%c
+    store i32 0x10325476, *%d
+
+    call @std_crypto_md5_transform(%a, %b, %c, %d, %opad_key_p)
+
+    // inner_digest is 16 bytes - no full blocks
+    %total_outer = add i32 64, 16
+    call @_hmac_md5_pad(%a, %b, %c, %d, %inner_p, 16, %total_outer, %mac)
+    ret void
+}

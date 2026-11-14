@@ -1,0 +1,51 @@
+// Test SHA-384 and SHA-512 with "abc" test vector
+extern @printf(fmt: *i8, ...) -> i32
+extern @std_crypto_sha384_compute(data: *i8, len: i32, digest: *i8) -> void
+extern @std_crypto_sha512_compute(data: *i8, len: i32, digest: *i8) -> void
+
+const @abc: [i8, 4] = "abc"
+
+// Print hex digest
+fun @print_hex(data: *i8, len: i32) -> void {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @loop_cond
+  @loop_cond:
+    %iv = load i32, *%i
+    %done = slt i32 %iv, %len
+    br %done, @loop_body, @loop_done
+  @loop_body:
+    %p = gep i8, *%data, %iv
+    %b = load i8, *%p
+    %bz = zext i8 %b to i32
+    call @printf("%02x", %bz)
+    %next = add i32 %iv, 1
+    store i32 %next, *%i
+    jmp @loop_cond
+  @loop_done:
+    ret void
+}
+
+fun @main() -> i32 {
+  @entry:
+    %dp = gep i8, *@abc, 0
+
+    // SHA-512
+    %digest512 = let [i8, 64]
+    %d512p = gep i8, *%digest512, 0
+    call @std_crypto_sha512_compute(%dp, 3, %d512p)
+    call @printf("SHA-512(\"abc\") = ")
+    call @print_hex(%d512p, 64)
+    call @printf("\n")
+
+    // SHA-384
+    %digest384 = let [i8, 48]
+    %d384p = gep i8, *%digest384, 0
+    call @std_crypto_sha384_compute(%dp, 3, %d384p)
+    call @printf("SHA-384(\"abc\") = ")
+    call @print_hex(%d384p, 48)
+    call @printf("\n")
+
+    ret i32 0
+}

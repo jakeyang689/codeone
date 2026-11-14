@@ -1,0 +1,227 @@
+// WebSocket opening handshake (RFC 6455 §4).
+//
+// The client sends an HTTP/1.1 Upgrade request carrying a random
+// Sec-WebSocket-Key; the server answers 101 with
+// Sec-WebSocket-Accept = base64(SHA-1(key + GUID)).
+
+extern @std_text_str_append(dst: *i8, cap: i32, off: i32, src: *i8, len: i32) -> i32
+extern @std_text_str_append_cstr(dst: *i8, cap: i32, off: i32, s: *i8) -> i32
+extern @std_text_str_lower(c: i8) -> i8
+extern @std_text_str_ncmp(s1: *i8, s2: *i8, n: i32) -> i32
+extern @std_text_str_len(s: *i8) -> i32
+
+extern @std_crypto_sha1_compute(data: *i8, len: i32, digest: *i8) -> void
+extern @std_crypto_b64_encode(out: *i8, data: *i8, in_len: i32) -> void
+extern @std_core_random_bytes(buf: *i8, len: i32) -> void
+
+extern @net_http_build_request_conn(buf: *i8, cap: i32, method: *i8, host: *i8,
+                                    path: *i8, headers: *i8, body: *i8,
+                                    body_len: i32, version: i32,
+                                    connection: *i8) -> i32
+extern @net_http_header_add(buf: *i8, cap: i32, off: i32, name: *i8,
+                            value: *i8) -> i32
+extern @net_http_parse_response(buf: *i8, len: i32, resp: *@HttpResponse) -> i32
+extern @net_http_header_get(buf: *i8, resp: *@HttpResponse, name: *i8,
+                            out: *i8, cap: i32) -> i32
+
+// Layout must match http/response.bx.
+struct @HttpResponse {
+  @version: i32,
+  @status: i32,
+  @reason_off: i32,
+  @reason_len: i32,
+  @headers_off: i32,
+  @headers_len: i32,
+  @body_off: i32,
+  @body_len: i32,
+  @content_length: i32,
+  @chunked: i32
+}
+
+const @ws_guid: [i8, 37] = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+// Compute the Sec-WebSocket-Accept value for a client key:
+// base64(SHA-1(key || GUID)). out must hold 29 bytes (28 chars + NUL).
+fun @net_ws_accept(key: *i8, key_len: i32, out: *i8) -> i32 {
+  @entry:
+    %too_long = sgt i32 %key_len, 64
+    br %too_long, @fail, @build
+  @build:
+    %buf = let [i8, 128]
+    %bp = gep i8, *%buf, 0
+    %o1 = call @std_text_str_append(%bp, 128, 0, %key, %key_len)
+    %o1_bad = slt i32 %o1, 0
+    br %o1_bad, @fail, @add_guid
+  @add_guid:
+    %guid = gep i8, *@ws_guid, 0
+    %o2 = call @std_text_str_append_cstr(%bp, 128, %o1, %guid)
+    %o2_bad = slt i32 %o2, 0
+    br %o2_bad, @fail, @hash
+  @hash:
+    %dg = let [i8, 20]
+    %dgp = gep i8, *%dg, 0
+    call @std_crypto_sha1_compute(%bp, %o2, %dgp)
+    call @std_crypto_b64_encode(%out, %dgp, 20)
+    ret i32 0
+  @fail:
+    ret i32 -1
+}
+
+// Generate a client key: 16 random bytes, base64 encoded.
+// out must hold 25 bytes (24 chars + NUL).
+fun @net_ws_make_key(out: *i8) -> i32 {
+  @entry:
+    %raw = let [i8, 16]
+    %rp = gep i8, *%raw, 0
+    call @std_core_random_bytes(%rp, 16)
+    call @std_crypto_b64_encode(%out, %rp, 16)
+    ret i32 0
+}
+
+// Build the client handshake request. Returns bytes written, or -1.
+fun @net_ws_build_handshake(buf: *i8, cap: i32, host: *i8, path: *i8,
+                            key_b64: *i8) -> i32 {
+  @entry:
+    %hb = let [i8, 512]
+    %hbp = gep i8, *%hb, 0
+    %o1 = call @net_http_header_add(%hbp, 512, 0, "Upgrade", "websocket")
+    %b1 = slt i32 %o1, 0
+    br %b1, @fail, @s2
+  @s2:
+    %o2 = call @net_http_header_add(%hbp, 512, %o1, "Sec-WebSocket-Key", %key_b64)
+    %b2 = slt i32 %o2, 0
+    br %b2, @fail, @s3
+  @s3:
+    %o3 = call @net_http_header_add(%hbp, 512, %o2, "Sec-WebSocket-Version", "13")
+    %b3 = slt i32 %o3, 0
+    br %b3, @fail, @term
+  @term:
+    %np = gep i8, *%hb, %o3
+    store i8 0, *%np
+    %n = call @net_http_build_request_conn(%buf, %cap, "GET", %host, %path,
+                                           %hbp, null, 0, 11, "Upgrade")
+    ret i32 %n
+  @fail:
+    ret i32 -1
+}
+
+// Case-insensitive comparison of a length-delimited string with a C string.
+fun @_ws_eq_ci(a: *i8, len: i32, b: *i8) -> i1 {
+  @entry:
+    %bl = call @std_text_str_len(%b)
+    %le = eq i32 %len, %bl
+    br %le, @init, @no
+  @init:
+    %i = let i32
+    store i32 0, *%i
+    jmp @cond
+  @cond:
+    %iv = load i32, *%i
+    %more = slt i32 %iv, %len
+    br %more, @body, @yes
+  @body:
+    %iv2 = load i32, *%i
+    %ap = gep i8, *%a, %iv2
+    %ac = load i8, *%ap
+    %bp = gep i8, *%b, %iv2
+    %bc = load i8, *%bp
+    %al = call @std_text_str_lower(%ac)
+    %bl2 = call @std_text_str_lower(%bc)
+    %same = eq i8 %al, %bl2
+    br %same, @next, @no
+  @next:
+    %iv3 = load i32, *%i
+    %nx = add i32 %iv3, 1
+    store i32 %nx, *%i
+    jmp @cond
+  @yes:
+    ret i1 1
+  @no:
+    ret i1 0
+}
+
+// Verify a 101 response. buf/len must hold the whole response head.
+// Returns 0 on success, -1 otherwise.
+fun @net_ws_check_handshake(buf: *i8, len: i32, key_b64: *i8) -> i32 {
+  @entry:
+    %resp = let @HttpResponse
+    %pr = call @net_http_parse_response(%buf, %len, %resp)
+    %pr_bad = slt i32 %pr, 0
+    br %pr_bad, @fail, @status
+  @status:
+    %st_p = field @HttpResponse, *%resp, 1
+    %st = load i32, *%st_p
+    %is101 = eq i32 %st, 101
+    br %is101, @upgrade, @fail
+  @upgrade:
+    %ub = let [i8, 64]
+    %ubp = gep i8, *%ub, 0
+    %ul = call @net_http_header_get(%buf, %resp, "upgrade", %ubp, 64)
+    %u_bad = slt i32 %ul, 0
+    br %u_bad, @fail, @u_cmp
+  @u_cmp:
+    %u_ok = call @_ws_eq_ci(%ubp, %ul, "websocket")
+    br %u_ok, @accept, @fail
+  @accept:
+    %ab = let [i8, 64]
+    %abp = gep i8, *%ab, 0
+    %al = call @net_http_header_get(%buf, %resp, "sec-websocket-accept", %abp, 64)
+    %a_bad = slt i32 %al, 0
+    br %a_bad, @fail, @expected
+  @expected:
+    %eb = let [i8, 64]
+    %ebp = gep i8, *%eb, 0
+    %kl = call @std_text_str_len(%key_b64)
+    %ar = call @net_ws_accept(%key_b64, %kl, %ebp)
+    %ar_bad = slt i32 %ar, 0
+    br %ar_bad, @fail, @acmp
+  @acmp:
+    %el = call @std_text_str_len(%ebp)
+    %len_eq = eq i32 %al, %el
+    br %len_eq, @cmp_bytes, @fail
+  @cmp_bytes:
+    %diff = call @std_text_str_ncmp(%abp, %ebp, %al)
+    %same = eq i32 %diff, 0
+    br %same, @ok, @fail
+  @ok:
+    ret i32 0
+  @fail:
+    ret i32 -1
+}
+
+// Server side: build the 101 response for a client key.
+// Returns bytes written, or -1.
+fun @net_ws_build_accept_response(buf: *i8, cap: i32, key: *i8,
+                                  key_len: i32) -> i32 {
+  @entry:
+    %ab = let [i8, 64]
+    %abp = gep i8, *%ab, 0
+    %ar = call @net_ws_accept(%key, %key_len, %abp)
+    %ar_bad = slt i32 %ar, 0
+    br %ar_bad, @fail, @s1
+  @s1:
+    %o1 = call @std_text_str_append_cstr(%buf, %cap, 0, "HTTP/1.1 101 Switching Protocols\r\n")
+    %b1 = slt i32 %o1, 0
+    br %b1, @fail, @s2
+  @s2:
+    %o2 = call @std_text_str_append_cstr(%buf, %cap, %o1, "Upgrade: websocket\r\n")
+    %b2 = slt i32 %o2, 0
+    br %b2, @fail, @s3
+  @s3:
+    %o3 = call @std_text_str_append_cstr(%buf, %cap, %o2, "Connection: Upgrade\r\n")
+    %b3 = slt i32 %o3, 0
+    br %b3, @fail, @s4
+  @s4:
+    %o4 = call @std_text_str_append_cstr(%buf, %cap, %o3, "Sec-WebSocket-Accept: ")
+    %b4 = slt i32 %o4, 0
+    br %b4, @fail, @s5
+  @s5:
+    %o5 = call @std_text_str_append_cstr(%buf, %cap, %o4, %abp)
+    %b5 = slt i32 %o5, 0
+    br %b5, @fail, @s6
+  @s6:
+    %o6 = call @std_text_str_append_cstr(%buf, %cap, %o5, "\r\n\r\n")
+    ret i32 %o6
+  @fail:
+    ret i32 -1
+}

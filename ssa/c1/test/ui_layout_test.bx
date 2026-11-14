@@ -1,0 +1,412 @@
+// Layout and hit-test checks for boxes/std/ui/widget.bx. Prints
+// "PASS ui_layout" on success.
+//
+// No window and no raylib here: the four platform drawing externs are stubbed
+// below. Text width is deterministic: len * size / 2.
+
+extern @printf(fmt: *i8, ...) -> i32
+extern @strlen(s: *i8) -> i64
+
+fun @c1_ui_rect(x: i32, y: i32, w: i32, h: i32, rgb: i32) -> void {
+@entry:
+  ret void
+}
+
+fun @c1_ui_rect_rounded(x: i32, y: i32, w: i32, h: i32, radius: i32, rgb: i32) -> void {
+@entry:
+  ret void
+}
+
+fun @c1_ui_text(text: *i8, x: i32, y: i32, size: i32, rgb: i32) -> void {
+@entry:
+  ret void
+}
+
+fun @c1_ui_text_width(text: *i8, size: i32) -> i32 {
+@entry:
+  %n64 = call @strlen(%text)
+  %n = trunc i64 %n64 to i32
+  %half = div i32 %size, 2
+  %w = mul i32 %n, %half
+  ret i32 %w
+}
+
+// Must match boxes/std/ui/widget.bx.
+struct @UiNode {
+  @kind: i32,
+  @pad: i32,
+  @gap: i32,
+  @radius: i32,
+  @color: i32,
+  @text: *i8,
+  @font_size: i32,
+  @x: i32,
+  @y: i32,
+  @w: i32,
+  @h: i32,
+  @first_child: *@UiNode,
+  @last_child: *@UiNode,
+  @next_sibling: *@UiNode,
+  @text_color: i32,
+  @state: i32,
+  @value: i32,
+  @max: i32
+}
+
+extern @std_ui_box(n: *@UiNode, kind: i32, pad: i32, gap: i32) -> void
+extern @std_ui_rect(n: *@UiNode, w: i32, h: i32, color: i32, radius: i32) -> void
+extern @std_ui_text(n: *@UiNode, text: *i8, size: i32, color: i32) -> void
+extern @std_ui_append(parent: *@UiNode, child: *@UiNode) -> void
+extern @std_ui_layout(root: *@UiNode, x: i32, y: i32, w: i32) -> void
+extern @std_ui_hit(n: *@UiNode, px: i32, py: i32) -> *@UiNode
+extern @std_ui_button(n: *@UiNode, text: *i8, size: i32, bg: i32, fg: i32, radius: i32) -> void
+extern @std_ui_button_update(n: *@UiNode, px: i32, py: i32, down: i32) -> void
+extern @std_ui_button_at(root: *@UiNode, px: i32, py: i32) -> *@UiNode
+extern @std_ui_checkbox(n: *@UiNode, text: *i8, size: i32, accent: i32, fg: i32) -> void
+extern @std_ui_slider(n: *@UiNode, value: i32, max: i32, accent: i32, track: i32) -> void
+extern @std_ui_progress(n: *@UiNode, value: i32, max: i32, accent: i32, track: i32) -> void
+extern @std_ui_input(n: *@UiNode, text: *i8, capacity: i32, size: i32, bg: i32, fg: i32) -> void
+extern @std_ui_pointer(n: *@UiNode, px: i32, py: i32, down: i32, clicked: i32) -> void
+extern @std_ui_slider_set(n: *@UiNode, px: i32) -> void
+extern @std_ui_input_type(n: *@UiNode, ch: i32) -> i32
+extern @std_ui_input_backspace(n: *@UiNode) -> i32
+extern @std_ui_keyboard(n: *@UiNode) -> i32
+extern @std_ui_paint(n: *@UiNode) -> void
+
+// Must match boxes/std/ui/widget.bx.
+enum @UiKind: i32 {
+  @Column = 0,
+  @Row = 1,
+  @Rect = 2,
+  @Text = 3,
+  @Button = 4,
+  @Checkbox = 5,
+  @Slider = 6,
+  @Progress = 7,
+  @Input = 8
+}
+
+enum @UiState: i32 {
+  @Normal = 0,
+  @Pressed = 1,
+  @Focused = 2
+}
+
+// Keyboard stubs: no characters, Enter (key id 2) always pressed.
+fun @c1_ui_char_pressed() -> i32 {
+@entry:
+  ret i32 0
+}
+
+fun @c1_ui_key_pressed(key: i32) -> i32 {
+@entry:
+  %enter = eq i32 %key, 2
+  %r = zext i1 %enter to i32
+  ret i32 %r
+}
+
+// Expected tree:
+//   column pad 10 gap 5
+//     rect 100x30
+//     text "abcd" size 20      -> 40x25
+// measured: 120x80; arranged at (0, 0) with width 200 -> 200x80
+// inner width 180, so children are stretched to 180 and stack at y=10, y=45.
+fun @main() -> i32 {
+@entry:
+  %id = let i32
+  %nodes = let [@UiNode, 8]
+  store i32 1, *%id
+
+  %root = gep @UiNode, *%nodes, 0
+  call @std_ui_box(%root, @UiKind.Column, 10, 5)
+  %r = gep @UiNode, *%nodes, 1
+  call @std_ui_rect(%r, 100, 30, 0xFF0000, 0)
+  call @std_ui_append(%root, %r)
+  %t = gep @UiNode, *%nodes, 2
+  call @std_ui_text(%t, "abcd", 20, 0xFFFFFF)
+  call @std_ui_append(%root, %t)
+
+  call @std_ui_layout(%root, 0, 0, 200)
+
+  // Button tree: "ok" at size 20 measures 20x16 for the label plus 32x16
+  // padding -> 52x36; the column stretches it to 200 wide.
+  %bnodes = let [@UiNode, 4]
+  %broot = gep @UiNode, *%bnodes, 0
+  call @std_ui_box(%broot, @UiKind.Column, 0, 0)
+  %btn = gep @UiNode, *%bnodes, 1
+  call @std_ui_button(%btn, "ok", 20, 0x112233, 0xFFFFFF, 4)
+  call @std_ui_append(%broot, %btn)
+  call @std_ui_layout(%broot, 0, 0, 200)
+
+  // Interactive widgets in a padded column. Heights: checkbox 25 (label line
+  // height), slider 20, progress 8, input 41 (line height + 16).
+  // Arranged at x=10 with width 180: y = 10, 40, 65, 78; root 129 tall.
+  %buf = let [i8, 16]
+  %b0 = gep i8, *%buf, 0
+  store i8 104, *%b0
+  %b1 = gep i8, *%buf, 1
+  store i8 105, *%b1
+  %b2 = gep i8, *%buf, 2
+  store i8 0, *%b2
+  %bufp = gep i8, *%buf, 0
+
+  %wnodes = let [@UiNode, 8]
+  %wroot = gep @UiNode, *%wnodes, 0
+  call @std_ui_box(%wroot, @UiKind.Column, 10, 5)
+  %wcb = gep @UiNode, *%wnodes, 1
+  call @std_ui_checkbox(%wcb, "abc", 20, 0x3366FF, 0xFFFFFF)
+  call @std_ui_append(%wroot, %wcb)
+  %wsl = gep @UiNode, *%wnodes, 2
+  call @std_ui_slider(%wsl, 25, 100, 0x3366FF, 0x444444)
+  call @std_ui_append(%wroot, %wsl)
+  %wpg = gep @UiNode, *%wnodes, 3
+  call @std_ui_progress(%wpg, 50, 100, 0x3366FF, 0x444444)
+  call @std_ui_append(%wroot, %wpg)
+  %win = gep @UiNode, *%wnodes, 4
+  call @std_ui_input(%win, %bufp, 16, 20, 0x222222, 0xFFFFFF)
+  call @std_ui_append(%wroot, %win)
+  call @std_ui_layout(%wroot, 0, 0, 200)
+
+  // root rect
+  store i32 2, *%id
+  %rxp = field @UiNode, *%root, 7
+  %rx = load i32, *%rxp
+  %ok = eq i32 %rx, 0
+  br %ok, @root_w, @fail
+@root_w:
+  store i32 3, *%id
+  %rwp = field @UiNode, *%root, 9
+  %rw = load i32, *%rwp
+  %ok2 = eq i32 %rw, 200
+  br %ok2, @root_h, @fail
+@root_h:
+  store i32 4, *%id
+  %rhp = field @UiNode, *%root, 10
+  %rh = load i32, *%rhp
+  %ok3 = eq i32 %rh, 80
+  br %ok3, @rect_x, @fail
+@rect_x:
+  store i32 5, *%id
+  %cxp = field @UiNode, *%r, 7
+  %cx = load i32, *%cxp
+  %ok4 = eq i32 %cx, 10
+  br %ok4, @rect_y, @fail
+@rect_y:
+  store i32 6, *%id
+  %cyp = field @UiNode, *%r, 8
+  %cy = load i32, *%cyp
+  %ok5 = eq i32 %cy, 10
+  br %ok5, @rect_w, @fail
+@rect_w:
+  store i32 7, *%id
+  %cwp = field @UiNode, *%r, 9
+  %cw = load i32, *%cwp
+  %ok6 = eq i32 %cw, 180
+  br %ok6, @rect_h, @fail
+@rect_h:
+  store i32 8, *%id
+  %chp = field @UiNode, *%r, 10
+  %ch = load i32, *%chp
+  %ok7 = eq i32 %ch, 30
+  br %ok7, @text_y, @fail
+@text_y:
+  store i32 9, *%id
+  %typ = field @UiNode, *%t, 8
+  %ty = load i32, *%typ
+  %ok8 = eq i32 %ty, 45
+  br %ok8, @text_w, @fail
+@text_w:
+  store i32 10, *%id
+  %twp = field @UiNode, *%t, 9
+  %tw = load i32, *%twp
+  %ok9 = eq i32 %tw, 180
+  br %ok9, @text_h, @fail
+@text_h:
+  store i32 11, *%id
+  %thp = field @UiNode, *%t, 10
+  %th = load i32, *%thp
+  %ok10 = eq i32 %th, 25
+  br %ok10, @hit_in, @fail
+@hit_in:
+  store i32 12, *%id
+  %h = call @std_ui_hit(%root, 15, 50)
+  %hit_t = eq *@UiNode %h, %t
+  br %hit_t, @hit_out, @fail
+@hit_out:
+  store i32 13, *%id
+  %miss = call @std_ui_hit(%root, 300, 300)
+  %none = eq *@UiNode %miss, null
+  br %none, @btn_w, @fail
+@btn_w:
+  store i32 14, *%id
+  %bwp = field @UiNode, *%btn, 9
+  %bw = load i32, *%bwp
+  %ok11 = eq i32 %bw, 200
+  br %ok11, @btn_h, @fail
+@btn_h:
+  store i32 15, *%id
+  %bhp = field @UiNode, *%btn, 10
+  %bh = load i32, *%bhp
+  %ok12 = eq i32 %bh, 36
+  br %ok12, @btn_hit, @fail
+@btn_hit:
+  store i32 16, *%id
+  %gotb = call @std_ui_button_at(%broot, 10, 10)
+  %hitb = eq *@UiNode %gotb, %btn
+  br %hitb, @btn_miss, @fail
+@btn_miss:
+  store i32 17, *%id
+  %missb = call @std_ui_button_at(%broot, 300, 300)
+  %noneb = eq *@UiNode %missb, null
+  br %noneb, @btn_press, @fail
+@btn_press:
+  store i32 18, *%id
+  call @std_ui_button_update(%broot, 10, 10, 1)
+  // Exercise the pressed paint path; the drawing externs are stubs.
+  call @std_ui_paint(%broot)
+  %stp = field @UiNode, *%btn, 15
+  %st = load i32, *%stp
+  %ok13 = eq i32 %st, 1
+  br %ok13, @btn_release, @fail
+@btn_release:
+  store i32 19, *%id
+  call @std_ui_button_update(%broot, 10, 10, 0)
+  %st2 = load i32, *%stp
+  %ok14 = eq i32 %st2, 0
+  br %ok14, @w_root_h, @fail
+@w_root_h:
+  store i32 20, *%id
+  %wrhp = field @UiNode, *%wroot, 10
+  %wrh = load i32, *%wrhp
+  %ok20 = eq i32 %wrh, 129
+  br %ok20, @w_sl_y, @fail
+@w_sl_y:
+  store i32 21, *%id
+  %wsyp = field @UiNode, *%wsl, 8
+  %wsy = load i32, *%wsyp
+  %ok21 = eq i32 %wsy, 40
+  br %ok21, @w_pg_y, @fail
+@w_pg_y:
+  store i32 22, *%id
+  %wpyp = field @UiNode, *%wpg, 8
+  %wpy = load i32, *%wpyp
+  %ok22 = eq i32 %wpy, 65
+  br %ok22, @w_in_pos, @fail
+@w_in_pos:
+  store i32 23, *%id
+  %wixp = field @UiNode, *%win, 7
+  %wix = load i32, *%wixp
+  %wiyp = field @UiNode, *%win, 8
+  %wiy = load i32, *%wiyp
+  %wihp = field @UiNode, *%win, 10
+  %wih = load i32, *%wihp
+  %okxa = eq i32 %wix, 10
+  %okya = eq i32 %wiy, 78
+  %okha = eq i32 %wih, 41
+  %okxy = and i1 %okxa, %okya
+  %ok23 = and i1 %okxy, %okha
+  br %ok23, @w_cb_size, @fail
+@w_cb_size:
+  store i32 24, *%id
+  %wcbwp = field @UiNode, *%wcb, 9
+  %wcbw = load i32, *%wcbwp
+  %wcbhp = field @UiNode, *%wcb, 10
+  %wcbh = load i32, *%wcbhp
+  %ok24a = eq i32 %wcbw, 180
+  %ok24b = eq i32 %wcbh, 25
+  %ok24 = and i1 %ok24a, %ok24b
+  br %ok24, @cb_click, @fail
+@cb_click:
+  store i32 25, *%id
+  call @std_ui_pointer(%wroot, 20, 20, 0, 1)
+  %wcbvp = field @UiNode, *%wcb, 16
+  %cv = load i32, *%wcbvp
+  %ok25 = eq i32 %cv, 1
+  br %ok25, @cb_click2, @fail
+@cb_click2:
+  store i32 26, *%id
+  call @std_ui_pointer(%wroot, 20, 20, 0, 1)
+  %cv2 = load i32, *%wcbvp
+  %ok26 = eq i32 %cv2, 0
+  br %ok26, @in_focus, @fail
+@in_focus:
+  store i32 27, *%id
+  call @std_ui_pointer(%wroot, 20, 90, 0, 1)
+  %winstp = field @UiNode, *%win, 15
+  %wist = load i32, *%winstp
+  %ok27 = eq i32 %wist, 2
+  br %ok27, @sl_click, @fail
+@sl_click:
+  store i32 28, *%id
+  call @std_ui_pointer(%wroot, 100, 50, 0, 1)
+  %wslvp = field @UiNode, *%wsl, 16
+  %sv = load i32, *%wslvp
+  %wist2 = load i32, *%winstp
+  %ok28a = eq i32 %sv, 50
+  %ok28b = eq i32 %wist2, 0
+  %ok28 = and i1 %ok28a, %ok28b
+  br %ok28, @sl_drag, @fail
+@sl_drag:
+  store i32 29, *%id
+  call @std_ui_pointer(%wroot, 10, 50, 1, 0)
+  %sv2 = load i32, *%wslvp
+  %ok29 = eq i32 %sv2, 0
+  br %ok29, @sl_clamp, @fail
+@sl_clamp:
+  store i32 30, *%id
+  call @std_ui_slider_set(%wsl, 300)
+  %sv3 = load i32, *%wslvp
+  %ok30 = eq i32 %sv3, 100
+  br %ok30, @type_focus, @fail
+@type_focus:
+  store i32 31, *%id
+  call @std_ui_pointer(%wroot, 20, 90, 0, 1)
+  %wist3 = load i32, *%winstp
+  %ok31 = eq i32 %wist3, 2
+  br %ok31, @type_char, @fail
+@type_char:
+  store i32 32, *%id
+  %typed = call @std_ui_input_type(%wroot, 88)
+  %bl = call @strlen(%bufp)
+  %b2p = gep i8, *%buf, 2
+  %b2v = load i8, *%b2p
+  %b2i = zext i8 %b2v to i32
+  %ok32a = eq i32 %typed, 1
+  %ok32b = eq i64 %bl, 3
+  %ok32c = eq i32 %b2i, 88
+  %ok32ab = and i1 %ok32a, %ok32b
+  %ok32 = and i1 %ok32ab, %ok32c
+  br %ok32, @backspace, @fail
+@backspace:
+  store i32 33, *%id
+  %rem = call @std_ui_input_backspace(%wroot)
+  %bl2 = call @strlen(%bufp)
+  %ok33a = eq i32 %rem, 1
+  %ok33b = eq i64 %bl2, 2
+  %ok33 = and i1 %ok33a, %ok33b
+  br %ok33, @enter_key, @fail
+@enter_key:
+  store i32 34, *%id
+  %ent = call @std_ui_keyboard(%wroot)
+  %wist4 = load i32, *%winstp
+  %ok34a = eq i32 %ent, 1
+  %ok34b = eq i32 %wist4, 0
+  %ok34 = and i1 %ok34a, %ok34b
+  br %ok34, @paint_all, @fail
+@paint_all:
+  store i32 35, *%id
+  // Exercise the checkbox-checked, slider-knob and input-caret paint paths.
+  %pcvp = field @UiNode, *%wcb, 16
+  store i32 1, *%pcvp
+  call @std_ui_slider_set(%wsl, 55)
+  call @std_ui_pointer(%wroot, 20, 90, 0, 1)
+  call @std_ui_paint(%wroot)
+  jmp @pass
+@pass:
+  call @printf("PASS ui_layout\n")
+  ret i32 0
+@fail:
+  %bad = load i32, *%id
+  call @printf("FAIL ui_layout at %d\n", %bad)
+  ret i32 1
+}

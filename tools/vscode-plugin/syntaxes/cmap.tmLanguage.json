@@ -1,0 +1,139 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "cmap",
+  "scopeName": "source.cmap",
+  "comment": "TextMate grammar for cmap pseudo-C (see cmap.md). Highlighting only — no language server runs for this scope, so nothing is diagnosed as 'undefined'.",
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#strings" },
+    { "include": "#characters" },
+    { "include": "#cmap-markers" },
+    { "include": "#types" },
+    { "include": "#keywords" },
+    { "include": "#numbers" },
+    { "include": "#labels" },
+    { "include": "#builtins" },
+    { "include": "#functions" },
+    { "include": "#operators" }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        {
+          "name": "comment.line.double-slash.cmap",
+          "match": "//.*$"
+        }
+      ]
+    },
+    "strings": {
+      "patterns": [
+        {
+          "name": "string.quoted.double.cmap",
+          "begin": "\"",
+          "end": "\"",
+          "patterns": [
+            { "name": "constant.character.escape.cmap", "match": "\\\\." }
+          ]
+        }
+      ]
+    },
+    "characters": {
+      "patterns": [
+        {
+          "name": "string.quoted.single.cmap",
+          "match": "'(\\\\.|[^'\\\\])'"
+        }
+      ]
+    },
+    "cmap-markers": {
+      "comment": "Notation cmap introduces on top of C: logical shift, phi, conversions.",
+      "patterns": [
+        { "name": "keyword.operator.cmap", "match": ">>>" },
+        {
+          "name": "constant.language.cmap",
+          "match": "φ|→|≡"
+        },
+        {
+          "name": "support.function.cmap",
+          "match": "\\b(?:zext|sext|trunc)<"
+        }
+      ]
+    },
+    "types": {
+      "patterns": [
+        {
+          "comment": "SSA widths, spelled out — this is what the C extension flagged as undefined.",
+          "name": "storage.type.cmap",
+          "match": "\\b(?:bool|char|int8|int16|int32|int64|float|double|v128)\\b"
+        }
+      ]
+    },
+    "keywords": {
+      "patterns": [
+        {
+          "name": "keyword.control.cmap",
+          "match": "\\b(?:if|else|while|for|do|break|continue|goto|return)\\b"
+        },
+        {
+          "name": "keyword.other.cmap",
+          "match": "\\b(?:struct|extern|const|static|void|sizeof|unsigned|signed)\\b"
+        },
+        {
+          "name": "constant.language.cmap",
+          "match": "\\b(?:true|false|null)\\b"
+        }
+      ]
+    },
+    "numbers": {
+      "patterns": [
+        {
+          "name": "constant.numeric.cmap",
+          "match": "\\b0[xX][0-9a-fA-F]+\\b|\\b\\d+\\.\\d+(?:[eE][-+]?\\d+)?\\b|\\b\\d+\\b"
+        }
+      ]
+    },
+    "labels": {
+      "patterns": [
+        {
+          "comment": "Basic block labels, flush left at the start of a line.",
+          "name": "entity.name.label.cmap",
+          "match": "^[A-Za-z_][A-Za-z0-9_]*(?=:)"
+        }
+      ]
+    },
+    "builtins": {
+      "patterns": [
+        {
+          "comment": "Atomic helpers and the memory orderings.",
+          "name": "support.function.cmap",
+          "match": "\\b(?:atomic_load|atomic_store|atomic_cas|atomic_xchg|atomic_add|atomic_sub|atomic_and|atomic_or|atomic_xor)\\b"
+        },
+        {
+          "comment": "Unsigned multiply-high helper.",
+          "name": "support.function.cmap",
+          "match": "\\b(?:mulhi)\\b"
+        },
+        {
+          "name": "constant.language.cmap",
+          "match": "\\b(?:seq_cst|acquire|release|acq_rel|relaxed)\\b"
+        }
+      ]
+    },
+    "functions": {
+      "patterns": [
+        {
+          "name": "entity.name.function.cmap",
+          "match": "\\b[A-Za-z_][A-Za-z0-9_]*(?=\\s*\\()"
+        }
+      ]
+    },
+    "operators": {
+      "patterns": [
+        {
+          "name": "keyword.operator.cmap",
+          "match": "[-+*/%&|^!<>=]=?|<<|>>|\\?|:"
+        }
+      ]
+    }
+  }
+}

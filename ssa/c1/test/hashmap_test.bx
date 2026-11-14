@@ -1,0 +1,206 @@
+// Hash map tests: put/get/update/remove, growth, and slot iteration.
+// Prints "PASS hashmap" on success.
+
+extern @printf(fmt: *i8, ...) -> i32
+extern @snprintf(buf: *i8, size: i64, fmt: *i8, ...) -> i32
+extern @strcmp(a: *i8, b: *i8) -> i32
+extern @std_data_hashmap_init(m: *i8, initial_cap: i32) -> i32
+extern @std_data_hashmap_put(m: *i8, key: *i8, key_len: i32,
+                             val: *i8, val_len: i32) -> i32
+extern @std_data_hashmap_get(m: *i8, key: *i8, key_len: i32,
+                             out: *i8, out_cap: i32) -> i32
+extern @std_data_hashmap_get_len(m: *i8, key: *i8, key_len: i32) -> i32
+extern @std_data_hashmap_has(m: *i8, key: *i8, key_len: i32) -> i32
+extern @std_data_hashmap_remove(m: *i8, key: *i8, key_len: i32) -> i32
+extern @std_data_hashmap_count(m: *i8) -> i32
+extern @std_data_hashmap_capacity(m: *i8) -> i32
+extern @std_data_hashmap_slot_key(m: *i8, slot: i32, out: *i8, cap: i32) -> i32
+extern @std_data_hashmap_free(m: *i8) -> void
+
+fun @main() -> i32 {
+  @entry:
+    %id = let i32
+    %m = let [i8, 32]
+    %buf = let [i8, 32]
+    %keyb = let [i8, 32]
+    %num = let i32
+    %bp = gep i8, *%buf, 0
+    %kp = gep i8, *%keyb, 0
+    %np = gep i32, *%num, 0
+    store i32 0, *%id
+    jmp @c1
+
+  @c1:
+    store i32 1, *%id
+    %r = call @std_data_hashmap_init(%m, 8)
+    %rok = eq i32 %r, 0
+    br %rok, @c2, @fail
+  @c2:
+    store i32 2, *%id
+    %p1 = call @std_data_hashmap_put(%m, "name", 4, "codeone", 7)
+    store i32 42, *%np
+    %p2 = call @std_data_hashmap_put(%m, "n", 1, %np, 4)
+    %p1ok = eq i32 %p1, 1
+    %p2ok = eq i32 %p2, 1
+    %a = and i1 %p1ok, %p2ok
+    br %a, @c3, @fail
+  @c3:
+    store i32 3, *%id
+    %g = call @std_data_hashmap_get(%m, "name", 4, %bp, 32)
+    %gz = gep i8, *%bp, %g
+    store i8 0, *%gz
+    %gc = call @strcmp(%bp, "codeone")
+    %gok = eq i32 %g, 7
+    %gcok = eq i32 %gc, 0
+    %b = and i1 %gok, %gcok
+    br %b, @c4, @fail
+  @c4:
+    store i32 4, *%id
+    %gl = call @std_data_hashmap_get_len(%m, "n", 1)
+    %g4 = call @std_data_hashmap_get(%m, "n", 1, %bp, 32)
+    %nv = load i32, *%bp
+    %glok = eq i32 %gl, 4
+    %g4ok = eq i32 %g4, 4
+    %nvok = eq i32 %nv, 42
+    %c = and i1 %glok, %g4ok
+    %d = and i1 %c, %nvok
+    br %d, @c5, @fail
+  @c5:
+    store i32 5, *%id
+    %h1 = call @std_data_hashmap_has(%m, "name", 4)
+    %h2 = call @std_data_hashmap_has(%m, "missing", 7)
+    %m1 = call @std_data_hashmap_get_len(%m, "missing", 7)
+    %h1ok = eq i32 %h1, 1
+    %h2ok = eq i32 %h2, 0
+    %m1ok = eq i32 %m1, -1
+    %e = and i1 %h1ok, %h2ok
+    %f = and i1 %e, %m1ok
+    br %f, @c6, @fail
+  @c6:
+    store i32 6, *%id
+    %u = call @std_data_hashmap_put(%m, "name", 4, "lang", 4)
+    %g2 = call @std_data_hashmap_get(%m, "name", 4, %bp, 32)
+    %g2z = gep i8, *%bp, %g2
+    store i8 0, *%g2z
+    %gc2 = call @strcmp(%bp, "lang")
+    %uok = eq i32 %u, 0
+    %g2ok = eq i32 %g2, 4
+    %gc2ok = eq i32 %gc2, 0
+    %x1 = and i1 %uok, %g2ok
+    %x2 = and i1 %x1, %gc2ok
+    br %x2, @c7, @fail
+  @c7:
+    store i32 7, *%id
+    %cnt = call @std_data_hashmap_count(%m)
+    %cntok = eq i32 %cnt, 2
+    br %cntok, @c8, @fail
+  @c8:
+    store i32 8, *%id
+    %rm = call @std_data_hashmap_remove(%m, "n", 1)
+    %hh = call @std_data_hashmap_has(%m, "n", 1)
+    %cnt2 = call @std_data_hashmap_count(%m)
+    %rm2 = call @std_data_hashmap_remove(%m, "n", 1)
+    %rmok = eq i32 %rm, 0
+    %hhok = eq i32 %hh, 0
+    %cnt2ok = eq i32 %cnt2, 1
+    %rm2ok = eq i32 %rm2, -1
+    %y1 = and i1 %rmok, %hhok
+    %y2 = and i1 %cnt2ok, %rm2ok
+    %y3 = and i1 %y1, %y2
+    br %y3, @c9, @fail
+
+    // grow the table with 100 more keys
+  @c9:
+    store i32 9, *%id
+    %i = let i32
+    store i32 0, *%i
+    jmp @gloop
+  @gloop:
+    %iv = load i32, *%i
+    %more = slt i32 %iv, 100
+    br %more, @gbody, @gdemo
+  @gbody:
+    %iv2 = load i32, *%i
+    %kn = call @snprintf(%kp, 32, "k%d", %iv2)
+    store i32 %iv2, *%np
+    %pr = call @std_data_hashmap_put(%m, %kp, %kn, %np, 4)
+    %iv3 = load i32, *%i
+    %in = add i32 %iv3, 1
+    store i32 %in, *%i
+    jmp @gloop
+  @gdemo:
+    store i32 10, *%id
+    %cnt3 = call @std_data_hashmap_count(%m)
+    %cap3 = call @std_data_hashmap_capacity(%m)
+    %k50 = call @snprintf(%kp, 32, "k%d", 50)
+    %g50 = call @std_data_hashmap_get(%m, %kp, %k50, %bp, 32)
+    %v50 = load i32, *%bp
+    %gname = call @std_data_hashmap_get(%m, "name", 4, %bp, 32)
+    %gnz = gep i8, *%bp, %gname
+    store i8 0, *%gnz
+    %gnc = call @strcmp(%bp, "lang")
+    %cnt3ok = eq i32 %cnt3, 101
+    %cap3ok = sgt i32 %cap3, 8
+    %g50ok = eq i32 %g50, 4
+    %v50ok = eq i32 %v50, 50
+    %gnameok = eq i32 %gname, 4
+    %gncok = eq i32 %gnc, 0
+    %z1 = and i1 %cnt3ok, %cap3ok
+    %z2 = and i1 %g50ok, %v50ok
+    %z3 = and i1 %gnameok, %gncok
+    %z4 = and i1 %z1, %z2
+    %z5 = and i1 %z4, %z3
+    br %z5, @c11, @fail
+
+    // count used slots by iteration
+  @c11:
+    store i32 11, *%id
+    %cap4 = call @std_data_hashmap_capacity(%m)
+    %s = let i32
+    %cnt4 = let i32
+    store i32 0, *%s
+    store i32 0, *%cnt4
+    jmp @sloop
+  @sloop:
+    %sv = load i32, *%s
+    %smore = slt i32 %sv, %cap4
+    br %smore, @sbody, @sdone
+  @sbody:
+    %sv2 = load i32, *%s
+    %kl = call @std_data_hashmap_slot_key(%m, %sv2, %kp, 32)
+    %used = sge i32 %kl, 0
+    br %used, @sinc, @snext
+  @sinc:
+    %cv = load i32, *%cnt4
+    %cn = add i32 %cv, 1
+    store i32 %cn, *%cnt4
+    jmp @snext
+  @snext:
+    %sv3 = load i32, *%s
+    %sn = add i32 %sv3, 1
+    store i32 %sn, *%s
+    jmp @sloop
+  @sdone:
+    %cf = load i32, *%cnt4
+    %ctotal = call @std_data_hashmap_count(%m)
+    %cfok = eq i32 %cf, %ctotal
+    br %cfok, @c12, @fail
+
+  @c12:
+    store i32 12, *%id
+    call @std_data_hashmap_free(%m)
+    %after = call @std_data_hashmap_count(%m)
+    %cafter = call @std_data_hashmap_capacity(%m)
+    %aok = eq i32 %after, 0
+    %cok = eq i32 %cafter, 0
+    %allok = and i1 %aok, %cok
+    br %allok, @pass, @fail
+
+  @pass:
+    call @printf("PASS hashmap\n")
+    ret i32 0
+  @fail:
+    %fid = load i32, *%id
+    call @printf("FAIL hashmap at case %d\n", %fid)
+    ret i32 1
+}

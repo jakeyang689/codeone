@@ -1,0 +1,1097 @@
+// TLS 1.3 client handshake (RFC 8446).
+//
+// Minimal profile: TLS_AES_128_GCM_SHA256, secp256r1 key share, and the
+// rsa_pss_rsae_sha256 / ecdsa_secp256r1_sha256 signature schemes.
+// No PSK, no 0-RTT, no client certificates, no HelloRetryRequest.
+
+extern @memcpy(dst: *i8, src: *i8, n: i64) -> *i8
+extern @memmove(dst: *i8, src: *i8, n: i64) -> *i8
+extern @memset(s: *i8, c: i32, n: i64) -> *i8
+extern @memcmp(a: *i8, b: *i8, n: i64) -> i32
+
+extern @put16(p: *i8, v: i16) -> void
+extern @put24(p: *i8, v: i32) -> void
+extern @get16(p: *i8) -> i16
+extern @c1_random_buf(buf: *i8, len: i64) -> void
+extern @send_hs(fd: i32, hst: i8, body: *i8, blen: i32) -> i32
+extern @read_hs(fd: i32, buf: *i8, cap: i32, hst: *i8, blen: *i32) -> i32
+extern @tls13_record_encrypt(fd: i32, seq: *i64, k: *i8, iv: *i8, ks: i32,
+                             t: i8, d: *i8, l: i32) -> i32
+extern @tls13_record_decrypt(fd: i32, seq: *i64, k: *i8, iv: *i8, ks: i32,
+                             b: *i8, c: i32, ot: *i8, ol: *i32) -> i32
+
+extern @std_crypto_sha256_compute(data: *i8, len: i32, digest: *i8) -> void
+extern @std_crypto_hmac_sha256(key: *i8, key_len: i32, data: *i8,
+                               data_len: i32, mac: *i8) -> void
+extern @std_crypto_tls13_early_secret_sha256(psk: *i8, psk_len: i32,
+                                             out: *i8) -> void
+extern @std_crypto_tls13_handshake_secret_sha256(early: *i8, ecdhe: *i8,
+                                                 ecdhe_len: i32,
+                                                 out: *i8) -> void
+extern @std_crypto_tls13_master_secret_sha256(hs: *i8, out: *i8) -> void
+extern @std_crypto_tls13_client_hs_traffic_sha256(hs: *i8, th: *i8,
+                                                  out: *i8) -> void
+extern @std_crypto_tls13_server_hs_traffic_sha256(hs: *i8, th: *i8,
+                                                  out: *i8) -> void
+extern @std_crypto_tls13_client_ap_traffic_sha256(ms: *i8, th: *i8,
+                                                  out: *i8) -> void
+extern @std_crypto_tls13_server_ap_traffic_sha256(ms: *i8, th: *i8,
+                                                  out: *i8) -> void
+extern @std_crypto_tls13_traffic_key_sha256(secret: *i8, out: *i8) -> void
+extern @std_crypto_tls13_traffic_iv_sha256(secret: *i8, out: *i8) -> void
+extern @std_crypto_tls13_finished_key_sha256(secret: *i8, out: *i8) -> void
+
+extern @std_crypto_p256_generate_keypair(priv: *i32, px: *i32, py: *i32) -> void
+extern @std_crypto_p256_ecdh(priv: *i32, peer_x: *i32, peer_y: *i32,
+                             secret_x: *i32) -> void
+extern @std_crypto_p256_verify(pub_x: *i32, pub_y: *i32, hash: *i8,
+                               r: *i32, s: *i32) -> i1
+extern @std_crypto_rsa_bn_from_bytes(r: *i32, bytes: *i8, byte_len: i32,
+                                     limbs: i32) -> void
+extern @std_crypto_rsa_bn_to_bytes(bytes: *i8, a: *i32, byte_len: i32,
+                                   limbs: i32) -> void
+extern @std_crypto_rsa_verify_pss_sha256(hash: *i8, sig: *i8, sig_len: i32,
+                                         e: *i32, e_limbs: i32, n: *i32,
+                                         limbs: i32) -> i1
+
+extern @x509_parse_rsa_pubkey(cert: *i8, cl: i32, no: *i32, eo: *i32,
+                              li: i32) -> i1
+extern @x509_parse_p256_pubkey(cert: *i8, cl: i32, pub_x: *i32,
+                               pub_y: *i32) -> i1
+extern @x509_check_hostname(cert: *i8, cl: i32, host: *i8,
+                            host_len: i32) -> i1
+extern @x509_verify_self_signed(cert: *i8, cl: i32, limbs: i32) -> i1
+extern @x509_verify_chain(leaf: *i8, leaf_len: i32,
+                          pool: *i8, offsets: *i32, lens: *i32, count: i32,
+                          roots: *i8, root_offsets: *i32, root_lens: *i32,
+                          root_count: i32, now_secs: i64, limbs: i32) -> i32
+extern @_x509_parse_ecdsa_sig(buf: *i8, len: i32, r_out: *i32,
+                              s_out: *i32) -> i1
+extern @get16(p: *i8) -> i16
+extern @c1_time_now_ms() -> i64
+
+// Record content types (RFC 5246 §6.2.1; TLS 1.3 keeps the outer type).
+enum @TlsContentType: i8 {
+  @ChangeCipherSpec = 20,
+  @Alert = 21,
+  @Handshake = 22,
+  @Application = 23
+}
+
+// Handshake message types used in TLS 1.3 (RFC 8446 §4).
+enum @TlsHandshakeType: i8 {
+  @ClientHello = 1,
+  @ServerHello = 2,
+  @EncryptedExtensions = 8,
+  @Certificate = 11,
+  @CertificateVerify = 15,
+  @Finished = 20
+}
+
+// Layout must match net/tls/client_api.bx.
+struct @TLS12Context {
+  @fd: i32,
+  @state: i32,
+  @version: i32,
+  @key_size: i32,
+  @limbs: i32,
+  @cipher_suite: i32,
+  @client_seq: i64,
+  @server_seq: i64,
+  @client_random: [i8, 32],
+  @server_random: [i8, 32],
+  @client_write_key: [i8, 32],
+  @server_write_key: [i8, 32],
+  @client_write_iv: [i8, 12],
+  @server_write_iv: [i8, 12],
+  @pre_master_secret: [i8, 48],
+  @master_secret: [i8, 48]
+}
+
+struct @TLS13Extension {
+  @init_client_seq: i64,
+  @_pad: [i8, 24],
+  @ecdhe_private: [i8, 32],
+  @ecdhe_public_x: [i8, 32],
+  @ecdhe_public_y: [i8, 32],
+  @server_ec_x: [i8, 32],
+  @server_ec_y: [i8, 32],
+  @handshake_traffic: [i8, 48],
+  @application_traffic: [i8, 48],
+  @sni_host: [i8, 256],
+  @sni_len: i32,
+  @role: i32,
+  @trust_pool: *i8,
+  @trust_offsets: *i32,
+  @trust_lens: *i32,
+  @trust_count: i32
+}
+
+struct @TLSContext {
+  @tls12: @TLS12Context,
+  @tls13: @TLS13Extension
+}
+
+const @T13_SUITE: i32 = 4865
+const @T13_HRR_RANDOM: [i8, 32] = [
+  0xCF, 0x21, 0xAD, 0x74, 0xE5, 0x9A, 0x61, 0x11, 0xBE, 0x1D, 0x8C, 0x02,
+  0x1E, 0x65, 0xB8, 0x91, 0xC2, 0xA2, 0x11, 0x16, 0x7A, 0xBB, 0x8C, 0x5E,
+  0x07, 0x9E, 0x09, 0xE2, 0xC8, 0xA8, 0x33, 0x9C
+]
+const @T13_CV_CTX: [i8, 34] = "TLS 1.3, server CertificateVerify"
+
+// Read a 3-byte big-endian length.
+fun @_t13_get24(p: *i8) -> i32 {
+  @entry:
+    %b0 = load i8, *%p
+    %p1 = gep i8, *%p, 1
+    %b1 = load i8, *%p1
+    %p2 = gep i8, *%p, 2
+    %b2 = load i8, *%p2
+    %i0 = zext i8 %b0 to i32
+    %i1 = zext i8 %b1 to i32
+    %i2 = zext i8 %b2 to i32
+    %s0 = shl i32 %i0, 16
+    %o0 = or i32 %s0, %i1
+    %s1 = shl i32 %o0, 8
+    %r = or i32 %s1, %i2
+    ret i32 %r
+}
+
+// Append a handshake message (header included) to the transcript.
+fun @_t13_tx_append(tx: *i8, tx_off: *i32, src: *i8, len: i32, cap: i32) -> i32 {
+  @entry:
+    %off = load i32, *%tx_off
+    %end = add i32 %off, %len
+    %ok = sle i32 %end, %cap
+    br %ok, @copy, @fail
+  @copy:
+    %dst = gep i8, *%tx, %off
+    %n64 = sext i32 %len to i64
+    call @memcpy(%dst, %src, %n64)
+    store i32 %end, *%tx_off
+    ret i32 0
+  @fail:
+    ret i32 -1
+}
+
+// Parse a TLS 1.3 ServerHello body and extract the P-256 key share.
+// Returns 0 on success, -2 for HelloRetryRequest, -1 otherwise.
+fun @_t13_parse_sh(body: *i8, blen: i32, sx: *i32, sy: *i32) -> i32 {
+  @entry:
+    %short = slt i32 %blen, 38
+    br %short, @sh_fail, @ver
+  @ver:
+    %v = call @get16(%body)
+    %v_ok = eq i16 %v, 771
+    br %v_ok, @hrr, @sh_fail
+  @hrr:
+    %rp = gep i8, *%body, 2
+    %hr = call @memcmp(%rp, @T13_HRR_RANDOM, 32)
+    %is_hrr = eq i32 %hr, 0
+    br %is_hrr, @sh_hrr, @sid
+  @sh_hrr:
+    ret i32 -2
+  @sid:
+    %sidp = gep i8, *%body, 34
+    %sid = load i8, *%sidp
+    %sid32 = zext i8 %sid to i32
+    %off0 = add i32 %sid32, 35
+    %lim = sub i32 %blen, 3
+    %fits = sle i32 %off0, %lim
+    br %fits, @suite, @sh_fail
+  @suite:
+    %sp = gep i8, *%body, %off0
+    %cs = call @get16(%sp)
+    %cs_ok = eq i16 %cs, 4865
+    br %cs_ok, @comp, @sh_fail
+  @comp:
+    %off1 = add i32 %off0, 3
+    %off1b = add i32 %off1, 2
+    %comp_ok = sle i32 %off1b, %blen
+    br %comp_ok, @ext_len, @sh_fail
+  @ext_len:
+    %ep = gep i8, *%body, %off1
+    %el = call @get16(%ep)
+    %el32 = zext i16 %el to i32
+    %off2 = add i32 %off1, 2
+    %end = add i32 %off2, %el32
+    %end_ok = sle i32 %end, %blen
+    br %end_ok, @walk_init, @sh_fail
+  @walk_init:
+    %off = let i32
+    store i32 %off2, *%off
+    %ver_ok = let i32
+    store i32 0, *%ver_ok
+    %key_ok = let i32
+    store i32 0, *%key_ok
+    jmp @walk
+  @walk:
+    %o = load i32, *%off
+    %more = slt i32 %o, %end
+    br %more, @ext, @walk_done
+  @ext:
+    %o2 = load i32, *%off
+    %x_end = sub i32 %end, %o2
+    %x_min = slt i32 %x_end, 4
+    br %x_min, @sh_fail, @ext_hdr
+  @ext_hdr:
+    %tp = gep i8, *%body, %o2
+    %et = call @get16(%tp)
+    %dp = gep i8, *%body, %o2
+    %dp2 = gep i8, *%dp, 2
+    %dl = call @get16(%dp2)
+    %dl32 = zext i16 %dl to i32
+    %dstart = add i32 %o2, 4
+    %dend = add i32 %dstart, %dl32
+    %d_ok = sle i32 %dend, %end
+    br %d_ok, @ext_dispatch, @sh_fail
+  @ext_dispatch:
+    %is_sv = eq i16 %et, 43
+    br %is_sv, @ext_sv, @chk_ks
+  @ext_sv:
+    %sv_ok = eq i32 %dl32, 2
+    br %sv_ok, @ext_sv_val, @sh_fail
+  @ext_sv_val:
+    %svp = gep i8, *%body, %dstart
+    %sv = call @get16(%svp)
+    %sv13 = eq i16 %sv, 772
+    br %sv13, @ext_sv_set, @sh_fail
+  @ext_sv_set:
+    store i32 1, *%ver_ok
+    jmp @ext_next
+  @chk_ks:
+    %is_ks = eq i16 %et, 51
+    br %is_ks, @ext_ks, @ext_next
+  @ext_ks:
+    // KeyShareEntry: group(2) + key length(2) + 65-byte P-256 point
+    %ks_min = slt i32 %dl32, 69
+    br %ks_min, @sh_fail, @ext_ks_group
+  @ext_ks_group:
+    %gp = gep i8, *%body, %dstart
+    %grp = call @get16(%gp)
+    %grp23 = eq i16 %grp, 23
+    br %grp23, @ext_ks_len, @sh_fail
+  @ext_ks_len:
+    %lp = gep i8, *%body, %dstart
+    %lp2 = gep i8, *%lp, 2
+    %kl = call @get16(%lp2)
+    %kl65 = eq i16 %kl, 65
+    br %kl65, @ext_ks_point, @sh_fail
+  @ext_ks_point:
+    %kptr = gep i8, *%body, %dstart
+    %kptr2 = gep i8, *%kptr, 4
+    %fmt = load i8, *%kptr2
+    %fmt4 = eq i8 %fmt, 4
+    br %fmt4, @ext_ks_copy, @sh_fail
+  @ext_ks_copy:
+    %xp = gep i8, *%kptr2, 1
+    %yp = gep i8, *%kptr2, 33
+    call @std_crypto_rsa_bn_from_bytes(%sx, %xp, 32, 8)
+    call @std_crypto_rsa_bn_from_bytes(%sy, %yp, 32, 8)
+    store i32 1, *%key_ok
+    jmp @ext_next
+  @ext_next:
+    %o3 = load i32, *%off
+    store i32 %dend, *%off
+    jmp @walk
+  @walk_done:
+    %vok = load i32, *%ver_ok
+    %kok = load i32, *%key_ok
+    %vok_b = ne i32 %vok, 0
+    %kok_b = ne i32 %kok, 0
+    %all = and i1 %vok_b, %kok_b
+    br %all, @sh_ok, @sh_fail
+  @sh_ok:
+    ret i32 0
+  @sh_fail:
+    ret i32 -1
+}
+
+// Extract the leaf certificate DER from a Certificate message body.
+fun @_t13_parse_cert(body: *i8, blen: i32, cert_out: *i8,
+                     cert_len_out: *i32) -> i32 {
+  @entry:
+    %min = slt i32 %blen, 4
+    br %min, @c_fail, @ctx_len
+  @ctx_len:
+    %clp = load i8, *%body
+    %cl = zext i8 %clp to i32
+    %o0 = add i32 %cl, 1
+    %lim = sub i32 %blen, 3
+    %fits = sle i32 %o0, %lim
+    br %fits, @list_len, @c_fail
+  @list_len:
+    %lp = gep i8, *%body, %o0
+    %ll = call @_t13_get24(%lp)
+    %ll_ok = sgt i32 %ll, 0
+    br %ll_ok, @first, @c_fail
+  @first:
+    %o1 = add i32 %o0, 3
+    %lim2 = sub i32 %blen, 3
+    %fits2 = sle i32 %o1, %lim2
+    br %fits2, @cert_len, @c_fail
+  @cert_len:
+    %cp = gep i8, *%body, %o1
+    %clen = call @_t13_get24(%cp)
+    %clen_ok = sgt i32 %clen, 0
+    %clen_max = sle i32 %clen, 8192
+    %clen_all = and i1 %clen_ok, %clen_max
+    br %clen_all, @cert_copy, @c_fail
+  @cert_copy:
+    %o2 = add i32 %o1, 3
+    %end = add i32 %o2, %clen
+    %end_ok = sle i32 %end, %blen
+    br %end_ok, @do_copy, @c_fail
+  @do_copy:
+    %src = gep i8, *%body, %o2
+    %n64 = sext i32 %clen to i64
+    call @memcpy(%cert_out, %src, %n64)
+    store i32 %clen, *%cert_len_out
+    ret i32 0
+  @c_fail:
+    ret i32 -1
+}
+
+// Copy every certificate after the first from a TLS 1.3 Certificate body
+// into pool. offsets/lens describe the copied intermediates. Returns the
+// number copied (0 when only a leaf was sent), or -1 on a malformed list.
+fun @_t13_parse_intermediates(body: *i8, blen: i32,
+                              pool: *i8, pool_cap: i32,
+                              offsets: *i32, lens: *i32,
+                              max_count: i32) -> i32 {
+  @entry:
+    %ctx_len_p = load i8, *%body
+    %ctx_len = zext i8 %ctx_len_p to i32
+    %o0 = add i32 %ctx_len, 1
+    %lp = gep i8, *%body, %o0
+    %list_len = call @_t13_get24(%lp)
+    %o1 = add i32 %o0, 3
+    %list_end = add i32 %o1, %list_len
+    %end_ok = sle i32 %list_end, %blen
+    br %end_ok, @skip_first, @fail
+
+  @skip_first:
+    %p1 = gep i8, *%body, %o1
+    %c0len = call @_t13_get24(%p1)
+    %o2 = add i32 %o1, 3
+    %e0 = add i32 %o2, %c0len
+    %e0_ok = sle i32 %e0, %blen
+    br %e0_ok, @ext_len, @fail
+  @ext_len:
+    %exp = gep i8, *%body, %e0
+    %exv16 = call @get16(%exp)
+    %exv = zext i16 %exv16 to i32
+    %o3 = add i32 %e0, 2
+    %o4 = add i32 %o3, %exv
+    %o4_ok = sle i32 %o4, %blen
+    br %o4_ok, @init, @fail
+
+  @init:
+    %off = let i32
+    %count = let i32
+    %used = let i32
+    store i32 %o4, *%off
+    store i32 0, *%count
+    store i32 0, *%used
+    jmp @cond
+
+  @cond:
+    %ov = load i32, *%off
+    %done = sge i32 %ov, %list_end
+    br %done, @ret, @more
+  @more:
+    %cnt = load i32, *%count
+    %full = sge i32 %cnt, %max_count
+    br %full, @ret, @read_entry
+  @read_entry:
+    %ov2 = load i32, *%off
+    %ce = add i32 %ov2, 2
+    %ce_ok = slt i32 %ce, %blen
+    br %ce_ok, @read_len, @fail
+  @read_len:
+    %cp = gep i8, *%body, %ov2
+    %clen = call @_t13_get24(%cp)
+    %dstart = add i32 %ov2, 3
+    %dend = add i32 %dstart, %clen
+    %ext_end = add i32 %dend, 2
+    %din = sle i32 %ext_end, %blen
+    br %din, @copy_check, @fail
+  @copy_check:
+    %uv = load i32, *%used
+    %capleft = sub i32 %pool_cap, %uv
+    %fits = sle i32 %clen, %capleft
+    br %fits, @do_copy, @fail
+  @do_copy:
+    %uv2 = load i32, *%used
+    %dst = gep i8, *%pool, %uv2
+    %ov3 = load i32, *%off
+    %ds2 = add i32 %ov3, 3
+    %src = gep i8, *%body, %ds2
+    %n64 = sext i32 %clen to i64
+    call @memcpy(%dst, %src, %n64)
+    %cnt2 = load i32, *%count
+    %offp = gep i32, *%offsets, %cnt2
+    store i32 %uv2, *%offp
+    %lenp = gep i32, *%lens, %cnt2
+    store i32 %clen, *%lenp
+    %unew = add i32 %uv2, %clen
+    store i32 %unew, *%used
+    %cnew = add i32 %cnt2, 1
+    store i32 %cnew, *%count
+    %dend2 = add i32 %ds2, %clen
+    %expp = gep i8, *%body, %dend2
+    %exl16 = call @get16(%expp)
+    %exl = zext i16 %exl16 to i32
+    %n1 = add i32 %dend2, 2
+    %n2 = add i32 %n1, %exl
+    store i32 %n2, *%off
+    jmp @cond
+
+  @ret:
+    %cr = load i32, *%count
+    ret i32 %cr
+  @fail:
+    ret i32 -1
+}
+
+// Verify a CertificateVerify message for the given transcript hash.
+fun @_t13_verify_cv(msg: *i8, blen: i32, cert: *i8, cert_len: i32,
+                    th: *i8, limbs: i32) -> i32 {
+  @entry:
+    %min = slt i32 %blen, 8
+    br %min, @cv_fail, @body
+  @body:
+    %p = gep i8, *%msg, 4
+    %scheme = call @get16(%p)
+    %p2 = gep i8, *%p, 2
+    %siglen = call @get16(%p2)
+    %siglen32 = zext i16 %siglen to i32
+    %total = add i32 %siglen32, 4
+    %size_ok = eq i32 %total, %blen
+    br %size_ok, @content, @cv_fail
+  @content:
+    %c = let [i8, 160]
+    %cp = gep i8, *%c, 0
+    call @memset(%cp, 0x20, 64)
+    %ctxp = gep i8, *%c, 64
+    call @memcpy(%ctxp, @T13_CV_CTX, 33)
+    %zerop = gep i8, *%c, 97
+    store i8 0, *%zerop
+    %thp = gep i8, *%c, 98
+    call @memcpy(%thp, %th, 32)
+    %cth = let [i8, 32]
+    %cthp = gep i8, *%cth, 0
+    call @std_crypto_sha256_compute(%cp, 130, %cthp)
+    %sig = gep i8, *%p, 4
+    %is_pss = eq i16 %scheme, 2052
+    br %is_pss, @pss, @chk_ec
+  @pss:
+    %n = let [i32, 128]
+    %e = let [i32, 128]
+    %np = gep i32, *%n, 0
+    %ep = gep i32, *%e, 0
+    %gk = call @x509_parse_rsa_pubkey(%cert, %cert_len, %np, %ep, %limbs)
+    br %gk, @pss_v, @cv_fail
+  @pss_v:
+    %v = call @std_crypto_rsa_verify_pss_sha256(%cthp, %sig, %siglen32, %ep,
+                                                %limbs, %np, %limbs)
+    %vi = zext i1 %v to i32
+    ret i32 %vi
+  @chk_ec:
+    %is_ec = eq i16 %scheme, 1027
+    br %is_ec, @ec, @cv_fail
+  @ec:
+    %px = let [i32, 8]
+    %py = let [i32, 8]
+    %pxp = gep i32, *%px, 0
+    %pyp = gep i32, *%py, 0
+    %gk2 = call @x509_parse_p256_pubkey(%cert, %cert_len, %pxp, %pyp)
+    br %gk2, @ec_sig, @cv_fail
+  @ec_sig:
+    %r = let [i32, 8]
+    %s = let [i32, 8]
+    %rp = gep i32, *%r, 0
+    %sp = gep i32, *%s, 0
+    %ps = call @_x509_parse_ecdsa_sig(%sig, %siglen32, %rp, %sp)
+    br %ps, @ec_v, @cv_fail
+  @ec_v:
+    %ev = call @std_crypto_p256_verify(%pxp, %pyp, %cthp, %rp, %sp)
+    %evi = zext i1 %ev to i32
+    ret i32 %evi
+  @cv_fail:
+    ret i32 0
+}
+
+// Verify a Finished message: HMAC(finished_key, transcript_hash).
+fun @_t13_verify_finished(msg: *i8, blen: i32, finished_key: *i8,
+                          th: *i8) -> i32 {
+  @entry:
+    %len_ok = eq i32 %blen, 32
+    br %len_ok, @calc, @fin_fail
+  @calc:
+    %body = gep i8, *%msg, 4
+    %calc = let [i8, 32]
+    %calcp = gep i8, *%calc, 0
+    call @std_crypto_hmac_sha256(%finished_key, 32, %th, 32, %calcp)
+    %cmp = call @memcmp(%calcp, %body, 32)
+    %same = eq i32 %cmp, 0
+    br %same, @fin_ok, @fin_fail
+  @fin_ok:
+    ret i32 1
+  @fin_fail:
+    ret i32 0
+}
+
+// ===== Build TLS 1.3 ClientHello with key_share =====
+fun @ch13(ctx: *@TLSContext, buf: *i8, cap: i32, olen: *i32) -> i32 {
+  @e:
+    %n32 = let i64
+    store i64 32, *%n32
+    %n32v = load i64, *%n32
+    store i8 3, *%buf
+    %p2 = gep i8, *%buf, 1
+    store i8 3, *%p2
+    %t12 = field @TLSContext, *%ctx, 0
+    %cr_arr = field @TLS12Context, *%t12, 8
+    %cr = gep i8, *%cr_arr, 0
+    call @c1_random_buf(%cr, %n32v)
+    %cr_dst = gep i8, *%buf, 2
+    call @memcpy(%cr_dst, %cr, %n32v)
+    %sid_len_p = gep i8, *%buf, 34
+    store i8 32, *%sid_len_p
+    %sid_p = gep i8, *%buf, 35
+    call @c1_random_buf(%sid_p, %n32v)
+    %cs_len_h = gep i8, *%buf, 67
+    store i8 0, *%cs_len_h
+    %cs_len_l = gep i8, *%buf, 68
+    store i8 2, *%cs_len_l
+    %cs_h = gep i8, *%buf, 69
+    store i8 0x13, *%cs_h
+    %cs_l = gep i8, *%buf, 70
+    store i8 0x01, *%cs_l
+    %cmpl = gep i8, *%buf, 71
+    store i8 1, *%cmpl
+    %cmp = gep i8, *%buf, 72
+    store i8 0, *%cmp
+    // Extensions length field at 73, extension data starts at 75
+    %eo = let i32
+    store i32 75, *%eo
+    // Extension 1: supported_versions (0x002B)
+    // extension_data = ProtocolVersion versions<2..254> (1-byte list length)
+    %o1 = load i32, *%eo
+    %p1 = gep i8, *%buf, %o1
+    call @put16(%p1, 43)
+    %p1d2 = add i32 %o1, 2
+    %p1d3 = gep i8, *%buf, %p1d2
+    call @put16(%p1d3, 3)
+    %p1l = add i32 %o1, 4
+    %p1l_p = gep i8, *%buf, %p1l
+    store i8 2, *%p1l_p
+    %p1v = add i32 %o1, 5
+    %p1v_p = gep i8, *%buf, %p1v
+    store i8 0x03, *%p1v_p
+    %p1v2 = add i32 %o1, 6
+    %p1v2_p = gep i8, *%buf, %p1v2
+    store i8 0x04, *%p1v2_p
+    %o1n = add i32 %o1, 7
+    store i32 %o1n, *%eo
+    // Extension 2: signature_algorithms (0x000D)
+    // rsa_pss_rsae_sha256 (0x0804) and ecdsa_secp256r1_sha256 (0x0403)
+    %o2 = load i32, *%eo
+    %p2a = gep i8, *%buf, %o2
+    call @put16(%p2a, 13)
+    %o2d = add i32 %o2, 2
+    %p2d = gep i8, *%buf, %o2d
+    call @put16(%p2d, 6)
+    %o2l = add i32 %o2, 4
+    %p2l = gep i8, *%buf, %o2l
+    call @put16(%p2l, 4)
+    %o2a = add i32 %o2, 6
+    %p2a2 = gep i8, *%buf, %o2a
+    call @put16(%p2a2, 2052)
+    %o2b = add i32 %o2, 8
+    %p2b = gep i8, *%buf, %o2b
+    call @put16(%p2b, 1027)
+    %o2n = add i32 %o2, 10
+    store i32 %o2n, *%eo
+    // Generate P-256 keypair
+    %i_priv = let [i32, 8]
+    %i_px = let [i32, 8]
+    %i_py = let [i32, 8]
+    %i_priv_p = gep i32, *%i_priv, 0
+    %i_px_p = gep i32, *%i_px, 0
+    %i_py_p = gep i32, *%i_py, 0
+    call @std_crypto_p256_generate_keypair(%i_priv_p, %i_px_p, %i_py_p)
+    %t13 = field @TLSContext, *%ctx, 1
+    %ec_priv_arr = field @TLS13Extension, *%t13, 2
+    %ec_priv = gep i8, *%ec_priv_arr, 0
+    %ec_px_arr = field @TLS13Extension, *%t13, 3
+    %ec_px = gep i8, *%ec_px_arr, 0
+    %ec_py_arr = field @TLS13Extension, *%t13, 4
+    %ec_py = gep i8, *%ec_py_arr, 0
+    call @std_crypto_rsa_bn_to_bytes(%ec_priv, %i_priv_p, 32, 8)
+    call @std_crypto_rsa_bn_to_bytes(%ec_px, %i_px_p, 32, 8)
+    call @std_crypto_rsa_bn_to_bytes(%ec_py, %i_py_p, 32, 8)
+    // Extension 3: supported_groups (0x000A)
+    %o3 = load i32, *%eo
+    %p3t = gep i8, *%buf, %o3
+    call @put16(%p3t, 10)
+    %o3d = add i32 %o3, 2
+    %p3d = gep i8, *%buf, %o3d
+    call @put16(%p3d, 4)
+    %o3l = add i32 %o3, 4
+    %p3l = gep i8, *%buf, %o3l
+    call @put16(%p3l, 2)
+    %o3g = add i32 %o3, 6
+    %p3g = gep i8, *%buf, %o3g
+    call @put16(%p3g, 23)
+    %o3n = add i32 %o3, 8
+    store i32 %o3n, *%eo
+    // Extension 4: key_share (0x0033)
+    %o4 = load i32, *%eo
+    %p4t = gep i8, *%buf, %o4
+    call @put16(%p4t, 51)
+    %o4d = add i32 %o4, 2
+    %p4d = gep i8, *%buf, %o4d
+    call @put16(%p4d, 71)
+    %o4l = add i32 %o4, 4
+    %p4l = gep i8, *%buf, %o4l
+    call @put16(%p4l, 69)
+    %o4g = add i32 %o4, 6
+    %p4g = gep i8, *%buf, %o4g
+    call @put16(%p4g, 23)
+    %o4k = add i32 %o4, 8
+    %p4k = gep i8, *%buf, %o4k
+    call @put16(%p4k, 65)
+    %o4v = add i32 %o4, 10
+    %p4v = gep i8, *%buf, %o4v
+    store i8 0x04, *%p4v
+    %o4x = add i32 %o4, 11
+    %p4x = gep i8, *%buf, %o4x
+    call @memcpy(%p4x, %ec_px, %n32v)
+    %o4y = add i32 %o4, 43
+    %p4y = gep i8, *%buf, %o4y
+    call @memcpy(%p4y, %ec_py, %n32v)
+    %o4n = add i32 %o4, 75
+    store i32 %o4n, *%eo
+    // Extension 5: server_name (SNI), when a host was set
+    %sni_arr = field @TLS13Extension, *%t13, 9
+    %snip = gep i8, *%sni_arr, 0
+    %sni_len_p = field @TLS13Extension, *%t13, 10
+    %snilen = load i32, *%sni_len_p
+    %has_sni = sgt i32 %snilen, 0
+    br %has_sni, @add_sni, @finish_ch
+  @add_sni:
+    %o5 = load i32, *%eo
+    %p5t = gep i8, *%buf, %o5
+    call @put16(%p5t, 0)
+    %edl = add i32 %snilen, 5
+    %edl16 = trunc i32 %edl to i16
+    %o5d = add i32 %o5, 2
+    %p5d = gep i8, *%buf, %o5d
+    call @put16(%p5d, %edl16)
+    %sll = add i32 %snilen, 3
+    %sll16 = trunc i32 %sll to i16
+    %o5l = add i32 %o5, 4
+    %p5l = gep i8, *%buf, %o5l
+    call @put16(%p5l, %sll16)
+    %o5n = add i32 %o5, 6
+    %p5n = gep i8, *%buf, %o5n
+    store i8 0, *%p5n
+    %o5hl = add i32 %o5, 7
+    %p5hl = gep i8, *%buf, %o5hl
+    %snilen16 = trunc i32 %snilen to i16
+    call @put16(%p5hl, %snilen16)
+    %o5h = add i32 %o5, 9
+    %p5h = gep i8, *%buf, %o5h
+    %sn64 = sext i32 %snilen to i64
+    call @memcpy(%p5h, %snip, %sn64)
+    %o5end = add i32 %o5h, %snilen
+    store i32 %o5end, *%eo
+    jmp @finish_ch
+  @finish_ch:
+    %final = load i32, *%eo
+    %ext_total = sub i32 %final, 75
+    %ext_total16 = trunc i32 %ext_total to i16
+    %elp = gep i8, *%buf, 73
+    call @put16(%elp, %ext_total16)
+    store i32 %final, *%olen
+    ret i32 0
+}
+
+// Perform the TLS 1.3 handshake on an established connection.
+// The SNI host must already be set with net_tls_set_host.
+// Returns 0 on success, -1 on failure.
+fun @net_tls13_connect(ctx: *i8, fd: i32, limbs: i32) -> i32 {
+  @entry:
+    %t12 = field @TLSContext, *%ctx, 0
+    %t13 = field @TLSContext, *%ctx, 1
+    %role_p = field @TLS13Extension, *%t13, 11
+    store i32 0, *%role_p
+    %fd_p = field @TLS12Context, *%t12, 0
+    store i32 %fd, *%fd_p
+    %ver_p = field @TLS12Context, *%t12, 2
+    store i32 13, *%ver_p
+    %host_arr = field @TLS13Extension, *%t13, 9
+    %host = gep i8, *%host_arr, 0
+    %hl_p = field @TLS13Extension, *%t13, 10
+    %host_len = load i32, *%hl_p
+
+    %ch = let [i8, 1024]
+    %chp = gep i8, *%ch, 0
+    %chlen = let i32
+    %chlenp = gep i32, *%chlen, 0
+    %msg = let [i8, 16384]
+    %mp = gep i8, *%msg, 0
+    %hst = let i8
+    %hstp = gep i8, *%hst, 0
+    %hbl = let i32
+    %hblp = gep i32, *%hbl, 0
+    %tx = let [i8, 32768]
+    %txp = gep i8, *%tx, 0
+    %tx_off = let i32
+    %tx_offp = gep i32, *%tx_off, 0
+    store i32 0, *%tx_offp
+    %rx = let [i8, 32768]
+    %rxp = gep i8, *%rx, 0
+    %rx_len = let i32
+    %rx_lenp = gep i32, *%rx_len, 0
+    %rx_off = let i32
+    %rx_offp = gep i32, *%rx_off, 0
+    %cert = let [i8, 8192]
+    %certp = gep i8, *%cert, 0
+    %cert_len = let i32
+    %cert_lenp = gep i32, *%cert_len, 0
+    %typp = let i8
+    %typp2 = gep i8, *%typp, 0
+    %olen = let i32
+    %olenp = gep i32, *%olen, 0
+
+    // ---------- ClientHello ----------
+    %cr = call @ch13(%ctx, %chp, 1024, %chlenp)
+    %cr_ok = eq i32 %cr, 0
+    br %cr_ok, @tx_ch, @fail
+  @tx_ch:
+    %chl = load i32, *%chlenp
+    %chl_ok = sgt i32 %chl, 0
+    br %chl_ok, @tx_build, @fail
+  @tx_build:
+    store i8 @TlsHandshakeType.ClientHello, *%txp
+    %trl = gep i8, *%txp, 1
+    call @put24(%trl, %chl)
+    %tchp = gep i8, *%txp, 4
+    %chl64 = sext i32 %chl to i64
+    call @memcpy(%tchp, %chp, %chl64)
+    %txn = add i32 %chl, 4
+    store i32 %txn, *%tx_offp
+    %snd = call @send_hs(%fd, @TlsHandshakeType.ClientHello, %chp, %chl)
+    %snd_ok = eq i32 %snd, 0
+    br %snd_ok, @read_sh, @fail
+
+  // ---------- ServerHello ----------
+  @read_sh:
+    %rh = call @read_hs(%fd, %mp, 16384, %hstp, %hblp)
+    %rh_ok = eq i32 %rh, 0
+    br %rh_ok, @sh_type, @fail
+  @sh_type:
+    %ht = load i8, *%hstp
+    %is_sh = eq i8 %ht, @TlsHandshakeType.ServerHello
+    br %is_sh, @sh_append, @fail
+  @sh_append:
+    %shl = load i32, *%hblp
+    %shtot = add i32 %shl, 4
+    %ap1 = call @_t13_tx_append(%txp, %tx_offp, %mp, %shtot, 32768)
+    %ap1_ok = eq i32 %ap1, 0
+    br %ap1_ok, @sh_parse, @fail
+  @sh_parse:
+    %shbody = gep i8, *%mp, 4
+    %sx = let [i32, 8]
+    %sy = let [i32, 8]
+    %sxp = gep i32, *%sx, 0
+    %syp = gep i32, *%sy, 0
+    %ps = call @_t13_parse_sh(%shbody, %shl, %sxp, %syp)
+    %ps_ok = eq i32 %ps, 0
+    br %ps_ok, @ecdh, @fail
+
+  // ---------- ECDHE + key schedule ----------
+  @ecdh:
+    %priv_arr = field @TLS13Extension, *%t13, 2
+    %privp = gep i8, *%priv_arr, 0
+    %priv_limbs = let [i32, 8]
+    %privlp = gep i32, *%priv_limbs, 0
+    call @std_crypto_rsa_bn_from_bytes(%privlp, %privp, 32, 8)
+    %sec = let [i32, 8]
+    %secp = gep i32, *%sec, 0
+    call @std_crypto_p256_ecdh(%privlp, %sxp, %syp, %secp)
+    %shared = let [i8, 32]
+    %sharedp = gep i8, *%shared, 0
+    call @std_crypto_rsa_bn_to_bytes(%sharedp, %secp, 32, 8)
+
+    %early = let [i8, 32]
+    %earlyp = gep i8, *%early, 0
+    call @std_crypto_tls13_early_secret_sha256(null, 0, %earlyp)
+    %hs = let [i8, 32]
+    %hsp = gep i8, *%hs, 0
+    call @std_crypto_tls13_handshake_secret_sha256(%earlyp, %sharedp, 32, %hsp)
+    %th = let [i8, 32]
+    %thp = gep i8, *%th, 0
+    %txl = load i32, *%tx_offp
+    call @std_crypto_sha256_compute(%txp, %txl, %thp)
+    %c_hs = let [i8, 32]
+    %c_hsp = gep i8, *%c_hs, 0
+    %s_hs = let [i8, 32]
+    %s_hsp = gep i8, *%s_hs, 0
+    call @std_crypto_tls13_client_hs_traffic_sha256(%hsp, %thp, %c_hsp)
+    call @std_crypto_tls13_server_hs_traffic_sha256(%hsp, %thp, %s_hsp)
+    %ckey = let [i8, 16]
+    %ckeyp = gep i8, *%ckey, 0
+    %civ = let [i8, 12]
+    %civp = gep i8, *%civ, 0
+    %skey = let [i8, 16]
+    %skeyp = gep i8, *%skey, 0
+    %siv = let [i8, 12]
+    %sivp = gep i8, *%siv, 0
+    call @std_crypto_tls13_traffic_key_sha256(%c_hsp, %ckeyp)
+    call @std_crypto_tls13_traffic_iv_sha256(%c_hsp, %civp)
+    call @std_crypto_tls13_traffic_key_sha256(%s_hsp, %skeyp)
+    call @std_crypto_tls13_traffic_iv_sha256(%s_hsp, %sivp)
+    %cfk = let [i8, 32]
+    %cfkp = gep i8, *%cfk, 0
+    %sfk = let [i8, 32]
+    %sfkp = gep i8, *%sfk, 0
+    call @std_crypto_tls13_finished_key_sha256(%c_hsp, %cfkp)
+    call @std_crypto_tls13_finished_key_sha256(%s_hsp, %sfkp)
+    %sseq = let i64
+    store i64 0, *%sseq
+    %cseq = let i64
+    store i64 0, *%cseq
+    store i32 0, *%rx_lenp
+    store i32 0, *%rx_offp
+    jmp @flight
+
+  // ---------- Encrypted handshake flight ----------
+  @flight:
+    %rl = load i32, *%rx_lenp
+    %ro = load i32, *%rx_offp
+    %avail = sub i32 %rl, %ro
+    %hdrok = sge i32 %avail, 4
+    br %hdrok, @have_hdr, @need_more
+  @need_more:
+    %ro2 = load i32, *%rx_offp
+    %comp = sgt i32 %ro2, 0
+    br %comp, @compact, @decrypt
+  @compact:
+    %ro3 = load i32, *%rx_offp
+    %rl3 = load i32, *%rx_lenp
+    %rem = sub i32 %rl3, %ro3
+    %srcp = gep i8, *%rxp, %ro3
+    %n64 = sext i32 %rem to i64
+    call @memmove(%rxp, %srcp, %n64)
+    store i32 %rem, *%rx_lenp
+    store i32 0, *%rx_offp
+    jmp @decrypt
+  @decrypt:
+    %rl4 = load i32, *%rx_lenp
+    %room = sub i32 32768, %rl4
+    %room_ok = sgt i32 %room, 0
+    br %room_ok, @do_decrypt, @fail
+  @do_decrypt:
+    %dst = gep i8, *%rxp, %rl4
+    %dr = call @tls13_record_decrypt(%fd, %sseq, %skeyp, %sivp, 16, %dst,
+                                     %room, %typp2, %olenp)
+    %dr_ok = eq i32 %dr, 0
+    br %dr_ok, @dec_type, @fail
+  @dec_type:
+    %dt = load i8, *%typp2
+    %dt_hs = eq i8 %dt, @TlsContentType.Handshake
+    br %dt_hs, @dec_add, @fail
+  @dec_add:
+    %rl5 = load i32, *%rx_lenp
+    %got = load i32, *%olen
+    %nrl = add i32 %rl5, %got
+    store i32 %nrl, *%rx_lenp
+    jmp @flight
+
+  @have_hdr:
+    %ro4 = load i32, *%rx_offp
+    %mptr = gep i8, *%rxp, %ro4
+    %mt = load i8, *%mptr
+    %mlp = gep i8, *%mptr, 1
+    %ml = call @_t13_get24(%mlp)
+    %need = add i32 %ml, 4
+    %rl6 = load i32, *%rx_lenp
+    %ro5 = load i32, *%rx_offp
+    %avail2 = sub i32 %rl6, %ro5
+    %have_msg = sge i32 %avail2, %need
+    br %have_msg, @dispatch, @need_more
+  @dispatch:
+    %is_ee = eq i8 %mt, @TlsHandshakeType.EncryptedExtensions
+    br %is_ee, @msg_ee, @chk_cert
+  @chk_cert:
+    %is_cert = eq i8 %mt, @TlsHandshakeType.Certificate
+    br %is_cert, @msg_cert, @chk_cv
+  @chk_cv:
+    %is_cv = eq i8 %mt, @TlsHandshakeType.CertificateVerify
+    br %is_cv, @msg_cv, @chk_fin
+  @chk_fin:
+    %is_fin = eq i8 %mt, @TlsHandshakeType.Finished
+    br %is_fin, @msg_fin, @fail
+
+  @msg_ee:
+    %a_ee = call @_t13_tx_append(%txp, %tx_offp, %mptr, %need, 32768)
+    %a_ee_ok = eq i32 %a_ee, 0
+    br %a_ee_ok, @adv_ee, @fail
+  @adv_ee:
+    %ro_ee = load i32, *%rx_offp
+    %nr_ee = add i32 %ro_ee, %need
+    store i32 %nr_ee, *%rx_offp
+    jmp @flight
+
+  @msg_cert:
+    %a_ct = call @_t13_tx_append(%txp, %tx_offp, %mptr, %need, 32768)
+    %a_ct_ok = eq i32 %a_ct, 0
+    br %a_ct_ok, @cert_parse, @fail
+  @cert_parse:
+    %cbody = gep i8, *%mptr, 4
+    %cpr = call @_t13_parse_cert(%cbody, %ml, %certp, %cert_lenp)
+    %cpr_ok = eq i32 %cpr, 0
+    br %cpr_ok, @cert_check, @fail
+  @cert_check:
+    %clv = load i32, *%cert_lenp
+    %host_ok = call @x509_check_hostname(%certp, %clv, %host, %host_len)
+    br %host_ok, @cert_ss, @fail
+  @cert_ss:
+    // A configured trust store turns on chain-of-trust validation. Without
+    // one the client keeps the previous permissive behaviour: a self-signed
+    // probe only, with CertificateVerify still checked below.
+    %cc_t13 = field @TLSContext, *%ctx, 1
+    %cc_tcp = field @TLS13Extension, *%cc_t13, 15
+    %cc_tcv = load i32, *%cc_tcp
+    %cc_has = sgt i32 %cc_tcv, 0
+    br %cc_has, @cert_chain, @cert_perm
+  @cert_chain:
+    %cc_ipool = let [i8, 8192]
+    %cc_ioffs = let [i32, 8]
+    %cc_ilens = let [i32, 8]
+    %cc_ipoolp = gep i8, *%cc_ipool, 0
+    %cc_ioffsp = gep i32, *%cc_ioffs, 0
+    %cc_ilensp = gep i32, *%cc_ilens, 0
+    %cc_icnt = call @_t13_parse_intermediates(%cbody, %ml, %cc_ipoolp, 8192,
+                                              %cc_ioffsp, %cc_ilensp, 8)
+    %cc_icnt_ok = sge i32 %cc_icnt, 0
+    br %cc_icnt_ok, @chain_verify, @fail
+  @chain_verify:
+    %cc_tpp = field @TLS13Extension, *%cc_t13, 12
+    %cc_tpool = load *i8, *%cc_tpp
+    %cc_top = field @TLS13Extension, *%cc_t13, 13
+    %cc_toffs = load *i32, *%cc_top
+    %cc_tlp = field @TLS13Extension, *%cc_t13, 14
+    %cc_tlens = load *i32, *%cc_tlp
+    %cc_ms = call @c1_time_now_ms()
+    %cc_now = div i64 %cc_ms, 1000
+    %cc_cr = call @x509_verify_chain(%certp, %clv, %cc_ipoolp, %cc_ioffsp,
+                                     %cc_ilensp, %cc_icnt,
+                                     %cc_tpool, %cc_toffs, %cc_tlens, %cc_tcv,
+                                     %cc_now, %limbs)
+    %cc_cr_ok = eq i32 %cc_cr, 0
+    br %cc_cr_ok, @cert_ok, @fail
+  @cert_perm:
+    call @x509_verify_self_signed(%certp, %clv, %limbs)
+    jmp @cert_ok
+  @cert_ok:
+    %ro_ct = load i32, *%rx_offp
+    %nr_ct = add i32 %ro_ct, %need
+    store i32 %nr_ct, *%rx_offp
+    jmp @flight
+
+  @msg_cv:
+    %txl_cv = load i32, *%tx_offp
+    call @std_crypto_sha256_compute(%txp, %txl_cv, %thp)
+    %clv2 = load i32, *%cert_lenp
+    %cv_ok = call @_t13_verify_cv(%mptr, %ml, %certp, %clv2, %thp, %limbs)
+    %cv_okb = eq i32 %cv_ok, 1
+    br %cv_okb, @cv_append, @fail
+  @cv_append:
+    %a_cv = call @_t13_tx_append(%txp, %tx_offp, %mptr, %need, 32768)
+    %a_cv_ok = eq i32 %a_cv, 0
+    br %a_cv_ok, @adv_cv, @fail
+  @adv_cv:
+    %ro_cv = load i32, *%rx_offp
+    %nr_cv = add i32 %ro_cv, %need
+    store i32 %nr_cv, *%rx_offp
+    jmp @flight
+
+  @msg_fin:
+    %txl_f = load i32, *%tx_offp
+    call @std_crypto_sha256_compute(%txp, %txl_f, %thp)
+    %fin_ok = call @_t13_verify_finished(%mptr, %ml, %sfkp, %thp)
+    %fin_okb = eq i32 %fin_ok, 1
+    br %fin_okb, @fin_append, @fail
+  @fin_append:
+    %a_f = call @_t13_tx_append(%txp, %tx_offp, %mptr, %need, 32768)
+    %a_f_ok = eq i32 %a_f, 0
+    br %a_f_ok, @app_keys, @fail
+
+  // ---------- Application keys + client Finished ----------
+  @app_keys:
+    %master = let [i8, 32]
+    %masterp = gep i8, *%master, 0
+    call @std_crypto_tls13_master_secret_sha256(%hsp, %masterp)
+    %th2 = let [i8, 32]
+    %th2p = gep i8, *%th2, 0
+    %txl2 = load i32, *%tx_offp
+    call @std_crypto_sha256_compute(%txp, %txl2, %th2p)
+    %c_ap = let [i8, 32]
+    %c_app = gep i8, *%c_ap, 0
+    %s_ap = let [i8, 32]
+    %s_app = gep i8, *%s_ap, 0
+    call @std_crypto_tls13_client_ap_traffic_sha256(%masterp, %th2p, %c_app)
+    call @std_crypto_tls13_server_ap_traffic_sha256(%masterp, %th2p, %s_app)
+    %cakey = let [i8, 16]
+    %cakeyp = gep i8, *%cakey, 0
+    %caiv = let [i8, 12]
+    %caivp = gep i8, *%caiv, 0
+    %sakey = let [i8, 16]
+    %sakeyp = gep i8, *%sakey, 0
+    %saiv = let [i8, 12]
+    %saivp = gep i8, *%saiv, 0
+    call @std_crypto_tls13_traffic_key_sha256(%c_app, %cakeyp)
+    call @std_crypto_tls13_traffic_iv_sha256(%c_app, %caivp)
+    call @std_crypto_tls13_traffic_key_sha256(%s_app, %sakeyp)
+    call @std_crypto_tls13_traffic_iv_sha256(%s_app, %saivp)
+    // client Finished = HMAC(cfk, transcript through server Finished)
+    %fin_msg = let [i8, 64]
+    %finp = gep i8, *%fin_msg, 0
+    store i8 @TlsHandshakeType.Finished, *%finp
+    %finlp = gep i8, *%finp, 1
+    call @put24(%finlp, 32)
+    %finbody = gep i8, *%finp, 4
+    call @std_crypto_hmac_sha256(%cfkp, 32, %th2p, 32, %finbody)
+    %cfr = call @tls13_record_encrypt(%fd, %cseq, %ckeyp, %civp, 16, @TlsContentType.Handshake,
+                                      %finp, 36)
+    %cfr_ok = eq i32 %cfr, 0
+    br %cfr_ok, @store_ctx, @fail
+
+  @store_ctx:
+    %cwk_arr = field @TLS12Context, *%t12, 10
+    %cwk = gep i8, *%cwk_arr, 0
+    call @memcpy(%cwk, %cakeyp, 16)
+    %swk_arr = field @TLS12Context, *%t12, 11
+    %swk = gep i8, *%swk_arr, 0
+    call @memcpy(%swk, %sakeyp, 16)
+    %cwi_arr = field @TLS12Context, *%t12, 12
+    %cwi = gep i8, *%cwi_arr, 0
+    call @memcpy(%cwi, %caivp, 12)
+    %swi_arr = field @TLS12Context, *%t12, 13
+    %swi = gep i8, *%swi_arr, 0
+    call @memcpy(%swi, %saivp, 12)
+    %csq_p = field @TLS12Context, *%t12, 6
+    store i64 0, *%csq_p
+    %ssq_p = field @TLS12Context, *%t12, 7
+    store i64 0, *%ssq_p
+    ret i32 0
+
+  @fail:
+    ret i32 -1
+}

@@ -1,0 +1,140 @@
+// End-to-end test: HTTPS GET https://example.com/ through the high-level
+// client, then parse the response with the HTTP module.
+//
+// Requires network access; not part of the default test groups.
+
+extern @printf(fmt: *i8, ...) -> i32
+
+extern @net_http_request(host: *i8, host_len: i32, port: i32, use_tls: i32,
+                         req: *i8, req_len: i32, resp: *i8, resp_cap: i32) -> i32
+extern @net_http_parse_response(buf: *i8, len: i32, resp: *@HttpResponse) -> i32
+extern @net_http_decode_chunked(src: *i8, src_len: i32, dst: *i8, cap: i32) -> i32
+extern @std_text_str_find_ci(buf: *i8, start: i32, end: i32, needle: *i8) -> i32
+
+struct @HttpResponse {
+  @version: i32,
+  @status: i32,
+  @reason_off: i32,
+  @reason_len: i32,
+  @headers_off: i32,
+  @headers_len: i32,
+  @body_off: i32,
+  @body_len: i32,
+  @content_length: i32,
+  @chunked: i32
+}
+
+const @HOST: [i8, 12] = "example.com"
+const @REQ: [i8, 57] = "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n"
+
+fun @main() -> i32 {
+  @entry:
+    %host = gep i8, *@HOST, 0
+    %req = gep i8, *@REQ, 0
+    %resp_buf = let [i8, 8192]
+    %rbp = gep i8, *%resp_buf, 0
+
+    %n = call @net_http_request(%host, 11, 443, 1, %req, 56, %rbp, 8192)
+    %n_ok = sgt i32 %n, 0
+    br %n_ok, @parse, @fail_request
+
+  @parse:
+    %hresp = let [i32, 10]
+    %rp = gep i32, *%hresp, 0
+    %pr = call @net_http_parse_response(%rbp, %n, %rp)
+    %pr_ok = eq i32 %pr, 0
+    br %pr_ok, @check_status, @fail_parse
+
+  @check_status:
+    %st_p = field @HttpResponse, *%rp, 1
+    %st = load i32, *%st_p
+    call @printf("HTTP status %d, %d bytes received\n", %st, %n)
+    %is200 = eq i32 %st, 200
+    br %is200, @body, @fail_status
+
+  @body:
+    %body_off_p = field @HttpResponse, *%rp, 6
+    %body_off = load i32, *%body_off_p
+    %ck_p = field @HttpResponse, *%rp, 9
+    %ck = load i32, *%ck_p
+    %is_chunked = eq i32 %ck, 1
+    %plain_buf = let [i8, 8192]
+    %pp = gep i8, *%plain_buf, 0
+    %bsize = let i32
+    br %is_chunked, @unchunk, @plain
+
+  @unchunk:
+    %src = gep i8, *%rbp, %body_off
+    %rem = sub i32 %n, %body_off
+    %cnt = call @net_http_decode_chunked(%src, %rem, %pp, 8191)
+    %cnt_bad = slt i32 %cnt, 0
+    br %cnt_bad, @fail_body, @store_size
+  @store_size:
+    store i32 %cnt, *%bsize
+    jmp @have_body
+
+  @plain:
+    %body_len_p = field @HttpResponse, *%rp, 7
+    %bl = load i32, *%body_len_p
+    %bl_neg = slt i32 %bl, 0
+    br %bl_neg, @fail_body, @copy_init
+  @copy_init:
+    %i = let i32
+    store i32 0, *%i
+    jmp @copy_cond
+  @copy_cond:
+    %iv = load i32, *%i
+    %under = slt i32 %iv, 8191
+    %more = slt i32 %iv, %bl
+    %both = and i1 %more, %under
+    br %both, @copy_one, @copy_done
+  @copy_one:
+    %iv2 = load i32, *%i
+    %sp = gep i8, *%rbp, %body_off
+    %sp2 = gep i8, *%sp, %iv2
+    %ch = load i8, *%sp2
+    %dp = gep i8, *%pp, %iv2
+    store i8 %ch, *%dp
+    %nx = add i32 %iv2, 1
+    store i32 %nx, *%i
+    jmp @copy_cond
+  @copy_done:
+    %copied = load i32, *%i
+    store i32 %copied, *%bsize
+    jmp @have_body
+
+  @have_body:
+    %size = load i32, *%bsize
+    call @printf("body: %d bytes\n", %size)
+    %too_small = slt i32 %size, 100
+    br %too_small, @fail_body, @look_html
+  @look_html:
+    %hb = call @std_text_str_find_ci(%pp, 0, %size, "<html")
+    %found = sge i32 %hb, 0
+    br %found, @pass, @look_doctype
+  @look_doctype:
+    %hd = call @std_text_str_find_ci(%pp, 0, %size, "<!doctype")
+    %found2 = sge i32 %hd, 0
+    br %found2, @pass, @look_title
+  @look_title:
+    %ht = call @std_text_str_find_ci(%pp, 0, %size, "<title")
+    %found3 = sge i32 %ht, 0
+    br %found3, @pass, @fail_body
+
+  @pass:
+    call @printf("PASS https_example\n")
+    ret i32 0
+
+  @fail_request:
+    call @printf("FAIL request\n")
+    ret i32 1
+  @fail_parse:
+    call @printf("FAIL http parse\n")
+    ret i32 2
+  @fail_status:
+    call @printf("FAIL status %d\n", %st)
+    ret i32 3
+  @fail_body:
+    call @printf("FAIL body\n")
+    ret i32 4
+}

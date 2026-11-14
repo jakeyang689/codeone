@@ -1,0 +1,58 @@
+// Constant-time comparison and secure zeroing.
+//
+// zero() calls into ssa/platform/secure.c so the compiler cannot eliminate the
+// stores; programs using it must link the platform library.
+
+extern @c1_secure_zero(p: *i8, n: i64) -> void
+
+// Returns 1 when the len-byte buffers are equal, 0 otherwise. The loop always
+// performs len iterations and never branches on the data, so the running time
+// depends only on len.
+fun @std_crypto_util_ct_eq(a: *i8, b: *i8, len: i32) -> i32 {
+  @entry:
+    %neg = slt i32 %len, 0
+    br %neg, @no, @init
+  @init:
+    %i = let i32
+    %acc = let i32
+    store i32 0, *%i
+    store i32 0, *%acc
+    jmp @cond
+  @cond:
+    %iv = load i32, *%i
+    %more = slt i32 %iv, %len
+    br %more, @body, @done
+  @body:
+    %pa = gep i8, *%a, %iv
+    %va = load i8, *%pa
+    %pb = gep i8, *%b, %iv
+    %vb = load i8, *%pb
+    %x = xor i8 %va, %vb
+    %xi = zext i8 %x to i32
+    %av = load i32, *%acc
+    %acc2 = or i32 %av, %xi
+    store i32 %acc2, *%acc
+    %n = add i32 %iv, 1
+    store i32 %n, *%i
+    jmp @cond
+  @done:
+    %af = load i32, *%acc
+    %z = eq i32 %af, 0
+    %r = zext i1 %z to i32
+    ret i32 %r
+  @no:
+    ret i32 0
+}
+
+// Overwrite len bytes with zeros. Negative lengths are ignored.
+fun @std_crypto_util_zero(buf: *i8, len: i32) -> void {
+  @entry:
+    %neg = slt i32 %len, 0
+    br %neg, @done, @go
+  @go:
+    %n64 = sext i32 %len to i64
+    call @c1_secure_zero(%buf, %n64)
+    ret void
+  @done:
+    ret void
+}

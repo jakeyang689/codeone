@@ -1,0 +1,161 @@
+// File I/O helpers: append, read_all/write_all, read_line, seek/tell.
+// Prints "PASS io" on success.
+
+extern @printf(fmt: *i8, ...) -> i32
+extern @snprintf(buf: *i8, size: i64, fmt: *i8, ...) -> i32
+extern @getpid() -> i32
+extern @strcmp(a: *i8, b: *i8) -> i32
+extern @remove(path: *i8) -> i32
+extern @std_io_file_open_read(path: *i8) -> *i8
+extern @std_io_file_open_write(path: *i8) -> *i8
+extern @std_io_file_open_append(path: *i8) -> *i8
+extern @std_io_file_close(fp: *i8) -> i32
+extern @std_io_file_read_all(fp: *i8, buf: *i8, cap: i32) -> i32
+extern @std_io_file_write_all(fp: *i8, buf: *i8, len: i32) -> i32
+extern @std_io_file_read_line(fp: *i8, buf: *i8, cap: i32) -> i32
+extern @std_io_file_seek(fp: *i8, offset: i64, whence: i32) -> i32
+extern @std_io_file_tell(fp: *i8) -> i64
+
+// Must match boxes/std/io/file.bx.
+enum @FileSeek: i32 {
+  @Set = 0,
+  @Cur = 1,
+  @End = 2
+}
+
+fun @main() -> i32 {
+  @entry:
+    %id = let i32
+    %path = let [i8, 128]
+    %buf = let [i8, 128]
+    %pp = gep i8, *%path, 0
+    %bp = gep i8, *%buf, 0
+    store i32 0, *%id
+    %pid = call @getpid()
+    %pn = call @snprintf(%pp, 128, "/tmp/codeone_io_test_%d.txt", %pid)
+    call @remove(%pp)
+    jmp @c1
+
+  @c1:
+    store i32 1, *%id
+    %w = call @std_io_file_open_write(%pp)
+    %wn = eq *i8 %w, null
+    br %wn, @fail, @c2
+  @c2:
+    store i32 2, *%id
+    %wa = call @std_io_file_write_all(%w, "hello", 5)
+    call @std_io_file_close(%w)
+    %waok = eq i32 %wa, 0
+    br %waok, @c3, @fail
+  @c3:
+    store i32 3, *%id
+    %a = call @std_io_file_open_append(%pp)
+    %an = eq *i8 %a, null
+    br %an, @fail, @w3
+  @w3:
+    %wa2 = call @std_io_file_write_all(%a, "!", 1)
+    call @std_io_file_close(%a)
+    %wa2ok = eq i32 %wa2, 0
+    br %wa2ok, @c4, @fail
+  @c4:
+    store i32 4, *%id
+    %r = call @std_io_file_open_read(%pp)
+    %rn = eq *i8 %r, null
+    br %rn, @fail, @r4
+  @r4:
+    %t0 = call @std_io_file_tell(%r)
+    %ra = call @std_io_file_read_all(%r, %bp, 128)
+    call @std_io_file_close(%r)
+    %t0ok = eq i64 %t0, 0
+    %raok = eq i32 %ra, 6
+    %rc = call @strcmp(%bp, "hello!")
+    %rcok = eq i32 %rc, 0
+    %a1 = and i1 %t0ok, %raok
+    %a2 = and i1 %a1, %rcok
+    br %a2, @c5, @fail
+  @c5:
+    store i32 5, *%id
+    %r2 = call @std_io_file_open_read(%pp)
+    %r2n = eq *i8 %r2, null
+    br %r2n, @fail, @s5
+  @s5:
+    %se = call @std_io_file_seek(%r2, 0, @FileSeek.End)
+    %te = call @std_io_file_tell(%r2)
+    %ss = call @std_io_file_seek(%r2, 0, @FileSeek.Set)
+    %ts = call @std_io_file_tell(%r2)
+    call @std_io_file_close(%r2)
+    %e1 = eq i32 %se, 0
+    %e2 = eq i64 %te, 6
+    %e3 = eq i32 %ss, 0
+    %e4 = eq i64 %ts, 0
+    %b1 = and i1 %e1, %e2
+    %b2 = and i1 %e3, %e4
+    %b3 = and i1 %b1, %b2
+    br %b3, @c6, @fail
+  @c6:
+    store i32 6, *%id
+    %r3 = call @std_io_file_open_read(%pp)
+    %r3n = eq *i8 %r3, null
+    br %r3n, @fail, @l6
+  @l6:
+    %l1 = call @std_io_file_read_line(%r3, %bp, 128)
+    %l1c = call @strcmp(%bp, "hello!")
+    %l2 = call @std_io_file_read_line(%r3, %bp, 128)
+    call @std_io_file_close(%r3)
+    %l1ok = eq i32 %l1, 6
+    %l1cok = eq i32 %l1c, 0
+    %l2ok = eq i32 %l2, 0
+    %d1 = and i1 %l1ok, %l1cok
+    %d2 = and i1 %d1, %l2ok
+    br %d2, @c7, @fail
+  @c7:
+    store i32 7, *%id
+    %w2 = call @std_io_file_open_write(%pp)
+    %w2n = eq *i8 %w2, null
+    br %w2n, @fail, @w7
+  @w7:
+    %wa3 = call @std_io_file_write_all(%w2, "a\nb\n", 4)
+    call @std_io_file_close(%w2)
+    %wa3ok = eq i32 %wa3, 0
+    br %wa3ok, @c8, @fail
+  @c8:
+    store i32 8, *%id
+    %r4 = call @std_io_file_open_read(%pp)
+    %r4n = eq *i8 %r4, null
+    br %r4n, @fail, @l8
+  @l8:
+    %m1 = call @std_io_file_read_line(%r4, %bp, 128)
+    %m1c = call @strcmp(%bp, "a\n")
+    %m2 = call @std_io_file_read_line(%r4, %bp, 128)
+    %m2c = call @strcmp(%bp, "b\n")
+    %m3 = call @std_io_file_read_line(%r4, %bp, 128)
+    call @std_io_file_close(%r4)
+    %m1ok = eq i32 %m1, 2
+    %m1cok = eq i32 %m1c, 0
+    %m2ok = eq i32 %m2, 2
+    %m2cok = eq i32 %m2c, 0
+    %m3ok = eq i32 %m3, 0
+    %f1 = and i1 %m1ok, %m1cok
+    %f2 = and i1 %m2ok, %m2cok
+    %f3 = and i1 %m3ok, %f2
+    %f4 = and i1 %f1, %f3
+    br %f4, @c9, @fail
+  @c9:
+    store i32 9, *%id
+    %rm = call @remove(%pp)
+    %rmok = eq i32 %rm, 0
+    br %rmok, @c10, @fail
+  @c10:
+    store i32 10, *%id
+    %r5 = call @std_io_file_open_read(%pp)
+    %r5n = eq *i8 %r5, null
+    br %r5n, @pass, @fail
+
+  @pass:
+    call @printf("PASS io\n")
+    ret i32 0
+  @fail:
+    %fid = load i32, *%id
+    call @printf("FAIL io at case %d\n", %fid)
+    ret i32 1
+}

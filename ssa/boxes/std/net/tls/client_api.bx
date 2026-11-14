@@ -1,0 +1,140 @@
+// TLS client public API.
+// ctx is *i8 for C compatibility; struct definitions enable field access.
+//
+// net_tls_send / net_tls_recv / net_tls_close live in base.bx: they select the
+// key, IV, and sequence from the context role, so client and server share them.
+
+// struct @TLS12Context { fields 0-15 }
+struct @TLS12Context {
+  @fd: i32,
+  @state: i32,
+  @version: i32,
+  @key_size: i32,
+  @limbs: i32,
+  @cipher_suite: i32,
+  @client_seq: i64,
+  @server_seq: i64,
+  @client_random: [i8, 32],
+  @server_random: [i8, 32],
+  @client_write_key: [i8, 32],
+  @server_write_key: [i8, 32],
+  @client_write_iv: [i8, 12],
+  @server_write_iv: [i8, 12],
+  @pre_master_secret: [i8, 48],
+  @master_secret: [i8, 48]
+}
+struct @TLS13Extension {
+  @init_client_seq: i64,
+  @_pad: [i8, 24],
+  @ecdhe_private: [i8, 32],
+  @ecdhe_public_x: [i8, 32],
+  @ecdhe_public_y: [i8, 32],
+  @server_ec_x: [i8, 32],
+  @server_ec_y: [i8, 32],
+  @handshake_traffic: [i8, 48],
+  @application_traffic: [i8, 48],
+  @sni_host: [i8, 256],
+  @sni_len: i32,
+  @role: i32,
+  @trust_pool: *i8,
+  @trust_offsets: *i32,
+  @trust_lens: *i32,
+  @trust_count: i32
+}
+struct @TLSContext {
+  @tls12: @TLS12Context,
+  @tls13: @TLS13Extension
+}
+
+extern @tls12_hs(ctx: *i8, fd: i32, limbs: i32) -> i32
+
+fun @net_tls_set_host(ctx: *i8, host: *i8, len: i32) -> void {
+  @e:
+    %t13 = field @TLSContext, *%ctx, 1
+    %host_arr = field @TLS13Extension, *%t13, 9
+    %dst = gep i8, *%host_arr, 0
+    // sni_host is 256 bytes; host names are limited to 255.
+    %use_len = let i32
+    %neg = slt i32 %len, 0
+    br %neg, @zero_len, @check_max
+  @check_max:
+    %too_long = sgt i32 %len, 255
+    br %too_long, @max_len, @store_len
+  @zero_len:
+    store i32 0, *%use_len
+    jmp @init
+  @max_len:
+    store i32 255, *%use_len
+    jmp @init
+  @store_len:
+    store i32 %len, *%use_len
+    jmp @init
+  @init:
+    %i = let i32
+    store i32 0, *%i
+    jmp @cond
+  @cond:
+    %iv = load i32, *%i
+    %ul = load i32, *%use_len
+    %more = slt i32 %iv, %ul
+    br %more, @body, @done
+  @body:
+    %iv2 = load i32, *%i
+    %sp = gep i8, *%host, %iv2
+    %c = load i8, *%sp
+    %dp = gep i8, *%dst, %iv2
+    store i8 %c, *%dp
+    %nx = add i32 %iv2, 1
+    store i32 %nx, *%i
+    jmp @cond
+  @done:
+    %lp = field @TLS13Extension, *%t13, 10
+    %ul2 = load i32, *%use_len
+    store i32 %ul2, *%lp
+    ret void
+}
+
+// Clear the trust store. Stack-allocated contexts are not zero-initialized,
+// so callers must invoke this (or net_tls_set_trust) before connecting;
+// an unset trust store means the server certificate is not chain-validated.
+fun @net_tls_init(ctx: *i8) -> void {
+  @e:
+    %t13 = field @TLSContext, *%ctx, 1
+    %pp = field @TLS13Extension, *%t13, 12
+    store *i8 null, *%pp
+    %op = field @TLS13Extension, *%t13, 13
+    store *i32 null, *%op
+    %lp = field @TLS13Extension, *%t13, 14
+    store *i32 null, *%lp
+    %cp = field @TLS13Extension, *%t13, 15
+    store i32 0, *%cp
+    ret void
+}
+
+// Configure a trust store for the TLS 1.3 handshake. pool/offsets/lens
+// describe `count` DER trust anchors laid out contiguously; the caller keeps
+// them alive for the lifetime of the connection. With count == 0 the client
+// falls back to the previous permissive behaviour (self-signed probe only).
+fun @net_tls_set_trust(ctx: *i8, pool: *i8, offsets: *i32, lens: *i32,
+                       count: i32) -> void {
+  @e:
+    %t13 = field @TLSContext, *%ctx, 1
+    %pp = field @TLS13Extension, *%t13, 12
+    store *i8 %pool, *%pp
+    %op = field @TLS13Extension, *%t13, 13
+    store *i32 %offsets, *%op
+    %lp = field @TLS13Extension, *%t13, 14
+    store *i32 %lens, *%lp
+    %cp = field @TLS13Extension, *%t13, 15
+    store i32 %count, *%cp
+    ret void
+}
+
+fun @net_tls12_connect(ctx: *i8, fd: i32, limbs: i32) -> i32 {
+  @e:
+    %t13 = field @TLSContext, *%ctx, 1
+    %rolep = field @TLS13Extension, *%t13, 11
+    store i32 0, *%rolep
+    %r = call @tls12_hs(%ctx, %fd, %limbs)
+    ret i32 %r
+}

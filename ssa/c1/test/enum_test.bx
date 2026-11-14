@@ -1,0 +1,75 @@
+// Enum declarations: each member is an internal read-only integer constant
+// named @<Enum>.<Member>, usable wherever an integer operand is expected.
+// Prints "PASS enum" on success.
+
+extern @printf(fmt: *i8, ...) -> i32
+extern @enum_dup_red() -> i32
+
+enum @Color: i32 {
+  @Red = 0,
+  @Green = 1,
+  @Blue = 2,
+  @White = 0xFF
+}
+
+enum @State: i8 {
+  @Idle = 0,
+  @Busy = 1
+}
+
+fun @main() -> i32 {
+@entry:
+  %id = let i32
+  store i32 1, *%id
+
+  // Arithmetic folds enum members to plain integers.
+  %b = add i32 @Color.Blue, 0
+  %ok1 = eq i32 %b, 2
+  br %ok1, @check_hex, @fail
+
+@check_hex:
+  store i32 2, *%id
+  %w = add i32 @Color.White, 0
+  %ok2 = eq i32 %w, 255
+  br %ok2, @check_i8, @fail
+
+@check_i8:
+  store i32 3, *%id
+  %s = let i8
+  store i8 @State.Busy, *%s
+  %sv = load i8, *%s
+  %si = zext i8 %sv to i32
+  %ok3 = eq i32 %si, 1
+  br %ok3, @check_store, @fail
+
+@check_store:
+  store i32 4, *%id
+  %slot = let i32
+  store i32 @Color.Green, *%slot
+  %g = load i32, *%slot
+  %ok4 = eq i32 %g, 1
+  br %ok4, @check_cmp, @fail
+
+@check_cmp:
+  store i32 5, *%id
+  %is_red = eq i32 @Color.Red, 2
+  %not_red = xor i1 %is_red, true
+  br %not_red, @check_other_file, @fail
+
+// The same enum is declared again in enum_dup.bx; members are file-local so
+// the two declarations do not collide at link time.
+@check_other_file:
+  store i32 6, *%id
+  %r = call @enum_dup_red()
+  %ok6 = eq i32 %r, 0
+  br %ok6, @pass, @fail
+
+@pass:
+  call @printf("PASS enum\n")
+  ret i32 0
+
+@fail:
+  %bad = load i32, *%id
+  call @printf("FAIL enum at %d\n", %bad)
+  ret i32 1
+}

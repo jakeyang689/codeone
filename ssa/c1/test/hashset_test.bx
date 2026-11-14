@@ -1,0 +1,70 @@
+// Hash set tests (built on the hash map). Prints "PASS hashset" on success.
+
+extern @printf(fmt: *i8, ...) -> i32
+extern @std_data_hashset_init(s: *i8, initial_cap: i32) -> i32
+extern @std_data_hashset_add(s: *i8, key: *i8, key_len: i32) -> i32
+extern @std_data_hashset_has(s: *i8, key: *i8, key_len: i32) -> i32
+extern @std_data_hashset_remove(s: *i8, key: *i8, key_len: i32) -> i32
+extern @std_data_hashset_count(s: *i8) -> i32
+extern @std_data_hashset_free(s: *i8) -> void
+
+fun @main() -> i32 {
+  @entry:
+    %id = let i32
+    %s = let [i8, 32]
+    store i32 0, *%id
+    jmp @c1
+
+  @c1:
+    store i32 1, *%id
+    %r = call @std_data_hashset_init(%s, 8)
+    %rok = eq i32 %r, 0
+    br %rok, @c2, @fail
+  @c2:
+    store i32 2, *%id
+    %a1 = call @std_data_hashset_add(%s, "a", 1)
+    %a2 = call @std_data_hashset_add(%s, "b", 1)
+    %a3 = call @std_data_hashset_add(%s, "a", 1)
+    %o1 = eq i32 %a1, 1
+    %o2 = eq i32 %a2, 1
+    %o3 = eq i32 %a3, 0
+    %x = and i1 %o1, %o2
+    %y = and i1 %x, %o3
+    br %y, @c3, @fail
+  @c3:
+    store i32 3, *%id
+    %h1 = call @std_data_hashset_has(%s, "a", 1)
+    %h2 = call @std_data_hashset_has(%s, "c", 1)
+    %n = call @std_data_hashset_count(%s)
+    %h1ok = eq i32 %h1, 1
+    %h2ok = eq i32 %h2, 0
+    %nok = eq i32 %n, 2
+    %u = and i1 %h1ok, %h2ok
+    %v = and i1 %u, %nok
+    br %v, @c4, @fail
+  @c4:
+    store i32 4, *%id
+    %rm = call @std_data_hashset_remove(%s, "a", 1)
+    %h3 = call @std_data_hashset_has(%s, "a", 1)
+    %n2 = call @std_data_hashset_count(%s)
+    %rmok = eq i32 %rm, 0
+    %h3ok = eq i32 %h3, 0
+    %n2ok = eq i32 %n2, 1
+    %w = and i1 %rmok, %h3ok
+    %z = and i1 %w, %n2ok
+    br %z, @c5, @fail
+  @c5:
+    store i32 5, *%id
+    call @std_data_hashset_free(%s)
+    %n3 = call @std_data_hashset_count(%s)
+    %n3ok = eq i32 %n3, 0
+    br %n3ok, @pass, @fail
+
+  @pass:
+    call @printf("PASS hashset\n")
+    ret i32 0
+  @fail:
+    %fid = load i32, *%id
+    call @printf("FAIL hashset at case %d\n", %fid)
+    ret i32 1
+}

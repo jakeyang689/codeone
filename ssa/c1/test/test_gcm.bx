@@ -1,0 +1,125 @@
+// AES-128-GCM test program
+extern @putchar(c: i32) -> i32
+extern @std_crypto_aes_gcm_encrypt(plaintext: *i8, pt_len: i32, aad: *i8, aad_len: i32,
+                                    key: *i8, iv: *i8, ciphertext: *i8, tag: *i8) -> i32
+extern @std_crypto_aes_gcm_decrypt(ciphertext: *i8, ct_len: i32, aad: *i8, aad_len: i32,
+                                    key: *i8, iv: *i8, tag: *i8, plaintext: *i8) -> i32
+
+// Test Case 1: Empty PT, no AAD
+// Key = 0^128, IV = 0^96, PT = empty
+// Expected Tag = 58e2fccefa7e3061367f1d57a4e7455a
+const @key1: [i8, 16] = [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
+const @iv1: [i8, 12] = [0,0,0,0,0,0,0,0,0,0,0,0]
+const @expected_tag1: [i8, 16] = [
+  0x58, 0xe2, 0xfc, 0xce, 0xfa, 0x7e, 0x30, 0x61,
+  0x36, 0x7f, 0x1d, 0x57, 0xa4, 0xe7, 0x45, 0x5a
+]
+
+// Test Case 2: 16-byte zero PT, no AAD
+// Key = 0^128, IV = 0^96, PT = 0^128
+// Expected CT = 0388dace60b6a392f328c2b971b2fe78
+// Expected Tag = ab6e47d42cec13bdf53a67b21257bddf
+const @pt2: [i8, 16] = [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
+const @expected_ct2: [i8, 16] = [
+  0x03, 0x88, 0xda, 0xce, 0x60, 0xb6, 0xa3, 0x92,
+  0xf3, 0x28, 0xc2, 0xb9, 0x71, 0xb2, 0xfe, 0x78
+]
+const @expected_tag2: [i8, 16] = [
+  0xab, 0x6e, 0x47, 0xd4, 0x2c, 0xec, 0x13, 0xbd,
+  0xf5, 0x3a, 0x67, 0xb2, 0x12, 0x57, 0xbd, 0xdf
+]
+
+fun @cmp(a: *i8, b: *i8, len: i32) -> i1 {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @c_cond
+  @c_cond:
+    %iv = load i32, *%i
+    %more = slt i32 %iv, %len
+    br %more, @c_body, @c_eq
+  @c_body:
+    %iv2 = load i32, *%i
+    %ap = gep i8, *%a, %iv2
+    %av = load i8, *%ap
+    %bp = gep i8, *%b, %iv2
+    %bv = load i8, *%bp
+    %ok = eq i8 %av, %bv
+    br %ok, @c_next, @c_neq
+  @c_next:
+    %iv3 = load i32, *%i
+    %next = add i32 %iv3, 1
+    store i32 %next, *%i
+    jmp @c_cond
+  @c_eq: ret i1 1
+  @c_neq: ret i1 0
+}
+
+fun @main() -> i32 {
+  @entry:
+    %tag = let [i8, 16]
+    %tag_p = gep i8, *%tag, 0
+
+    // Test 1: Empty PT, tag only
+    call @std_crypto_aes_gcm_encrypt(null, 0, null, 0, @key1, @iv1, null, %tag_p)
+    %t1_ok = call @cmp(%tag_p, @expected_tag1, 16)
+    br %t1_ok, @test2, @fail1
+
+  @test2:
+    // Test 2: 16-byte PT, no AAD
+    %ct = let [i8, 16]
+    %ct_p = gep i8, *%ct, 0
+    call @std_crypto_aes_gcm_encrypt(@pt2, 16, null, 0, @key1, @iv1, %ct_p, %tag_p)
+    %ct_ok = call @cmp(%ct_p, @expected_ct2, 16)
+    br %ct_ok, @check_tag2, @fail2
+
+  @check_tag2:
+    %t2_ok = call @cmp(%tag_p, @expected_tag2, 16)
+    br %t2_ok, @test3, @fail2_tag
+
+  @test3:
+    // Test 3: Decrypt and verify
+    %pt = let [i8, 16]
+    %pt_p = gep i8, *%pt, 0
+    %dec_ok = call @std_crypto_aes_gcm_decrypt(%ct_p, 16, null, 0, @key1, @iv1, %tag_p, %pt_p)
+    %got_zero = eq i32 %dec_ok, 0
+    br %got_zero, @dec_verify, @fail3
+
+  @dec_verify:
+    %pt_ok = call @cmp(%pt_p, @pt2, 16)
+    br %pt_ok, @pass, @fail3
+
+  @pass:
+    call @putchar(80)
+    call @putchar(65)
+    call @putchar(83)
+    call @putchar(83)
+    call @putchar(10)
+    ret i32 0
+
+  @fail1:
+    call @putchar(49)
+    call @putchar(70)
+    call @putchar(10)
+    ret i32 1
+
+  @fail2:
+    call @putchar(50)
+    call @putchar(67)
+    call @putchar(84)
+    call @putchar(10)
+    ret i32 2
+
+  @fail2_tag:
+    call @putchar(50)
+    call @putchar(84)
+    call @putchar(65)
+    call @putchar(71)
+    call @putchar(10)
+    ret i32 3
+
+  @fail3:
+    call @putchar(51)
+    call @putchar(10)
+    ret i32 4
+}

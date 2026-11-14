@@ -1,0 +1,56 @@
+// Memory operations backed by libc.
+//
+// The wrappers keep the @std_mem_memops_* API. Defining @memcpy, @memset and
+// friends here would shadow the optimized libc routines for every box linked
+// with this file, and a portable memmove cannot be written without comparing
+// pointers.
+
+extern @memcpy(dst: *i8, src: *i8, n: i64) -> *i8
+extern @memset(s: *i8, c: i32, n: i64) -> *i8
+extern @memmove(dst: *i8, src: *i8, n: i64) -> *i8
+extern @memcmp(s1: *i8, s2: *i8, n: i64) -> i32
+extern @memchr(s: *i8, c: i32, n: i64) -> *i8
+
+fun @std_mem_memops_copy(dst: *i8, src: *i8, n: i32) -> void {
+  @entry:
+    %n64 = sext i32 %n to i64
+    call @memcpy(%dst, %src, %n64)
+    ret void
+}
+
+fun @std_mem_memops_zero(s: *i8, n: i32) -> void {
+  @entry:
+    %n64 = sext i32 %n to i64
+    call @memset(%s, 0, %n64)
+    ret void
+}
+
+fun @std_mem_memops_set(s: *i8, c: i8, n: i32) -> void {
+  @entry:
+    %ci = zext i8 %c to i32
+    %n64 = sext i32 %n to i64
+    call @memset(%s, %ci, %n64)
+    ret void
+}
+
+fun @std_mem_memops_move(dst: *i8, src: *i8, n: i32) -> void {
+  @entry:
+    %n64 = sext i32 %n to i64
+    call @memmove(%dst, %src, %n64)
+    ret void
+}
+
+fun @std_mem_memops_chr(s: *i8, c: i8, n: i32) -> *i8 {
+  @entry:
+    %ci = zext i8 %c to i32
+    %n64 = sext i32 %n to i64
+    %r = call @memchr(%s, %ci, %n64)
+    ret *i8 %r
+}
+
+fun @std_mem_memops_cmp(s1: *i8, s2: *i8, n: i32) -> i32 {
+  @entry:
+    %n64 = sext i32 %n to i64
+    %r = call @memcmp(%s1, %s2, %n64)
+    ret i32 %r
+}

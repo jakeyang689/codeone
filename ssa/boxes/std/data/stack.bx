@@ -1,0 +1,106 @@
+// Stack data structure (fixed capacity, stored as byte array)
+// Metadata is a struct; data elements follow at offset 12.
+// Usage:
+//   %stack = let [i8, 256]     // 256 bytes, can hold ~61 i32 values
+//   call @std_data_stack_init(%stack, 256, 4)
+
+struct @Stack { @capacity: i32, @elem_size: i32, @count: i32 }
+
+fun @std_data_stack_init(s: *i8, capacity: i32, elem_size: i32) -> void {
+  @entry:
+    %cap_p = field @Stack, *%s, 0
+    store i32 %capacity, *%cap_p
+    %es_p = field @Stack, *%s, 1
+    store i32 %elem_size, *%es_p
+    %cnt_p = field @Stack, *%s, 2
+    store i32 0, *%cnt_p
+    ret void
+}
+
+fun @std_data_stack_push(s: *i8, val_ptr: *i8) -> void {
+  @entry:
+    %cnt_p = field @Stack, *%s, 2
+    %cnt = load i32, *%cnt_p
+    %cap_p = field @Stack, *%s, 0
+    %cap = load i32, *%cap_p
+    %full = slt i32 %cnt, %cap
+    br %full, @do_push, @done
+
+  @do_push:
+    %es_p = field @Stack, *%s, 1
+    %es = load i32, *%es_p
+    %off = mul i32 %cnt, %es
+    %data_p = gep i8, *%s, 12     // skip 12 bytes of metadata (3 x i32)
+    %dst = gep i8, *%data_p, %off
+    %elem_i = let i32
+    store i32 0, *%elem_i
+    jmp @cp_cond
+
+  @cp_cond:
+    %ei = load i32, *%elem_i
+    %c = slt i32 %ei, %es
+    br %c, @cp_byte, @cp_done
+
+  @cp_byte:
+    %ei_b = load i32, *%elem_i
+    %ps = gep i8, *%val_ptr, %ei_b
+    %b = load i8, *%ps
+    %pd = gep i8, *%dst, %ei_b
+    store i8 %b, *%pd
+    %ei2 = add i32 %ei_b, 1
+    store i32 %ei2, *%elem_i
+    jmp @cp_cond
+
+  @cp_done:
+    %cnt2 = add i32 %cnt, 1
+    store i32 %cnt2, *%cnt_p
+    jmp @done
+
+  @done:
+    ret void
+}
+
+fun @std_data_stack_pop(s: *i8, val_ptr: *i8) -> void {
+  @entry:
+    %cnt_p = field @Stack, *%s, 2
+    %cnt = load i32, *%cnt_p
+    %empty = eq i32 %cnt, 0
+    br %empty, @done_ret, @do_pop
+
+  @do_pop:
+    %cnt2 = sub i32 %cnt, 1
+    store i32 %cnt2, *%cnt_p
+    %es_p = field @Stack, *%s, 1
+    %es = load i32, *%es_p
+    %off = mul i32 %cnt2, %es
+    %data_p = gep i8, *%s, 12
+    %src = gep i8, *%data_p, %off
+    %elem_i = let i32
+    store i32 0, *%elem_i
+    jmp @pc_cond
+
+  @pc_cond:
+    %ei = load i32, *%elem_i
+    %c = slt i32 %ei, %es
+    br %c, @pc_byte, @done_ret
+
+  @pc_byte:
+    %ei_b = load i32, *%elem_i
+    %ps = gep i8, *%src, %ei_b
+    %b = load i8, *%ps
+    %pd = gep i8, *%val_ptr, %ei_b
+    store i8 %b, *%pd
+    %ei2 = add i32 %ei_b, 1
+    store i32 %ei2, *%elem_i
+    jmp @pc_cond
+
+  @done_ret:
+    ret void
+}
+
+fun @std_data_stack_count(s: *i8) -> i32 {
+  @entry:
+    %cnt_p = field @Stack, *%s, 2
+    %cnt = load i32, *%cnt_p
+    ret i32 %cnt
+}

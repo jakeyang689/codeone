@@ -1,0 +1,320 @@
+// Integer to string conversion (itoa, now supports negative)
+// buf: [i8, 12] minimum, returns string length (excluding null)
+// atoi: string to i32
+// hex parse: hex string to i32
+
+fun @std_core_convert_itoa(val: i32, buf: *i8) -> i32 {
+  @entry:
+    %iptr = let i32
+    %vptr = let i64
+    %lenptr = let i32
+    %cntr = let i32
+    %neg_flag = let i32
+    store i32 0, *%iptr
+    store i32 0, *%neg_flag
+
+    %z = eq i32 %val, 0
+    br %z, @print_zero, @check_neg
+
+  @print_zero:
+    %zp0 = gep i8, *%buf, 0
+    store i8 48, *%zp0    // '0'
+    %zp1 = gep i8, *%buf, 1
+    store i8 0, *%zp1
+    ret i32 1
+
+  @check_neg:
+    %n = slt i32 %val, 0
+    br %n, @set_neg, @store_abs
+
+  @set_neg:
+    store i32 1, *%neg_flag
+    %v64 = sext i32 %val to i64
+    %abs64 = sub i64 0, %v64   // safe: -(-2147483648) = 2147483648 fits in i64
+    store i64 %abs64, *%vptr
+    jmp @extract
+
+  @store_abs:
+    %vp64 = sext i32 %val to i64
+    store i64 %vp64, *%vptr
+    jmp @extract
+
+  @extract:
+    %v = load i64, *%vptr
+    %i = load i32, *%iptr
+    %d64 = rem i64 %v, 10
+    %d = trunc i64 %d64 to i32
+    %ch = add i32 %d, 48
+    %ch8 = trunc i32 %ch to i8
+    %p = gep i8, *%buf, %i
+    store i8 %ch8, *%p
+    %q64 = div i64 %v, 10
+    store i64 %q64, *%vptr
+    %i2 = add i32 %i, 1
+    store i32 %i2, *%iptr
+    %done = eq i64 %q64, 0
+    br %done, @save_len, @extract
+
+  @save_len:
+    %cnt = load i32, *%iptr
+    store i32 %cnt, *%lenptr
+    %nf_load = load i32, *%neg_flag
+    %nf_bool = ne i32 %nf_load, 0
+    br %nf_bool, @shift_for_neg, @setup_rev
+
+  @shift_for_neg:
+    // Shift digits right by 1 to make room for '-'
+    %slen = load i32, *%lenptr
+    %sptr = let i32
+    store i32 %slen, *%sptr
+    jmp @sh_cond
+
+  @sh_cond:
+    %si = load i32, *%sptr
+    %sd = eq i32 %si, 0
+    br %sd, @place_minus, @sh_body
+
+  @sh_body:
+    %siv = load i32, *%sptr
+    %src_pos = sub i32 %siv, 1
+    %src_p = gep i8, *%buf, %src_pos
+    %b = load i8, *%src_p
+    %dst_p = gep i8, *%buf, %siv
+    store i8 %b, *%dst_p
+    %dec = sub i32 %siv, 1
+    store i32 %dec, *%sptr
+    jmp @sh_cond
+
+  @place_minus:
+    %mp = gep i8, *%buf, 0
+    store i8 45, *%mp    // '-'
+    %neg_len = load i32, *%lenptr
+    %final_len = add i32 %neg_len, 1
+    store i32 %final_len, *%lenptr
+    jmp @setup_rev
+
+  @setup_rev:
+    %nf_setup = load i32, *%neg_flag
+    %nf_setup_b = ne i32 %nf_setup, 0
+    br %nf_setup_b, @rev_start_one, @rev_start_zero
+  @rev_start_one:
+    store i32 1, *%cntr
+    jmp @rev_cond
+  @rev_start_zero:
+    store i32 0, *%cntr
+    jmp @rev_cond
+
+  @rev_cond:
+    %cur = load i32, *%cntr
+    %rev_len = load i32, *%lenptr
+    %nf_rev = load i32, *%neg_flag
+    %far = sub i32 %rev_len, %cur
+    %far2 = sub i32 %far, 1
+    %far3 = add i32 %far2, %nf_rev    // far = rev_len - 1 - cur + neg_flag
+    %more = slt i32 %cur, %far3
+    br %more, @rev_body, @rev_done
+
+  @rev_body:
+    %c_i = load i32, *%cntr
+    %r_len = load i32, *%lenptr
+    %nf_body = load i32, *%neg_flag
+    %fi = sub i32 %r_len, %c_i
+    %fi2 = sub i32 %fi, 1
+    %fi3 = add i32 %fi2, %nf_body    // far = rev_len - 1 - cur + neg_flag
+    %p_lo = gep i8, *%buf, %c_i
+    %p_hi = gep i8, *%buf, %fi3
+    %b_lo = load i8, *%p_lo
+    %b_hi = load i8, *%p_hi
+    store i8 %b_hi, *%p_lo
+    store i8 %b_lo, *%p_hi
+    %c_next = add i32 %c_i, 1
+    store i32 %c_next, *%cntr
+    jmp @rev_cond
+
+  @rev_done:
+    %fin_len = load i32, *%lenptr
+    %np = gep i8, *%buf, %fin_len
+    store i8 0, *%np
+    ret i32 %fin_len
+}
+
+// atoi — parse decimal string to i32
+fun @std_core_convert_atoi(s: *i8) -> i32 {
+  @entry:
+    %iptr = let i32
+    %neg_flag = let i32
+    %result = let i32
+    store i32 0, *%iptr
+    store i32 0, *%neg_flag
+    store i32 0, *%result
+    jmp @skip_spaces
+
+  @skip_spaces:
+    %pos = load i32, *%iptr
+    %pp = gep i8, *%s, %pos
+    %c = load i8, *%pp
+    %is_sp = eq i8 %c, 32    // ' '
+    br %is_sp, @next_space, @check_sign
+
+  @next_space:
+    %p2 = add i32 %pos, 1
+    store i32 %p2, *%iptr
+    jmp @skip_spaces
+
+  @check_sign:
+    %pos_s = load i32, *%iptr
+    %pp_s = gep i8, *%s, %pos_s
+    %c_s = load i8, *%pp_s
+    %is_minus = eq i8 %c_s, 45   // '-'
+    br %is_minus, @set_neg, @check_plus
+
+  @set_neg:
+    store i32 1, *%neg_flag
+    %pos_m = add i32 %pos_s, 1
+    store i32 %pos_m, *%iptr
+    jmp @parse_loop
+
+  @check_plus:
+    %is_plus = eq i8 %c_s, 43    // '+'
+    br %is_plus, @skip_plus, @parse_loop
+
+  @skip_plus:
+    %pos_pl = add i32 %pos_s, 1
+    store i32 %pos_pl, *%iptr
+    jmp @parse_loop
+
+  @parse_loop:
+    %pos_i = load i32, *%iptr
+    %pp_i = gep i8, *%s, %pos_i
+    %c_i = load i8, *%pp_i
+    %ge_0 = sge i8 %c_i, 48     // '0'
+    br %ge_0, @check_digit, @finish_parse
+
+  @check_digit:
+    %le_9 = sle i8 %c_i, 57     // '9'
+    br %le_9, @add_digit, @finish_parse
+
+  @add_digit:
+    %val = load i32, *%result
+    %c_int = zext i8 %c_i to i32
+    %digit = sub i32 %c_int, 48
+    %new_val = mul i32 %val, 10
+    %new_val2 = add i32 %new_val, %digit
+    store i32 %new_val2, *%result
+    %pos_next = add i32 %pos_i, 1
+    store i32 %pos_next, *%iptr
+    jmp @parse_loop
+
+  @finish_parse:
+    %nf_load2 = load i32, *%neg_flag
+    %nf_bool2 = ne i32 %nf_load2, 0
+    br %nf_bool2, @apply_neg, @done
+
+  @apply_neg:
+    %pos_val = load i32, *%result
+    %neg_val = sub i32 0, %pos_val
+    store i32 %neg_val, *%result
+    jmp @done
+
+  @done:
+    %r = load i32, *%result
+    ret i32 %r
+}
+
+// Parse hex string to i32 (handles optional "0x"/"0X" prefix)
+fun @std_core_convert_hex(s: *i8) -> i32 {
+  @entry:
+    %iptr = let i32
+    %result = let i32
+    store i32 0, *%iptr
+    store i32 0, *%result
+    jmp @check_0x
+
+  @check_0x:
+    %pos0 = load i32, *%iptr
+    %pp0 = gep i8, *%s, %pos0
+    %c0 = load i8, *%pp0
+    %is_0 = eq i8 %c0, 48      // '0'
+    br %is_0, @check_x, @hex_loop
+
+  @check_x:
+    %pos1 = add i32 %pos0, 1
+    %pp1 = gep i8, *%s, %pos1
+    %cx = load i8, *%pp1
+    %is_x = eq i8 %cx, 120      // 'x'
+    %is_X = eq i8 %cx, 88       // 'X'
+    %is_any = or i1 %is_x, %is_X
+    br %is_any, @skip_prefix, @hex_loop
+
+  @skip_prefix:
+    %pos2 = add i32 %pos1, 1
+    store i32 %pos2, *%iptr
+    jmp @hex_loop
+
+  @hex_loop:
+    %pi = load i32, *%iptr
+    %pp = gep i8, *%s, %pi
+    %ch = load i8, *%pp
+    %nul = eq i8 %ch, 0
+    br %nul, @done, @parse_hex_digit
+
+  @parse_hex_digit:
+    %val = load i32, *%result
+    %ci = zext i8 %ch to i32
+    %ge_0 = sge i8 %ch, 48
+    br %ge_0, @check_9, @check_A
+
+  @check_9:
+    %le_9 = sle i8 %ch, 57
+    br %le_9, @digit, @check_A
+
+  @digit:
+    %d = sub i32 %ci, 48
+    %nv = mul i32 %val, 16
+    %nv2 = add i32 %nv, %d
+    store i32 %nv2, *%result
+    %p_next = add i32 %pi, 1
+    store i32 %p_next, *%iptr
+    jmp @hex_loop
+
+  @check_A:
+    %ge_A = sge i8 %ch, 65     // 'A'
+    br %ge_A, @check_F, @check_a
+
+  @check_F:
+    %le_F = sle i8 %ch, 70     // 'F'
+    br %le_F, @hex_A_F, @check_a
+
+  @hex_A_F:
+    %d_a = sub i32 %ci, 55     // 'A' - 10 = 55, so c - 55 = digit value
+    %nv_a = mul i32 %val, 16
+    %nv2_a = add i32 %nv_a, %d_a
+    store i32 %nv2_a, *%result
+    %p_next_a = add i32 %pi, 1
+    store i32 %p_next_a, *%iptr
+    jmp @hex_loop
+
+  @check_a:
+    %ge_a = sge i8 %ch, 97     // 'a'
+    br %ge_a, @check_f, @skip_char
+
+  @check_f:
+    %le_f = sle i8 %ch, 102    // 'f'
+    br %le_f, @hex_a_f, @skip_char
+
+  @hex_a_f:
+    %d_af = sub i32 %ci, 87    // 'a' - 10 = 87
+    %nv_af = mul i32 %val, 16
+    %nv2_af = add i32 %nv_af, %d_af
+    store i32 %nv2_af, *%result
+    %p_next_af = add i32 %pi, 1
+    store i32 %p_next_af, *%iptr
+    jmp @hex_loop
+
+  @skip_char:
+    jmp @done
+
+  @done:
+    %r = load i32, *%result
+    ret i32 %r
+}

@@ -1,0 +1,160 @@
+// AES/GCM hardware acceleration benchmark.
+//
+// CBC keeps both a pure software entry (_sw_*) and a hardware one, so they can
+// be compared in a single run. GCM now dispatches internally (AES + GHASH),
+// so run the program twice to compare:
+//     ./aes_hw_bench
+//     C1_NO_HW=1 ./aes_hw_bench
+
+extern @malloc(n: i64) -> *i8
+extern @clock() -> i64
+extern @printf(fmt: *i8, ...) -> i32
+extern @memset(s: *i8, c: i32, n: i64) -> *i8
+extern @memcmp(a: *i8, b: *i8, n: i64) -> i32
+extern @c1_cpu_features() -> i64
+
+extern @std_crypto_aes128_cbc_encrypt(plaintext: *i8, plaintext_len: i32, key: *i8, iv: *i8, ciphertext: *i8) -> void
+extern @std_crypto_aes256_cbc_encrypt(plaintext: *i8, plaintext_len: i32, key: *i8, iv: *i8, ciphertext: *i8) -> void
+extern @std_crypto_aes_gcm_encrypt(plaintext: *i8, pt_len: i32, aad: *i8, aad_len: i32,
+                                    key: *i8, iv: *i8, ciphertext: *i8, tag: *i8) -> i32
+extern @std_crypto_aes256_gcm_encrypt(plaintext: *i8, pt_len: i32, aad: *i8, aad_len: i32,
+                                       key: *i8, iv: *i8, ciphertext: *i8, tag: *i8) -> i32
+
+extern @_sw_aes128_cbc_encrypt(plaintext: *i8, plaintext_len: i32, key: *i8, iv: *i8, ciphertext: *i8) -> void
+extern @_sw_aes256_cbc_encrypt(plaintext: *i8, plaintext_len: i32, key: *i8, iv: *i8, ciphertext: *i8) -> void
+
+const @key128: [i8, 16] = [
+  0x2b, 0x7e, 0x15, 0x16, 0x28, 0xae, 0xd2, 0xa6,
+  0xab, 0xf7, 0x15, 0x88, 0x09, 0xcf, 0x4f, 0x3c
+]
+const @key256: [i8, 32] = [
+  0x60, 0x3d, 0xeb, 0x10, 0x15, 0xca, 0x71, 0xbe,
+  0x2b, 0x73, 0xae, 0xf0, 0x85, 0x7d, 0x77, 0x81,
+  0x1f, 0x35, 0x2c, 0x07, 0x3b, 0x61, 0x08, 0xd7,
+  0x2d, 0x98, 0x10, 0xa3, 0x09, 0x14, 0xdf, 0xf4
+]
+const @iv16: [i8, 16] = [
+  0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+  0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f
+]
+const @iv12: [i8, 12] = [ 0xca, 0xfe, 0xba, 0xbe, 0xfa, 0xce, 0xdb, 0xad,
+                          0xde, 0xca, 0xf8, 0x88 ]
+const @aad: [i8, 4] = [ 0xde, 0xad, 0xbe, 0xef ]
+
+fun @bench_cbc128(sw: i1, nbytes: i32, pt: *i8, ct: *i8, key: *i8, iv: *i8) -> i64 {
+  @entry:
+    %t0 = call @clock()
+    br %sw, @do_sw, @do_hw
+  @do_sw:
+    call @_sw_aes128_cbc_encrypt(%pt, %nbytes, %key, %iv, %ct)
+    jmp @stop
+  @do_hw:
+    call @std_crypto_aes128_cbc_encrypt(%pt, %nbytes, %key, %iv, %ct)
+    jmp @stop
+  @stop:
+    %t1 = call @clock()
+    %us = sub i64 %t1, %t0
+    ret i64 %us
+}
+
+fun @bench_cbc256(sw: i1, nbytes: i32, pt: *i8, ct: *i8, key: *i8, iv: *i8) -> i64 {
+  @entry:
+    %t0 = call @clock()
+    br %sw, @do_sw, @do_hw
+  @do_sw:
+    call @_sw_aes256_cbc_encrypt(%pt, %nbytes, %key, %iv, %ct)
+    jmp @stop
+  @do_hw:
+    call @std_crypto_aes256_cbc_encrypt(%pt, %nbytes, %key, %iv, %ct)
+    jmp @stop
+  @stop:
+    %t1 = call @clock()
+    %us = sub i64 %t1, %t0
+    ret i64 %us
+}
+
+fun @bench_gcm128(nbytes: i32, pt: *i8, ct: *i8, key: *i8, iv: *i8, aad: *i8, tag: *i8) -> i64 {
+  @entry:
+    %t0 = call @clock()
+    %r = call @std_crypto_aes_gcm_encrypt(%pt, %nbytes, %aad, 4, %key, %iv, %ct, %tag)
+    %t1 = call @clock()
+    %us = sub i64 %t1, %t0
+    ret i64 %us
+}
+
+fun @bench_gcm256(nbytes: i32, pt: *i8, ct: *i8, key: *i8, iv: *i8, aad: *i8, tag: *i8) -> i64 {
+  @entry:
+    %t0 = call @clock()
+    %r = call @std_crypto_aes256_gcm_encrypt(%pt, %nbytes, %aad, 4, %key, %iv, %ct, %tag)
+    %t1 = call @clock()
+    %us = sub i64 %t1, %t0
+    ret i64 %us
+}
+
+fun @mbps(nbytes: i32, us: i64) -> i64 {
+  @entry:
+    %toosmall = slt i64 %us, 1
+    br %toosmall, @zero, @calc
+  @calc:
+    %nb = sext i32 %nbytes to i64
+    %r = div i64 %nb, %us
+    ret i64 %r
+  @zero:
+    ret i64 0
+}
+
+fun @main() -> i32 {
+  @entry:
+    %feat = call @c1_cpu_features()
+    %mode = and i64 %feat, 1
+    call @printf("cpu features: 0x%llx (hardware AES=%lld)\n", %feat, %mode)
+
+    %total = add i32 0, 8388608
+    %pt = call @malloc(8388608)
+    %ct_a = call @malloc(8388608)
+    %ct_b = call @malloc(8388608)
+    %tag_a = call @malloc(16)
+    %tag_b = call @malloc(16)
+    call @memset(%pt, 0xa5, 8388608)
+
+    %kp = gep i8, *@key128, 0
+    %k2p = gep i8, *@key256, 0
+    %ivp = gep i8, *@iv16, 0
+    %iv12p = gep i8, *@iv12, 0
+    %aadp = gep i8, *@aad, 0
+
+    // Cross-check CBC: software vs dispatched (0 = identical).
+    %chk = add i32 0, 65536
+    call @_sw_aes128_cbc_encrypt(%pt, %chk, %kp, %ivp, %ct_a)
+    call @std_crypto_aes128_cbc_encrypt(%pt, %chk, %kp, %ivp, %ct_b)
+    %d1 = call @memcmp(%ct_a, %ct_b, 65536)
+    call @printf("check CBC-128 identical: %d\n", %d1)
+
+    call @_sw_aes256_cbc_encrypt(%pt, %chk, %k2p, %ivp, %ct_a)
+    call @std_crypto_aes256_cbc_encrypt(%pt, %chk, %k2p, %ivp, %ct_b)
+    %d2 = call @memcmp(%ct_a, %ct_b, 65536)
+    call @printf("check CBC-256 identical: %d\n", %d2)
+
+    // Throughput.
+    %us_sw = call @bench_cbc128(1, %total, %pt, %ct_a, %kp, %ivp)
+    %us_hw = call @bench_cbc128(0, %total, %pt, %ct_b, %kp, %ivp)
+    %m_sw = call @mbps(%total, %us_sw)
+    %m_hw = call @mbps(%total, %us_hw)
+    call @printf("CBC-128  sw %lld MB/s | hw %lld MB/s\n", %m_sw, %m_hw)
+
+    %us_sw2 = call @bench_cbc256(1, %total, %pt, %ct_a, %k2p, %ivp)
+    %us_hw2 = call @bench_cbc256(0, %total, %pt, %ct_b, %k2p, %ivp)
+    %m_sw2 = call @mbps(%total, %us_sw2)
+    %m_hw2 = call @mbps(%total, %us_hw2)
+    call @printf("CBC-256  sw %lld MB/s | hw %lld MB/s\n", %m_sw2, %m_hw2)
+
+    %us_g1 = call @bench_gcm128(%total, %pt, %ct_a, %kp, %iv12p, %aadp, %tag_a)
+    %m_g1 = call @mbps(%total, %us_g1)
+    call @printf("GCM-128  %lld MB/s (%lld us)\n", %m_g1, %us_g1)
+
+    %us_g2 = call @bench_gcm256(%total, %pt, %ct_b, %k2p, %iv12p, %aadp, %tag_b)
+    %m_g2 = call @mbps(%total, %us_g2)
+    call @printf("GCM-256  %lld MB/s (%lld us)\n", %m_g2, %us_g2)
+
+    ret i32 0
+}

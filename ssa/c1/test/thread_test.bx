@@ -1,0 +1,341 @@
+// Threads: spawn/join, detach, mutex, condition variable, scheduling helpers.
+//
+// Prints "PASS thread" and returns 0 on success, "FAIL thread" and 1 otherwise.
+
+extern @printf(fmt: *i8, ...) -> i32
+
+extern @std_thread_spawn(task_id: i32, arg: *i8) -> *i8
+extern @std_thread_join(t: *i8) -> i32
+extern @std_thread_detach(t: *i8) -> i32
+
+extern @std_thread_mutex_new() -> *i8
+extern @std_thread_mutex_lock(m: *i8) -> i32
+extern @std_thread_mutex_trylock(m: *i8) -> i32
+extern @std_thread_mutex_unlock(m: *i8) -> i32
+extern @std_thread_mutex_free(m: *i8) -> i32
+
+extern @std_thread_cond_new() -> *i8
+extern @std_thread_cond_wait(c: *i8, m: *i8) -> i32
+extern @std_thread_cond_timedwait(c: *i8, m: *i8, ms: i32) -> i32
+extern @std_thread_cond_signal(c: *i8) -> i32
+extern @std_thread_cond_free(c: *i8) -> i32
+
+extern @std_thread_sleep_ms(ms: i32) -> void
+extern @std_thread_self() -> i64
+extern @std_thread_cpu_count() -> i32
+
+struct @Shared {
+  @mutex: *i8,
+  @cond: *i8,
+  @counter: i32,
+  @flag: i32,
+  @done: i32,
+  @spawned: i32,
+  @wait_rc: i32
+}
+
+const @thread_count: i32 = 4
+const @thread_iters: i32 = 20000
+
+// Application-provided entry point (see boxes/std/thread/thread.bx).
+// task_id selects the body; arg points at the shared state.
+fun @thread_run(task_id: i32, arg: *i8) -> i32 {
+  @entry:
+    %is_counter = eq i32 %task_id, 1
+    br %is_counter, @worker_counter, @check_waiter
+
+  @check_waiter:
+    %is_waiter = eq i32 %task_id, 2
+    br %is_waiter, @worker_waiter, @check_detached
+
+  @check_detached:
+    %is_detached = eq i32 %task_id, 3
+    br %is_detached, @worker_detached, @check_timed
+
+  @check_timed:
+    %is_timed = eq i32 %task_id, 4
+    br %is_timed, @worker_timed_waiter, @unknown
+
+  @unknown:
+    ret i32 1
+
+  @worker_counter:
+    %i = let i32
+    store i32 0, *%i
+    jmp @wc_cond
+
+  @wc_cond:
+    %iv = load i32, *%i
+    %more = slt i32 %iv, @thread_iters
+    br %more, @wc_body, @wc_done
+
+  @wc_body:
+    %mp = field @Shared, *%arg, 0
+    %m = load *i8, *%mp
+    call @std_thread_mutex_lock(%m)
+    %cp = field @Shared, *%arg, 2
+    %cv = load i32, *%cp
+    %cv1 = add i32 %cv, 1
+    store i32 %cv1, *%cp
+    call @std_thread_mutex_unlock(%m)
+    %iv2 = load i32, *%i
+    %next = add i32 %iv2, 1
+    store i32 %next, *%i
+    jmp @wc_cond
+
+  @wc_done:
+    ret i32 0
+
+  @worker_waiter:
+    %wmp = field @Shared, *%arg, 0
+    %wm = load *i8, *%wmp
+    %wcp = field @Shared, *%arg, 1
+    %wc = load *i8, *%wcp
+    call @std_thread_mutex_lock(%wm)
+    jmp @wait_check
+
+  @wait_check:
+    %fp = field @Shared, *%arg, 3
+    %fv = load i32, *%fp
+    %ready = ne i32 %fv, 0
+    br %ready, @wait_got, @wait_do
+
+  @wait_do:
+    call @std_thread_cond_wait(%wc, %wm)
+    jmp @wait_check
+
+  @wait_got:
+    %dp = field @Shared, *%arg, 4
+    store i32 1, *%dp
+    call @std_thread_mutex_unlock(%wm)
+    ret i32 0
+
+  @worker_detached:
+    %dmp = field @Shared, *%arg, 0
+    %dm = load *i8, *%dmp
+    call @std_thread_mutex_lock(%dm)
+    %sp = field @Shared, *%arg, 5
+    store i32 1, *%sp
+    call @std_thread_mutex_unlock(%dm)
+    ret i32 0
+
+  @worker_timed_waiter:
+    %tmp_mp = field @Shared, *%arg, 0
+    %tmp_m = load *i8, *%tmp_mp
+    %tmp_cp = field @Shared, *%arg, 1
+    %tmp_c = load *i8, *%tmp_cp
+    call @std_thread_mutex_lock(%tmp_m)
+    jmp @tw_check
+
+  @tw_check:
+    %tmp_fp = field @Shared, *%arg, 3
+    %tmp_fv = load i32, *%tmp_fp
+    %tmp_ready = ne i32 %tmp_fv, 0
+    br %tmp_ready, @tw_got, @tw_do
+
+  @tw_do:
+    %tmp_rc = call @std_thread_cond_timedwait(%tmp_c, %tmp_m, 5000)
+    %tmp_wrcp = field @Shared, *%arg, 6
+    store i32 %tmp_rc, *%tmp_wrcp
+    jmp @tw_check
+
+  @tw_got:
+    %tmp_dp = field @Shared, *%arg, 4
+    store i32 1, *%tmp_dp
+    call @std_thread_mutex_unlock(%tmp_m)
+    ret i32 0
+}
+
+fun @main() -> i32 {
+  @entry:
+    %sh = let @Shared
+    %poll = let i32
+
+    %mp = field @Shared, *%sh, 0
+    %m = call @std_thread_mutex_new()
+    store *i8 %m, *%mp
+
+    %cp = field @Shared, *%sh, 1
+    %c = call @std_thread_cond_new()
+    store *i8 %c, *%cp
+
+    %ctp = field @Shared, *%sh, 2
+    store i32 0, *%ctp
+    %fp = field @Shared, *%sh, 3
+    store i32 0, *%fp
+    %dp = field @Shared, *%sh, 4
+    store i32 0, *%dp
+    %sp = field @Shared, *%sh, 5
+    store i32 0, *%sp
+    %wrp = field @Shared, *%sh, 6
+    store i32 0, *%wrp
+    jmp @try_lock
+
+  // ---- mutex trylock: acquire, then report busy ----
+  @try_lock:
+    %tl1 = call @std_thread_mutex_trylock(%m)
+    %tl1ok = eq i32 %tl1, 0
+    br %tl1ok, @try_busy, @fail
+
+  @try_busy:
+    %tl2 = call @std_thread_mutex_trylock(%m)
+    %busy = eq i32 %tl2, 1
+    br %busy, @try_release, @fail
+
+  @try_release:
+    %ul = call @std_thread_mutex_unlock(%m)
+    %ulok = eq i32 %ul, 0
+    br %ulok, @timeout_wait, @fail
+
+  // ---- timedwait with nothing to signal it must time out ----
+  @timeout_wait:
+    %ml = call @std_thread_mutex_lock(%m)
+    %tw = call @std_thread_cond_timedwait(%c, %m, 30)
+    %twok = eq i32 %tw, 1
+    %mu = call @std_thread_mutex_unlock(%m)
+    br %twok, @spawn_threads, @fail
+
+  // ---- 4 threads increment a mutex-protected counter ----
+  @spawn_threads:
+    %h0 = call @std_thread_spawn(1, %sh)
+    %h1 = call @std_thread_spawn(1, %sh)
+    %h2 = call @std_thread_spawn(1, %sh)
+    %h3 = call @std_thread_spawn(1, %sh)
+
+    %j0 = call @std_thread_join(%h0)
+    %j1 = call @std_thread_join(%h1)
+    %j2 = call @std_thread_join(%h2)
+    %j3 = call @std_thread_join(%h3)
+    %s01 = add i32 %j0, %j1
+    %s012 = add i32 %s01, %j2
+    %sum = add i32 %s012, %j3
+    %jok = eq i32 %sum, 0
+    br %jok, @check_counter, @fail
+
+  @check_counter:
+    %ctp2 = field @Shared, *%sh, 2
+    %count = load i32, *%ctp2
+    %expected = mul i32 @thread_count, @thread_iters
+    %cok = eq i32 %count, %expected
+    br %cok, @cond_start, @fail
+
+  // ---- condition variable handshake ----
+  @cond_start:
+    %w = call @std_thread_spawn(2, %sh)
+    call @std_thread_sleep_ms(50)
+
+    %mp2 = field @Shared, *%sh, 0
+    %m2 = load *i8, *%mp2
+    call @std_thread_mutex_lock(%m2)
+    %fp2 = field @Shared, *%sh, 3
+    store i32 1, *%fp2
+    %cp2 = field @Shared, *%sh, 1
+    %c2 = load *i8, *%cp2
+    call @std_thread_cond_signal(%c2)
+    call @std_thread_mutex_unlock(%m2)
+
+    %jw = call @std_thread_join(%w)
+    %jwok = eq i32 %jw, 0
+    br %jwok, @check_block_done, @fail
+
+  @check_block_done:
+    %bdp = field @Shared, *%sh, 4
+    %bdv = load i32, *%bdp
+    %bdok = eq i32 %bdv, 1
+    br %bdok, @timed_start, @fail
+
+  // ---- condition variable handshake with timed wait ----
+  @timed_start:
+    %rfp = field @Shared, *%sh, 3
+    store i32 0, *%rfp
+    %rdp = field @Shared, *%sh, 4
+    store i32 0, *%rdp
+    %rwrp = field @Shared, *%sh, 6
+    store i32 0, *%rwrp
+
+    %w4 = call @std_thread_spawn(4, %sh)
+    call @std_thread_sleep_ms(50)
+
+    %mp3 = field @Shared, *%sh, 0
+    %m3 = load *i8, *%mp3
+    call @std_thread_mutex_lock(%m3)
+    %fp3 = field @Shared, *%sh, 3
+    store i32 1, *%fp3
+    %cp3 = field @Shared, *%sh, 1
+    %c3 = load *i8, *%cp3
+    call @std_thread_cond_signal(%c3)
+    call @std_thread_mutex_unlock(%m3)
+
+    %jw4 = call @std_thread_join(%w4)
+    %jw4ok = eq i32 %jw4, 0
+    br %jw4ok, @check_done, @fail
+
+  @check_done:
+    %dp2 = field @Shared, *%sh, 4
+    %dv = load i32, *%dp2
+    %dok = eq i32 %dv, 1
+    br %dok, @check_wait_rc, @fail
+
+  @check_wait_rc:
+    %wrp2 = field @Shared, *%sh, 6
+    %wrv = load i32, *%wrp2
+    %wrok = eq i32 %wrv, 0
+    br %wrok, @detach_start, @fail
+
+  // ---- detached thread runs without an explicit join ----
+  @detach_start:
+    %d = call @std_thread_spawn(3, %sh)
+    %dr = call @std_thread_detach(%d)
+    %dro = eq i32 %dr, 0
+    br %dro, @poll_init, @fail
+
+  @poll_init:
+    store i32 0, *%poll
+    jmp @poll_cond
+
+  @poll_cond:
+    %pv = load i32, *%poll
+    %plimit = slt i32 %pv, 2000
+    br %plimit, @poll_check, @fail
+
+  @poll_check:
+    %sp2 = field @Shared, *%sh, 5
+    %spv = load i32, *%sp2
+    %spok = eq i32 %spv, 1
+    br %spok, @sanity, @poll_sleep
+
+  @poll_sleep:
+    %pv2 = load i32, *%poll
+    %pnext = add i32 %pv2, 1
+    store i32 %pnext, *%poll
+    call @std_thread_sleep_ms(1)
+    jmp @poll_cond
+
+  // ---- scheduling helpers ----
+  @sanity:
+    %ncpu = call @std_thread_cpu_count()
+    %cpuok = sgt i32 %ncpu, 0
+    br %cpuok, @check_self, @fail
+
+  @check_self:
+    %self = call @std_thread_self()
+    %selfok = ne i64 %self, 0
+    br %selfok, @release, @fail
+
+  @release:
+    %fm = load *i8, *%mp
+    %fc = load *i8, *%cp
+    %fcr = call @std_thread_cond_free(%fc)
+    %fmr = call @std_thread_mutex_free(%fm)
+    %rel = add i32 %fcr, %fmr
+    %relok = eq i32 %rel, 0
+    br %relok, @pass, @fail
+
+  @pass:
+    call @printf("PASS thread\n")
+    ret i32 0
+
+  @fail:
+    call @printf("FAIL thread\n")
+    ret i32 1
+}

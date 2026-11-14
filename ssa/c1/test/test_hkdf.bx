@@ -1,0 +1,163 @@
+// HKDF test program — RFC 5869 test vectors
+extern @putchar(c: i32) -> i32
+extern @std_crypto_hkdf_extract_sha256(salt: *i8, salt_len: i32, ikm: *i8, ikm_len: i32, prk: *i8) -> void
+extern @std_crypto_hkdf_expand_sha256(prk: *i8, info: *i8, info_len: i32, out_len: i32, okm: *i8) -> void
+
+// Test Case 1: Basic
+// IKM = 0x0b * 22, salt = 0x00..0x0c (13 bytes), info = 0xf0..0xf9 (10 bytes), L = 42
+const @ikm1: [i8, 22] = [ 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b,
+                           0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b,
+                           0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b ]
+const @salt1: [i8, 13] = [ 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+                           0x08, 0x09, 0x0a, 0x0b, 0x0c ]
+const @info1: [i8, 10] = [ 0xf0, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7,
+                           0xf8, 0xf9 ]
+const @expected_prk1: [i8, 32] = [
+  0x07, 0x77, 0x09, 0x36, 0x2c, 0x2e, 0x32, 0xdf,
+  0x0d, 0xdc, 0x3f, 0x0d, 0xc4, 0x7b, 0xba, 0x63,
+  0x90, 0xb6, 0xc7, 0x3b, 0xb5, 0x0f, 0x9c, 0x31,
+  0x22, 0xec, 0x84, 0x4a, 0xd7, 0xc2, 0xb3, 0xe5
+]
+const @expected_okm1: [i8, 42] = [
+  0x3c, 0xb2, 0x5f, 0x25, 0xfa, 0xac, 0xd5, 0x7a,
+  0x90, 0x43, 0x4f, 0x64, 0xd0, 0x36, 0x2f, 0x2a,
+  0x2d, 0x2d, 0x0a, 0x90, 0xcf, 0x1a, 0x5a, 0x4c,
+  0x5d, 0xb0, 0x2d, 0x56, 0xec, 0xc4, 0xc5, 0xbf,
+  0x34, 0x00, 0x72, 0x08, 0xd5, 0xb8, 0x87, 0x18,
+  0x58, 0x65
+]
+
+// Test Case 2: Test with empty salt
+// IKM = 0x0c * 22, salt = empty (0 bytes), info = empty, L = 42
+const @ikm2: [i8, 22] = [ 0x0c, 0x0c, 0x0c, 0x0c, 0x0c, 0x0c, 0x0c, 0x0c,
+                           0x0c, 0x0c, 0x0c, 0x0c, 0x0c, 0x0c, 0x0c, 0x0c,
+                           0x0c, 0x0c, 0x0c, 0x0c, 0x0c, 0x0c ]
+const @expected_prk2: [i8, 32] = [
+  0xaa, 0x84, 0x1e, 0x1f, 0x35, 0x74, 0xf3, 0x2d,
+  0x13, 0xfb, 0xa8, 0x00, 0x5f, 0xcd, 0x9b, 0x8d,
+  0x77, 0x67, 0x82, 0xa5, 0xdf, 0xa1, 0x92, 0x38,
+  0x92, 0xfd, 0x8b, 0x63, 0x5d, 0x3a, 0x89, 0xdf
+]
+const @expected_okm2: [i8, 42] = [
+  0x59, 0x68, 0x99, 0x17, 0x9a, 0xb1, 0xbc, 0x00,
+  0xa7, 0xc0, 0x37, 0x86, 0xff, 0x43, 0xee, 0x53,
+  0x50, 0x04, 0xbe, 0x2b, 0xb9, 0xbe, 0x68, 0xbc,
+  0x14, 0x06, 0x63, 0x6f, 0x54, 0xbd, 0x33, 0x8a,
+  0x66, 0xa2, 0x37, 0xba, 0x2a, 0xcb, 0xce, 0xe3,
+  0xc9, 0xa7
+]
+
+// Compare two arrays, return 1 if equal
+fun @cmp(a: *i8, b: *i8, len: i32) -> i1 {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @c_cond
+  @c_cond:
+    %iv = load i32, *%i
+    %more = slt i32 %iv, %len
+    br %more, @c_body, @c_eq
+  @c_body:
+    %iv2 = load i32, *%i
+    %ap = gep i8, *%a, %iv2
+    %av = load i8, *%ap
+    %bp = gep i8, *%b, %iv2
+    %bv = load i8, *%bp
+    %ok = eq i8 %av, %bv
+    br %ok, @c_next, @c_neq
+  @c_next:
+    %iv3 = load i32, *%i
+    %next = add i32 %iv3, 1
+    store i32 %next, *%i
+    jmp @c_cond
+  @c_eq: ret i1 1
+  @c_neq: ret i1 0
+}
+
+fun @main() -> i32 {
+  @entry:
+    %prk = let [i8, 32]
+    %prk_p = gep i8, *%prk, 0
+    %okm = let [i8, 64]
+    %okm_p = gep i8, *%okm, 0
+
+    // --- Test 1: Basic ---
+    // Extract
+    call @std_crypto_hkdf_extract_sha256(@salt1, 13, @ikm1, 22, %prk_p)
+    %prk_ok = call @cmp(%prk_p, @expected_prk1, 32)
+    br %prk_ok, @t1_expand, @fail_prk1
+
+  @t1_expand:
+    // Expand
+    call @std_crypto_hkdf_expand_sha256(%prk_p, @info1, 10, 42, %okm_p)
+    %okm_ok = call @cmp(%okm_p, @expected_okm1, 42)
+    br %okm_ok, @test2, @fail_okm1
+
+  @test2:
+    // --- Test 2: Empty salt ---
+    call @std_crypto_hkdf_extract_sha256(null, 0, @ikm2, 22, %prk_p)
+    %prk2_ok = call @cmp(%prk_p, @expected_prk2, 32)
+    br %prk2_ok, @t2_expand, @fail_prk2
+
+  @t2_expand:
+    // Expand with empty info
+    call @std_crypto_hkdf_expand_sha256(%prk_p, null, 0, 42, %okm_p)
+    %okm2_ok = call @cmp(%okm_p, @expected_okm2, 42)
+    br %okm2_ok, @pass, @fail_okm2
+
+  @pass:
+    call @putchar(80)
+    call @putchar(65)
+    call @putchar(83)
+    call @putchar(83)
+    call @putchar(10)
+    ret i32 0
+
+  @fail_prk1:
+    call @putchar(80)
+    call @putchar(82)
+    call @putchar(75)
+    call @putchar(49)
+    call @putchar(70)
+    call @putchar(65)
+    call @putchar(73)
+    call @putchar(76)
+    call @putchar(10)
+    ret i32 1
+
+  @fail_okm1:
+    call @putchar(79)
+    call @putchar(75)
+    call @putchar(77)
+    call @putchar(49)
+    call @putchar(70)
+    call @putchar(65)
+    call @putchar(73)
+    call @putchar(76)
+    call @putchar(10)
+    ret i32 2
+
+  @fail_prk2:
+    call @putchar(80)
+    call @putchar(82)
+    call @putchar(75)
+    call @putchar(50)
+    call @putchar(70)
+    call @putchar(65)
+    call @putchar(73)
+    call @putchar(76)
+    call @putchar(10)
+    ret i32 3
+
+  @fail_okm2:
+    call @putchar(79)
+    call @putchar(75)
+    call @putchar(77)
+    call @putchar(50)
+    call @putchar(70)
+    call @putchar(65)
+    call @putchar(73)
+    call @putchar(76)
+    call @putchar(10)
+    ret i32 4
+}

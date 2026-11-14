@@ -1,0 +1,138 @@
+// Hashmap with open addressing (linear probing)
+// Keys:   [i32, 16]  (sentinel -1 = empty slot)
+// Values: [i32, 16]
+// Capacity fixed at 16.
+
+fun @hash(key: i32) -> i32 {
+  @entry:
+    %cap = sub i32 0, 16
+    %r = rem i32 %key, 16
+    %neg = slt i32 %r, 0
+    br %neg, @fix, @done
+  @fix:
+    %fixed = add i32 %r, 16
+    ret i32 %fixed
+  @done:
+    ret i32 %r
+}
+
+fun @hashmap_init(keys: *i32) -> void {
+  @entry:
+    %i_ptr = let i32
+    store i32 0, *%i_ptr
+    jmp @init_cond
+  @init_cond:
+    %iv = load i32, *%i_ptr
+    %ic = slt i32 %iv, 16
+    br %ic, @init_body, @init_done
+  @init_body:
+    %iv2 = load i32, *%i_ptr
+    %p = gep i32, *%keys, %iv2
+    store i32 -1, *%p
+    %iv3 = add i32 %iv2, 1
+    store i32 %iv3, *%i_ptr
+    jmp @init_cond
+  @init_done:
+    ret void
+}
+
+fun @hashmap_insert(keys: *i32, values: *i32, key: i32, val: i32) -> void {
+  @entry:
+    %i_slot = let i32
+    %hash = call @hash(%key)
+    store i32 %hash, *%i_slot
+    jmp @iloop
+  @iloop:
+    %i = load i32, *%i_slot
+    %pk = gep i32, *%keys, %i
+    %k = load i32, *%pk
+    %free = eq i32 %k, -1
+    br %free, @iput, @icheck
+  @icheck:
+    %same = eq i32 %k, %key
+    br %same, @iput, @inext
+  @inext:
+    %in = add i32 %i, 1
+    %iw = rem i32 %in, 16
+    store i32 %iw, *%i_slot
+    jmp @iloop
+  @iput:
+    store i32 %key, *%pk
+    %pv = gep i32, *%values, %i
+    store i32 %val, *%pv
+    ret void
+}
+
+fun @hashmap_get(keys: *i32, values: *i32, key: i32, def: i32) -> i32 {
+  @entry:
+    %gi_slot = let i32
+    %gc_slot = let i32
+    %hash_g = call @hash(%key)
+    store i32 %hash_g, *%gi_slot
+    store i32 0, *%gc_slot
+    jmp @gloop
+  @gloop:
+    %gi = load i32, *%gi_slot
+    %pgk = gep i32, *%keys, %gi
+    %gk = load i32, *%pgk
+    %gfree = eq i32 %gk, -1
+    br %gfree, @gmiss, @gcheck
+  @gcheck:
+    %gmatch = eq i32 %gk, %key
+    br %gmatch, @gfound, @gnext
+  @gnext:
+    %gn = add i32 %gi, 1
+    %gw = rem i32 %gn, 16
+    store i32 %gw, *%gi_slot
+    %gc = load i32, *%gc_slot
+    %gc1 = add i32 %gc, 1
+    store i32 %gc1, *%gc_slot
+    %gmore = slt i32 %gc1, 16
+    br %gmore, @gloop, @gmiss
+  @gfound:
+    %pgv = gep i32, *%values, %gi
+    %gv = load i32, *%pgv
+    ret i32 %gv
+  @gmiss:
+    ret i32 %def
+}
+
+fun @main() -> i32 {
+  @entry:
+    %keys_arr = let [i32, 16]
+    %vals_arr = let [i32, 16]
+    %keys = gep i32, *%keys_arr, 0
+    %vals = gep i32, *%vals_arr, 0
+    call @hashmap_init(%keys)
+    call @hashmap_insert(%keys, %vals, 3, 100)
+    call @hashmap_insert(%keys, %vals, 7, 200)
+    call @hashmap_insert(%keys, %vals, 15, 300)
+    %collision_key = add i32 3, 16
+    call @hashmap_insert(%keys, %vals, %collision_key, 400)
+
+    // Verify: get all inserted keys
+    %r3 = call @hashmap_get(%keys, %vals, 3, -1)
+    %c3 = eq i32 %r3, 100
+    br %c3, @c7, @fail
+  @c7:
+    %r7 = call @hashmap_get(%keys, %vals, 7, -1)
+    %c7v = eq i32 %r7, 200
+    br %c7v, @c15, @fail
+  @c15:
+    %r15 = call @hashmap_get(%keys, %vals, 15, -1)
+    %c15v = eq i32 %r15, 300
+    br %c15v, @c19, @fail
+  @c19:
+    %r19 = call @hashmap_get(%keys, %vals, %collision_key, -1)
+    %c19v = eq i32 %r19, 400
+    br %c19v, @c99, @fail
+  @c99:
+    // Lookup nonexistent key
+    %r99 = call @hashmap_get(%keys, %vals, 999, -1)
+    %c99v = eq i32 %r99, -1
+    br %c99v, @pass, @fail
+  @pass:
+    ret i32 0
+  @fail:
+    ret i32 1
+}

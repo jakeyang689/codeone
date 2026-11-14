@@ -1,0 +1,1897 @@
+// JSON parser, tree builder, and serializer.
+//
+// Values are nodes in a tree. Arrays and objects store their children as a
+// singly linked sibling list; object members also carry a key. Parsed strings
+// and keys are heap-allocated copies, so the input buffer may be released
+// after parsing. Numbers keep both an integer and a floating-point form.
+
+extern @malloc(n: i64) -> *i8
+extern @free(p: *i8) -> void
+extern @memset(s: *i8, c: i32, n: i64) -> *i8
+extern @memcpy(dst: *i8, src: *i8, n: i64) -> *i8
+extern @memcmp(a: *i8, b: *i8, n: i64) -> i32
+extern @strlen(s: *i8) -> i64
+extern @strtod(s: *i8, endptr: *i8) -> f64
+extern @strtoll(s: *i8, endptr: *i8, base: i32) -> i64
+extern @snprintf(buf: *i8, size: i64, fmt: *i8, ...) -> i32
+
+// Node type tags, also returned by std_json_type.
+enum @JsonType: i32 {
+  @Null = 0,
+  @Bool = 1,
+  @Int = 2,
+  @Float = 3,
+  @String = 4,
+  @Array = 5,
+  @Object = 6
+}
+
+// Node allocation size: the struct is currently 72 bytes; keep slack so that
+// adding fields does not immediately corrupt the heap.
+const @JSON_NODE_SZ: i32 = 128
+const @JSON_MAX_DEPTH: i32 = 128
+
+struct @JsonValue {
+  @type: i32,
+  @bool_val: i32,
+  @num_i: i64,
+  @num_f: f64,
+  @str: *i8,
+  @str_len: i32,
+  @first: *i8,
+  @next: *i8,
+  @key: *i8,
+  @key_len: i32
+}
+
+struct @JsonParser {
+  @text: *i8,
+  @len: i32,
+  @pos: i32,
+  @err: i32,
+  @err_pos: i32
+}
+
+// ===== nodes =====
+
+fun @_json_new_node(t: i32) -> *i8 {
+  @entry:
+    %p = call @malloc(128)
+    %nul = eq *i8 %p, null
+    br %nul, @fail, @init
+  @init:
+    call @memset(%p, 0, 128)
+    %tp = field @JsonValue, *%p, 0
+    store i32 %t, *%tp
+    ret *i8 %p
+  @fail:
+    ret *i8 null
+}
+
+// Free one node (and its subtree).
+fun @_json_free_node(v: *i8) -> void {
+  @entry:
+    %fp = field @JsonValue, *%v, 6
+    %child = load *i8, *%fp
+    call @_json_free_list(%child)
+    %sp = field @JsonValue, *%v, 4
+    %s = load *i8, *%sp
+    %sn = eq *i8 %s, null
+    br %sn, @key, @free_s
+  @free_s:
+    call @free(%s)
+    jmp @key
+  @key:
+    %kp = field @JsonValue, *%v, 8
+    %k = load *i8, *%kp
+    %kn = eq *i8 %k, null
+    br %kn, @node, @free_k
+  @free_k:
+    call @free(%k)
+    jmp @node
+  @node:
+    call @free(%v)
+    ret void
+}
+
+// Free a sibling list iteratively; recursion only follows nesting.
+fun @_json_free_list(v: *i8) -> void {
+  @entry:
+    %cur = let *i8
+    store *i8 %v, *%cur
+    jmp @cond
+  @cond:
+    %cv = load *i8, *%cur
+    %nul = eq *i8 %cv, null
+    br %nul, @done, @body
+  @body:
+    %np = field @JsonValue, *%cv, 7
+    %next = load *i8, *%np
+    call @_json_free_node(%cv)
+    store *i8 %next, *%cur
+    jmp @cond
+  @done:
+    ret void
+}
+
+fun @std_json_free(v: *i8) -> void {
+  @entry:
+    call @_json_free_list(%v)
+    ret void
+}
+
+// ===== builders =====
+
+fun @std_json_new_null() -> *i8 {
+  @entry:
+    %v = call @_json_new_node(@JsonType.Null)
+    ret *i8 %v
+}
+
+fun @std_json_new_bool(b: i32) -> *i8 {
+  @entry:
+    %v = call @_json_new_node(@JsonType.Bool)
+    %nul = eq *i8 %v, null
+    br %nul, @fail, @set
+  @set:
+    %nz = ne i32 %b, 0
+    %bi = zext i1 %nz to i32
+    %p = field @JsonValue, *%v, 1
+    store i32 %bi, *%p
+    ret *i8 %v
+  @fail:
+    ret *i8 null
+}
+
+fun @std_json_new_int(i: i64) -> *i8 {
+  @entry:
+    %v = call @_json_new_node(@JsonType.Int)
+    %nul = eq *i8 %v, null
+    br %nul, @fail, @set
+  @set:
+    %p = field @JsonValue, *%v, 2
+    store i64 %i, *%p
+    ret *i8 %v
+  @fail:
+    ret *i8 null
+}
+
+fun @std_json_new_float(f: f64) -> *i8 {
+  @entry:
+    %v = call @_json_new_node(@JsonType.Float)
+    %nul = eq *i8 %v, null
+    br %nul, @fail, @set
+  @set:
+    %p = field @JsonValue, *%v, 3
+    store f64 %f, *%p
+    ret *i8 %v
+  @fail:
+    ret *i8 null
+}
+
+fun @std_json_new_string(s: *i8, len: i32) -> *i8 {
+  @entry:
+    %neg = slt i32 %len, 0
+    br %neg, @fail, @mk
+  @mk:
+    %v = call @_json_new_node(@JsonType.String)
+    %nul = eq *i8 %v, null
+    br %nul, @fail, @alloc
+  @alloc:
+    %n1 = add i32 %len, 1
+    %n64 = sext i32 %n1 to i64
+    %buf = call @malloc(%n64)
+    %bnul = eq *i8 %buf, null
+    br %bnul, @free_v, @copy
+  @copy:
+    %l64 = sext i32 %len to i64
+    call @memcpy(%buf, %s, %l64)
+    %zp = gep i8, *%buf, %len
+    store i8 0, *%zp
+    %sp = field @JsonValue, *%v, 4
+    store *i8 %buf, *%sp
+    %slp = field @JsonValue, *%v, 5
+    store i32 %len, *%slp
+    ret *i8 %v
+  @free_v:
+    call @std_json_free(%v)
+    ret *i8 null
+  @fail:
+    ret *i8 null
+}
+
+fun @std_json_new_array() -> *i8 {
+  @entry:
+    %v = call @_json_new_node(@JsonType.Array)
+    ret *i8 %v
+}
+
+fun @std_json_new_object() -> *i8 {
+  @entry:
+    %v = call @_json_new_node(@JsonType.Object)
+    ret *i8 %v
+}
+
+fun @std_json_add(v: *i8, child: *i8) -> i32 {
+  @entry:
+    %vn = eq *i8 %v, null
+    %cn = eq *i8 %child, null
+    %bad = or i1 %vn, %cn
+    br %bad, @fail, @type
+  @type:
+    %tp = field @JsonValue, *%v, 0
+    %t = load i32, *%tp
+    %isa = eq i32 %t, @JsonType.Array
+    %iso = eq i32 %t, @JsonType.Object
+    %ok = or i1 %isa, %iso
+    br %ok, @find, @fail
+  @find:
+    %fp = field @JsonValue, *%v, 6
+    %first = load *i8, *%fp
+    %fnul = eq *i8 %first, null
+    br %fnul, @set_first, @walk
+  @set_first:
+    store *i8 %child, *%fp
+    ret i32 0
+  @walk:
+    %cur = let *i8
+    store *i8 %first, *%cur
+    jmp @walk_cond
+  @walk_cond:
+    %cv = load *i8, *%cur
+    %np = field @JsonValue, *%cv, 7
+    %next = load *i8, *%np
+    %nn = eq *i8 %next, null
+    br %nn, @append, @adv
+  @adv:
+    store *i8 %next, *%cur
+    jmp @walk_cond
+  @append:
+    %np2 = field @JsonValue, *%cv, 7
+    store *i8 %child, *%np2
+    ret i32 0
+  @fail:
+    ret i32 -1
+}
+
+fun @std_json_set(v: *i8, key: *i8, key_len: i32, child: *i8) -> i32 {
+  @entry:
+    %vn = eq *i8 %v, null
+    %kn = eq *i8 %key, null
+    %cn = eq *i8 %child, null
+    %kneg = slt i32 %key_len, 0
+    %b1 = or i1 %vn, %kn
+    %b2 = or i1 %cn, %kneg
+    %bad = or i1 %b1, %b2
+    br %bad, @fail, @type
+  @type:
+    %tp = field @JsonValue, *%v, 0
+    %t = load i32, *%tp
+    %iso = eq i32 %t, @JsonType.Object
+    br %iso, @alloc, @fail
+  @alloc:
+    %n1 = add i32 %key_len, 1
+    %n64 = sext i32 %n1 to i64
+    %kbuf = call @malloc(%n64)
+    %bnul = eq *i8 %kbuf, null
+    br %bnul, @fail, @copy
+  @copy:
+    %l64 = sext i32 %key_len to i64
+    call @memcpy(%kbuf, %key, %l64)
+    %zp = gep i8, *%kbuf, %key_len
+    store i8 0, *%zp
+    %kp = field @JsonValue, *%child, 8
+    store *i8 %kbuf, *%kp
+    %klp = field @JsonValue, *%child, 9
+    store i32 %key_len, *%klp
+    %r = call @std_json_add(%v, %child)
+    ret i32 %r
+  @fail:
+    ret i32 -1
+}
+
+// ===== accessors =====
+
+// The language has no int/float conversion instructions, so conversions go
+// through the C library.
+fun @_json_f2i(f: f64) -> i64 {
+  @entry:
+    %buf = let [i8, 64]
+    %bp = gep i8, *%buf, 0
+    call @snprintf(%bp, 64, "%.0f", %f)
+    %r = call @strtoll(%bp, null, 10)
+    ret i64 %r
+}
+
+fun @_json_i2f(i: i64) -> f64 {
+  @entry:
+    %buf = let [i8, 64]
+    %bp = gep i8, *%buf, 0
+    call @snprintf(%bp, 64, "%lld", %i)
+    %r = call @strtod(%bp, null)
+    ret f64 %r
+}
+
+fun @std_json_type(v: *i8) -> i32 {
+  @entry:
+    %nul = eq *i8 %v, null
+    br %nul, @none, @load
+  @none:
+    ret i32 -1
+  @load:
+    %tp = field @JsonValue, *%v, 0
+    %t = load i32, *%tp
+    ret i32 %t
+}
+
+fun @std_json_count(v: *i8) -> i32 {
+  @entry:
+    %nul = eq *i8 %v, null
+    br %nul, @zero, @walk_init
+  @zero:
+    ret i32 0
+  @walk_init:
+    %fp = field @JsonValue, *%v, 6
+    %cur = let *i8
+    %first = load *i8, *%fp
+    store *i8 %first, *%cur
+    %cnt = let i32
+    store i32 0, *%cnt
+    jmp @cond
+  @cond:
+    %cv = load *i8, *%cur
+    %cn = eq *i8 %cv, null
+    br %cn, @done, @body
+  @body:
+    %cv2 = load i32, *%cnt
+    %cn2 = add i32 %cv2, 1
+    store i32 %cn2, *%cnt
+    %np = field @JsonValue, *%cv, 7
+    %next = load *i8, *%np
+    store *i8 %next, *%cur
+    jmp @cond
+  @done:
+    %r = load i32, *%cnt
+    ret i32 %r
+}
+
+fun @std_json_at(v: *i8, idx: i32) -> *i8 {
+  @entry:
+    %nul = eq *i8 %v, null
+    %neg = slt i32 %idx, 0
+    %bad = or i1 %nul, %neg
+    br %bad, @none, @init
+  @none:
+    ret *i8 null
+  @init:
+    %fp = field @JsonValue, *%v, 6
+    %cur = let *i8
+    %first = load *i8, *%fp
+    store *i8 %first, *%cur
+    %i = let i32
+    store i32 0, *%i
+    jmp @cond
+  @cond:
+    %cv = load *i8, *%cur
+    %cn = eq *i8 %cv, null
+    br %cn, @none, @chk
+  @chk:
+    %iv = load i32, *%i
+    %hit = eq i32 %iv, %idx
+    br %hit, @found, @adv
+  @adv:
+    %iv2 = load i32, *%i
+    %in = add i32 %iv2, 1
+    store i32 %in, *%i
+    %cv2 = load *i8, *%cur
+    %np = field @JsonValue, *%cv2, 7
+    %next = load *i8, *%np
+    store *i8 %next, *%cur
+    jmp @cond
+  @found:
+    ret *i8 %cv
+}
+
+fun @std_json_get(v: *i8, key: *i8) -> *i8 {
+  @entry:
+    %vn = eq *i8 %v, null
+    %kn = eq *i8 %key, null
+    %bad = or i1 %vn, %kn
+    br %bad, @none, @type
+  @none:
+    ret *i8 null
+  @type:
+    %tp = field @JsonValue, *%v, 0
+    %t = load i32, *%tp
+    %isobj = eq i32 %t, @JsonType.Object
+    br %isobj, @init, @none
+  @init:
+    %kl64 = call @strlen(%key)
+    %klen = trunc i64 %kl64 to i32
+    %fp = field @JsonValue, *%v, 6
+    %cur = let *i8
+    %first = load *i8, *%fp
+    store *i8 %first, *%cur
+    jmp @cond
+  @cond:
+    %cv = load *i8, *%cur
+    %cn = eq *i8 %cv, null
+    br %cn, @none, @chk
+  @chk:
+    %cv2 = load *i8, *%cur
+    %klp = field @JsonValue, *%cv2, 9
+    %cl = load i32, *%klp
+    %lenok = eq i32 %cl, %klen
+    br %lenok, @cmp, @adv
+  @cmp:
+    %cv3 = load *i8, *%cur
+    %kp = field @JsonValue, *%cv3, 8
+    %ks = load *i8, *%kp
+    %n64 = sext i32 %klen to i64
+    %r = call @memcmp(%ks, %key, %n64)
+    %same = eq i32 %r, 0
+    br %same, @found, @adv
+  @adv:
+    %cv4 = load *i8, *%cur
+    %np = field @JsonValue, *%cv4, 7
+    %next = load *i8, *%np
+    store *i8 %next, *%cur
+    jmp @cond
+  @found:
+    %cv5 = load *i8, *%cur
+    ret *i8 %cv5
+}
+
+fun @std_json_bool(v: *i8) -> i32 {
+  @entry:
+    %nul = eq *i8 %v, null
+    br %nul, @zero, @type
+  @zero:
+    ret i32 0
+  @type:
+    %tp = field @JsonValue, *%v, 0
+    %t = load i32, *%tp
+    %isb = eq i32 %t, @JsonType.Bool
+    br %isb, @load, @zero
+  @load:
+    %bp = field @JsonValue, *%v, 1
+    %b = load i32, *%bp
+    ret i32 %b
+}
+
+fun @std_json_int(v: *i8) -> i64 {
+  @entry:
+    %nul = eq *i8 %v, null
+    br %nul, @zero, @type
+  @zero:
+    ret i64 0
+  @type:
+    %tp = field @JsonValue, *%v, 0
+    %t = load i32, *%tp
+    %isi = eq i32 %t, @JsonType.Int
+    br %isi, @load_i, @chk_f
+  @load_i:
+    %ip = field @JsonValue, *%v, 2
+    %iv = load i64, *%ip
+    ret i64 %iv
+  @chk_f:
+    %isf = eq i32 %t, @JsonType.Float
+    br %isf, @conv, @zero
+  @conv:
+    %fp = field @JsonValue, *%v, 3
+    %fv = load f64, *%fp
+    %c = call @_json_f2i(%fv)
+    ret i64 %c
+}
+
+fun @std_json_float(v: *i8) -> f64 {
+  @entry:
+    %nul = eq *i8 %v, null
+    br %nul, @zero, @type
+  @zero:
+    ret f64 0.0
+  @type:
+    %tp = field @JsonValue, *%v, 0
+    %t = load i32, *%tp
+    %isf = eq i32 %t, @JsonType.Float
+    br %isf, @load_f, @chk_i
+  @load_f:
+    %fp = field @JsonValue, *%v, 3
+    %fv = load f64, *%fp
+    ret f64 %fv
+  @chk_i:
+    %isi = eq i32 %t, @JsonType.Int
+    br %isi, @conv, @zero
+  @conv:
+    %ip = field @JsonValue, *%v, 2
+    %iv = load i64, *%ip
+    %c = call @_json_i2f(%iv)
+    ret f64 %c
+}
+
+fun @std_json_str(v: *i8, out_len: *i32) -> *i8 {
+  @entry:
+    %nul = eq *i8 %v, null
+    br %nul, @zero, @type
+  @zero:
+    store i32 0, *%out_len
+    ret *i8 null
+  @type:
+    %tp = field @JsonValue, *%v, 0
+    %t = load i32, *%tp
+    %iss = eq i32 %t, @JsonType.String
+    br %iss, @load, @zero
+  @load:
+    %slp = field @JsonValue, *%v, 5
+    %sl = load i32, *%slp
+    store i32 %sl, *%out_len
+    %sp = field @JsonValue, *%v, 4
+    %s = load *i8, *%sp
+    ret *i8 %s
+}
+
+// ===== parser helpers =====
+
+fun @_json_set_err(p: *i8) -> void {
+  @entry:
+    %ep = field @JsonParser, *%p, 3
+    %e = load i32, *%ep
+    %has = ne i32 %e, 0
+    br %has, @done, @set
+  @set:
+    store i32 1, *%ep
+    %posp = field @JsonParser, *%p, 2
+    %pos = load i32, *%posp
+    %errp = field @JsonParser, *%p, 4
+    store i32 %pos, *%errp
+    jmp @done
+  @done:
+    ret void
+}
+
+fun @_json_ws(p: *i8) -> void {
+  @entry:
+    %textp = field @JsonParser, *%p, 0
+    %text = load *i8, *%textp
+    %lenp = field @JsonParser, *%p, 1
+    %len = load i32, *%lenp
+    %posp = field @JsonParser, *%p, 2
+    jmp @cond
+  @cond:
+    %pos = load i32, *%posp
+    %inb = slt i32 %pos, %len
+    br %inb, @one, @done
+  @one:
+    %cp = gep i8, *%text, %pos
+    %c = load i8, *%cp
+    %is_sp = eq i8 %c, 32
+    %is_tab = eq i8 %c, 9
+    %is_nl = eq i8 %c, 10
+    %is_cr = eq i8 %c, 13
+    %a1 = or i1 %is_sp, %is_tab
+    %a2 = or i1 %is_nl, %is_cr
+    %is_ws = or i1 %a1, %a2
+    br %is_ws, @adv, @done
+  @adv:
+    %n = add i32 %pos, 1
+    store i32 %n, *%posp
+    jmp @cond
+  @done:
+    ret void
+}
+
+// Current byte as i32, or -1 at end of input.
+fun @_json_cur(p: *i8) -> i32 {
+  @entry:
+    %textp = field @JsonParser, *%p, 0
+    %text = load *i8, *%textp
+    %lenp = field @JsonParser, *%p, 1
+    %len = load i32, *%lenp
+    %posp = field @JsonParser, *%p, 2
+    %pos = load i32, *%posp
+    %inb = slt i32 %pos, %len
+    br %inb, @load, @none
+  @none:
+    ret i32 -1
+  @load:
+    %cp = gep i8, *%text, %pos
+    %c = load i8, *%cp
+    %ci = zext i8 %c to i32
+    ret i32 %ci
+}
+
+fun @_json_match(p: *i8, lit: *i8, len: i32) -> i32 {
+  @entry:
+    %textp = field @JsonParser, *%p, 0
+    %text = load *i8, *%textp
+    %lenp = field @JsonParser, *%p, 1
+    %total = load i32, *%lenp
+    %posp = field @JsonParser, *%p, 2
+    %pos = load i32, *%posp
+    %end = add i32 %pos, %len
+    %fits = sle i32 %end, %total
+    br %fits, @cmp, @fail
+  @cmp:
+    %src = gep i8, *%text, %pos
+    %n64 = sext i32 %len to i64
+    %r = call @memcmp(%src, %lit, %n64)
+    %same = eq i32 %r, 0
+    br %same, @ok, @fail
+  @ok:
+    store i32 %end, *%posp
+    ret i32 0
+  @fail:
+    call @_json_set_err(%p)
+    ret i32 -1
+}
+
+fun @_json_hexval(c: i8) -> i32 {
+  @entry:
+    %ci = zext i8 %c to i32
+    %ge0 = sge i32 %ci, 48
+    %le9 = sle i32 %ci, 57
+    %isd = and i1 %ge0, %le9
+    br %isd, @digit, @lower
+  @digit:
+    %dv = sub i32 %ci, 48
+    ret i32 %dv
+  @lower:
+    %gea = sge i32 %ci, 97
+    %lez = sle i32 %ci, 102
+    %isl = and i1 %gea, %lez
+    br %isl, @low, @upper
+  @low:
+    %lv = sub i32 %ci, 87
+    ret i32 %lv
+  @upper:
+    %geA = sge i32 %ci, 65
+    %leZ = sle i32 %ci, 70
+    %isU = and i1 %geA, %leZ
+    br %isU, @up, @bad
+  @up:
+    %uv = sub i32 %ci, 55
+    ret i32 %uv
+  @bad:
+    ret i32 -1
+}
+
+// Read exactly four hex digits at the parser position.
+fun @_json_read_u4(p: *i8) -> i32 {
+  @entry:
+    %textp = field @JsonParser, *%p, 0
+    %text = load *i8, *%textp
+    %lenp = field @JsonParser, *%p, 1
+    %len = load i32, *%lenp
+    %posp = field @JsonParser, *%p, 2
+    %pos = load i32, *%posp
+    %end = add i32 %pos, 4
+    %fits = sle i32 %end, %len
+    br %fits, @init, @fail
+  @init:
+    %cp = let i32
+    %k = let i32
+    store i32 0, *%cp
+    store i32 0, *%k
+    jmp @cond
+  @cond:
+    %kv = load i32, *%k
+    %more = slt i32 %kv, 4
+    br %more, @body, @done
+  @body:
+    %idx = add i32 %pos, %kv
+    %bp = gep i8, *%text, %idx
+    %c = load i8, *%bp
+    %v = call @_json_hexval(%c)
+    %ok = sge i32 %v, 0
+    br %ok, @acc, @fail
+  @acc:
+    %cpv = load i32, *%cp
+    %sh = shl i32 %cpv, 4
+    %add = or i32 %sh, %v
+    store i32 %add, *%cp
+    %k2 = load i32, *%k
+    %kn = add i32 %k2, 1
+    store i32 %kn, *%k
+    jmp @cond
+  @done:
+    store i32 %end, *%posp
+    %r = load i32, *%cp
+    ret i32 %r
+  @fail:
+    call @_json_set_err(%p)
+    ret i32 -1
+}
+
+// Encode one code point as UTF-8 into buf at *op.
+fun @_json_put_utf8(buf: *i8, op: *i32, cp: i32) -> i32 {
+  @entry:
+    %o = load i32, *%op
+    %lt7 = slt i32 %cp, 128
+    br %lt7, @one, @chk2
+  @one:
+    %p1 = gep i8, *%buf, %o
+    %b1 = trunc i32 %cp to i8
+    store i8 %b1, *%p1
+    %n1 = add i32 %o, 1
+    store i32 %n1, *%op
+    ret i32 0
+  @chk2:
+    %lt11 = slt i32 %cp, 2048
+    br %lt11, @two, @chk3
+  @two:
+    %sh6 = lshr i32 %cp, 6
+    %b0i = or i32 192, %sh6
+    %b0 = trunc i32 %b0i to i8
+    %p0 = gep i8, *%buf, %o
+    store i8 %b0, *%p0
+    %m6 = and i32 %cp, 63
+    %b1i = or i32 128, %m6
+    %b1b = trunc i32 %b1i to i8
+    %o1 = add i32 %o, 1
+    %p1b = gep i8, *%buf, %o1
+    store i8 %b1b, *%p1b
+    %n2 = add i32 %o, 2
+    store i32 %n2, *%op
+    ret i32 0
+  @chk3:
+    %lt16 = slt i32 %cp, 65536
+    br %lt16, @three, @four
+  @three:
+    %sh12 = lshr i32 %cp, 12
+    %b0i3 = or i32 224, %sh12
+    %b03 = trunc i32 %b0i3 to i8
+    %p03 = gep i8, *%buf, %o
+    store i8 %b03, *%p03
+    %sh6b = lshr i32 %cp, 6
+    %m6b = and i32 %sh6b, 63
+    %b1i3 = or i32 128, %m6b
+    %b13 = trunc i32 %b1i3 to i8
+    %o13 = add i32 %o, 1
+    %p13 = gep i8, *%buf, %o13
+    store i8 %b13, *%p13
+    %m6c = and i32 %cp, 63
+    %b2i = or i32 128, %m6c
+    %b23 = trunc i32 %b2i to i8
+    %o23 = add i32 %o, 2
+    %p23 = gep i8, *%buf, %o23
+    store i8 %b23, *%p23
+    %n3 = add i32 %o, 3
+    store i32 %n3, *%op
+    ret i32 0
+  @four:
+    %sh18 = lshr i32 %cp, 18
+    %b0i4 = or i32 240, %sh18
+    %b04 = trunc i32 %b0i4 to i8
+    %p04 = gep i8, *%buf, %o
+    store i8 %b04, *%p04
+    %sh12b = lshr i32 %cp, 12
+    %m12 = and i32 %sh12b, 63
+    %b1i4 = or i32 128, %m12
+    %b14 = trunc i32 %b1i4 to i8
+    %o14 = add i32 %o, 1
+    %p14 = gep i8, *%buf, %o14
+    store i8 %b14, *%p14
+    %sh6c = lshr i32 %cp, 6
+    %m6d = and i32 %sh6c, 63
+    %b2i4 = or i32 128, %m6d
+    %b24 = trunc i32 %b2i4 to i8
+    %o24 = add i32 %o, 2
+    %p24 = gep i8, *%buf, %o24
+    store i8 %b24, *%p24
+    %m6e = and i32 %cp, 63
+    %b3i = or i32 128, %m6e
+    %b34 = trunc i32 %b3i to i8
+    %o34 = add i32 %o, 3
+    %p34 = gep i8, *%buf, %o34
+    store i8 %b34, *%p34
+    %n4 = add i32 %o, 4
+    store i32 %n4, *%op
+    ret i32 0
+}
+
+// ===== parser: strings =====
+
+fun @_json_parse_string_into(p: *i8, v: *i8) -> i32 {
+  @entry:
+    %textp = field @JsonParser, *%p, 0
+    %text = load *i8, *%textp
+    %lenp = field @JsonParser, *%p, 1
+    %len = load i32, *%lenp
+    %posp = field @JsonParser, *%p, 2
+    %pos = load i32, *%posp
+    %cp = gep i8, *%text, %pos
+    %c = load i8, *%cp
+    %isq = eq i8 %c, 34
+    br %isq, @open, @fail
+  @open:
+    %p1 = add i32 %pos, 1
+    store i32 %p1, *%posp
+    %cap = sub i32 %len, %p1
+    %cap1 = add i32 %cap, 1
+    %cap64 = sext i32 %cap1 to i64
+    %buf = call @malloc(%cap64)
+    %bnul = eq *i8 %buf, null
+    br %bnul, @fail, @init
+  @init:
+    %o = let i32
+    %outb = let i8
+    store i32 0, *%o
+    jmp @loop
+  @loop:
+    %pv = load i32, *%posp
+    %inb = slt i32 %pv, %len
+    br %inb, @one, @unterm
+  @one:
+    %ccp = gep i8, *%text, %pv
+    %cc = load i8, *%ccp
+    %isquote = eq i8 %cc, 34
+    br %isquote, @close, @chk_bs
+  @chk_bs:
+    %isbs = eq i8 %cc, 92
+    br %isbs, @escape, @plain
+  @plain:
+    %ov = load i32, *%o
+    %op = gep i8, *%buf, %ov
+    store i8 %cc, *%op
+    %o1 = add i32 %ov, 1
+    store i32 %o1, *%o
+    %pn = add i32 %pv, 1
+    store i32 %pn, *%posp
+    jmp @loop
+  @escape:
+    %ep = add i32 %pv, 1
+    store i32 %ep, *%posp
+    %ein = slt i32 %ep, %len
+    br %ein, @esc_read, @esc_bad
+  @esc_read:
+    %ecp = gep i8, *%text, %ep
+    %ec = load i8, *%ecp
+    %eq_q = eq i8 %ec, 34
+    %eq_bs = eq i8 %ec, 92
+    %eq_sl = eq i8 %ec, 47
+    %eq_b = eq i8 %ec, 98
+    %eq_f = eq i8 %ec, 102
+    %eq_n = eq i8 %ec, 110
+    %eq_r = eq i8 %ec, 114
+    %eq_t = eq i8 %ec, 116
+    %eq_u = eq i8 %ec, 117
+    br %eq_q, @esc_q, @esc_c2
+  @esc_q:
+    store i8 34, *%outb
+    jmp @esc_out
+  @esc_c2:
+    br %eq_bs, @esc_bs, @esc_c3
+  @esc_bs:
+    store i8 92, *%outb
+    jmp @esc_out
+  @esc_c3:
+    br %eq_sl, @esc_sl, @esc_c4
+  @esc_sl:
+    store i8 47, *%outb
+    jmp @esc_out
+  @esc_c4:
+    br %eq_b, @esc_b, @esc_c5
+  @esc_b:
+    store i8 8, *%outb
+    jmp @esc_out
+  @esc_c5:
+    br %eq_f, @esc_f, @esc_c6
+  @esc_f:
+    store i8 12, *%outb
+    jmp @esc_out
+  @esc_c6:
+    br %eq_n, @esc_n, @esc_c7
+  @esc_n:
+    store i8 10, *%outb
+    jmp @esc_out
+  @esc_c7:
+    br %eq_r, @esc_r, @esc_c8
+  @esc_r:
+    store i8 13, *%outb
+    jmp @esc_out
+  @esc_c8:
+    br %eq_t, @esc_t, @esc_c9
+  @esc_t:
+    store i8 9, *%outb
+    jmp @esc_out
+  @esc_c9:
+    br %eq_u, @esc_u, @esc_bad
+  @esc_out:
+    %ov2 = load i32, *%o
+    %op2 = gep i8, *%buf, %ov2
+    %ob = load i8, *%outb
+    store i8 %ob, *%op2
+    %o2 = add i32 %ov2, 1
+    store i32 %o2, *%o
+    %epn = add i32 %ep, 1
+    store i32 %epn, *%posp
+    jmp @loop
+  @esc_u:
+    %u1 = add i32 %ep, 1
+    store i32 %u1, *%posp
+    %hi = call @_json_read_u4(%p)
+    %hiok = sge i32 %hi, 0
+    br %hiok, @sur_chk, @esc_bad
+  @sur_chk:
+    %hi_low = sge i32 %hi, 55296
+    %hi_high = sle i32 %hi, 56319
+    %is_high = and i1 %hi_low, %hi_high
+    br %is_high, @pair_try, @single
+  @pair_try:
+    %pp = load i32, *%posp
+    %pend = add i32 %pp, 2
+    %pfits = sle i32 %pend, %len
+    br %pfits, @pair_c1, @single
+  @pair_c1:
+    %c1p = gep i8, *%text, %pp
+    %c1 = load i8, *%c1p
+    %c2i = add i32 %pp, 1
+    %c2p = gep i8, *%text, %c2i
+    %c2 = load i8, *%c2p
+    %ok1 = eq i8 %c1, 92
+    %ok2 = eq i8 %c2, 117
+    %okp = and i1 %ok1, %ok2
+    br %okp, @pair_read, @single
+  @pair_read:
+    %np = add i32 %pp, 2
+    store i32 %np, *%posp
+    %lo = call @_json_read_u4(%p)
+    %lok = sge i32 %lo, 0
+    br %lok, @pair_range, @esc_bad
+  @pair_range:
+    %lo_low = sge i32 %lo, 56320
+    %lo_high = sle i32 %lo, 57343
+    %lo_ok = and i1 %lo_low, %lo_high
+    br %lo_ok, @pair_comb, @pair_bad_lo
+  @pair_comb:
+    %hsub = sub i32 %hi, 55296
+    %hsh = shl i32 %hsub, 10
+    %lsub = sub i32 %lo, 56320
+    %base = add i32 65536, %hsh
+    %cpv = add i32 %base, %lsub
+    %r1 = call @_json_put_utf8(%buf, %o, %cpv)
+    jmp @loop
+  @pair_bad_lo:
+    %r2 = call @_json_put_utf8(%buf, %o, 65533)
+    jmp @loop
+  @single:
+    %sl_low = sge i32 %hi, 56320
+    %sl_high = sle i32 %hi, 57343
+    %is_low = and i1 %sl_low, %sl_high
+    br %is_low, @single_repl, @single_ok
+  @single_repl:
+    %r3 = call @_json_put_utf8(%buf, %o, 65533)
+    jmp @loop
+  @single_ok:
+    %r4 = call @_json_put_utf8(%buf, %o, %hi)
+    jmp @loop
+  @close:
+    %fo = load i32, *%o
+    %zp = gep i8, *%buf, %fo
+    store i8 0, *%zp
+    %tp = field @JsonValue, *%v, 0
+    store i32 4, *%tp
+    %sp = field @JsonValue, *%v, 4
+    store *i8 %buf, *%sp
+    %slp = field @JsonValue, *%v, 5
+    store i32 %fo, *%slp
+    %np2 = add i32 %pv, 1
+    store i32 %np2, *%posp
+    ret i32 0
+  @unterm:
+    call @free(%buf)
+    call @_json_set_err(%p)
+    ret i32 -1
+  @esc_bad:
+    call @free(%buf)
+    call @_json_set_err(%p)
+    ret i32 -1
+  @fail:
+    call @_json_set_err(%p)
+    ret i32 -1
+}
+
+fun @_json_parse_string_value(p: *i8) -> *i8 {
+  @entry:
+    %v = call @_json_new_node(@JsonType.String)
+    %nul = eq *i8 %v, null
+    br %nul, @fail, @into
+  @into:
+    %r = call @_json_parse_string_into(%p, %v)
+    %ok = eq i32 %r, 0
+    br %ok, @done, @freev
+  @freev:
+    call @std_json_free(%v)
+    ret *i8 null
+  @done:
+    ret *i8 %v
+  @fail:
+    ret *i8 null
+}
+
+// ===== parser: numbers =====
+
+fun @_json_has_float(s: *i8, len: i32) -> i32 {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @cond
+  @cond:
+    %iv = load i32, *%i
+    %more = slt i32 %iv, %len
+    br %more, @body, @none
+  @body:
+    %p = gep i8, *%s, %iv
+    %c = load i8, *%p
+    %isdot = eq i8 %c, 46
+    %ise = eq i8 %c, 101
+    %isE = eq i8 %c, 69
+    %a = or i1 %isdot, %ise
+    %b = or i1 %a, %isE
+    br %b, @yes, @next
+  @next:
+    %n = add i32 %iv, 1
+    store i32 %n, *%i
+    jmp @cond
+  @yes:
+    ret i32 1
+  @none:
+    ret i32 0
+}
+
+fun @_json_parse_number(p: *i8) -> *i8 {
+  @entry:
+    %textp = field @JsonParser, *%p, 0
+    %text = load *i8, *%textp
+    %lenp = field @JsonParser, *%p, 1
+    %len = load i32, *%lenp
+    %posp = field @JsonParser, *%p, 2
+    %start = load i32, *%posp
+    %i = let i32
+    store i32 %start, *%i
+    // optional minus
+    %c0p = gep i8, *%text, %start
+    %c0 = load i8, *%c0p
+    %isneg = eq i8 %c0, 45
+    br %isneg, @sign, @int0
+  @sign:
+    %s1 = add i32 %start, 1
+    store i32 %s1, *%i
+    jmp @int0
+  @int0:
+    %iv = load i32, *%i
+    %inb = slt i32 %iv, %len
+    br %inb, @intc, @bad
+  @intc:
+    %ip = gep i8, *%text, %iv
+    %ic = load i8, *%ip
+    %is0 = eq i8 %ic, 48
+    br %is0, @zero, @nz
+  @zero:
+    %zn = add i32 %iv, 1
+    store i32 %zn, *%i
+    %zv = load i32, *%i
+    %zin = slt i32 %zv, %len
+    br %zin, @zero_chk, @frac
+  @zero_chk:
+    %zp = gep i8, *%text, %zv
+    %zc = load i8, *%zp
+    %zg = sge i8 %zc, 48
+    %zl = sle i8 %zc, 57
+    %zisd = and i1 %zg, %zl
+    br %zisd, @bad, @frac
+  @nz:
+    %n1ok = sge i8 %ic, 49
+    %n2ok = sle i8 %ic, 57
+    %nzok = and i1 %n1ok, %n2ok
+    br %nzok, @digits, @bad
+  @digits:
+    %dv = load i32, *%i
+    %dn = add i32 %dv, 1
+    store i32 %dn, *%i
+    %jv = load i32, *%i
+    %jin = slt i32 %jv, %len
+    br %jin, @dig_chk, @frac
+  @dig_chk:
+    %jp = gep i8, *%text, %jv
+    %jc = load i8, *%jp
+    %jg = sge i8 %jc, 48
+    %jl = sle i8 %jc, 57
+    %jok = and i1 %jg, %jl
+    br %jok, @digits, @frac
+  @frac:
+    %fv = load i32, *%i
+    %fin = slt i32 %fv, %len
+    br %fin, @frac_chk, @done_scan
+  @frac_chk:
+    %fp = gep i8, *%text, %fv
+    %fc = load i8, *%fp
+    %isdot = eq i8 %fc, 46
+    br %isdot, @frac_first0, @exp_chk
+  @frac_first0:
+    %fd = add i32 %fv, 1
+    store i32 %fd, *%i
+    %f0v = load i32, *%i
+    %f0in = slt i32 %f0v, %len
+    br %f0in, @frac_first, @bad
+  @frac_first:
+    %f0p = gep i8, *%text, %f0v
+    %f0c = load i8, *%f0p
+    %f0g = sge i8 %f0c, 48
+    %f0l = sle i8 %f0c, 57
+    %f0ok = and i1 %f0g, %f0l
+    br %f0ok, @frac_loop, @bad
+  @frac_loop:
+    %flv = load i32, *%i
+    %fln = add i32 %flv, 1
+    store i32 %fln, *%i
+    %flv2 = load i32, *%i
+    %flin = slt i32 %flv2, %len
+    br %flin, @frac_chk2, @done_scan
+  @frac_chk2:
+    %fcp = gep i8, *%text, %flv2
+    %fcc = load i8, *%fcp
+    %fcg = sge i8 %fcc, 48
+    %fcl = sle i8 %fcc, 57
+    %fcok = and i1 %fcg, %fcl
+    br %fcok, @frac_loop, @exp_chk
+  @exp_chk:
+    %ev = load i32, *%i
+    %ein = slt i32 %ev, %len
+    br %ein, @exp_c, @done_scan
+  @exp_c:
+    %ep = gep i8, *%text, %ev
+    %ec = load i8, *%ep
+    %ise = eq i8 %ec, 101
+    %isE = eq i8 %ec, 69
+    %iseither = or i1 %ise, %isE
+    br %iseither, @exp_sign, @done_scan
+  @exp_sign:
+    %es = add i32 %ev, 1
+    store i32 %es, *%i
+    %esv = load i32, *%i
+    %esin = slt i32 %esv, %len
+    br %esin, @exp_sc, @bad
+  @exp_sc:
+    %esp = gep i8, *%text, %esv
+    %esc = load i8, *%esp
+    %isplus = eq i8 %esc, 43
+    %isminus = eq i8 %esc, 45
+    %issgn = or i1 %isplus, %isminus
+    br %issgn, @exp_skip, @exp_d0
+  @exp_skip:
+    %sk = add i32 %esv, 1
+    store i32 %sk, *%i
+    jmp @exp_d0
+  @exp_d0:
+    %edv = load i32, *%i
+    %edin = slt i32 %edv, %len
+    br %edin, @exp_dchk, @bad
+  @exp_dchk:
+    %edp = gep i8, *%text, %edv
+    %edc = load i8, *%edp
+    %edg = sge i8 %edc, 48
+    %edl = sle i8 %edc, 57
+    %edok = and i1 %edg, %edl
+    br %edok, @exp_dloop, @bad
+  @exp_dloop:
+    %elv = load i32, *%i
+    %eln = add i32 %elv, 1
+    store i32 %eln, *%i
+    %elv2 = load i32, *%i
+    %elin = slt i32 %elv2, %len
+    br %elin, @exp_dchk2, @done_scan
+  @exp_dchk2:
+    %e2p = gep i8, *%text, %elv2
+    %e2c = load i8, *%e2p
+    %e2g = sge i8 %e2c, 48
+    %e2l = sle i8 %e2c, 57
+    %e2ok = and i1 %e2g, %e2l
+    br %e2ok, @exp_dloop, @done_scan
+  @done_scan:
+    %end = load i32, *%i
+    store i32 %end, *%posp
+    %nlen = sub i32 %end, %start
+    %toolong = sgt i32 %nlen, 63
+    br %toolong, @bad, @copy
+  @copy:
+    %tmp = let [i8, 64]
+    %tp = gep i8, *%tmp, 0
+    %src = gep i8, *%text, %start
+    %n64 = sext i32 %nlen to i64
+    call @memcpy(%tp, %src, %n64)
+    %zpos = gep i8, *%tp, %nlen
+    store i8 0, *%zpos
+    %isf = call @_json_has_float(%tp, %nlen)
+    %isfloat = ne i32 %isf, 0
+    br %isfloat, @mk_float, @mk_int
+  @mk_int:
+    %iv64 = call @strtoll(%tp, null, 10)
+    %node = call @_json_new_node(@JsonType.Int)
+    %nn = eq *i8 %node, null
+    br %nn, @bad_node, @int_ok
+  @int_ok:
+    %vp = field @JsonValue, *%node, 2
+    store i64 %iv64, *%vp
+    ret *i8 %node
+  @mk_float:
+    %fv64 = call @strtod(%tp, null)
+    %fnode = call @_json_new_node(@JsonType.Float)
+    %fnn = eq *i8 %fnode, null
+    br %fnn, @bad_node, @float_ok
+  @float_ok:
+    %fpv = field @JsonValue, *%fnode, 3
+    store f64 %fv64, *%fpv
+    ret *i8 %fnode
+  @bad_node:
+    call @_json_set_err(%p)
+    ret *i8 null
+  @bad:
+    call @_json_set_err(%p)
+    ret *i8 null
+}
+
+// ===== parser: values, arrays, objects =====
+
+fun @_json_parse_value(p: *i8, depth: i32) -> *i8 {
+  @entry:
+    %deep = sgt i32 %depth, 128
+    br %deep, @fail, @ws
+  @ws:
+    call @_json_ws(%p)
+    %c = call @_json_cur(%p)
+    %isquote = eq i32 %c, 34
+    br %isquote, @str, @chk_obj
+  @chk_obj:
+    %isobj = eq i32 %c, 123
+    br %isobj, @obj, @chk_arr
+  @chk_arr:
+    %isarr = eq i32 %c, 91
+    br %isarr, @arr, @chk_lit
+  @chk_lit:
+    %ist = eq i32 %c, 116
+    br %ist, @true, @chk_lit2
+  @chk_lit2:
+    %isf = eq i32 %c, 102
+    br %isf, @false, @chk_lit3
+  @chk_lit3:
+    %isn = eq i32 %c, 110
+    br %isn, @nullv, @chk_num
+  @chk_num:
+    %isdash = eq i32 %c, 45
+    %d1 = sge i32 %c, 48
+    %d2 = sle i32 %c, 57
+    %isdig = and i1 %d1, %d2
+    %isnum = or i1 %isdash, %isdig
+    br %isnum, @num, @fail
+  @str:
+    %sv = call @_json_parse_string_value(%p)
+    ret *i8 %sv
+  @obj:
+    %ov = call @_json_parse_object(%p, %depth)
+    ret *i8 %ov
+  @arr:
+    %av = call @_json_parse_array(%p, %depth)
+    ret *i8 %av
+  @num:
+    %nv = call @_json_parse_number(%p)
+    ret *i8 %nv
+  @true:
+    %r1 = call @_json_match(%p, "true", 4)
+    %ok1 = eq i32 %r1, 0
+    br %ok1, @true_node, @fail
+  @true_node:
+    %tv = call @std_json_new_bool(1)
+    ret *i8 %tv
+  @false:
+    %r2 = call @_json_match(%p, "false", 5)
+    %ok2 = eq i32 %r2, 0
+    br %ok2, @false_node, @fail
+  @false_node:
+    %fv = call @std_json_new_bool(0)
+    ret *i8 %fv
+  @nullv:
+    %r3 = call @_json_match(%p, "null", 4)
+    %ok3 = eq i32 %r3, 0
+    br %ok3, @null_node, @fail
+  @null_node:
+    %nv2 = call @std_json_new_null()
+    ret *i8 %nv2
+  @fail:
+    call @_json_set_err(%p)
+    ret *i8 null
+}
+
+fun @_json_parse_array(p: *i8, depth: i32) -> *i8 {
+  @entry:
+    %node = call @_json_new_node(@JsonType.Array)
+    %nn = eq *i8 %node, null
+    br %nn, @fail, @open
+  @open:
+    %posp = field @JsonParser, *%p, 2
+    %pos = load i32, *%posp
+    %p1 = add i32 %pos, 1
+    store i32 %p1, *%posp
+    %tail = let *i8
+    store *i8 null, *%tail
+    call @_json_ws(%p)
+    %c = call @_json_cur(%p)
+    %isclose = eq i32 %c, 93
+    br %isclose, @empty, @elem
+  @empty:
+    %posp2 = field @JsonParser, *%p, 2
+    %pos2 = load i32, *%posp2
+    %p2 = add i32 %pos2, 1
+    store i32 %p2, *%posp2
+    ret *i8 %node
+  @elem:
+    %d1 = add i32 %depth, 1
+    %child = call @_json_parse_value(%p, %d1)
+    %cn = eq *i8 %child, null
+    br %cn, @fail_node, @append
+  @append:
+    %fp = field @JsonValue, *%node, 6
+    %first = load *i8, *%fp
+    %fnul = eq *i8 %first, null
+    br %fnul, @set_first, @set_tail
+  @set_first:
+    store *i8 %child, *%fp
+    store *i8 %child, *%tail
+    jmp @after
+  @set_tail:
+    %tv = load *i8, *%tail
+    %tnp = field @JsonValue, *%tv, 7
+    store *i8 %child, *%tnp
+    store *i8 %child, *%tail
+    jmp @after
+  @after:
+    call @_json_ws(%p)
+    %c2 = call @_json_cur(%p)
+    %iscomma = eq i32 %c2, 44
+    br %iscomma, @comma, @chk_close
+  @comma:
+    %posp3 = field @JsonParser, *%p, 2
+    %pos3 = load i32, *%posp3
+    %p3 = add i32 %pos3, 1
+    store i32 %p3, *%posp3
+    call @_json_ws(%p)
+    jmp @elem
+  @chk_close:
+    %isrb = eq i32 %c2, 93
+    br %isrb, @close, @fail_node
+  @close:
+    %posp4 = field @JsonParser, *%p, 2
+    %pos4 = load i32, *%posp4
+    %p4 = add i32 %pos4, 1
+    store i32 %p4, *%posp4
+    ret *i8 %node
+  @fail_node:
+    call @std_json_free(%node)
+    ret *i8 null
+  @fail:
+    ret *i8 null
+}
+
+fun @_json_parse_object(p: *i8, depth: i32) -> *i8 {
+  @entry:
+    %node = call @_json_new_node(@JsonType.Object)
+    %nn = eq *i8 %node, null
+    br %nn, @fail, @open
+  @open:
+    %posp = field @JsonParser, *%p, 2
+    %pos = load i32, *%posp
+    %p1 = add i32 %pos, 1
+    store i32 %p1, *%posp
+    %tail = let *i8
+    store *i8 null, *%tail
+    call @_json_ws(%p)
+    %c = call @_json_cur(%p)
+    %isclose = eq i32 %c, 125
+    br %isclose, @empty, @elem
+  @empty:
+    %posp2 = field @JsonParser, *%p, 2
+    %pos2 = load i32, *%posp2
+    %p2 = add i32 %pos2, 1
+    store i32 %p2, *%posp2
+    ret *i8 %node
+  @elem:
+    %kv = let @JsonValue
+    %kr = call @_json_parse_string_into(%p, %kv)
+    %kok = eq i32 %kr, 0
+    br %kok, @colon, @fail_node
+  @colon:
+    call @_json_ws(%p)
+    %c2 = call @_json_cur(%p)
+    %iscolon = eq i32 %c2, 58
+    br %iscolon, @colon_adv, @fail_key
+  @colon_adv:
+    %posp3 = field @JsonParser, *%p, 2
+    %pos3 = load i32, *%posp3
+    %p3 = add i32 %pos3, 1
+    store i32 %p3, *%posp3
+    %d1 = add i32 %depth, 1
+    %child = call @_json_parse_value(%p, %d1)
+    %cn = eq *i8 %child, null
+    br %cn, @fail_key, @attach
+  @attach:
+    %ksp = field @JsonValue, *%kv, 4
+    %ks = load *i8, *%ksp
+    %klp = field @JsonValue, *%kv, 5
+    %kl = load i32, *%klp
+    %ckp = field @JsonValue, *%child, 8
+    store *i8 %ks, *%ckp
+    %cklp = field @JsonValue, *%child, 9
+    store i32 %kl, *%cklp
+    %fp = field @JsonValue, *%node, 6
+    %first = load *i8, *%fp
+    %fnul = eq *i8 %first, null
+    br %fnul, @set_first, @set_tail
+  @set_first:
+    store *i8 %child, *%fp
+    store *i8 %child, *%tail
+    jmp @after
+  @set_tail:
+    %tv = load *i8, *%tail
+    %tnp = field @JsonValue, *%tv, 7
+    store *i8 %child, *%tnp
+    store *i8 %child, *%tail
+    jmp @after
+  @after:
+    call @_json_ws(%p)
+    %c3 = call @_json_cur(%p)
+    %iscomma = eq i32 %c3, 44
+    br %iscomma, @comma, @chk_close
+  @comma:
+    %posp4 = field @JsonParser, *%p, 2
+    %pos4 = load i32, *%posp4
+    %p4 = add i32 %pos4, 1
+    store i32 %p4, *%posp4
+    call @_json_ws(%p)
+    jmp @elem
+  @chk_close:
+    %isrb = eq i32 %c3, 125
+    br %isrb, @close, @fail_node
+  @close:
+    %posp5 = field @JsonParser, *%p, 2
+    %pos5 = load i32, *%posp5
+    %p5 = add i32 %pos5, 1
+    store i32 %p5, *%posp5
+    ret *i8 %node
+  @fail_key:
+    %ksp2 = field @JsonValue, *%kv, 4
+    %ks2 = load *i8, *%ksp2
+    %kn = eq *i8 %ks2, null
+    br %kn, @fail_node, @free_key
+  @free_key:
+    call @free(%ks2)
+    jmp @fail_node
+  @fail_node:
+    call @std_json_free(%node)
+    ret *i8 null
+  @fail:
+    ret *i8 null
+}
+
+fun @std_json_parse_ex(text: *i8, len: i32, err_pos: *i32) -> *i8 {
+  @entry:
+    %nul = eq *i8 %text, null
+    %neg = slt i32 %len, 0
+    %bad = or i1 %nul, %neg
+    br %bad, @fail0, @init
+  @fail0:
+    store i32 0, *%err_pos
+    ret *i8 null
+  @init:
+    %p = let @JsonParser
+    %tp = field @JsonParser, *%p, 0
+    store *i8 %text, *%tp
+    %lp = field @JsonParser, *%p, 1
+    store i32 %len, *%lp
+    %pp = field @JsonParser, *%p, 2
+    store i32 0, *%pp
+    %ep = field @JsonParser, *%p, 3
+    store i32 0, *%ep
+    %erp = field @JsonParser, *%p, 4
+    store i32 0, *%erp
+    %v = call @_json_parse_value(%p, 0)
+    %vn = eq *i8 %v, null
+    br %vn, @fail, @trail
+  @trail:
+    call @_json_ws(%p)
+    %pp2 = field @JsonParser, *%p, 2
+    %pos = load i32, *%pp2
+    %atend = eq i32 %pos, %len
+    br %atend, @ok, @garbage
+  @garbage:
+    call @_json_set_err(%p)
+    call @std_json_free(%v)
+    jmp @fail
+  @ok:
+    store i32 0, *%err_pos
+    ret *i8 %v
+  @fail:
+    %erp2 = field @JsonParser, *%p, 4
+    %e = load i32, *%erp2
+    store i32 %e, *%err_pos
+    ret *i8 null
+}
+
+fun @std_json_parse(text: *i8, len: i32) -> *i8 {
+  @entry:
+    %err = let i32
+    %ep = gep i32, *%err, 0
+    %v = call @std_json_parse_ex(%text, %len, %ep)
+    ret *i8 %v
+}
+
+// ===== serializer =====
+
+fun @_json_putc(c: i8, out: *i8, cap: i32, offp: *i32) -> i32 {
+  @entry:
+    %o = load i32, *%offp
+    %room = slt i32 %o, %cap
+    br %room, @ok, @fail
+  @ok:
+    %p = gep i8, *%out, %o
+    store i8 %c, *%p
+    %n = add i32 %o, 1
+    store i32 %n, *%offp
+    ret i32 0
+  @fail:
+    ret i32 -1
+}
+
+fun @_json_raw(src: *i8, len: i32, out: *i8, cap: i32, offp: *i32) -> i32 {
+  @entry:
+    %o = load i32, *%offp
+    %end = add i32 %o, %len
+    %fits = sle i32 %end, %cap
+    br %fits, @ok, @fail
+  @ok:
+    %d = gep i8, *%out, %o
+    %n64 = sext i32 %len to i64
+    call @memcpy(%d, %src, %n64)
+    store i32 %end, *%offp
+    ret i32 0
+  @fail:
+    ret i32 -1
+}
+
+fun @_json_hexch(n: i32) -> i8 {
+  @entry:
+    %lt = slt i32 %n, 10
+    br %lt, @dig, @alpha
+  @dig:
+    %d = add i32 %n, 48
+    %c = trunc i32 %d to i8
+    ret i8 %c
+  @alpha:
+    %a = add i32 %n, 87
+    %c2 = trunc i32 %a to i8
+    ret i8 %c2
+}
+
+fun @_json_wr_string(s: *i8, len: i32, out: *i8, cap: i32, offp: *i32) -> i32 {
+  @entry:
+    %r0 = call @_json_putc(34, %out, %cap, %offp)
+    %ok0 = eq i32 %r0, 0
+    br %ok0, @init, @fail
+  @init:
+    %i = let i32
+    store i32 0, *%i
+    jmp @cond
+  @cond:
+    %iv = load i32, *%i
+    %more = slt i32 %iv, %len
+    br %more, @one, @endq
+  @one:
+    %p = gep i8, *%s, %iv
+    %c = load i8, *%p
+    %isq = eq i8 %c, 34
+    br %isq, @esc_q, @chk_bs
+  @chk_bs:
+    %isbs = eq i8 %c, 92
+    br %isbs, @esc_bs, @chk_nl
+  @esc_q:
+    %a1 = call @_json_putc(92, %out, %cap, %offp)
+    %a2 = call @_json_putc(34, %out, %cap, %offp)
+    %aok = add i32 %a1, %a2
+    %az = eq i32 %aok, 0
+    br %az, @next, @fail
+  @esc_bs:
+    %b1 = call @_json_putc(92, %out, %cap, %offp)
+    %b2 = call @_json_putc(92, %out, %cap, %offp)
+    %bok = add i32 %b1, %b2
+    %bz = eq i32 %bok, 0
+    br %bz, @next, @fail
+  @chk_nl:
+    %isnl = eq i8 %c, 10
+    br %isnl, @esc_n, @chk_cr
+  @esc_n:
+    %n1 = call @_json_putc(92, %out, %cap, %offp)
+    %n2 = call @_json_putc(110, %out, %cap, %offp)
+    %nok = add i32 %n1, %n2
+    %nz = eq i32 %nok, 0
+    br %nz, @next, @fail
+  @chk_cr:
+    %iscr = eq i8 %c, 13
+    br %iscr, @esc_r, @chk_tab
+  @esc_r:
+    %r1 = call @_json_putc(92, %out, %cap, %offp)
+    %r2 = call @_json_putc(114, %out, %cap, %offp)
+    %rok = add i32 %r1, %r2
+    %rz = eq i32 %rok, 0
+    br %rz, @next, @fail
+  @chk_tab:
+    %ist = eq i8 %c, 9
+    br %ist, @esc_t, @chk_ctl
+  @esc_t:
+    %t1 = call @_json_putc(92, %out, %cap, %offp)
+    %t2 = call @_json_putc(116, %out, %cap, %offp)
+    %tok = add i32 %t1, %t2
+    %tz = eq i32 %tok, 0
+    br %tz, @next, @fail
+  @chk_ctl:
+    %ci = zext i8 %c to i32
+    %isctl = slt i32 %ci, 32
+    br %isctl, @esc_ctl, @plain
+  @esc_ctl:
+    %q1 = call @_json_putc(92, %out, %cap, %offp)
+    %q2 = call @_json_putc(117, %out, %cap, %offp)
+    %q3 = call @_json_putc(48, %out, %cap, %offp)
+    %q4 = call @_json_putc(48, %out, %cap, %offp)
+    %hi = lshr i32 %ci, 4
+    %hich = call @_json_hexch(%hi)
+    %q5 = call @_json_putc(%hich, %out, %cap, %offp)
+    %lo = and i32 %ci, 15
+    %loch = call @_json_hexch(%lo)
+    %q6 = call @_json_putc(%loch, %out, %cap, %offp)
+    %s1 = add i32 %q1, %q2
+    %s2 = add i32 %q3, %q4
+    %s3 = add i32 %q5, %q6
+    %ssum = add i32 %s1, %s2
+    %stot = add i32 %ssum, %s3
+    %sz = eq i32 %stot, 0
+    br %sz, @next, @fail
+  @plain:
+    %pr = call @_json_putc(%c, %out, %cap, %offp)
+    %pok = eq i32 %pr, 0
+    br %pok, @next, @fail
+  @next:
+    %iv2 = load i32, *%i
+    %in = add i32 %iv2, 1
+    store i32 %in, *%i
+    jmp @cond
+  @endq:
+    %rq = call @_json_putc(34, %out, %cap, %offp)
+    ret i32 %rq
+  @fail:
+    ret i32 -1
+}
+
+fun @_json_wr_number(v: *i8, out: *i8, cap: i32, offp: *i32) -> i32 {
+  @entry:
+    %tp = field @JsonValue, *%v, 0
+    %t = load i32, *%tp
+    %buf = let [i8, 64]
+    %bp = gep i8, *%buf, 0
+    %isint = eq i32 %t, @JsonType.Int
+    br %isint, @int, @float
+  @int:
+    %ip = field @JsonValue, *%v, 2
+    %iv = load i64, *%ip
+    %n = call @snprintf(%bp, 64, "%lld", %iv)
+    %r = call @_json_raw(%bp, %n, %out, %cap, %offp)
+    ret i32 %r
+  @float:
+    %fp = field @JsonValue, *%v, 3
+    %fv = load f64, *%fp
+    %n2 = call @snprintf(%bp, 64, "%.17g", %fv)
+    %c0p = gep i8, *%bp, 0
+    %c0 = load i8, *%c0p
+    %isn = eq i8 %c0, 110
+    %isi = eq i8 %c0, 105
+    %isneg = eq i8 %c0, 45
+    br %isn, @nullv, @chk_i
+  @chk_i:
+    br %isi, @nullv, @chk_neg
+  @chk_neg:
+    br %isneg, @negchk, @copy_f
+  @negchk:
+    %c1p = gep i8, *%bp, 1
+    %c1 = load i8, *%c1p
+    %ni = eq i8 %c1, 105
+    br %ni, @nullv, @copy_f
+  @nullv:
+    %rn = call @_json_raw("null", 4, %out, %cap, %offp)
+    ret i32 %rn
+  @copy_f:
+    %rf = call @_json_raw(%bp, %n2, %out, %cap, %offp)
+    ret i32 %rf
+}
+
+fun @_json_wr_value(v: *i8, out: *i8, cap: i32, offp: *i32) -> i32 {
+  @entry:
+    %nul = eq *i8 %v, null
+    br %nul, @nullv, @typed
+  @nullv:
+    %r = call @_json_raw("null", 4, %out, %cap, %offp)
+    ret i32 %r
+  @typed:
+    %tp = field @JsonValue, *%v, 0
+    %t = load i32, *%tp
+    %t0 = eq i32 %t, @JsonType.Null
+    br %t0, @nullv, @t1
+  @t1:
+    %isb = eq i32 %t, @JsonType.Bool
+    br %isb, @bool, @t2
+  @bool:
+    %bp = field @JsonValue, *%v, 1
+    %bv = load i32, *%bp
+    %nz = ne i32 %bv, 0
+    br %nz, @true, @false
+  @true:
+    %rt = call @_json_raw("true", 4, %out, %cap, %offp)
+    ret i32 %rt
+  @false:
+    %rf = call @_json_raw("false", 5, %out, %cap, %offp)
+    ret i32 %rf
+  @t2:
+    %isnum = eq i32 %t, @JsonType.Int
+    %isnum2 = eq i32 %t, @JsonType.Float
+    %anynum = or i1 %isnum, %isnum2
+    br %anynum, @num, @t4
+  @num:
+    %rn = call @_json_wr_number(%v, %out, %cap, %offp)
+    ret i32 %rn
+  @t4:
+    %iss = eq i32 %t, @JsonType.String
+    br %iss, @str, @t5
+  @str:
+    %sp = field @JsonValue, *%v, 4
+    %s = load *i8, *%sp
+    %slp = field @JsonValue, *%v, 5
+    %sl = load i32, *%slp
+    %rs = call @_json_wr_string(%s, %sl, %out, %cap, %offp)
+    ret i32 %rs
+  @t5:
+    %isa = eq i32 %t, @JsonType.Array
+    br %isa, @arr, @t6
+  @t6:
+    %iso = eq i32 %t, @JsonType.Object
+    br %iso, @obj, @nullv
+  @arr:
+    %ra = call @_json_wr_array(%v, %out, %cap, %offp)
+    ret i32 %ra
+  @obj:
+    %ro = call @_json_wr_object(%v, %out, %cap, %offp)
+    ret i32 %ro
+}
+
+fun @_json_wr_array(v: *i8, out: *i8, cap: i32, offp: *i32) -> i32 {
+  @entry:
+    %r0 = call @_json_putc(91, %out, %cap, %offp)
+    %ok0 = eq i32 %r0, 0
+    br %ok0, @init, @fail
+  @init:
+    %fp = field @JsonValue, *%v, 6
+    %cur = let *i8
+    %first = load *i8, *%fp
+    store *i8 %first, *%cur
+    %firstflag = let i32
+    store i32 1, *%firstflag
+    jmp @cond
+  @cond:
+    %cv = load *i8, *%cur
+    %cn = eq *i8 %cv, null
+    br %cn, @close, @body
+  @body:
+    %ff = load i32, *%firstflag
+    %isfirst = eq i32 %ff, 1
+    br %isfirst, @no_comma, @comma
+  @comma:
+    %rc = call @_json_putc(44, %out, %cap, %offp)
+    %cok = eq i32 %rc, 0
+    br %cok, @no_comma, @fail
+  @no_comma:
+    store i32 0, *%firstflag
+    %cv2 = load *i8, *%cur
+    %rv = call @_json_wr_value(%cv2, %out, %cap, %offp)
+    %vok = eq i32 %rv, 0
+    br %vok, @adv, @fail
+  @adv:
+    %cv3 = load *i8, *%cur
+    %np = field @JsonValue, *%cv3, 7
+    %next = load *i8, *%np
+    store *i8 %next, *%cur
+    jmp @cond
+  @close:
+    %r1 = call @_json_putc(93, %out, %cap, %offp)
+    ret i32 %r1
+  @fail:
+    ret i32 -1
+}
+
+fun @_json_wr_object(v: *i8, out: *i8, cap: i32, offp: *i32) -> i32 {
+  @entry:
+    %r0 = call @_json_putc(123, %out, %cap, %offp)
+    %ok0 = eq i32 %r0, 0
+    br %ok0, @init, @fail
+  @init:
+    %fp = field @JsonValue, *%v, 6
+    %cur = let *i8
+    %first = load *i8, *%fp
+    store *i8 %first, *%cur
+    %firstflag = let i32
+    store i32 1, *%firstflag
+    jmp @cond
+  @cond:
+    %cv = load *i8, *%cur
+    %cn = eq *i8 %cv, null
+    br %cn, @close, @body
+  @body:
+    %ff = load i32, *%firstflag
+    %isfirst = eq i32 %ff, 1
+    br %isfirst, @no_comma, @comma
+  @comma:
+    %rc = call @_json_putc(44, %out, %cap, %offp)
+    %cok = eq i32 %rc, 0
+    br %cok, @no_comma, @fail
+  @no_comma:
+    store i32 0, *%firstflag
+    %cv2 = load *i8, *%cur
+    %kp = field @JsonValue, *%cv2, 8
+    %k = load *i8, *%kp
+    %klp = field @JsonValue, *%cv2, 9
+    %kl = load i32, *%klp
+    %rk = call @_json_wr_string(%k, %kl, %out, %cap, %offp)
+    %kok = eq i32 %rk, 0
+    br %kok, @colon, @fail
+  @colon:
+    %rcolon = call @_json_putc(58, %out, %cap, %offp)
+    %colok = eq i32 %rcolon, 0
+    br %colok, @val, @fail
+  @val:
+    %cv3 = load *i8, *%cur
+    %rv = call @_json_wr_value(%cv3, %out, %cap, %offp)
+    %vok = eq i32 %rv, 0
+    br %vok, @adv, @fail
+  @adv:
+    %cv4 = load *i8, *%cur
+    %np = field @JsonValue, *%cv4, 7
+    %next = load *i8, *%np
+    store *i8 %next, *%cur
+    jmp @cond
+  @close:
+    %r1 = call @_json_putc(125, %out, %cap, %offp)
+    ret i32 %r1
+  @fail:
+    ret i32 -1
+}
+
+fun @std_json_write(v: *i8, out: *i8, cap: i32) -> i32 {
+  @entry:
+    %onul = eq *i8 %out, null
+    %capneg = slt i32 %cap, 0
+    %bad = or i1 %onul, %capneg
+    br %bad, @fail, @init
+  @init:
+    %off = let i32
+    %offp = gep i32, *%off, 0
+    store i32 0, *%offp
+    %r = call @_json_wr_value(%v, %out, %cap, %offp)
+    %ok = eq i32 %r, 0
+    br %ok, @term, @fail
+  @term:
+    %o = load i32, *%offp
+    %room = slt i32 %o, %cap
+    br %room, @term_do, @done
+  @term_do:
+    %zp = gep i8, *%out, %o
+    store i8 0, *%zp
+    jmp @done
+  @done:
+    ret i32 %o
+  @fail:
+    ret i32 -1
+}

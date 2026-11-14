@@ -1,0 +1,712 @@
+// TLS Record Layer — RFC 5246 §6.2
+// Handles plaintext and AEAD-encrypted records for TLS 1.2 and 1.3.
+
+extern @net_socket_send(fd: i32, buf: *i8, len: i32) -> i32
+extern @net_socket_recv(fd: i32, buf: *i8, len: i32) -> i32
+extern @std_crypto_aes_gcm_encrypt(pt: *i8, pt_len: i32, aad: *i8, aad_len: i32, key: *i8, iv: *i8, ct: *i8, tag: *i8) -> i32
+extern @std_crypto_aes_gcm_decrypt(ct: *i8, ct_len: i32, aad: *i8, aad_len: i32, key: *i8, iv: *i8, pt: *i8, tag: *i8) -> i32
+extern @std_crypto_aes256_gcm_encrypt(pt: *i8, pt_len: i32, aad: *i8, aad_len: i32, key: *i8, iv: *i8, ct: *i8, tag: *i8) -> i32
+extern @std_crypto_aes256_gcm_decrypt(ct: *i8, ct_len: i32, aad: *i8, aad_len: i32, key: *i8, iv: *i8, pt: *i8, tag: *i8) -> i32
+extern @memcpy(dst: *i8, src: *i8, n: i64) -> *i8
+
+// Record content types (RFC 5246 §6.2.1).
+enum @TlsContentType: i8 {
+  @ChangeCipherSpec = 20,
+  @Alert = 21,
+  @Handshake = 22,
+  @Application = 23
+}
+
+const @TLS_VER_12: i16 = 771   // 0x0303
+const @TLS_HDR_SZ: i32 = 5
+
+// Read exactly n bytes from fd into buf. Returns bytes read or -1 on error.
+fun @tls_recv_all(fd: i32, buf: *i8, n: i32) -> i32 {
+  @entry:
+    %off = let i32
+    %rem = let i32
+    store i32 0, *%off
+    store i32 %n, *%rem
+    jmp @ra_loop
+  @ra_loop:
+    %rv = load i32, *%rem
+    %more = sgt i32 %rv, 0
+    br %more, @ra_read, @ra_done
+  @ra_read:
+    %r_off = load i32, *%off
+    %r_rem = load i32, *%rem
+    %dst = gep i8, *%buf, %r_off
+    %got = call @net_socket_recv(%fd, %dst, %r_rem)
+    %err = slt i32 %got, 1
+    br %err, @ra_error, @ra_ok
+  @ra_ok:
+    %new_off = add i32 %r_off, %got
+    %new_rem = sub i32 %r_rem, %got
+    store i32 %new_off, *%off
+    store i32 %new_rem, *%rem
+    jmp @ra_loop
+  @ra_done:
+    ret i32 %n
+  @ra_error:
+    ret i32 -1
+}
+
+// Write exactly n bytes from buf to fd. Returns n or -1 on error.
+fun @tls_send_all(fd: i32, buf: *i8, n: i32) -> i32 {
+  @entry:
+    %off = let i32
+    %rem = let i32
+    store i32 0, *%off
+    store i32 %n, *%rem
+    jmp @sa_loop
+  @sa_loop:
+    %rv = load i32, *%rem
+    %more = sgt i32 %rv, 0
+    br %more, @sa_send, @sa_done
+  @sa_send:
+    %s_off = load i32, *%off
+    %s_rem = load i32, *%rem
+    %src = gep i8, *%buf, %s_off
+    %sent = call @net_socket_send(%fd, %src, %s_rem)
+    %err = slt i32 %sent, 1
+    br %err, @sa_error, @sa_ok
+  @sa_ok:
+    %new_off2 = add i32 %s_off, %sent
+    %new_rem2 = sub i32 %s_rem, %sent
+    store i32 %new_off2, *%off
+    store i32 %new_rem2, *%rem
+    jmp @sa_loop
+  @sa_done:
+    ret i32 %n
+  @sa_error:
+    ret i32 -1
+}
+
+// Read a TLS record header (5 bytes) from fd.
+fun @tls_read_header(fd: i32, out_typ: *i8, out_len: *i32) -> i32 {
+  @entry:
+    %hdr = let [i8, 5]
+    %hp = gep i8, *%hdr, 0
+    %got = call @tls_recv_all(%fd, %hp, 5)
+    %err = slt i32 %got, 0
+    br %err, @fail, @parse
+  @parse:
+    %ct = load i8, *%hp
+    store i8 %ct, *%out_typ
+    %len_hi_p = gep i8, *%hp, 3
+    %len_lo_p = gep i8, *%hp, 4
+    %l_hi = load i8, *%len_hi_p
+    %l_lo = load i8, *%len_lo_p
+    %l_hi_i = zext i8 %l_hi to i32
+    %l_lo_i = zext i8 %l_lo to i32
+    %payload_len = shl i32 %l_hi_i, 8
+    %payload_len2 = or i32 %payload_len, %l_lo_i
+    store i32 %payload_len2, *%out_len
+    ret i32 0
+  @fail:
+    ret i32 -1
+}
+
+// Write a TLS record header + payload to fd.
+fun @tls_write_record(fd: i32, typ: i8, ver: i16, data: *i8, len: i32) -> i32 {
+  @entry:
+    %buf = let [i8, 5]
+    %bp = gep i8, *%buf, 0
+    store i8 %typ, *%bp
+    %ver_hi = ashr i16 %ver, 8
+    %ver_hi_i = trunc i16 %ver_hi to i8
+    %ver_lo_i = trunc i16 %ver to i8
+    %v1 = gep i8, *%bp, 1
+    store i8 %ver_hi_i, *%v1
+    %v2 = gep i8, *%bp, 2
+    store i8 %ver_lo_i, *%v2
+    %len_hi = lshr i32 %len, 8
+    %len_hi_i = trunc i32 %len_hi to i8
+    %len_lo_i = trunc i32 %len to i8
+    %l1 = gep i8, *%bp, 3
+    store i8 %len_hi_i, *%l1
+    %l2 = gep i8, *%bp, 4
+    store i8 %len_lo_i, *%l2
+    %r1 = call @tls_send_all(%fd, %bp, 5)
+    %r1err = slt i32 %r1, 0
+    br %r1err, @fail, @send_body
+  @send_body:
+    %r2 = call @tls_send_all(%fd, %data, %len)
+    %r2err = slt i32 %r2, 0
+    br %r2err, @fail, @ok
+  @ok:
+    ret i32 0
+  @fail:
+    ret i32 -1
+}
+
+// Read a TLS plaintext record.
+fun @tls_read_plain(fd: i32, buf: *i8, buf_cap: i32, out_typ: *i8, out_len: *i32) -> i32 {
+  @entry:
+    %ct = let i8
+    %ctp = gep i8, *%ct, 0
+    %plen = let i32
+    %plenp = gep i32, *%plen, 0
+    %r = call @tls_read_header(%fd, %ctp, %plenp)
+    %r_err = slt i32 %r, 0
+    br %r_err, @fail, @read_body
+  @read_body:
+    %pv = load i32, *%plenp
+    %too_big = sgt i32 %pv, %buf_cap
+    br %too_big, @fail, @read_it
+  @read_it:
+    %body_len = load i32, *%plenp
+    %got = call @tls_recv_all(%fd, %buf, %body_len)
+    %got_err = slt i32 %got, 0
+    br %got_err, @fail, @done
+  @done:
+    %ct_v = load i8, *%ctp
+    store i8 %ct_v, *%out_typ
+    %pl_v = load i32, *%plenp
+    store i32 %pl_v, *%out_len
+    ret i32 0
+  @fail:
+    ret i32 -1
+}
+
+// Build 12-byte GCM nonce for TLS 1.2:
+// nonce = write_iv (4 bytes) || seq_num (8 bytes, network order)
+fun @tls12_build_nonce(nonce: *i8, write_iv: *i8, seq_num: i64) -> void {
+  @entry:
+    %n64_4 = let i64
+    store i64 4, *%n64_4
+    %n64_4v = load i64, *%n64_4
+    call @memcpy(%nonce, %write_iv, %n64_4v)
+    %s7 = trunc i64 %seq_num to i8
+    %s6 = lshr i64 %seq_num, 8
+    %s6b = trunc i64 %s6 to i8
+    %s5 = lshr i64 %seq_num, 16
+    %s5b = trunc i64 %s5 to i8
+    %s4 = lshr i64 %seq_num, 24
+    %s4b = trunc i64 %s4 to i8
+    %s3 = lshr i64 %seq_num, 32
+    %s3b = trunc i64 %s3 to i8
+    %s2 = lshr i64 %seq_num, 40
+    %s2b = trunc i64 %s2 to i8
+    %s1 = lshr i64 %seq_num, 48
+    %s1b = trunc i64 %s1 to i8
+    %s0 = lshr i64 %seq_num, 56
+    %s0b = trunc i64 %s0 to i8
+    %p0 = gep i8, *%nonce, 4
+    store i8 %s0b, *%p0
+    %p1 = gep i8, *%nonce, 5
+    store i8 %s1b, *%p1
+    %p2 = gep i8, *%nonce, 6
+    store i8 %s2b, *%p2
+    %p3 = gep i8, *%nonce, 7
+    store i8 %s3b, *%p3
+    %p4 = gep i8, *%nonce, 8
+    store i8 %s4b, *%p4
+    %p5 = gep i8, *%nonce, 9
+    store i8 %s5b, *%p5
+    %p6 = gep i8, *%nonce, 10
+    store i8 %s6b, *%p6
+    %p7 = gep i8, *%nonce, 11
+    store i8 %s7, *%p7
+    ret void
+}
+
+// Build AAD for TLS 1.2 AEAD:
+// seq_num (8 bytes BE) || content_type (1 byte) || version (2 bytes) || plaintext_len (2 bytes BE)
+fun @tls12_build_aad(aad: *i8, seq_num: i64, typ: i8, ver: i16, pt_len: i32) -> void {
+  @entry:
+    %s7 = trunc i64 %seq_num to i8
+    %s6 = lshr i64 %seq_num, 8
+    %s6b = trunc i64 %s6 to i8
+    %s5 = lshr i64 %seq_num, 16
+    %s5b = trunc i64 %s5 to i8
+    %s4 = lshr i64 %seq_num, 24
+    %s4b = trunc i64 %s4 to i8
+    %s3 = lshr i64 %seq_num, 32
+    %s3b = trunc i64 %s3 to i8
+    %s2 = lshr i64 %seq_num, 40
+    %s2b = trunc i64 %s2 to i8
+    %s1 = lshr i64 %seq_num, 48
+    %s1b = trunc i64 %s1 to i8
+    %s0 = lshr i64 %seq_num, 56
+    %s0b = trunc i64 %s0 to i8
+    %p0 = gep i8, *%aad, 0
+    store i8 %s0b, *%p0
+    %p1 = gep i8, *%aad, 1
+    store i8 %s1b, *%p1
+    %p2 = gep i8, *%aad, 2
+    store i8 %s2b, *%p2
+    %p3 = gep i8, *%aad, 3
+    store i8 %s3b, *%p3
+    %p4 = gep i8, *%aad, 4
+    store i8 %s4b, *%p4
+    %p5 = gep i8, *%aad, 5
+    store i8 %s5b, *%p5
+    %p6 = gep i8, *%aad, 6
+    store i8 %s6b, *%p6
+    %p7 = gep i8, *%aad, 7
+    store i8 %s7, *%p7
+    %p8 = gep i8, *%aad, 8
+    store i8 %typ, *%p8
+    %ver_h = ashr i16 %ver, 8
+    %ver_hi = trunc i16 %ver_h to i8
+    %ver_lo = trunc i16 %ver to i8
+    %p9 = gep i8, *%aad, 9
+    store i8 %ver_hi, *%p9
+    %p10 = gep i8, *%aad, 10
+    store i8 %ver_lo, *%p10
+    %pl_h = lshr i32 %pt_len, 8
+    %pl_hi = trunc i32 %pl_h to i8
+    %pl_lo = trunc i32 %pt_len to i8
+    %p11 = gep i8, *%aad, 11
+    store i8 %pl_hi, *%p11
+    %p12 = gep i8, *%aad, 12
+    store i8 %pl_lo, *%p12
+    ret void
+}
+
+// Encrypt and send a TLS 1.2 record using AES-128-GCM.
+// key_size: 16 for AES-128-GCM, 32 for AES-256-GCM
+// write_iv: 4 bytes, seq: *i64 (sequence number, incremented after use)
+// output record: content_type || version(0x0303) || length(2) || explicit_nonce(8) || ciphertext || tag(16)
+// AAD content_type is 23 (application data) per RFC 5288, even for handshake records
+fun @tls12_record_encrypt(fd: i32, seq: *i64, write_key: *i8, write_iv: *i8,
+                          key_size: i32, typ: i8, data: *i8, len: i32) -> i32 {
+  @entry:
+    %neg_len = slt i32 %len, 0
+    br %neg_len, @fail, @check_len
+  @check_len:
+    // rec_body holds 8-byte explicit nonce + ciphertext + 16-byte tag.
+    %too_big = sgt i32 %len, 16384
+    br %too_big, @fail, @setup
+  @setup:
+    %explicit = let [i8, 8]
+    %exp_p = gep i8, *%explicit, 0
+    %nonce = let [i8, 12]
+    %nonce_p = gep i8, *%nonce, 0
+    %seq_v = load i64, *%seq
+    call @tls12_build_nonce(%nonce_p, %write_iv, %seq_v)
+    // AAD uses same content_type as record header
+    %aad = let [i8, 13]
+    %aad_p = gep i8, *%aad, 0
+    call @tls12_build_aad(%aad_p, %seq_v, %typ, 771, %len)
+    // Encrypt
+    %ct = let [i8, 16384]
+    %ct_p = gep i8, *%ct, 0
+    %tag = let [i8, 16]
+    %tag_p = gep i8, *%tag, 0
+    %is_aes128 = eq i32 %key_size, 16
+    br %is_aes128, @enc_128, @enc_256
+  @enc_128:
+    %r128 = call @std_crypto_aes_gcm_encrypt(%data, %len, %aad_p, 13, %write_key, %nonce_p, %ct_p, %tag_p)
+    jmp @build_record
+  @enc_256:
+    %r256 = call @std_crypto_aes256_gcm_encrypt(%data, %len, %aad_p, 13, %write_key, %nonce_p, %ct_p, %tag_p)
+    jmp @build_record
+  @build_record:
+    // 8-byte nonce + 16384-byte ciphertext + 16-byte tag.
+    %rec_body = let [i8, 16408]
+    %rbp = gep i8, *%rec_body, 0
+    // Write explicit nonce (seq_num as big-endian)
+    %s0v = lshr i64 %seq_v, 56
+    %s0b2 = trunc i64 %s0v to i8
+    %ps0 = gep i8, *%exp_p, 0
+    store i8 %s0b2, *%ps0
+    %s1v = lshr i64 %seq_v, 48
+    %s1b2 = trunc i64 %s1v to i8
+    %ps1 = gep i8, *%exp_p, 1
+    store i8 %s1b2, *%ps1
+    %s2v = lshr i64 %seq_v, 40
+    %s2b2 = trunc i64 %s2v to i8
+    %ps2 = gep i8, *%exp_p, 2
+    store i8 %s2b2, *%ps2
+    %s3v = lshr i64 %seq_v, 32
+    %s3b2 = trunc i64 %s3v to i8
+    %ps3 = gep i8, *%exp_p, 3
+    store i8 %s3b2, *%ps3
+    %s4v = lshr i64 %seq_v, 24
+    %s4b2 = trunc i64 %s4v to i8
+    %ps4 = gep i8, *%exp_p, 4
+    store i8 %s4b2, *%ps4
+    %s5v = lshr i64 %seq_v, 16
+    %s5b2 = trunc i64 %s5v to i8
+    %ps5 = gep i8, *%exp_p, 5
+    store i8 %s5b2, *%ps5
+    %s6v = lshr i64 %seq_v, 8
+    %s6b2 = trunc i64 %s6v to i8
+    %ps6 = gep i8, *%exp_p, 6
+    store i8 %s6b2, *%ps6
+    %s7b = trunc i64 %seq_v to i8
+    %ps7 = gep i8, *%exp_p, 7
+    store i8 %s7b, *%ps7
+    // Copy explicit nonce
+    call @memcpy(%rbp, %exp_p, 8)
+    // Copy ciphertext
+    %n64_len = sext i32 %len to i64
+    %ct_off = gep i8, *%rbp, 8
+    call @memcpy(%ct_off, %ct_p, %n64_len)
+    // Copy tag
+    %tag_off = gep i8, *%rbp, 8
+    %tag_off2 = gep i8, *%tag_off, %len
+    %n64_16 = let i64
+    store i64 16, *%n64_16
+    %n64_16v = load i64, *%n64_16
+    call @memcpy(%tag_off2, %tag_p, %n64_16v)
+    // Record length = 8 + len + 16
+    %rec_len = add i32 %len, 24
+    // Send with same content_type
+    %send_r = call @tls_write_record(%fd, %typ, 771, %rbp, %rec_len)
+    %send_ok = eq i32 %send_r, 0
+    br %send_ok, @inc_seq, @fail
+  @inc_seq:
+    %old = load i64, *%seq
+    %new = add i64 %old, 1
+    store i64 %new, *%seq
+    ret i32 0
+  @fail:
+    ret i32 -1
+}
+
+// Read and decrypt a TLS 1.2 encrypted record.
+// Handles both application_data (23) and handshake (22) outer content types.
+// On success: out_typ = inner content type, out_len = plaintext length
+fun @tls12_record_decrypt(fd: i32, seq: *i64, write_key: *i8, write_iv: *i8,
+                          key_size: i32, buf: *i8, buf_cap: i32,
+                          out_typ: *i8, out_len: *i32) -> i32 {
+  @entry:
+    %ct_byte = let i8
+    %ctp2 = gep i8, *%ct_byte, 0
+    %plen2 = let i32
+    %plenp2 = gep i32, *%plen2, 0
+    %r = call @tls_read_header(%fd, %ctp2, %plenp2)
+    %r_err = slt i32 %r, 0
+    br %r_err, @fail2, @check_ct
+  @check_ct:
+    %ct_val = load i8, *%ctp2
+    %is_app23 = eq i8 %ct_val, @TlsContentType.Application
+    %is_hs = eq i8 %ct_val, @TlsContentType.Handshake
+    %is_enc = or i1 %is_app23, %is_hs
+    br %is_enc, @read_enc, @maybe_plain
+  @maybe_plain:
+    // CCS (20) or Alert (21) - return as-is
+    %pl_v2 = load i32, *%plenp2
+    %too_big2 = sgt i32 %pl_v2, %buf_cap
+    br %too_big2, @fail2, @read_plain_body
+  @read_plain_body:
+    %body_len2 = load i32, *%plenp2
+    call @tls_recv_all(%fd, %buf, %body_len2)
+    %ct_v2 = load i8, *%ctp2
+    store i8 %ct_v2, *%out_typ
+    store i32 %body_len2, *%out_len
+    ret i32 0
+  @read_enc:
+    %enc_len = load i32, *%plenp2
+    %too_big3 = sgt i32 %enc_len, 16640
+    br %too_big3, @fail2, @read_enc_body
+  @read_enc_body:
+    %enc = let [i8, 16640]
+    %enc_p = gep i8, *%enc, 0
+    call @tls_recv_all(%fd, %enc_p, %enc_len)
+    // Extract explicit_nonce (8 bytes)
+    %explicit_nonce = let [i8, 8]
+    %exp_p2 = gep i8, *%explicit_nonce, 0
+    call @memcpy(%exp_p2, %enc_p, 8)
+    // ciphertext starts at offset 8
+    %ct_start = gep i8, *%enc_p, 8
+    %ct_body_len = sub i32 %enc_len, 24
+    %ct_body_len_neg = slt i32 %ct_body_len, 0
+    br %ct_body_len_neg, @fail2, @check_ct_len
+  @check_ct_len:
+    // The plaintext is written straight into the caller's buffer.
+    %over_cap = sgt i32 %ct_body_len, %buf_cap
+    br %over_cap, @fail2, @ct_fits
+  @ct_fits:
+    %tag_start_off = add i32 %ct_body_len, 8
+    %tag_start = gep i8, *%enc_p, %tag_start_off
+    // Build nonce = write_iv (4) || explicit_nonce (8)
+    %nonce2 = let [i8, 12]
+    %nonce_p2 = gep i8, *%nonce2, 0
+    call @memcpy(%nonce_p2, %write_iv, 4)
+    %nonce_iv = gep i8, *%nonce_p2, 4
+    call @memcpy(%nonce_iv, %exp_p2, 8)
+    // Build AAD with current seq_num and content type from record header
+    %seq_v2 = load i64, *%seq
+    %rec_ct = load i8, *%ctp2
+    %aad2 = let [i8, 13]
+    %aad_p2 = gep i8, *%aad2, 0
+    call @tls12_build_aad(%aad_p2, %seq_v2, %rec_ct, 771, %ct_body_len)
+    // Decrypt
+    %decrypt_ok = eq i32 %key_size, 16
+    br %decrypt_ok, @dec_128, @dec_256
+  @dec_128:
+    %dr128 = call @std_crypto_aes_gcm_decrypt(%ct_start, %ct_body_len, %aad_p2, 13, %write_key, %nonce_p2, %tag_start, %buf)
+    jmp @check_result
+  @dec_256:
+    %dr256 = call @std_crypto_aes256_gcm_decrypt(%ct_start, %ct_body_len, %aad_p2, 13, %write_key, %nonce_p2, %tag_start, %buf)
+    jmp @check_result
+  @check_result:
+    %dec_r = phi [%dr128, @dec_128], [%dr256, @dec_256]
+    %dec_err = slt i32 %dec_r, 0
+    br %dec_err, @fail2, @dec_done
+  @dec_done:
+    %old2 = load i64, *%seq
+    %new2 = add i64 %old2, 1
+    store i64 %new2, *%seq
+    %ct_val3 = load i8, *%ctp2
+    store i8 %ct_val3, *%out_typ
+    store i32 %ct_body_len, *%out_len
+    ret i32 0
+  @fail2:
+    ret i32 -1
+}
+
+// TLS 1.3 functions follow (unchanged)
+fun @tls13_build_nonce(nonce: *i8, write_iv: *i8, seq_num: i64) -> void {
+  @entry:
+    %n64_12 = let i64
+    store i64 12, *%n64_12
+    %n64_12v = load i64, *%n64_12
+    call @memcpy(%nonce, %write_iv, %n64_12v)
+    // The 64-bit sequence number is XORed into the last eight bytes in
+    // network byte order (big-endian).
+    %s0v = lshr i64 %seq_num, 56
+    %s0b = trunc i64 %s0v to i8
+    %n0 = gep i8, *%nonce, 4
+    %nv0 = load i8, *%n0
+    %x0 = xor i8 %nv0, %s0b
+    store i8 %x0, *%n0
+    %s1v = lshr i64 %seq_num, 48
+    %s1b3 = trunc i64 %s1v to i8
+    %n1 = gep i8, *%nonce, 5
+    %nv1 = load i8, *%n1
+    %x1 = xor i8 %nv1, %s1b3
+    store i8 %x1, *%n1
+    %s2v2 = lshr i64 %seq_num, 40
+    %s2b3 = trunc i64 %s2v2 to i8
+    %n2 = gep i8, *%nonce, 6
+    %nv2 = load i8, *%n2
+    %x2 = xor i8 %nv2, %s2b3
+    store i8 %x2, *%n2
+    %s3v2 = lshr i64 %seq_num, 32
+    %s3b3 = trunc i64 %s3v2 to i8
+    %n3 = gep i8, *%nonce, 7
+    %nv3 = load i8, *%n3
+    %x3 = xor i8 %nv3, %s3b3
+    store i8 %x3, *%n3
+    %s4v2 = lshr i64 %seq_num, 24
+    %s4b3 = trunc i64 %s4v2 to i8
+    %n4 = gep i8, *%nonce, 8
+    %nv4 = load i8, *%n4
+    %x4 = xor i8 %nv4, %s4b3
+    store i8 %x4, *%n4
+    %s5v2 = lshr i64 %seq_num, 16
+    %s5b3 = trunc i64 %s5v2 to i8
+    %n5 = gep i8, *%nonce, 9
+    %nv5 = load i8, *%n5
+    %x5 = xor i8 %nv5, %s5b3
+    store i8 %x5, *%n5
+    %s6v2 = lshr i64 %seq_num, 8
+    %s6b3 = trunc i64 %s6v2 to i8
+    %n6 = gep i8, *%nonce, 10
+    %nv6 = load i8, *%n6
+    %x6 = xor i8 %nv6, %s6b3
+    store i8 %x6, *%n6
+    %s7b3 = trunc i64 %seq_num to i8
+    %n7 = gep i8, *%nonce, 11
+    %nv7 = load i8, *%n7
+    %x7 = xor i8 %nv7, %s7b3
+    store i8 %x7, *%n7
+    ret void
+}
+
+fun @tls13_build_aad(aad: *i8, typ: i8, ver: i16, pt_len: i32) -> void {
+  @entry:
+    store i8 %typ, *%aad
+    %v1a = ashr i16 %ver, 8
+    %v1b = trunc i16 %v1a to i8
+    %p1 = gep i8, *%aad, 1
+    store i8 %v1b, *%p1
+    %v2a = trunc i16 %ver to i8
+    %p2 = gep i8, *%aad, 2
+    store i8 %v2a, *%p2
+    %pl_h = lshr i32 %pt_len, 8
+    %pl_hi = trunc i32 %pl_h to i8
+    %pl_lo = trunc i32 %pt_len to i8
+    %p3 = gep i8, *%aad, 3
+    store i8 %pl_hi, *%p3
+    %p4 = gep i8, *%aad, 4
+    store i8 %pl_lo, *%p4
+    ret void
+}
+
+fun @tls13_record_encrypt(fd: i32, seq: *i64, write_key: *i8, write_iv: *i8,
+                          key_size: i32, typ: i8, data: *i8, len: i32) -> i32 {
+  @entry:
+    %neg_len = slt i32 %len, 0
+    br %neg_len, @fail3, @check_len
+  @check_len:
+    // plaintext = data || content_type, so len + 1 must fit in 16384.
+    %too_big = sgt i32 %len, 16383
+    br %too_big, @fail3, @setup
+  @setup:
+    %pt_len = add i32 %len, 1
+    %plaintext = let [i8, 16384]
+    %pp = gep i8, *%plaintext, 0
+    %len64 = sext i32 %len to i64
+    call @memcpy(%pp, %data, %len64)
+    %ct_byte_p = gep i8, *%pp, %len
+    store i8 %typ, *%ct_byte_p
+    %nonce = let [i8, 12]
+    %nonce_p = gep i8, *%nonce, 0
+    %seq_v = load i64, *%seq
+    call @tls13_build_nonce(%nonce_p, %write_iv, %seq_v)
+    %aad = let [i8, 5]
+    %aad_p = gep i8, *%aad, 0
+    // AAD carries the ciphertext record length (inner plaintext + tag).
+    %aad_len13 = add i32 %pt_len, 16
+    call @tls13_build_aad(%aad_p, @TlsContentType.Application, 771, %aad_len13)
+    // Ciphertext (pt_len) followed by the 16-byte tag.
+    %ct_buf = let [i8, 16400]
+    %ct_buf_p = gep i8, *%ct_buf, 0
+    %tag = let [i8, 16]
+    %tag_p = gep i8, *%tag, 0
+    %is128 = eq i32 %key_size, 16
+    br %is128, @e13_128, @e13_256
+  @e13_128:
+    call @std_crypto_aes_gcm_encrypt(%pp, %pt_len, %aad_p, 5, %write_key, %nonce_p, %ct_buf_p, %tag_p)
+    jmp @write13
+  @e13_256:
+    call @std_crypto_aes256_gcm_encrypt(%pp, %pt_len, %aad_p, 5, %write_key, %nonce_p, %ct_buf_p, %tag_p)
+    jmp @write13
+  @write13:
+    // Append the tag after the ciphertext.
+    %tag_dst = gep i8, *%ct_buf_p, %pt_len
+    call @memcpy(%tag_dst, %tag_p, 16)
+    %rec_len = add i32 %pt_len, 16
+    %send_r = call @tls_write_record(%fd, @TlsContentType.Application, 771, %ct_buf_p, %rec_len)
+    %send_ok2 = eq i32 %send_r, 0
+    br %send_ok2, @inc_seq13, @fail3
+  @inc_seq13:
+    %old = load i64, *%seq
+    %new = add i64 %old, 1
+    store i64 %new, *%seq
+    ret i32 0
+  @fail3:
+    ret i32 -1
+}
+
+fun @tls13_record_decrypt(fd: i32, seq: *i64, write_key: *i8, write_iv: *i8,
+                          key_size: i32, buf: *i8, buf_cap: i32,
+                          out_typ: *i8, out_len: *i32) -> i32 {
+  @entry:
+    %ct = let i8
+    %ctp3 = gep i8, *%ct, 0
+    %plen = let i32
+    %plenp3 = gep i32, *%plen, 0
+    %enc = let [i8, 16640]
+    %enc_p = gep i8, *%enc, 0
+    jmp @read_hdr13
+  @read_hdr13:
+    %r = call @tls_read_header(%fd, %ctp3, %plenp3)
+    %r_err = slt i32 %r, 0
+    br %r_err, @fail4, @check_ct13
+  @check_ct13:
+    %ct_val = load i8, *%ctp3
+    // Middlebox-compatibility ChangeCipherSpec records are not part of the
+    // TLS 1.3 handshake; discard them without touching the sequence number.
+    %is_ccs = eq i8 %ct_val, @TlsContentType.ChangeCipherSpec
+    br %is_ccs, @skip_ccs13, @not_ccs13
+  @skip_ccs13:
+    %clen = load i32, *%plenp3
+    %cbig = sgt i32 %clen, 16640
+    br %cbig, @fail4, @discard13
+  @discard13:
+    %cr = call @tls_recv_all(%fd, %enc_p, %clen)
+    %cr_err = slt i32 %cr, 0
+    br %cr_err, @fail4, @read_hdr13
+  @not_ccs13:
+    %is_app13 = eq i8 %ct_val, @TlsContentType.Application
+    br %is_app13, @read_enc13, @maybe_plain13
+  @maybe_plain13:
+    %pl_v = load i32, *%plenp3
+    %too_big = sgt i32 %pl_v, %buf_cap
+    br %too_big, @fail4, @read_plain13
+  @read_plain13:
+    %body_len = load i32, *%plenp3
+    call @tls_recv_all(%fd, %buf, %body_len)
+    %ct_v = load i8, *%ctp3
+    store i8 %ct_v, *%out_typ
+    store i32 %body_len, *%out_len
+    ret i32 0
+  @read_enc13:
+    %enc_len = load i32, *%plenp3
+    %too_big_enc = sgt i32 %enc_len, 16640
+    br %too_big_enc, @fail4, @read_enc_body13
+  @read_enc_body13:
+    %er = call @tls_recv_all(%fd, %enc_p, %enc_len)
+    %er_err = slt i32 %er, 0
+    br %er_err, @fail4, @check_pt13
+  @check_pt13:
+    %pt_len13 = sub i32 %enc_len, 16
+    %pt_len_neg = slt i32 %pt_len13, 0
+    br %pt_len_neg, @fail4, @check_cap13
+  @check_cap13:
+    %over_cap = sgt i32 %pt_len13, %buf_cap
+    br %over_cap, @fail4, @decrypt13
+  @decrypt13:
+    %seq_v = load i64, *%seq
+    %nonce3 = let [i8, 12]
+    %nonce_p3 = gep i8, *%nonce3, 0
+    call @tls13_build_nonce(%nonce_p3, %write_iv, %seq_v)
+    %aad3 = let [i8, 5]
+    %aad_p3 = gep i8, *%aad3, 0
+    // AAD carries the ciphertext record length (inner plaintext + tag).
+    call @tls13_build_aad(%aad_p3, @TlsContentType.Application, 771, %enc_len)
+    %tag2 = let [i8, 16]
+    %tag_p2 = gep i8, *%tag2, 0
+    %tag_src = gep i8, *%enc_p, %pt_len13
+    call @memcpy(%tag_p2, %tag_src, 16)
+    %is128 = eq i32 %key_size, 16
+    br %is128, @d13_128, @d13_256
+  @d13_128:
+    %dr = call @std_crypto_aes_gcm_decrypt(%enc_p, %pt_len13, %aad_p3, 5, %write_key, %nonce_p3, %tag_p2, %buf)
+    jmp @check_d13
+  @d13_256:
+    %dr2 = call @std_crypto_aes256_gcm_decrypt(%enc_p, %pt_len13, %aad_p3, 5, %write_key, %nonce_p3, %tag_p2, %buf)
+    jmp @check_d13
+  @check_d13:
+    %dec_r = phi [%dr, @d13_128], [%dr2, @d13_256]
+    %dec_err = slt i32 %dec_r, 0
+    br %dec_err, @fail4, @dec_done13
+  @dec_done13:
+    %old = load i64, *%seq
+    %new = add i64 %old, 1
+    store i64 %new, *%seq
+    // The plaintext ends with the inner content type followed by optional
+    // zero padding; scan back over the padding.
+    %k = let i32
+    store i32 %pt_len13, *%k
+    jmp @strip_cond13
+  @strip_cond13:
+    %kv = load i32, *%k
+    %knone = eq i32 %kv, 0
+    br %knone, @fail4, @strip_body13
+  @strip_body13:
+    %idx = sub i32 %kv, 1
+    %pp = gep i8, *%buf, %idx
+    %pv = load i8, *%pp
+    %pz = eq i8 %pv, 0
+    br %pz, @strip_next13, @got_type13
+  @strip_next13:
+    store i32 %idx, *%k
+    jmp @strip_cond13
+  @got_type13:
+    %type_idx = sub i32 %kv, 1
+    %type_p = gep i8, *%buf, %type_idx
+    %type_v = load i8, *%type_p
+    store i8 %type_v, *%out_typ
+    store i32 %type_idx, *%out_len
+    ret i32 0
+  @fail4:
+    ret i32 -1
+}

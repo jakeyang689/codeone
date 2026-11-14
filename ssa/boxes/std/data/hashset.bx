@@ -1,0 +1,52 @@
+// Hash set of byte strings, built on std/data/hashmap.bx.
+//
+// Both hashmap.bx and hashset.bx must be included in the build:
+//
+//   c1 app.bx boxes/std/data/hashmap.bx boxes/std/data/hashset.bx
+//
+// The caller provides at least 32 bytes of header storage.
+
+extern @std_data_hashmap_init(m: *i8, initial_cap: i32) -> i32
+extern @std_data_hashmap_put(m: *i8, key: *i8, key_len: i32,
+                             val: *i8, val_len: i32) -> i32
+extern @std_data_hashmap_has(m: *i8, key: *i8, key_len: i32) -> i32
+extern @std_data_hashmap_remove(m: *i8, key: *i8, key_len: i32) -> i32
+extern @std_data_hashmap_count(m: *i8) -> i32
+extern @std_data_hashmap_free(m: *i8) -> void
+
+fun @std_data_hashset_init(s: *i8, initial_cap: i32) -> i32 {
+  @entry:
+    %r = call @std_data_hashmap_init(%s, %initial_cap)
+    ret i32 %r
+}
+
+// Returns 1 when added, 0 when already present, -1 on error.
+fun @std_data_hashset_add(s: *i8, key: *i8, key_len: i32) -> i32 {
+  @entry:
+    %r = call @std_data_hashmap_put(%s, %key, %key_len, null, 0)
+    ret i32 %r
+}
+
+fun @std_data_hashset_has(s: *i8, key: *i8, key_len: i32) -> i32 {
+  @entry:
+    %r = call @std_data_hashmap_has(%s, %key, %key_len)
+    ret i32 %r
+}
+
+fun @std_data_hashset_remove(s: *i8, key: *i8, key_len: i32) -> i32 {
+  @entry:
+    %r = call @std_data_hashmap_remove(%s, %key, %key_len)
+    ret i32 %r
+}
+
+fun @std_data_hashset_count(s: *i8) -> i32 {
+  @entry:
+    %r = call @std_data_hashmap_count(%s)
+    ret i32 %r
+}
+
+fun @std_data_hashset_free(s: *i8) -> void {
+  @entry:
+    call @std_data_hashmap_free(%s)
+    ret void
+}

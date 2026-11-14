@@ -1,0 +1,261 @@
+// Growable vector of fixed-size elements.
+//
+// The caller provides at least 32 bytes of storage for the header:
+//
+//   %v = let [i8, 32]
+//   call @std_data_vector_init(%v, 4, 8)   // elements of 4 bytes, room for 8
+//   call @std_data_vector_push(%v, %val)   // copies elem_size bytes
+//
+// Elements live in a heap buffer that doubles when full. Sizes are i32.
+
+extern @malloc(n: i64) -> *i8
+extern @realloc(p: *i8, n: i64) -> *i8
+extern @free(p: *i8) -> void
+extern @memcpy(dst: *i8, src: *i8, n: i64) -> *i8
+
+struct @Vector {
+  @data: *i8,
+  @count: i32,
+  @capacity: i32,
+  @elem_size: i32
+}
+
+// Initial capacity used when the caller passes 0.
+const @_VEC_MIN_CAP: i32 = 4
+
+fun @std_data_vector_init(v: *i8, elem_size: i32, initial_cap: i32) -> i32 {
+  @entry:
+    %esok = sgt i32 %elem_size, 0
+    %capok = sge i32 %initial_cap, 0
+    %ok = and i1 %esok, %capok
+    br %ok, @cap, @fail
+  @cap:
+    %cap0 = let i32
+    %z = eq i32 %initial_cap, 0
+    br %z, @use_min, @use_arg
+  @use_min:
+    store i32 4, *%cap0
+    jmp @alloc
+  @use_arg:
+    store i32 %initial_cap, *%cap0
+    jmp @alloc
+  @alloc:
+    %capv = load i32, *%cap0
+    %bytes = mul i32 %capv, %elem_size
+    %bytesneg = slt i32 %bytes, 0
+    br %bytesneg, @fail, @do_alloc
+  @do_alloc:
+    %b64 = sext i32 %bytes to i64
+    %data = call @malloc(%b64)
+    %dn = eq *i8 %data, null
+    br %dn, @fail, @store
+  @store:
+    %dp = field @Vector, *%v, 0
+    store *i8 %data, *%dp
+    %cp = field @Vector, *%v, 2
+    %capv2 = load i32, *%cap0
+    store i32 %capv2, *%cp
+    %sp = field @Vector, *%v, 3
+    store i32 %elem_size, *%sp
+    %np = field @Vector, *%v, 1
+    store i32 0, *%np
+    ret i32 0
+  @fail:
+    ret i32 -1
+}
+
+// Ensure room for at least cap elements. Returns 0 or -1.
+fun @std_data_vector_reserve(v: *i8, cap: i32) -> i32 {
+  @entry:
+    %cp = field @Vector, *%v, 2
+    %cur = load i32, *%cp
+    %enough = sle i32 %cap, %cur
+    br %enough, @ok, @grow
+  @grow:
+    %esp = field @Vector, *%v, 3
+    %es = load i32, *%esp
+    %bytes = mul i32 %cap, %es
+    %neg = slt i32 %bytes, 0
+    br %neg, @fail, @re
+  @re:
+    %dp = field @Vector, *%v, 0
+    %data = load *i8, *%dp
+    %b64 = sext i32 %bytes to i64
+    %nd = call @realloc(%data, %b64)
+    %nn = eq *i8 %nd, null
+    br %nn, @fail, @store
+  @store:
+    %dp2 = field @Vector, *%v, 0
+    store *i8 %nd, *%dp2
+    %cp2 = field @Vector, *%v, 2
+    store i32 %cap, *%cp2
+    jmp @ok
+  @ok:
+    ret i32 0
+  @fail:
+    ret i32 -1
+}
+
+fun @std_data_vector_push(v: *i8, val: *i8) -> i32 {
+  @entry:
+    %vn = eq *i8 %val, null
+    br %vn, @fail, @load
+  @load:
+    %cp = field @Vector, *%v, 2
+    %cap = load i32, *%cp
+    %np = field @Vector, *%v, 1
+    %count = load i32, *%np
+    %full = sge i32 %count, %cap
+    br %full, @grow, @copy
+  @grow:
+    %cap2 = mul i32 %cap, 2
+    %bad = sle i32 %cap2, 0
+    br %bad, @fail, @reserve
+  @reserve:
+    %r = call @std_data_vector_reserve(%v, %cap2)
+    %rok = eq i32 %r, 0
+    br %rok, @reload, @fail
+  @reload:
+    %np2 = field @Vector, *%v, 1
+    %count2 = load i32, *%np2
+    jmp @copy
+  @copy:
+    %cnt = load i32, *%np
+    %esp = field @Vector, *%v, 3
+    %es = load i32, *%esp
+    %dp = field @Vector, *%v, 0
+    %data = load *i8, *%dp
+    %off = mul i32 %cnt, %es
+    %dst = gep i8, *%data, %off
+    %e64 = sext i32 %es to i64
+    call @memcpy(%dst, %val, %e64)
+    %nc = add i32 %cnt, 1
+    store i32 %nc, *%np
+    ret i32 0
+  @fail:
+    ret i32 -1
+}
+
+fun @std_data_vector_get(v: *i8, idx: i32, out: *i8) -> i32 {
+  @entry:
+    %np = field @Vector, *%v, 1
+    %count = load i32, *%np
+    %bad = sge i32 %idx, %count
+    %neg = slt i32 %idx, 0
+    %bad2 = or i1 %bad, %neg
+    br %bad2, @fail, @copy
+  @copy:
+    %esp = field @Vector, *%v, 3
+    %es = load i32, *%esp
+    %dp = field @Vector, *%v, 0
+    %data = load *i8, *%dp
+    %off = mul i32 %idx, %es
+    %src = gep i8, *%data, %off
+    %e64 = sext i32 %es to i64
+    call @memcpy(%out, %src, %e64)
+    ret i32 0
+  @fail:
+    ret i32 -1
+}
+
+fun @std_data_vector_set(v: *i8, idx: i32, val: *i8) -> i32 {
+  @entry:
+    %np = field @Vector, *%v, 1
+    %count = load i32, *%np
+    %bad = sge i32 %idx, %count
+    %neg = slt i32 %idx, 0
+    %vn = eq *i8 %val, null
+    %b1 = or i1 %bad, %neg
+    %b2 = or i1 %b1, %vn
+    br %b2, @fail, @copy
+  @copy:
+    %esp = field @Vector, *%v, 3
+    %es = load i32, *%esp
+    %dp = field @Vector, *%v, 0
+    %data = load *i8, *%dp
+    %off = mul i32 %idx, %es
+    %dst = gep i8, *%data, %off
+    %e64 = sext i32 %es to i64
+    call @memcpy(%dst, %val, %e64)
+    ret i32 0
+  @fail:
+    ret i32 -1
+}
+
+// Pointer to element idx, or null when out of range.
+fun @std_data_vector_ptr(v: *i8, idx: i32) -> *i8 {
+  @entry:
+    %np = field @Vector, *%v, 1
+    %count = load i32, *%np
+    %bad = sge i32 %idx, %count
+    %neg = slt i32 %idx, 0
+    %b = or i1 %bad, %neg
+    br %b, @none, @addr
+  @addr:
+    %esp = field @Vector, *%v, 3
+    %es = load i32, *%esp
+    %dp = field @Vector, *%v, 0
+    %data = load *i8, *%dp
+    %off = mul i32 %idx, %es
+    %p = gep i8, *%data, %off
+    ret *i8 %p
+  @none:
+    ret *i8 null
+}
+
+fun @std_data_vector_data(v: *i8) -> *i8 {
+  @entry:
+    %dp = field @Vector, *%v, 0
+    %data = load *i8, *%dp
+    ret *i8 %data
+}
+
+fun @std_data_vector_count(v: *i8) -> i32 {
+  @entry:
+    %np = field @Vector, *%v, 1
+    %n = load i32, *%np
+    ret i32 %n
+}
+
+fun @std_data_vector_capacity(v: *i8) -> i32 {
+  @entry:
+    %cp = field @Vector, *%v, 2
+    %c = load i32, *%cp
+    ret i32 %c
+}
+
+fun @std_data_vector_elem_size(v: *i8) -> i32 {
+  @entry:
+    %sp = field @Vector, *%v, 3
+    %s = load i32, *%sp
+    ret i32 %s
+}
+
+fun @std_data_vector_clear(v: *i8) -> void {
+  @entry:
+    %np = field @Vector, *%v, 1
+    store i32 0, *%np
+    ret void
+}
+
+// Free the heap buffer and reset the header.
+fun @std_data_vector_free(v: *i8) -> void {
+  @entry:
+    %dp = field @Vector, *%v, 0
+    %data = load *i8, *%dp
+    %dn = eq *i8 %data, null
+    br %dn, @reset, @free_data
+  @free_data:
+    call @free(%data)
+    jmp @reset
+  @reset:
+    %dp2 = field @Vector, *%v, 0
+    store *i8 null, *%dp2
+    %np = field @Vector, *%v, 1
+    store i32 0, *%np
+    %cp = field @Vector, *%v, 2
+    store i32 0, *%cp
+    %sp = field @Vector, *%v, 3
+    store i32 0, *%sp
+    ret void
+}

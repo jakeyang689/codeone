@@ -1,0 +1,422 @@
+// PKCS#1 v1.5 signature padding (EMSA-PKCS1-v1_5)
+// For RSA signature sign/verify used in TLS 1.2 CertificateVerify
+// Depends on: rsa.bx (bn_mod_pow, bn_from_bytes, bn_to_bytes, bn_zero, bn_copy)
+
+extern @std_crypto_rsa_bn_from_bytes(r: *i32, bytes: *i8, byte_len: i32, limbs: i32) -> void
+extern @std_crypto_rsa_bn_to_bytes(bytes: *i8, a: *i32, byte_len: i32, limbs: i32) -> void
+extern @std_crypto_rsa_bn_zero(r: *i32, limbs: i32) -> void
+extern @std_crypto_rsa_bn_mod_pow(r: *i32, base: *i32, exp: *i32, exp_limbs: i32, m: *i32, limbs: i32) -> void
+
+// SHA-256 DigestInfo prefix (19 bytes before hash)
+const @_digestinfo_sha256_prefix: [i8, 19] = [
+  0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86,
+  0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, 0x05,
+  0x00, 0x04, 0x20
+]
+
+// pkcs1_v15_encode: build EMSA-PKCS1-v1_5 encoded message
+// hash: 32-byte SHA-256 digest
+// em: output buffer (must be em_len bytes, same as RSA modulus size)
+fun @std_crypto_pkcs1_v15_encode(hash: *i8, em: *i8, em_len: i32) -> void {
+  @entry:
+    // EM = 0x00 || 0x01 || PS || 0x00 || DigestInfo
+    // DigestInfo = prefix(19) + hash(32) = 51 bytes
+    // PS padding length = em_len - 3 - 51
+
+    %ps_len = sub i32 %em_len, 3
+    %ps_len2 = sub i32 %ps_len, 51
+
+    // EM[0] = 0x00
+    store i8 0, *%em
+    // EM[1] = 0x01
+    %em1 = gep i8, *%em, 1
+    store i8 0x01, *%em1
+
+    // Fill PS with 0xFF
+    %psi = let i32
+    store i32 0, *%psi
+    jmp @ps_cond
+  @ps_cond:
+    %psiv = load i32, *%psi
+    %psmore = slt i32 %psiv, %ps_len2
+    br %psmore, @ps_body, @ps_done
+  @ps_body:
+    %psiv2 = load i32, *%psi
+    %off = add i32 %psiv2, 2
+    %pp = gep i8, *%em, %off
+    store i8 0xFF, *%pp
+    %psnext = add i32 %psiv2, 1
+    store i32 %psnext, *%psi
+    jmp @ps_cond
+  @ps_done:
+    // Separator 0x00 after PS
+    %sep_off = add i32 %ps_len2, 2
+    %sep = gep i8, *%em, %sep_off
+    store i8 0x00, *%sep
+
+    // Copy DigestInfo prefix (19 bytes)
+    %di = let i32
+    store i32 0, *%di
+    jmp @di_cond
+  @di_cond:
+    %div = load i32, *%di
+    %dimore = slt i32 %div, 19
+    br %dimore, @di_body, @di_hash
+  @di_body:
+    %div2 = load i32, *%di
+    %pref_p = gep i8, *@_digestinfo_sha256_prefix, %div2
+    %pref_v = load i8, *%pref_p
+    %em_off = add i32 %sep_off, 1
+    %em_off2 = add i32 %em_off, %div2
+    %em_p = gep i8, *%em, %em_off2
+    store i8 %pref_v, *%em_p
+    %dinext = add i32 %div2, 1
+    store i32 %dinext, *%di
+    jmp @di_cond
+  @di_hash:
+    // Copy hash (32 bytes)
+    %hi = let i32
+    store i32 0, *%hi
+    jmp @hash_cond
+  @hash_cond:
+    %hiv = load i32, *%hi
+    %hmore = slt i32 %hiv, 32
+    br %hmore, @hash_body, @hash_done
+  @hash_body:
+    %hiv2 = load i32, *%hi
+    %hp = gep i8, *%hash, %hiv2
+    %hv = load i8, *%hp
+    %h_em_off = add i32 %sep_off, 1
+    %h_em_off2 = add i32 %h_em_off, 19
+    %h_em_off3 = add i32 %h_em_off2, %hiv2
+    %hem_p = gep i8, *%em, %h_em_off3
+    store i8 %hv, *%hem_p
+    %hnext = add i32 %hiv2, 1
+    store i32 %hnext, *%hi
+    jmp @hash_cond
+  @hash_done: ret void
+}
+
+// rsa_sign_pkcs1_v15: RSA sign with PKCS#1 v1.5 padding
+// hash: 32-byte SHA-256 digest
+// n: modulus bigint (limbs limbs), d: private exponent bigint (limbs limbs)
+// signature: output byte buffer (byte_len = limbs * 4)
+fun @std_crypto_rsa_sign_pkcs1_v15(hash: *i8, d: *i32, n: *i32, limbs: i32, signature: *i8) -> void {
+  @entry:
+    %em_len = shl i32 %limbs, 2
+    %em = let [i8, 512]
+    %emp = gep i8, *%em, 0
+
+    // Encode EM = PKCS#1 v1.5 padding
+    call @std_crypto_pkcs1_v15_encode(%hash, %emp, %em_len)
+
+    // Convert EM to bigint (big-endian bytes -> little-endian limbs)
+    %m_bn = let [i32, 128]
+    %m_bnp = gep i32, *%m_bn, 0
+    call @std_crypto_rsa_bn_from_bytes(%m_bnp, %emp, %em_len, %limbs)
+
+    // s = m^d mod n
+    %s_bn = let [i32, 128]
+    %s_bnp = gep i32, *%s_bn, 0
+    call @std_crypto_rsa_bn_mod_pow(%s_bnp, %m_bnp, %d, %limbs, %n, %limbs)
+
+    // Convert signature to bytes
+    call @std_crypto_rsa_bn_to_bytes(%signature, %s_bnp, %em_len, %limbs)
+    ret void
+}
+
+// rsa_verify_pkcs1_v15: RSA verify with PKCS#1 v1.5 padding
+// hash: 32-byte SHA-256 digest
+// signature: byte buffer (byte_len = limbs * 4)
+// n: modulus bigint (limbs limbs), e: public exponent bigint (limbs limbs)
+// Returns: 1 if valid, 0 if invalid
+fun @std_crypto_rsa_verify_pkcs1_v15(hash: *i8, signature: *i8, e: *i32, n: *i32, limbs: i32) -> i1 {
+  @entry:
+    %em_len = shl i32 %limbs, 2
+
+    // Convert signature to bigint
+    %sig_bn = let [i32, 128]
+    %sig_bnp = gep i32, *%sig_bn, 0
+    call @std_crypto_rsa_bn_from_bytes(%sig_bnp, %signature, %em_len, %limbs)
+
+    // m = s^e mod n
+    %m_bn = let [i32, 128]
+    %m_bnp = gep i32, *%m_bn, 0
+    call @std_crypto_rsa_bn_mod_pow(%m_bnp, %sig_bnp, %e, %limbs, %n, %limbs)
+
+    // Convert decrypted message to bytes
+    %em2 = let [i8, 512]
+    %em2p = gep i8, *%em2, 0
+    call @std_crypto_rsa_bn_to_bytes(%em2p, %m_bnp, %em_len, %limbs)
+
+    // Build expected EM
+    %expected = let [i8, 512]
+    %expectedp = gep i8, *%expected, 0
+    call @std_crypto_pkcs1_v15_encode(%hash, %expectedp, %em_len)
+
+    // Compare: EM == expected
+    %ci = let i32
+    store i32 0, *%ci
+    jmp @vfy_cond
+  @vfy_cond:
+    %civ = load i32, *%ci
+    %cmore = slt i32 %civ, %em_len
+    br %cmore, @vfy_body, @vfy_pass
+  @vfy_body:
+    %civ2 = load i32, *%ci
+    %ep = gep i8, *%em2p, %civ2
+    %ev = load i8, *%ep
+    %xp = gep i8, *%expectedp, %civ2
+    %xv = load i8, *%xp
+    %match = eq i8 %ev, %xv
+    br %match, @vfy_next, @vfy_fail
+  @vfy_next:
+    %civ3 = add i32 %civ2, 1
+    store i32 %civ3, *%ci
+    jmp @vfy_cond
+  @vfy_pass: ret i1 1
+  @vfy_fail: ret i1 0
+}
+
+
+// ============================================================
+// RSAES-PKCS1-v1_5 Encryption Padding (Type 2) — RFC 8017 §7.2.1
+// ============================================================
+// EM = 0x00 || 0x02 || PS (≥8 random non-zero bytes) || 0x00 || M
+// em_len must be >= msg_len + 11
+
+extern @c1_random_buf(buf: *i8, len: i64) -> void
+
+// pkcs1_v15_encrypt_pad: build RSAES-PKCS1-v1_5 encoded message
+// msg: input message, msg_len: message length (≤ em_len - 11)
+// em: output buffer (em_len bytes)
+// Returns: 0 on success, -1 if msg_len > em_len - 11
+fun @std_crypto_pkcs1_v15_encrypt_pad(msg: *i8, msg_len: i32, em: *i8, em_len: i32) -> i32 {
+  @entry:
+    %min_em = add i32 %msg_len, 11
+    %too_small = slt i32 %em_len, %min_em
+    br %too_small, @pad_err, @pad_start
+
+  @pad_start:
+    // EM[0] = 0x00
+    store i8 0, *%em
+    // EM[1] = 0x02
+    %em1 = gep i8, *%em, 1
+    store i8 0x02, *%em1
+
+    // PS length = em_len - 3 - msg_len
+    %ps_len = sub i32 %em_len, 3
+    %ps_len2 = sub i32 %ps_len, %msg_len
+
+    // Generate random padding bytes (including possibly zero bytes)
+    %tmp = let [i8, 512]
+    %tmp_p = gep i8, *%tmp, 0
+    %ps_len_64 = sext i32 %ps_len2 to i64
+    call @c1_random_buf(%tmp_p, %ps_len_64)
+
+    // Write PS bytes: replace zeros with non-zero random values
+    %psi = let i32
+    store i32 0, *%psi
+    jmp @ps_fill_cond
+
+  @ps_fill_cond:
+    %psiv = load i32, *%psi
+    %psmore = slt i32 %psiv, %ps_len2
+    br %psmore, @ps_fill_body, @ps_sep
+
+  @ps_fill_body:
+    %psiv2 = load i32, *%psi
+    %tmp_p_elem = gep i8, *%tmp_p, %psiv2
+    %rand_byte = load i8, *%tmp_p_elem
+    %is_zero = eq i8 %rand_byte, 0
+    br %is_zero, @ps_retry, @ps_write
+
+  @ps_retry:
+    // Replace zero byte with a non-zero random byte (write directly to tmp buffer)
+    %one = let i64
+    store i64 1, *%one
+    %onev = load i64, *%one
+    call @c1_random_buf(%tmp_p_elem, %onev)
+    %retry_byte = load i8, *%tmp_p_elem
+    %still_zero = eq i8 %retry_byte, 0
+    br %still_zero, @ps_retry, @ps_write
+
+  @ps_write:
+    // Read final byte from tmp buffer (either original or after retry)
+    %final_byte = load i8, *%tmp_p_elem
+    %em_off = add i32 %psiv2, 2
+    %em_p = gep i8, *%em, %em_off
+    store i8 %final_byte, *%em_p
+    %psnext = add i32 %psiv2, 1
+    store i32 %psnext, *%psi
+    jmp @ps_fill_cond
+
+  @ps_sep:
+    // Separator 0x00 after PS
+    %sep_off = add i32 %ps_len2, 2
+    %sep = gep i8, *%em, %sep_off
+    store i8 0x00, *%sep
+
+    // Copy message after separator
+    %mi = let i32
+    store i32 0, *%mi
+    jmp @msg_copy_cond
+
+  @msg_copy_cond:
+    %miv = load i32, *%mi
+    %mmore = slt i32 %miv, %msg_len
+    br %mmore, @msg_copy_body, @msg_copy_done
+
+  @msg_copy_body:
+    %miv2 = load i32, *%mi
+    %src = gep i8, *%msg, %miv2
+    %sv = load i8, *%src
+    %em_off2 = add i32 %sep_off, 1
+    %em_off3 = add i32 %em_off2, %miv2
+    %em_p2 = gep i8, *%em, %em_off3
+    store i8 %sv, *%em_p2
+    %mnext = add i32 %miv2, 1
+    store i32 %mnext, *%mi
+    jmp @msg_copy_cond
+
+  @msg_copy_done:
+    ret i32 0
+
+  @pad_err:
+    ret i32 -1
+}
+
+// rsa_encrypt_pkcs1_v15: RSA encryption with PKCS#1 v1.5 padding
+// msg: plaintext message, msg_len: message length
+// n: modulus bigint, e: public exponent, limbs: limb count
+// ciphertext: output buffer (byte_len = limbs * 4)
+// Returns: 0 on success, -1 on error
+fun @std_crypto_rsa_encrypt_pkcs1_v15(msg: *i8, msg_len: i32,
+                                       e: *i32, n: *i32, limbs: i32,
+                                       ciphertext: *i8) -> i32 {
+  @entry:
+    %em_len = shl i32 %limbs, 2
+    %em = let [i8, 512]
+    %emp = gep i8, *%em, 0
+
+    // Apply PKCS#1 v1.5 encryption padding
+    %pad_result = call @std_crypto_pkcs1_v15_encrypt_pad(%msg, %msg_len, %emp, %em_len)
+    %pad_ok = eq i32 %pad_result, 0
+    br %pad_ok, @do_encrypt, @enc_err
+
+  @do_encrypt:
+    // Convert EM to bigint
+    %m_bn = let [i32, 128]
+    %m_bnp = gep i32, *%m_bn, 0
+    call @std_crypto_rsa_bn_from_bytes(%m_bnp, %emp, %em_len, %limbs)
+
+    // c = m^e mod n
+    %c_bn = let [i32, 128]
+    %c_bnp = gep i32, *%c_bn, 0
+    call @std_crypto_rsa_bn_mod_pow(%c_bnp, %m_bnp, %e, %limbs, %n, %limbs)
+
+    // Convert ciphertext to bytes
+    call @std_crypto_rsa_bn_to_bytes(%ciphertext, %c_bnp, %em_len, %limbs)
+    ret i32 0
+
+  @enc_err:
+    ret i32 -1
+}
+
+// rsa_decrypt_pkcs1_v15: RSA decryption with PKCS#1 v1.5 padding
+// ciphertext: input ciphertext buffer (byte_len = limbs * 4)
+// d: private exponent, n: modulus, limbs: limb count
+// msg: output plaintext buffer, msg_len: output message length
+// Returns: 0 on success, -1 on error (padding invalid)
+fun @std_crypto_rsa_decrypt_pkcs1_v15(ciphertext: *i8,
+                                       d: *i32, n: *i32, limbs: i32,
+                                       msg: *i8, msg_len: *i32) -> i32 {
+  @entry:
+    %em_len = shl i32 %limbs, 2
+
+    // Convert ciphertext to bigint
+    %c_bn = let [i32, 128]
+    %c_bnp = gep i32, *%c_bn, 0
+    call @std_crypto_rsa_bn_from_bytes(%c_bnp, %ciphertext, %em_len, %limbs)
+
+    // m = c^d mod n
+    %m_bn = let [i32, 128]
+    %m_bnp = gep i32, *%m_bn, 0
+    call @std_crypto_rsa_bn_mod_pow(%m_bnp, %c_bnp, %d, %limbs, %n, %limbs)
+
+    // Convert decrypted message to bytes
+    %em = let [i8, 512]
+    %emp = gep i8, *%em, 0
+    call @std_crypto_rsa_bn_to_bytes(%emp, %m_bnp, %em_len, %limbs)
+
+    // Validate and unpad: EM = 0x00 || 0x02 || PS (non-zero) || 0x00 || M
+    %first = load i8, *%emp
+    %first_ok = eq i8 %first, 0
+    br %first_ok, @check_type, @dec_err
+
+  @check_type:
+    %em1 = gep i8, *%emp, 1
+    %type = load i8, *%em1
+    %type_ok = eq i8 %type, 0x02
+    br %type_ok, @find_sep, @dec_err
+
+  @find_sep:
+    %sep_pos = let i32
+    store i32 2, *%sep_pos
+    jmp @sep_cond
+
+  @sep_cond:
+    %spos = load i32, *%sep_pos
+    %past_end = sge i32 %spos, %em_len
+    br %past_end, @dec_err, @sep_check
+
+  @sep_check:
+    %sp = gep i8, *%emp, %spos
+    %sb = load i8, *%sp
+    %is_sep = eq i8 %sb, 0
+    %is_ps_byte = slt i32 %spos, 2
+    br %is_sep, @sep_found, @sep_next
+
+  @sep_next:
+    %spos2 = add i32 %spos, 1
+    store i32 %spos2, *%sep_pos
+    jmp @sep_cond
+
+  @sep_found:
+    // sep_pos must be >= 10 (meaning PS >= 8)
+    %min_inline = sge i32 %spos, 10
+    br %min_inline, @copy_msg, @dec_err
+
+  @copy_msg:
+    // Copy message after separator
+    %msg_off = add i32 %spos, 1
+    %msg_data_len = sub i32 %em_len, %msg_off
+    store i32 %msg_data_len, *%msg_len
+
+    %mi = let i32
+    store i32 0, *%mi
+    jmp @msg_out_cond
+
+  @msg_out_cond:
+    %miv = load i32, *%mi
+    %mmore = slt i32 %miv, %msg_data_len
+    br %mmore, @msg_out_body, @msg_out_done
+
+  @msg_out_body:
+    %miv2 = load i32, *%mi
+    %src_off = add i32 %msg_off, %miv2
+    %src_p = gep i8, *%emp, %src_off
+    %sv = load i8, *%src_p
+    %dst_p = gep i8, *%msg, %miv2
+    store i8 %sv, *%dst_p
+    %mnext = add i32 %miv2, 1
+    store i32 %mnext, *%mi
+    jmp @msg_out_cond
+
+  @msg_out_done:
+    ret i32 0
+
+  @dec_err:
+    store i32 0, *%msg_len
+    ret i32 -1
+}

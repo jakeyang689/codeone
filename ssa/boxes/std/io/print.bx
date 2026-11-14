@@ -1,0 +1,72 @@
+// Print utilities via putchar (positive integers only)
+
+extern @putchar(c: i32) -> i32
+
+fun @std_io_print_ch(c: i8) -> i32 {
+  @entry:
+    %ci = zext i8 %c to i32
+    %r = call @putchar(%ci)
+    ret i32 %r
+}
+
+fun @std_io_print_nl() -> i32 {
+  @entry:
+    %r = call @putchar('\n')
+    ret i32 %r
+}
+
+fun @std_io_print_i32(val: i32) -> i32 {
+  @entry:
+    %buf = let [i8, 12]
+    %bp = gep i8, *%buf, 0
+    %iptr = let i32
+    %vptr = let i32
+    store i32 0, *%iptr
+    store i32 %val, *%vptr
+
+    %z = eq i32 %val, 0
+    br %z, @print_zero, @extract
+
+  @print_zero:
+    %z_ch = trunc i32 48 to i8
+    call @std_io_print_ch(%z_ch)
+    ret i32 1
+
+  @extract:
+    %v = load i32, *%vptr
+    %i = load i32, *%iptr
+    %d = rem i32 %v, 10
+    %ch = add i32 %d, 48
+    %ch8 = trunc i32 %ch to i8
+    %p = gep i8, *%bp, %i
+    store i8 %ch8, *%p
+    %q = div i32 %v, 10
+    store i32 %q, *%vptr
+    %i2 = add i32 %i, 1
+    store i32 %i2, *%iptr
+    %done = eq i32 %q, 0
+    br %done, @print_rev, @extract
+
+  @print_rev:
+    %len = load i32, *%iptr
+    %idx = let i32
+    store i32 %len, *%idx
+    jmp @pr_cond
+
+  @pr_cond:
+    %cur = load i32, *%idx
+    %cur2 = sub i32 %cur, 1
+    store i32 %cur2, *%idx
+    %neg = slt i32 %cur2, 0
+    br %neg, @pr_done, @pr_one
+
+  @pr_one:
+    %ci = load i32, *%idx
+    %pp = gep i8, *%bp, %ci
+    %cv = load i8, *%pp
+    call @std_io_print_ch(%cv)
+    jmp @pr_cond
+
+  @pr_done:
+    ret i32 %len
+}

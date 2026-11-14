@@ -1,0 +1,164 @@
+// Time: wall clock, monotonic clock, and ISO 8601 formatting/parsing.
+// Prints "PASS time" on success, "FAIL time at case N" otherwise.
+
+extern @printf(fmt: *i8, ...) -> i32
+extern @strlen(s: *i8) -> i64
+extern @strcmp(a: *i8, b: *i8) -> i32
+extern @std_time_now_ms() -> i64
+extern @std_time_monotonic_ms() -> i64
+extern @std_time_format_iso8601(ms: i64, out: *i8, cap: i32) -> i32
+extern @std_time_parse_iso8601(s: *i8, len: i32, out_ms: *i64) -> i32
+
+const @EPOCH = "1970-01-01T00:00:00.000Z"
+const @LEAP = "2024-02-29T12:34:56.789Z"
+const @PRE = "1969-12-31T23:59:59.999Z"
+const @OFF = "1970-01-01T01:00:00+01:00"
+const @NOZ = "1970-01-01T00:00:00"
+const @FRAC1 = "2000-01-01T00:00:00.5Z"
+const @FRAC1_OUT = "2000-01-01T00:00:00.500Z"
+const @BADDAY = "2024-02-30T00:00:00Z"
+const @BAD = "not a date"
+
+fun @len_of(s: *i8) -> i32 {
+  @entry:
+    %l64 = call @strlen(%s)
+    %l = trunc i64 %l64 to i32
+    ret i32 %l
+}
+
+fun @main() -> i32 {
+  @entry:
+    %id = let i32
+    %ms = let i64
+    %msp = gep i64, *%ms, 0
+    %out = let [i8, 64]
+    store i32 0, *%id
+
+    // ---- clocks ----
+    store i32 1, *%id
+    %now = call @std_time_now_ms()
+    %nowok = sgt i64 %now, 1600000000000
+    br %nowok, @c2, @fail
+  @c2:
+    store i32 2, *%id
+    %m1 = call @std_time_monotonic_ms()
+    %m2 = call @std_time_monotonic_ms()
+    %mok = sge i64 %m2, %m1
+    br %mok, @c3, @fail
+
+    // ---- formatting ----
+  @c3:
+    store i32 3, *%id
+    %op = gep i8, *%out, 0
+    %r0 = call @std_time_format_iso8601(0, %op, 64)
+    %r0ok = eq i32 %r0, 24
+    br %r0ok, @c4, @fail
+  @c4:
+    store i32 4, *%id
+    %cmp0 = call @strcmp(%op, @EPOCH)
+    %cmp0ok = eq i32 %cmp0, 0
+    br %cmp0ok, @c5, @fail
+  @c5:
+    store i32 5, *%id
+    %rl = call @std_time_format_iso8601(1709210096789, %op, 64)
+    %rlok = eq i32 %rl, 24
+    br %rlok, @c6, @fail
+  @c6:
+    store i32 6, *%id
+    %cmpl = call @strcmp(%op, @LEAP)
+    %cmplok = eq i32 %cmpl, 0
+    br %cmplok, @c7, @fail
+  @c7:
+    store i32 7, *%id
+    %rp = call @std_time_format_iso8601(-1, %op, 64)
+    %rpok = eq i32 %rp, 24
+    br %rpok, @c8, @fail
+  @c8:
+    store i32 8, *%id
+    %cmpp = call @strcmp(%op, @PRE)
+    %cmppok = eq i32 %cmpp, 0
+    br %cmppok, @c9, @fail
+  @c9:
+    store i32 9, *%id
+    %small = call @std_time_format_iso8601(0, %op, 24)
+    %smallok = eq i32 %small, -1
+    br %smallok, @c10, @fail
+
+    // ---- parsing ----
+  @c10:
+    store i32 10, *%id
+    %lp = gep i8, *@LEAP, 0
+    %ll = call @len_of(%lp)
+    %pr = call @std_time_parse_iso8601(%lp, %ll, %msp)
+    %prok = eq i32 %pr, 0
+    br %prok, @c11, @fail
+  @c11:
+    store i32 11, *%id
+    %pm = load i64, *%msp
+    %pmok = eq i64 %pm, 1709210096789
+    br %pmok, @c12, @fail
+  @c12:
+    store i32 12, *%id
+    %ofp = gep i8, *@OFF, 0
+    %ofl = call @len_of(%ofp)
+    %por = call @std_time_parse_iso8601(%ofp, %ofl, %msp)
+    %pom = load i64, *%msp
+    %po_ok = eq i32 %por, 0
+    %po_m = eq i64 %pom, 0
+    %po = and i1 %po_ok, %po_m
+    br %po, @c13, @fail
+  @c13:
+    store i32 13, *%id
+    %nzp = gep i8, *@NOZ, 0
+    %nzl = call @len_of(%nzp)
+    %pnr = call @std_time_parse_iso8601(%nzp, %nzl, %msp)
+    %pnm = load i64, *%msp
+    %pn_ok = eq i32 %pnr, 0
+    %pn_m = eq i64 %pnm, 0
+    %pn = and i1 %pn_ok, %pn_m
+    br %pn, @c14, @fail
+  @c14:
+    store i32 14, *%id
+    %frp = gep i8, *@FRAC1, 0
+    %frl = call @len_of(%frp)
+    %frr = call @std_time_parse_iso8601(%frp, %frl, %msp)
+    %frm = load i64, *%msp
+    %fr_ok = eq i32 %frr, 0
+    %fr_m = eq i64 %frm, 946684800500
+    %fr = and i1 %fr_ok, %fr_m
+    br %fr, @c15, @fail
+
+    // ---- round trip ----
+  @c15:
+    store i32 15, *%id
+    %rtp = gep i64, *%ms, 0
+    %rtm = load i64, *%rtp
+    %rtw = call @std_time_format_iso8601(%rtm, %op, 64)
+    %rtcmp = call @strcmp(%op, @FRAC1_OUT)
+    %rtok = eq i32 %rtcmp, 0
+    br %rtok, @c16, @fail
+
+    // ---- invalid input ----
+  @c16:
+    store i32 16, *%id
+    %bdp = gep i8, *@BADDAY, 0
+    %bdl = call @len_of(%bdp)
+    %bdr = call @std_time_parse_iso8601(%bdp, %bdl, %msp)
+    %bdok = eq i32 %bdr, -1
+    br %bdok, @c17, @fail
+  @c17:
+    store i32 17, *%id
+    %bp2 = gep i8, *@BAD, 0
+    %bl2 = call @len_of(%bp2)
+    %br2 = call @std_time_parse_iso8601(%bp2, %bl2, %msp)
+    %bok2 = eq i32 %br2, -1
+    br %bok2, @pass, @fail
+
+  @pass:
+    call @printf("PASS time\n")
+    ret i32 0
+  @fail:
+    %fid = load i32, *%id
+    call @printf("FAIL time at case %d\n", %fid)
+    ret i32 1
+}

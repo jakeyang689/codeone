@@ -1,0 +1,83 @@
+{
+  "name": "codeone-cmap",
+  "displayName": "CodeOne cmap preview",
+  "description": "Preview the pseudo-C (cmap) rendering of an SSA .bx file, side by side.",
+  "version": "0.0.1",
+  "publisher": "codeone",
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "main": "./extension.js",
+  "activationEvents": [
+    "onLanguage:bx",
+    "onCommand:codeone.previewCmap"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "bx",
+        "aliases": [
+          "SSA",
+          "bx"
+        ],
+        "extensions": [
+          ".bx"
+        ],
+        "configuration": "./language-configuration.json"
+      },
+      {
+        "id": "cmap",
+        "aliases": [
+          "cmap",
+          "CodeOne cmap"
+        ],
+        "extensions": [
+          ".cmap"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "cmap",
+        "scopeName": "source.cmap",
+        "path": "./syntaxes/cmap.tmLanguage.json"
+      }
+    ],
+    "commands": [
+      {
+        "command": "codeone.previewCmap",
+        "title": "Preview cmap",
+        "category": "CodeOne",
+        "icon": "$(open-preview)"
+      },
+      {
+        "command": "codeone.showLog",
+        "title": "Show Log",
+        "category": "CodeOne"
+      }
+    ],
+    "menus": {
+      "editor/title": [
+        {
+          "command": "codeone.previewCmap",
+          "when": "resourceLangId == bx",
+          "group": "navigation"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "CodeOne",
+      "properties": {
+        "codeone.c1Path": {
+          "type": "string",
+          "default": "",
+          "description": "Path to the c1 compiler. Leave empty to auto-detect: first <workspace>/ssa/c1/c1 and <workspace>/toolchain/*/bin/c1, then whatever 'c1' is on PATH."
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,197 @@
+// RSA-2048 Performance Benchmark
+// Measure with: time ./test/rsa_bench
+extern @printf(fmt: *i8, ...) -> i32
+extern @memset(s: *i8, c: i32, n: i64) -> *i8
+extern @memcpy(dst: *i8, src: *i8, n: i64) -> *i8
+extern @c1_random_buf(buf: *i8, len: i64) -> void
+
+extern @std_crypto_rsa_bn_zero(r: *i32, limbs: i32) -> void
+extern @std_crypto_rsa_bn_random(r: *i32, limbs: i32) -> void
+extern @std_crypto_rsa_bn_mod_pow(r: *i32, base: *i32, exp: *i32, exp_limbs: i32, m: *i32, limbs: i32) -> void
+extern @std_crypto_rsa_gen_keypair(n: *i32, e: *i32, d: *i32, p: *i32, q: *i32, limbs: i32) -> void
+extern @std_crypto_rsa_encrypt_pkcs1_v15(msg: *i8, msg_len: i32, e: *i32, n: *i32, limbs: i32, ct: *i8) -> i32
+extern @std_crypto_rsa_decrypt_pkcs1_v15(ct: *i8, d: *i32, n: *i32, limbs: i32, pt: *i8, pt_len: *i32) -> i32
+
+fun @bench_mod_pow_e() -> i32 {
+  @e:
+    %n = let [i32, 64]
+    %base = let [i32, 64]
+    %exp = let [i32, 64]
+    %result = let [i32, 64]
+    %np = gep i32, *%n, 0
+    %bp = gep i32, *%base, 0
+    %ep = gep i32, *%exp, 0
+    %rp = gep i32, *%result, 0
+
+    call @std_crypto_rsa_bn_random(%np, 64)
+    call @std_crypto_rsa_bn_random(%bp, 64)
+    call @std_crypto_rsa_bn_zero(%rp, 64)
+    store i32 65537, *%ep
+
+    // 100 iterations with small exponent
+    %ci = let i32
+    store i32 0, *%ci
+    jmp @mp_cond
+  @mp_cond:
+    %civ = load i32, *%ci
+    %more = slt i32 %civ, 100
+    br %more, @mp_body, @mp_done
+  @mp_body:
+    call @std_crypto_rsa_bn_mod_pow(%rp, %bp, %ep, 1, %np, 64)
+    %next = add i32 %civ, 1
+    store i32 %next, *%ci
+    jmp @mp_cond
+  @mp_done:
+    ret i32 0
+}
+
+fun @bench_mod_pow_full() -> i32 {
+  @e:
+    %n = let [i32, 64]
+    %base = let [i32, 64]
+    %exp = let [i32, 64]
+    %result = let [i32, 64]
+    %np = gep i32, *%n, 0
+    %bp = gep i32, *%base, 0
+    %ep = gep i32, *%exp, 0
+    %rp = gep i32, *%result, 0
+
+    call @std_crypto_rsa_bn_random(%np, 64)
+    call @std_crypto_rsa_bn_random(%bp, 64)
+    call @std_crypto_rsa_bn_random(%ep, 64)
+
+    // 5 iterations with full exponent
+    %ci = let i32
+    store i32 0, *%ci
+    jmp @mp_cond
+  @mp_cond:
+    %civ = load i32, *%ci
+    %more = slt i32 %civ, 5
+    br %more, @mp_body, @mp_done
+  @mp_body:
+    call @std_crypto_rsa_bn_mod_pow(%rp, %bp, %ep, 64, %np, 64)
+    %next = add i32 %civ, 1
+    store i32 %next, *%ci
+    jmp @mp_cond
+  @mp_done:
+    ret i32 0
+}
+
+fun @bench_keygen() -> i32 {
+  @e:
+    %n = let [i32, 64]
+    %e = let [i32, 64]
+    %d = let [i32, 64]
+    %p = let [i32, 64]
+    %q = let [i32, 64]
+    %np = gep i32, *%n, 0
+    %ep = gep i32, *%e, 0
+    %dp = gep i32, *%d, 0
+    %pp = gep i32, *%p, 0
+    %qp = gep i32, *%q, 0
+
+    call @std_crypto_rsa_gen_keypair(%np, %ep, %dp, %pp, %qp, 64)
+    ret i32 0
+}
+
+fun @bench_pkcs1_encrypt() -> i32 {
+  @e:
+    %msg = let [i8, 32]
+    %ct_buf = let [i8, 256]
+    %msg_p = gep i8, *%msg, 0
+    %ct_p = gep i8, *%ct_buf, 0
+    call @c1_random_buf(%msg_p, 32)
+
+    %n = let [i32, 64]
+    %e = let [i32, 64]
+    %d = let [i32, 64]
+    %p = let [i32, 64]
+    %q = let [i32, 64]
+    %np = gep i32, *%n, 0
+    %ep = gep i32, *%e, 0
+    %dp = gep i32, *%d, 0
+    %pp = gep i32, *%p, 0
+    %qp = gep i32, *%q, 0
+
+    call @std_crypto_rsa_gen_keypair(%np, %ep, %dp, %pp, %qp, 64)
+
+    %ci = let i32
+    store i32 0, *%ci
+    jmp @enc_cond
+  @enc_cond:
+    %civ = load i32, *%ci
+    %more = slt i32 %civ, 100
+    br %more, @enc_body, @enc_done
+  @enc_body:
+    call @std_crypto_rsa_encrypt_pkcs1_v15(%msg_p, 32, %ep, %np, 64, %ct_p)
+    %next = add i32 %civ, 1
+    store i32 %next, *%ci
+    jmp @enc_cond
+  @enc_done:
+    ret i32 0
+}
+
+fun @bench_pkcs1_decrypt() -> i32 {
+  @e:
+    %msg = let [i8, 32]
+    %msg_p = gep i8, *%msg, 0
+    call @c1_random_buf(%msg_p, 32)
+
+    %n = let [i32, 64]
+    %e = let [i32, 64]
+    %d = let [i32, 64]
+    %p = let [i32, 64]
+    %q = let [i32, 64]
+    %np = gep i32, *%n, 0
+    %ep = gep i32, *%e, 0
+    %dp = gep i32, *%d, 0
+    %pp = gep i32, *%p, 0
+    %qp = gep i32, *%q, 0
+
+    call @std_crypto_rsa_gen_keypair(%np, %ep, %dp, %pp, %qp, 64)
+
+    %ct_buf = let [i8, 256]
+    %ct_p = gep i8, *%ct_buf, 0
+    call @std_crypto_rsa_encrypt_pkcs1_v15(%msg_p, 32, %ep, %np, 64, %ct_p)
+
+    %pt_buf = let [i8, 256]
+    %pt_p = gep i8, *%pt_buf, 0
+    %pt_len = let i32
+    %plen_p = gep i32, *%pt_len, 0
+
+    %ci = let i32
+    store i32 0, *%ci
+    jmp @dec_cond
+  @dec_cond:
+    %civ = load i32, *%ci
+    %more = slt i32 %civ, 100
+    br %more, @dec_body, @dec_done
+  @dec_body:
+    call @std_crypto_rsa_decrypt_pkcs1_v15(%ct_p, %dp, %np, 64, %pt_p, %plen_p)
+    %next = add i32 %civ, 1
+    store i32 %next, *%ci
+    jmp @dec_cond
+  @dec_done:
+    ret i32 0
+}
+
+fun @main() -> i32 {
+  @e:
+    call @printf("Benchmarking RSA-2048 mod_pow (e=65537, 100 ops)...\n")
+    call @bench_mod_pow_e()
+    call @printf("Done.\n")
+    call @printf("Benchmarking RSA-2048 mod_pow (full exp, 5 ops)...\n")
+    call @bench_mod_pow_full()
+    call @printf("Done.\n")
+    call @printf("Benchmarking RSA-2048 keygen (1 op)...\n")
+    call @bench_keygen()
+    call @printf("Done.\n")
+    call @printf("Benchmarking RSA-2048 PKCS1 encrypt (100 ops)...\n")
+    call @bench_pkcs1_encrypt()
+    call @printf("Done.\n")
+    call @printf("Benchmarking RSA-2048 PKCS1 decrypt (100 ops)...\n")
+    call @bench_pkcs1_decrypt()
+    call @printf("Done.\n")
+    call @printf("All benchmarks complete.\n")
+    ret i32 0
+}

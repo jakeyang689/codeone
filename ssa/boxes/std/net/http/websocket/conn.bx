@@ -1,0 +1,499 @@
+// WebSocket client connection (RFC 6455).
+//
+// Sits on top of the HTTP client: net_ws_open performs the Upgrade handshake,
+// after which the same connection carries masked frames. Received frames are
+// buffered, reassembled across continuations, and control frames (ping) are
+// answered automatically.
+
+extern @memmove(dst: *i8, src: *i8, n: i64) -> *i8
+extern @std_text_str_find_ci(buf: *i8, start: i32, end: i32, needle: *i8) -> i32
+
+extern @net_http_client_open(host: *i8, host_len: i32, port: i32, use_tls: i32,
+                             c: *@HttpClient) -> i32
+extern @net_http_client_send(c: *@HttpClient, data: *i8, len: i32) -> i32
+extern @net_http_client_recv(c: *@HttpClient, buf: *i8, cap: i32,
+                            out_len: *i32) -> i32
+extern @net_http_client_read_head(c: *@HttpClient, buf: *i8, cap: i32,
+                                  out_len: *i32) -> i32
+extern @net_http_client_close(c: *@HttpClient) -> i32
+
+extern @std_core_random_bytes(buf: *i8, len: i32) -> void
+
+extern @net_ws_make_key(out: *i8) -> i32
+extern @net_ws_build_handshake(buf: *i8, cap: i32, host: *i8, path: *i8,
+                               key_b64: *i8) -> i32
+extern @net_ws_check_handshake(buf: *i8, len: i32, key_b64: *i8) -> i32
+
+extern @net_ws_build_frame(buf: *i8, cap: i32, opcode: i32, payload: *i8,
+                           len: i32, fin: i32, masked: i32, key: *i8) -> i32
+extern @net_ws_parse_frame(buf: *i8, len: i32, f: *@WsFrame,
+                           out_need: *i32) -> i32
+extern @net_ws_close_code(payload: *i8, len: i32) -> i32
+extern @net_ws_put_close_code(buf: *i8, code: i32) -> void
+
+// Must match frame.bx.
+enum @WsOpcode: i32 {
+  @Continuation = 0,
+  @Text = 1,
+  @Binary = 2,
+  @Close = 8,
+  @Ping = 9,
+  @Pong = 10
+}
+
+struct @WsFrame {
+  @fin: i32,
+  @opcode: i32,
+  @masked: i32,
+  @payload_off: i32,
+  @payload_len: i32,
+  @header_len: i32
+}
+
+// Layout must match http/client.bx.
+struct @HttpClient {
+  @fd: i32,
+  @use_tls: i32,
+  @ctx: [i8, 1024]
+}
+
+// rx holds bytes read from the socket; [rx_off, rx_len) are unconsumed.
+// state: 0 = open, 1 = close sent (half closed), 2 = closed.
+struct @WsClient {
+  @http: @HttpClient,
+  @rx: [i8, 32768],
+  @rx_len: i32,
+  @rx_off: i32,
+  @state: i32,
+  @close_code: i32
+}
+
+// Connect to host:port and perform the Upgrade handshake for path.
+// use_tls != 0 selects wss (TLS 1.2). Returns 0 on success, -1 on failure.
+fun @net_ws_open(w: *@WsClient, host: *i8, host_len: i32, port: i32,
+                 use_tls: i32, path: *i8) -> i32 {
+  @entry:
+    %rxl_p = field @WsClient, *%w, 2
+    store i32 0, *%rxl_p
+    %rxo_p = field @WsClient, *%w, 3
+    store i32 0, *%rxo_p
+    %cl_p = field @WsClient, *%w, 4
+    store i32 0, *%cl_p
+    %cc_p = field @WsClient, *%w, 5
+    store i32 0, *%cc_p
+    %hp = field @WsClient, *%w, 0
+    %ro = call @net_http_client_open(%host, %host_len, %port, %use_tls, %hp)
+    %ro_ok = eq i32 %ro, 0
+    br %ro_ok, @key, @fail
+  @key:
+    %key = let [i8, 32]
+    %keyp = gep i8, *%key, 0
+    call @net_ws_make_key(%keyp)
+    %req = let [i8, 1024]
+    %reqp = gep i8, *%req, 0
+    %rn = call @net_ws_build_handshake(%reqp, 1024, %host, %path, %keyp)
+    %rn_ok = sgt i32 %rn, 0
+    br %rn_ok, @send, @close_fail
+  @send:
+    %sr = call @net_http_client_send(%hp, %reqp, %rn)
+    %sr_ok = eq i32 %sr, 0
+    br %sr_ok, @read, @close_fail
+  @read:
+    %rxp = field @WsClient, *%w, 1
+    %rx = gep i8, *%rxp, 0
+    %head_len = let i32
+    %hlp = gep i32, *%head_len, 0
+    %rr = call @net_http_client_read_head(%hp, %rx, 32768, %hlp)
+    %rr_ok = eq i32 %rr, 0
+    br %rr_ok, @check, @close_fail
+  @check:
+    %hv = load i32, *%head_len
+    %cr = call @net_ws_check_handshake(%rx, %hv, %keyp)
+    %cr_ok = eq i32 %cr, 0
+    br %cr_ok, @store, @close_fail
+  @store:
+    // Keep everything after the head: it may already contain frames.
+    %hv2 = load i32, *%head_len
+    store i32 %hv2, *%rxl_p
+    %he = call @std_text_str_find_ci(%rx, 0, %hv2, "\r\n\r\n")
+    %he_bad = slt i32 %he, 0
+    br %he_bad, @close_fail, @set_off
+  @set_off:
+    %bo = add i32 %he, 4
+    store i32 %bo, *%rxo_p
+    ret i32 0
+  @close_fail:
+    call @net_http_client_close(%hp)
+    ret i32 -1
+  @fail:
+    ret i32 -1
+}
+
+// Build and transmit a single masked frame.
+fun @_ws_send_frame(w: *@WsClient, opcode: i32, payload: *i8, len: i32,
+                    fin: i32) -> i32 {
+  @entry:
+    %clp = field @WsClient, *%w, 4
+    %closed = load i32, *%clp
+    %is_closed = ne i32 %closed, 0
+    br %is_closed, @fail, @mk
+  @mk:
+    %rand = let [i8, 4]
+    %randp = gep i8, *%rand, 0
+    call @std_core_random_bytes(%randp, 4)
+    %fb = let [i8, 16416]
+    %fbp = gep i8, *%fb, 0
+    %n = call @net_ws_build_frame(%fbp, 16416, %opcode, %payload, %len,
+                                  %fin, 1, %randp)
+    %n_ok = sgt i32 %n, 0
+    br %n_ok, @send, @fail
+  @send:
+    %hp = field @WsClient, *%w, 0
+    %r = call @net_http_client_send(%hp, %fbp, %n)
+    ret i32 %r
+  @fail:
+    ret i32 -1
+}
+
+// Send one message, splitting it into fragments of at most 16384 bytes.
+// Data uses @WsOpcode.Text or @WsOpcode.Binary; control frames use the same
+// call with @WsOpcode.Ping or @WsOpcode.Pong and a payload of at most 125
+// bytes.
+fun @net_ws_send(w: *@WsClient, opcode: i32, payload: *i8, len: i32) -> i32 {
+  @entry:
+    %neg = slt i32 %len, 0
+    br %neg, @fail, @init
+  @init:
+    %off = let i32
+    store i32 0, *%off
+    %first = let i32
+    store i32 1, *%first
+    jmp @loop
+  @loop:
+    %ov = load i32, *%off
+    %rem = sub i32 %len, %ov
+    %more = sgt i32 %rem, 0
+    br %more, @chunk, @finish
+  @chunk:
+    %ov2 = load i32, *%off
+    %rem2 = sub i32 %len, %ov2
+    %big = sgt i32 %rem2, 16384
+    br %big, @sz_big, @sz_rem
+  @sz_big:
+    jmp @have_sz
+  @sz_rem:
+    jmp @have_sz
+  @have_sz:
+    %sz = phi i32 [ 16384, @sz_big ], [ %rem2, @sz_rem ]
+    %fv = load i32, *%first
+    %is_first = eq i32 %fv, 1
+    %fb = zext i1 %is_first to i32
+    %op = mul i32 %opcode, %fb
+    %last = eq i32 %rem2, %sz
+    %fin = zext i1 %last to i32
+    %pp = gep i8, *%payload, %ov2
+    %sr = call @_ws_send_frame(%w, %op, %pp, %sz, %fin)
+    %sr_ok = eq i32 %sr, 0
+    br %sr_ok, @advance, @fail
+  @advance:
+    %ov3 = load i32, *%off
+    %no = add i32 %ov3, %sz
+    store i32 %no, *%off
+    store i32 0, *%first
+    jmp @loop
+  @finish:
+    %fv2 = load i32, *%first
+    %still_first = eq i32 %fv2, 1
+    br %still_first, @empty, @done
+  @empty:
+    %zr = call @_ws_send_frame(%w, %opcode, %payload, 0, 1)
+    ret i32 %zr
+  @done:
+    ret i32 0
+  @fail:
+    ret i32 -1
+}
+
+fun @net_ws_send_text(w: *@WsClient, s: *i8, len: i32) -> i32 {
+  @entry:
+    %r = call @net_ws_send(%w, @WsOpcode.Text, %s, %len)
+    ret i32 %r
+}
+
+fun @net_ws_send_binary(w: *@WsClient, data: *i8, len: i32) -> i32 {
+  @entry:
+    %r = call @net_ws_send(%w, @WsOpcode.Binary, %data, %len)
+    ret i32 %r
+}
+
+// Start the closing handshake. code 0 sends an empty close payload;
+// otherwise the 2-byte status code and reason (at most 123 bytes) are sent.
+fun @net_ws_send_close(w: *@WsClient, code: i32, reason: *i8,
+                       reason_len: i32) -> i32 {
+  @entry:
+    %clp = field @WsClient, *%w, 4
+    %state = load i32, *%clp
+    %not_open = ne i32 %state, 0
+    br %not_open, @fail, @size
+  @size:
+    %too_long = sgt i32 %reason_len, 123
+    br %too_long, @fail, @build
+  @build:
+    %pb = let [i8, 128]
+    %pbp = gep i8, *%pb, 0
+    %has_code = sgt i32 %code, 0
+    br %has_code, @with_code, @send_empty
+  @with_code:
+    call @net_ws_put_close_code(%pbp, %code)
+    %has_reason = sgt i32 %reason_len, 0
+    br %has_reason, @copy_init, @send_code
+  @copy_init:
+    %k = let i32
+    store i32 0, *%k
+    jmp @copy_cond
+  @copy_cond:
+    %kv = load i32, *%k
+    %kmore = slt i32 %kv, %reason_len
+    br %kmore, @copy_body, @send_code
+  @copy_body:
+    %kv2 = load i32, *%k
+    %sp = gep i8, *%reason, %kv2
+    %ch = load i8, *%sp
+    %di = add i32 %kv2, 2
+    %dp = gep i8, *%pb, %di
+    store i8 %ch, *%dp
+    %kn = add i32 %kv2, 1
+    store i32 %kn, *%k
+    jmp @copy_cond
+  @send_code:
+    %n2 = add i32 2, %reason_len
+    %r = call @_ws_send_frame(%w, @WsOpcode.Close, %pbp, %n2, 1)
+    jmp @mark
+  @send_empty:
+    %r2 = call @_ws_send_frame(%w, @WsOpcode.Close, %pbp, 0, 1)
+    jmp @mark
+  @mark:
+    %fr = phi i32 [ %r, @send_code ], [ %r2, @send_empty ]
+    store i32 1, *%clp
+    %ccp = field @WsClient, *%w, 5
+    store i32 %code, *%ccp
+    ret i32 %fr
+  @fail:
+    ret i32 -1
+}
+
+// Consume already-processed bytes so unconsumed data starts at rx[0].
+fun @_ws_compact(w: *@WsClient) -> void {
+  @entry:
+    %xp = field @WsClient, *%w, 3
+    %off = load i32, *%xp
+    %none = sle i32 %off, 0
+    br %none, @done, @do
+  @do:
+    %rxlp = field @WsClient, *%w, 2
+    %len = load i32, *%rxlp
+    %rem = sub i32 %len, %off
+    %empty = sle i32 %rem, 0
+    br %empty, @no_data, @move
+  @no_data:
+    store i32 0, *%rxlp
+    jmp @reset
+  @move:
+    %rxp = field @WsClient, *%w, 1
+    %rx = gep i8, *%rxp, 0
+    %src = gep i8, *%rx, %off
+    %n64 = sext i32 %rem to i64
+    call @memmove(%rx, %src, %n64)
+    store i32 %rem, *%rxlp
+    jmp @reset
+  @reset:
+    store i32 0, *%xp
+    jmp @done
+  @done:
+    ret void
+}
+
+// Receive one complete message into dst.
+//
+// Returns @WsOpcode.Text, @WsOpcode.Binary or @WsOpcode.Close (peer closed,
+// close code available via net_ws_close_code_of), and stores the payload
+// length in out_len.
+// Ping frames are answered with a pong and do not surface here.
+// Returns -1 on EOF, protocol error, or if the message exceeds cap.
+fun @net_ws_recv(w: *@WsClient, dst: *i8, cap: i32, out_len: *i32) -> i32 {
+  @entry:
+    %msg_op = let i32
+    store i32 0, *%msg_op
+    %msg_len = let i32
+    store i32 0, *%msg_len
+    jmp @loop
+  @loop:
+    %clp = field @WsClient, *%w, 4
+    %state = load i32, *%clp
+    %fully_closed = eq i32 %state, 2
+    br %fully_closed, @fail, @compact
+  @compact:
+    call @_ws_compact(%w)
+    %rxlp = field @WsClient, *%w, 2
+    %rxlen = load i32, *%rxlp
+    %rxp = field @WsClient, *%w, 1
+    %rx = gep i8, *%rxp, 0
+    %fr = let @WsFrame
+    %need = let i32
+    %needp = gep i32, *%need, 0
+    %pr = call @net_ws_parse_frame(%rx, %rxlen, %fr, %needp)
+    %pr_ok = eq i32 %pr, 0
+    br %pr_ok, @got_frame, @pr_more
+  @pr_more:
+    %is_more = eq i32 %pr, -1
+    br %is_more, @fill_chk, @fail
+  @fill_chk:
+    %nv = load i32, *%need
+    %too_big = sgt i32 %nv, 32768
+    br %too_big, @fail, @fill
+  @fill:
+    %cur = load i32, *%rxlp
+    %room = sub i32 32768, %cur
+    %no_room = sle i32 %room, 0
+    br %no_room, @fail, @do_fill
+  @do_fill:
+    %hp = field @WsClient, *%w, 0
+    %cur2 = load i32, *%rxlp
+    %dstp = gep i8, *%rx, %cur2
+    %got = let i32
+    %gotp = gep i32, *%got, 0
+    %rr = call @net_http_client_recv(%hp, %dstp, %room, %gotp)
+    %rr_bad = slt i32 %rr, 0
+    br %rr_bad, @fail, @got_chk
+  @got_chk:
+    %g = load i32, *%got
+    %g_zero = eq i32 %g, 0
+    br %g_zero, @fail, @g_add
+  @g_add:
+    %cur3 = load i32, *%rxlp
+    %nt = add i32 %cur3, %g
+    store i32 %nt, *%rxlp
+    jmp @loop
+  @got_frame:
+    %mkp = field @WsFrame, *%fr, 2
+    %mkv = load i32, *%mkp
+    %masked = ne i32 %mkv, 0
+    br %masked, @fail, @take
+  @take:
+    %opo = field @WsFrame, *%fr, 1
+    %op = load i32, *%opo
+    %plp = field @WsFrame, *%fr, 4
+    %plen = load i32, *%plp
+    %offp = field @WsFrame, *%fr, 3
+    %poff = load i32, *%offp
+    %pay = gep i8, *%rx, %poff
+    %hlp = field @WsFrame, *%fr, 5
+    %hlen = load i32, *%hlp
+    %total = add i32 %hlen, %plen
+    %rxop = field @WsClient, *%w, 3
+    store i32 %total, *%rxop
+    %is_ctrl = sge i32 %op, @WsOpcode.Close
+    br %is_ctrl, @ctrl, @data
+  @ctrl:
+    %is_close = eq i32 %op, @WsOpcode.Close
+    br %is_close, @close, @ctrl_ping
+  @ctrl_ping:
+    %is_ping = eq i32 %op, @WsOpcode.Ping
+    br %is_ping, @ping, @loop
+  @ping:
+    // Pongs are only sent while open; after close was sent they are dropped.
+    %still_open = eq i32 %state, 0
+    br %still_open, @ping_send, @loop
+  @ping_send:
+    %pr2 = call @_ws_send_frame(%w, @WsOpcode.Pong, %pay, %plen, 1)
+    %pr2_ok = eq i32 %pr2, 0
+    br %pr2_ok, @loop, @fail
+  @close:
+    %cc = call @net_ws_close_code(%pay, %plen)
+    %ccp = field @WsClient, *%w, 5
+    store i32 %cc, *%ccp
+    %we_sent = eq i32 %state, 1
+    br %we_sent, @close_mark, @close_echo
+  @close_echo:
+    %ec = call @net_ws_send_close(%w, %cc, null, 0)
+    jmp @close_mark
+  @close_mark:
+    store i32 2, *%clp
+    ret i32 @WsOpcode.Close
+  @data:
+    %is_cont = eq i32 %op, @WsOpcode.Continuation
+    br %is_cont, @cont, @new_msg
+  @new_msg:
+    %ml = load i32, *%msg_op
+    %in_progress = ne i32 %ml, 0
+    br %in_progress, @fail, @start
+  @start:
+    store i32 %op, *%msg_op
+    store i32 0, *%msg_len
+    jmp @append
+  @cont:
+    %ml2 = load i32, *%msg_op
+    %no_start = eq i32 %ml2, 0
+    br %no_start, @fail, @append
+  @append:
+    %cur_len = load i32, *%msg_len
+    %new_len = add i32 %cur_len, %plen
+    %over = sgt i32 %new_len, %cap
+    br %over, @fail, @copy_init
+  @copy_init:
+    %k = let i32
+    store i32 0, *%k
+    jmp @copy_cond
+  @copy_cond:
+    %kv = load i32, *%k
+    %kmore = slt i32 %kv, %plen
+    br %kmore, @copy_body, @copy_done
+  @copy_body:
+    %kv2 = load i32, *%k
+    %sp = gep i8, *%pay, %kv2
+    %ch = load i8, *%sp
+    %di = add i32 %cur_len, %kv2
+    %dp = gep i8, *%dst, %di
+    store i8 %ch, *%dp
+    %kn = add i32 %kv2, 1
+    store i32 %kn, *%k
+    jmp @copy_cond
+  @copy_done:
+    store i32 %new_len, *%msg_len
+    %finp = field @WsFrame, *%fr, 0
+    %finv = load i32, *%finp
+    %isfin = eq i32 %finv, 1
+    br %isfin, @complete, @loop
+  @complete:
+    %ro = load i32, *%msg_op
+    %lrv = load i32, *%msg_len
+    store i32 %lrv, *%out_len
+    ret i32 %ro
+  @fail:
+    ret i32 -1
+}
+
+// 1 once the closing handshake has started, 0 while the connection is open.
+fun @net_ws_is_closed(w: *@WsClient) -> i32 {
+  @entry:
+    %clp = field @WsClient, *%w, 4
+    %v = load i32, *%clp
+    %closed = ne i32 %v, 0
+    %r = zext i1 %closed to i32
+    ret i32 %r
+}
+
+fun @net_ws_close_code_of(w: *@WsClient) -> i32 {
+  @entry:
+    %ccp = field @WsClient, *%w, 5
+    %v = load i32, *%ccp
+    ret i32 %v
+}
+
+// Close the underlying transport.
+fun @net_ws_destroy(w: *@WsClient) -> i32 {
+  @entry:
+    %hp = field @WsClient, *%w, 0
+    %r = call @net_http_client_close(%hp)
+    ret i32 %r
+}

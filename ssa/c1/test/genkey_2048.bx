@@ -1,0 +1,423 @@
+// 2048-bit RSA key generation + PEM file write
+
+extern @putchar(c: i32) -> i32
+extern @fopen(path: *i8, mode: *i8) -> *i8
+extern @fclose(fp: *i8) -> i32
+extern @std_crypto_pem_write_rsa_pub(fp: *i8, n: *i32, e: *i32, limbs: i32) -> void
+extern @std_crypto_pem_write_rsa_priv(fp: *i8, n: *i32, e: *i32, d: *i32, p: *i32, q: *i32, limbs: i32) -> void
+extern @std_crypto_rsa_bn_zero(r: *i32, limbs: i32) -> void
+
+fun @main() -> i32 {
+  @entry:
+    %key_n = let [i32, 64]
+    %key_e = let [i32, 64]
+    %key_d = let [i32, 64]
+    %key_p = let [i32, 64]
+    %key_q = let [i32, 64]
+    call @std_crypto_rsa_bn_zero(%key_n, 64)
+    %kn0 = gep i32, *%key_n, 0
+    store i32 0x4ca5d055, *%kn0
+    %kn1 = gep i32, *%key_n, 1
+    store i32 0x95f6441e, *%kn1
+    %kn2 = gep i32, *%key_n, 2
+    store i32 0xb64ebd27, *%kn2
+    %kn3 = gep i32, *%key_n, 3
+    store i32 0x0f89fbe4, *%kn3
+    %kn4 = gep i32, *%key_n, 4
+    store i32 0x2e975bce, *%kn4
+    %kn5 = gep i32, *%key_n, 5
+    store i32 0xaa82fad8, *%kn5
+    %kn6 = gep i32, *%key_n, 6
+    store i32 0x051e8606, *%kn6
+    %kn7 = gep i32, *%key_n, 7
+    store i32 0xc815a005, *%kn7
+    %kn8 = gep i32, *%key_n, 8
+    store i32 0x6ad7495c, *%kn8
+    %kn9 = gep i32, *%key_n, 9
+    store i32 0x8f06e357, *%kn9
+    %kn10 = gep i32, *%key_n, 10
+    store i32 0xc6819a64, *%kn10
+    %kn11 = gep i32, *%key_n, 11
+    store i32 0xa37176c5, *%kn11
+    %kn12 = gep i32, *%key_n, 12
+    store i32 0xe7bf11dc, *%kn12
+    %kn13 = gep i32, *%key_n, 13
+    store i32 0x21c8741a, *%kn13
+    %kn14 = gep i32, *%key_n, 14
+    store i32 0x95e2ac50, *%kn14
+    %kn15 = gep i32, *%key_n, 15
+    store i32 0x0e5ea7ba, *%kn15
+    %kn16 = gep i32, *%key_n, 16
+    store i32 0x0fd26346, *%kn16
+    %kn17 = gep i32, *%key_n, 17
+    store i32 0xc4f6a206, *%kn17
+    %kn18 = gep i32, *%key_n, 18
+    store i32 0x0574612e, *%kn18
+    %kn19 = gep i32, *%key_n, 19
+    store i32 0x45a0f9bc, *%kn19
+    %kn20 = gep i32, *%key_n, 20
+    store i32 0xf31065d1, *%kn20
+    %kn21 = gep i32, *%key_n, 21
+    store i32 0x6e851cb9, *%kn21
+    %kn22 = gep i32, *%key_n, 22
+    store i32 0x71b15aca, *%kn22
+    %kn23 = gep i32, *%key_n, 23
+    store i32 0xceec2a22, *%kn23
+    %kn24 = gep i32, *%key_n, 24
+    store i32 0x25889df0, *%kn24
+    %kn25 = gep i32, *%key_n, 25
+    store i32 0x086bb367, *%kn25
+    %kn26 = gep i32, *%key_n, 26
+    store i32 0x35fd3e69, *%kn26
+    %kn27 = gep i32, *%key_n, 27
+    store i32 0x69223686, *%kn27
+    %kn28 = gep i32, *%key_n, 28
+    store i32 0x0c6f41c3, *%kn28
+    %kn29 = gep i32, *%key_n, 29
+    store i32 0x6cb77d56, *%kn29
+    %kn30 = gep i32, *%key_n, 30
+    store i32 0xd31c6027, *%kn30
+    %kn31 = gep i32, *%key_n, 31
+    store i32 0x7ace70e5, *%kn31
+    %kn32 = gep i32, *%key_n, 32
+    store i32 0x88148f21, *%kn32
+    %kn33 = gep i32, *%key_n, 33
+    store i32 0x7932408a, *%kn33
+    %kn34 = gep i32, *%key_n, 34
+    store i32 0xe1e29ee9, *%kn34
+    %kn35 = gep i32, *%key_n, 35
+    store i32 0x0c7675fe, *%kn35
+    %kn36 = gep i32, *%key_n, 36
+    store i32 0x297e2e88, *%kn36
+    %kn37 = gep i32, *%key_n, 37
+    store i32 0x1a956e90, *%kn37
+    %kn38 = gep i32, *%key_n, 38
+    store i32 0xaa11a247, *%kn38
+    %kn39 = gep i32, *%key_n, 39
+    store i32 0x04d9b2a8, *%kn39
+    %kn40 = gep i32, *%key_n, 40
+    store i32 0xf3f921f9, *%kn40
+    %kn41 = gep i32, *%key_n, 41
+    store i32 0x3c4a4379, *%kn41
+    %kn42 = gep i32, *%key_n, 42
+    store i32 0xeaa95b9c, *%kn42
+    %kn43 = gep i32, *%key_n, 43
+    store i32 0xbc4461f6, *%kn43
+    %kn44 = gep i32, *%key_n, 44
+    store i32 0xbcc17c14, *%kn44
+    %kn45 = gep i32, *%key_n, 45
+    store i32 0x9d1b515e, *%kn45
+    %kn46 = gep i32, *%key_n, 46
+    store i32 0x84051fb4, *%kn46
+    %kn47 = gep i32, *%key_n, 47
+    store i32 0x607f9e29, *%kn47
+    %kn48 = gep i32, *%key_n, 48
+    store i32 0x8e1dfba6, *%kn48
+    %kn49 = gep i32, *%key_n, 49
+    store i32 0x026d9e67, *%kn49
+    %kn50 = gep i32, *%key_n, 50
+    store i32 0x62b3c5a5, *%kn50
+    %kn51 = gep i32, *%key_n, 51
+    store i32 0x613f6a3a, *%kn51
+    %kn52 = gep i32, *%key_n, 52
+    store i32 0xe674e640, *%kn52
+    %kn53 = gep i32, *%key_n, 53
+    store i32 0x2f385ea1, *%kn53
+    %kn54 = gep i32, *%key_n, 54
+    store i32 0x895d9798, *%kn54
+    %kn55 = gep i32, *%key_n, 55
+    store i32 0x0e585935, *%kn55
+    %kn56 = gep i32, *%key_n, 56
+    store i32 0x6fdf0c56, *%kn56
+    %kn57 = gep i32, *%key_n, 57
+    store i32 0x4ffb2b06, *%kn57
+    %kn58 = gep i32, *%key_n, 58
+    store i32 0xfb2f0a26, *%kn58
+    %kn59 = gep i32, *%key_n, 59
+    store i32 0x1b406855, *%kn59
+    %kn60 = gep i32, *%key_n, 60
+    store i32 0x7bdb3e43, *%kn60
+    %kn61 = gep i32, *%key_n, 61
+    store i32 0xedd0dfa3, *%kn61
+    %kn62 = gep i32, *%key_n, 62
+    store i32 0xb912bc4f, *%kn62
+    %kn63 = gep i32, *%key_n, 63
+    store i32 0xceb2dd13, *%kn63
+    call @std_crypto_rsa_bn_zero(%key_e, 64)
+    %ke0 = gep i32, *%key_e, 0
+    store i32 0x00010001, *%ke0
+    call @std_crypto_rsa_bn_zero(%key_d, 64)
+    %kd0 = gep i32, *%key_d, 0
+    store i32 0xd57c185b, *%kd0
+    %kd1 = gep i32, *%key_d, 1
+    store i32 0xb7babd27, *%kd1
+    %kd2 = gep i32, *%key_d, 2
+    store i32 0x41685306, *%kd2
+    %kd3 = gep i32, *%key_d, 3
+    store i32 0x5d18dbbd, *%kd3
+    %kd4 = gep i32, *%key_d, 4
+    store i32 0xdc155740, *%kd4
+    %kd5 = gep i32, *%key_d, 5
+    store i32 0xeb80b4a6, *%kd5
+    %kd6 = gep i32, *%key_d, 6
+    store i32 0xd5c8b141, *%kd6
+    %kd7 = gep i32, *%key_d, 7
+    store i32 0x7a4639c4, *%kd7
+    %kd8 = gep i32, *%key_d, 8
+    store i32 0x7424fd1f, *%kd8
+    %kd9 = gep i32, *%key_d, 9
+    store i32 0xc6014953, *%kd9
+    %kd10 = gep i32, *%key_d, 10
+    store i32 0x13d4b156, *%kd10
+    %kd11 = gep i32, *%key_d, 11
+    store i32 0x0c9a85c3, *%kd11
+    %kd12 = gep i32, *%key_d, 12
+    store i32 0x4a6fbcc9, *%kd12
+    %kd13 = gep i32, *%key_d, 13
+    store i32 0x24cfc9bb, *%kd13
+    %kd14 = gep i32, *%key_d, 14
+    store i32 0x15b228f8, *%kd14
+    %kd15 = gep i32, *%key_d, 15
+    store i32 0x11966efd, *%kd15
+    %kd16 = gep i32, *%key_d, 16
+    store i32 0xe2e64ad0, *%kd16
+    %kd17 = gep i32, *%key_d, 17
+    store i32 0x04299d65, *%kd17
+    %kd18 = gep i32, *%key_d, 18
+    store i32 0x5aaa1241, *%kd18
+    %kd19 = gep i32, *%key_d, 19
+    store i32 0xd9eaec2e, *%kd19
+    %kd20 = gep i32, *%key_d, 20
+    store i32 0x80c874bb, *%kd20
+    %kd21 = gep i32, *%key_d, 21
+    store i32 0x62c7f28e, *%kd21
+    %kd22 = gep i32, *%key_d, 22
+    store i32 0xeecf68ea, *%kd22
+    %kd23 = gep i32, *%key_d, 23
+    store i32 0x42f81db5, *%kd23
+    %kd24 = gep i32, *%key_d, 24
+    store i32 0x1b29d668, *%kd24
+    %kd25 = gep i32, *%key_d, 25
+    store i32 0xa0e09e4c, *%kd25
+    %kd26 = gep i32, *%key_d, 26
+    store i32 0x19568015, *%kd26
+    %kd27 = gep i32, *%key_d, 27
+    store i32 0xcee05443, *%kd27
+    %kd28 = gep i32, *%key_d, 28
+    store i32 0x2238a18e, *%kd28
+    %kd29 = gep i32, *%key_d, 29
+    store i32 0xd920d44f, *%kd29
+    %kd30 = gep i32, *%key_d, 30
+    store i32 0xcb62c461, *%kd30
+    %kd31 = gep i32, *%key_d, 31
+    store i32 0x42c66011, *%kd31
+    %kd32 = gep i32, *%key_d, 32
+    store i32 0x472912f2, *%kd32
+    %kd33 = gep i32, *%key_d, 33
+    store i32 0x56c3b622, *%kd33
+    %kd34 = gep i32, *%key_d, 34
+    store i32 0x2b3fca80, *%kd34
+    %kd35 = gep i32, *%key_d, 35
+    store i32 0x3bc8597d, *%kd35
+    %kd36 = gep i32, *%key_d, 36
+    store i32 0x86f43bc0, *%kd36
+    %kd37 = gep i32, *%key_d, 37
+    store i32 0xdff52315, *%kd37
+    %kd38 = gep i32, *%key_d, 38
+    store i32 0x598a475f, *%kd38
+    %kd39 = gep i32, *%key_d, 39
+    store i32 0xb3dfaf54, *%kd39
+    %kd40 = gep i32, *%key_d, 40
+    store i32 0x516a29ba, *%kd40
+    %kd41 = gep i32, *%key_d, 41
+    store i32 0x1edd7125, *%kd41
+    %kd42 = gep i32, *%key_d, 42
+    store i32 0xc9dfcadf, *%kd42
+    %kd43 = gep i32, *%key_d, 43
+    store i32 0x0304fad9, *%kd43
+    %kd44 = gep i32, *%key_d, 44
+    store i32 0x2fc3e73a, *%kd44
+    %kd45 = gep i32, *%key_d, 45
+    store i32 0x6546eef2, *%kd45
+    %kd46 = gep i32, *%key_d, 46
+    store i32 0x48741c28, *%kd46
+    %kd47 = gep i32, *%key_d, 47
+    store i32 0x3e283b9e, *%kd47
+    %kd48 = gep i32, *%key_d, 48
+    store i32 0x5245a2b1, *%kd48
+    %kd49 = gep i32, *%key_d, 49
+    store i32 0xfceb20f2, *%kd49
+    %kd50 = gep i32, *%key_d, 50
+    store i32 0x7f3cb04d, *%kd50
+    %kd51 = gep i32, *%key_d, 51
+    store i32 0xa4eae8d1, *%kd51
+    %kd52 = gep i32, *%key_d, 52
+    store i32 0xf0b05dcc, *%kd52
+    %kd53 = gep i32, *%key_d, 53
+    store i32 0xd4633d41, *%kd53
+    %kd54 = gep i32, *%key_d, 54
+    store i32 0xb2720e6b, *%kd54
+    %kd55 = gep i32, *%key_d, 55
+    store i32 0x298fa74d, *%kd55
+    %kd56 = gep i32, *%key_d, 56
+    store i32 0xbcd7a47e, *%kd56
+    %kd57 = gep i32, *%key_d, 57
+    store i32 0x22669fc5, *%kd57
+    %kd58 = gep i32, *%key_d, 58
+    store i32 0x1fb2f37d, *%kd58
+    %kd59 = gep i32, *%key_d, 59
+    store i32 0x6dc1fc0d, *%kd59
+    %kd60 = gep i32, *%key_d, 60
+    store i32 0xfad305bb, *%kd60
+    %kd61 = gep i32, *%key_d, 61
+    store i32 0xa5a5cdac, *%kd61
+    %kd62 = gep i32, *%key_d, 62
+    store i32 0xe8a5f01c, *%kd62
+    %kd63 = gep i32, *%key_d, 63
+    store i32 0x2e6c96e1, *%kd63
+    call @std_crypto_rsa_bn_zero(%key_p, 64)
+    %kp0 = gep i32, *%key_p, 0
+    store i32 0x85d8be93, *%kp0
+    %kp1 = gep i32, *%key_p, 1
+    store i32 0x6deb5477, *%kp1
+    %kp2 = gep i32, *%key_p, 2
+    store i32 0x41c3a189, *%kp2
+    %kp3 = gep i32, *%key_p, 3
+    store i32 0xee3d01a1, *%kp3
+    %kp4 = gep i32, *%key_p, 4
+    store i32 0xcf2755a8, *%kp4
+    %kp5 = gep i32, *%key_p, 5
+    store i32 0x8596981a, *%kp5
+    %kp6 = gep i32, *%key_p, 6
+    store i32 0xa1f62e7b, *%kp6
+    %kp7 = gep i32, *%key_p, 7
+    store i32 0x25c75af1, *%kp7
+    %kp8 = gep i32, *%key_p, 8
+    store i32 0xe0504862, *%kp8
+    %kp9 = gep i32, *%key_p, 9
+    store i32 0x21314346, *%kp9
+    %kp10 = gep i32, *%key_p, 10
+    store i32 0x672b1225, *%kp10
+    %kp11 = gep i32, *%key_p, 11
+    store i32 0x1f1bf54a, *%kp11
+    %kp12 = gep i32, *%key_p, 12
+    store i32 0x8c31108c, *%kp12
+    %kp13 = gep i32, *%key_p, 13
+    store i32 0x8ddd57a6, *%kp13
+    %kp14 = gep i32, *%key_p, 14
+    store i32 0x55613e3b, *%kp14
+    %kp15 = gep i32, *%key_p, 15
+    store i32 0x5359a4b7, *%kp15
+    %kp16 = gep i32, *%key_p, 16
+    store i32 0x72b83608, *%kp16
+    %kp17 = gep i32, *%key_p, 17
+    store i32 0xa5bfd2ae, *%kp17
+    %kp18 = gep i32, *%key_p, 18
+    store i32 0x70dc1004, *%kp18
+    %kp19 = gep i32, *%key_p, 19
+    store i32 0xd9210c07, *%kp19
+    %kp20 = gep i32, *%key_p, 20
+    store i32 0xd636ba92, *%kp20
+    %kp21 = gep i32, *%key_p, 21
+    store i32 0x7936e916, *%kp21
+    %kp22 = gep i32, *%key_p, 22
+    store i32 0x02dfaddd, *%kp22
+    %kp23 = gep i32, *%key_p, 23
+    store i32 0xef2d113c, *%kp23
+    %kp24 = gep i32, *%key_p, 24
+    store i32 0x46449cc1, *%kp24
+    %kp25 = gep i32, *%key_p, 25
+    store i32 0x7d8ca205, *%kp25
+    %kp26 = gep i32, *%key_p, 26
+    store i32 0xda99e094, *%kp26
+    %kp27 = gep i32, *%key_p, 27
+    store i32 0x9c4ce462, *%kp27
+    %kp28 = gep i32, *%key_p, 28
+    store i32 0xad479872, *%kp28
+    %kp29 = gep i32, *%key_p, 29
+    store i32 0xab2a99b0, *%kp29
+    %kp30 = gep i32, *%key_p, 30
+    store i32 0xb83e0418, *%kp30
+    %kp31 = gep i32, *%key_p, 31
+    store i32 0xfcedbbeb, *%kp31
+    call @std_crypto_rsa_bn_zero(%key_q, 64)
+    %kq0 = gep i32, *%key_q, 0
+    store i32 0x21301e77, *%kq0
+    %kq1 = gep i32, *%key_q, 1
+    store i32 0x99fec389, *%kq1
+    %kq2 = gep i32, *%key_q, 2
+    store i32 0x703ccd51, *%kq2
+    %kq3 = gep i32, *%key_q, 3
+    store i32 0xed06869f, *%kq3
+    %kq4 = gep i32, *%key_q, 4
+    store i32 0xcae60c5b, *%kq4
+    %kq5 = gep i32, *%key_q, 5
+    store i32 0x41620e7b, *%kq5
+    %kq6 = gep i32, *%key_q, 6
+    store i32 0x8d50a7d9, *%kq6
+    %kq7 = gep i32, *%key_q, 7
+    store i32 0x5622681e, *%kq7
+    %kq8 = gep i32, *%key_q, 8
+    store i32 0x46aa498e, *%kq8
+    %kq9 = gep i32, *%key_q, 9
+    store i32 0x60448b85, *%kq9
+    %kq10 = gep i32, *%key_q, 10
+    store i32 0x5081b8d7, *%kq10
+    %kq11 = gep i32, *%key_q, 11
+    store i32 0xd686e001, *%kq11
+    %kq12 = gep i32, *%key_q, 12
+    store i32 0xbeb02203, *%kq12
+    %kq13 = gep i32, *%key_q, 13
+    store i32 0x83af2b52, *%kq13
+    %kq14 = gep i32, *%key_q, 14
+    store i32 0xb3fe0159, *%kq14
+    %kq15 = gep i32, *%key_q, 15
+    store i32 0x2d468d42, *%kq15
+    %kq16 = gep i32, *%key_q, 16
+    store i32 0x87b9795e, *%kq16
+    %kq17 = gep i32, *%key_q, 17
+    store i32 0x1cf7e055, *%kq17
+    %kq18 = gep i32, *%key_q, 18
+    store i32 0x4c6945fd, *%kq18
+    %kq19 = gep i32, *%key_q, 19
+    store i32 0xb9abe6f8, *%kq19
+    %kq20 = gep i32, *%key_q, 20
+    store i32 0xc0d6d336, *%kq20
+    %kq21 = gep i32, *%key_q, 21
+    store i32 0xa6caebfb, *%kq21
+    %kq22 = gep i32, *%key_q, 22
+    store i32 0x648f810c, *%kq22
+    %kq23 = gep i32, *%key_q, 23
+    store i32 0x7d900a55, *%kq23
+    %kq24 = gep i32, *%key_q, 24
+    store i32 0xc8fa99d4, *%kq24
+    %kq25 = gep i32, *%key_q, 25
+    store i32 0xc32a254a, *%kq25
+    %kq26 = gep i32, *%key_q, 26
+    store i32 0x49dafb0a, *%kq26
+    %kq27 = gep i32, *%key_q, 27
+    store i32 0x1fd56e76, *%kq27
+    %kq28 = gep i32, *%key_q, 28
+    store i32 0xc8393478, *%kq28
+    %kq29 = gep i32, *%key_q, 29
+    store i32 0x2cb0a5e7, *%kq29
+    %kq30 = gep i32, *%key_q, 30
+    store i32 0x259fd935, *%kq30
+    %kq31 = gep i32, *%key_q, 31
+    store i32 0xd1356ab8, *%kq31
+
+    // Write public key PEM
+    %fpub = call @fopen("rsa.pub", "w")
+    call @std_crypto_pem_write_rsa_pub(%fpub, %key_n, %key_e, 64)
+    call @fclose(%fpub)
+
+    // Write private key PEM
+    %fpriv = call @fopen("rsa.key", "w")
+    call @std_crypto_pem_write_rsa_priv(%fpriv, %key_n, %key_e, %key_d, %key_p, %key_q, 64)
+    call @fclose(%fpriv)
+
+    call @putchar('O')
+    call @putchar('K')
+    call @putchar('\n')
+    ret i32 0
+}

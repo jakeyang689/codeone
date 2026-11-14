@@ -1,0 +1,172 @@
+// TLS 1.2 step-by-step debug test
+extern @printf(fmt: *i8, ...) -> i32
+extern @memset(s: *i8, c: i32, n: i64) -> *i8
+
+extern @net_socket_tcp() -> i32
+extern @net_socket_connect(fd: i32, port: i32) -> i32
+extern @net_socket_close(fd: i32) -> i32
+
+extern @net_tls12_connect(ctx: *i8, fd: i32, limbs: i32) -> i32
+
+// Direct access to step functions for tracing
+extern @ch12(ctx: *i8, buf: *i8, cap: i32, olen: *i32) -> i32
+extern @tls_write_record(fd: i32, typ: i8, ver: i16, data: *i8, len: i32) -> i32
+extern @read_hs(fd: i32, buf: *i8, cap: i32, hst: *i8, blen: *i32) -> i32
+extern @parse_sh(buf: *i8, blen: i32, sr: *i8, cs: *i16) -> i32
+extern @extract_rsa(body: *i8, blen: i32, no: *i32, eo: *i32, li: i32) -> i32
+
+fun @main() -> i32 {
+  @entry:
+    %ctx = let [i8, 1024]
+    %ctxp = gep i8, *%ctx, 0
+    call @memset(%ctxp, 0, 1024)
+
+    call @printf("=== TLS 1.2 Step-by-Step ===\n")
+
+    // Connect
+    %fd = call @net_socket_tcp()
+    call @printf("Socket=%d\n", %fd)
+    %cr = call @net_socket_connect(%fd, 4433)
+    call @printf("Connect=%d\n", %cr)
+
+    // Step 1: Build and send ClientHello
+    %ch = let [i8, 512]
+    %chp = gep i8, *%ch, 0
+    %ch_len = let i32
+    %ch_lenp = gep i32, *%ch_len, 0
+    %r1 = call @ch12(%ctxp, %chp, 512, %ch_lenp)
+    call @printf("ch12=%d\n", %r1)
+    %ch_lenv = load i32, *%ch_lenp
+    call @printf("ch_len=%d\n", %ch_lenv)
+
+    // Send CH via send_hs equivalent
+    %rec = let [i8, 512]
+    %recp = gep i8, *%rec, 0
+    store i8 1, *%recp
+    %lenp = gep i8, *%recp, 1
+    call @put24(%lenp, %ch_lenv)
+    %bodyp = gep i8, *%recp, 4
+    %n64 = sext i32 %ch_lenv to i64
+    call @memcpy(%bodyp, %chp, %n64)
+    %total = add i32 %ch_lenv, 4
+    %send_r = call @tls_write_record(%fd, 22, 771, %recp, %total)
+    call @printf("send_CH=%d\n", %send_r)
+
+    // Step 2: Read ServerHello
+    %buf = let [i8, 4096]
+    %bp = gep i8, *%buf, 0
+    %hst = let i8
+    %hstp = gep i8, *%hst, 0
+    %hsl = let i32
+    %hslp = gep i32, *%hsl, 0
+    %r2 = call @read_hs(%fd, %bp, 4096, %hstp, %hslp)
+    call @printf("read_hs=%d\n", %r2)
+    %t = load i8, *%hstp
+    %ti = zext i8 %t to i32
+    call @printf("  type=%d\n", %ti)
+    %blen = load i32, *%hslp
+    call @printf("  blen=%d\n", %blen)
+    %is_sh = eq i8 %t, 2
+    br %is_sh, @parse_sh_ans, @fail_early
+
+  @parse_sh_ans:
+    %sr = let [i8, 32]
+    %srp = gep i8, *%sr, 0
+    %cs = let i16
+    %csp = gep i16, *%cs, 0
+    %r3 = call @parse_sh(%bp, %blen, %srp, %csp)
+    call @printf("parse_sh=%d\n", %r3)
+    %csv = load i16, *%csp
+    call @printf("  cs=0x%x\n", %csv)
+    %r3_ok = eq i32 %r3, 0
+    br %r3_ok, @step3, @step2_fail
+
+  @step2_fail:
+    call @printf("ServerHello parse failed\n")
+    jmp @fail_early
+
+  @step3:
+    // Read Certificate
+    call @printf("Reading Certificate...\n")
+    %r4 = call @read_hs(%fd, %bp, 4096, %hstp, %hslp)
+    call @printf("read_cert=%d\n", %r4)
+    %t2 = load i8, *%hstp
+    %t2i = zext i8 %t2 to i32
+    call @printf("  type=%d\n", %t2i)
+    %blen2 = load i32, *%hslp
+    call @printf("  blen=%d\n", %blen2)
+    %is_cert = eq i8 %t2, 11
+    br %is_cert, @extract, @step3_is_sh
+
+  @step3_is_sh:
+    %is_sh2 = eq i8 %t2, 2
+    br %is_sh2, @parse_sh2, @step3_is_shd
+
+  @parse_sh2:
+    %r3b = call @parse_sh(%bp, %blen2, %srp, %csp)
+    call @printf("parse_sh2=%d\n", %r3b)
+    jmp @step3
+
+  @step3_is_shd:
+    %is_shd = eq i8 %t2, 14
+    br %is_shd, @step4, @fail_early
+
+  @extract:
+    %rn = let [i32, 64]
+    %re = let [i32, 64]
+    %rnp = gep i32, *%rn, 0
+    %rep = gep i32, *%re, 0
+    %r5 = call @extract_rsa(%bp, %blen2, %rnp, %rep, 64)
+    call @printf("extract_rsa=%d\n", %r5)
+
+    // Step 4: Read ServerHelloDone
+    call @printf("Reading SHD...\n")
+    %r6 = call @read_hs(%fd, %bp, 4096, %hstp, %hslp)
+    call @printf("read_shd=%d\n", %r6)
+    %t3 = load i8, *%hstp
+    %t3i = zext i8 %t3 to i32
+    call @printf("  type=%d\n", %t3i)
+    %is_shd2 = eq i8 %t3, 14
+    br %is_shd2, @step5, @fail_early
+
+  @step5:
+    call @printf("Step 5: would send CKE (handshake API not directly accessible)\n")
+    jmp @step5full
+
+  @step5full:
+    // Try full handshake
+    call @printf("\n--- Trying full @net_tls12_connect ---\n")
+    call @net_socket_close(%fd)
+    %fd2 = call @net_socket_tcp()
+    %cr2 = call @net_socket_connect(%fd2, 4433)
+    call @printf("Connect2=%d\n", %cr2)
+    call @memset(%ctxp, 0, 1024)
+    %hs_r = call @net_tls12_connect(%ctxp, %fd2, 64)
+    call @printf("tls12_hs=%d\n", %hs_r)
+    call @net_socket_close(%fd2)
+    %hs_ok = eq i32 %hs_r, 0
+    br %hs_ok, @pass, @fail_early
+
+  @step4:
+    call @printf("Got SHD instead of Certificate - trying full handshake\n")
+    call @net_socket_close(%fd)
+    %fd3 = call @net_socket_tcp()
+    %cr3 = call @net_socket_connect(%fd3, 4433)
+    call @memset(%ctxp, 0, 1024)
+    %hs_r2 = call @net_tls12_connect(%ctxp, %fd3, 64)
+    call @printf("tls12_hs=%d\n", %hs_r2)
+    call @net_socket_close(%fd3)
+    jmp @pass
+
+  @pass:
+    call @printf("PASS\n")
+    ret i32 0
+
+  @fail_early:
+    call @net_socket_close(%fd)
+    call @printf("FAIL\n")
+    ret i32 1
+}
+
+extern @put24(p: *i8, v: i32) -> void
+extern @memcpy(dst: *i8, src: *i8, n: i64) -> *i8

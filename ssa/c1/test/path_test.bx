@@ -1,0 +1,179 @@
+// Path helper tests. Prints "PASS path" on success.
+
+extern @printf(fmt: *i8, ...) -> i32
+extern @strlen(s: *i8) -> i64
+extern @strcmp(a: *i8, b: *i8) -> i32
+extern @std_io_path_basename(path: *i8, out: *i8, cap: i32) -> i32
+extern @std_io_path_dirname(path: *i8, out: *i8, cap: i32) -> i32
+extern @std_io_path_extension(path: *i8, out: *i8, cap: i32) -> i32
+extern @std_io_path_join(a: *i8, b: *i8, out: *i8, cap: i32) -> i32
+extern @std_io_path_is_absolute(path: *i8) -> i1
+
+// An empty string literal in a call argument is not supported by the
+// compiler yet, so use an explicit one-byte global.
+const @EMPTY: [i8, 1] = [0]
+
+fun @_check(len: i32, buf: *i8, exp: *i8) -> i32 {
+  @entry:
+    %cmp = call @strcmp(%buf, %exp)
+    %cmpz = eq i32 %cmp, 0
+    %l64 = call @strlen(%exp)
+    %l = trunc i64 %l64 to i32
+    %lok = eq i32 %len, %l
+    %ok = and i1 %cmpz, %lok
+    %r = zext i1 %ok to i32
+    ret i32 %r
+}
+
+fun @main() -> i32 {
+  @entry:
+    %id = let i32
+    %buf = let [i8, 256]
+    %op = gep i8, *%buf, 0
+    %ep = gep i8, *@EMPTY, 0
+    store i32 0, *%id
+    jmp @c1
+
+  @c1:
+    store i32 1, *%id
+    %r1 = call @std_io_path_basename("/a/b/c.txt", %op, 256)
+    %o1 = call @_check(%r1, %op, "c.txt")
+    %ok1 = eq i32 %o1, 1
+    br %ok1, @c2, @fail
+  @c2:
+    store i32 2, *%id
+    %r2 = call @std_io_path_basename("/a/b/", %op, 256)
+    %o2 = call @_check(%r2, %op, "b")
+    %ok2 = eq i32 %o2, 1
+    br %ok2, @c3, @fail
+  @c3:
+    store i32 3, *%id
+    %r3 = call @std_io_path_basename("/", %op, 256)
+    %o3 = call @_check(%r3, %op, "/")
+    %ok3 = eq i32 %o3, 1
+    br %ok3, @c4, @fail
+  @c4:
+    store i32 4, *%id
+    %r4 = call @std_io_path_basename(%ep, %op, 256)
+    %o4 = call @_check(%r4, %op, ".")
+    %ok4 = eq i32 %o4, 1
+    br %ok4, @c5, @fail
+  @c5:
+    store i32 5, *%id
+    %r5 = call @std_io_path_basename("abc", %op, 256)
+    %o5 = call @_check(%r5, %op, "abc")
+    %ok5 = eq i32 %o5, 1
+    br %ok5, @c6, @fail
+  @c6:
+    store i32 6, *%id
+    %r6 = call @std_io_path_dirname("/a/b/c.txt", %op, 256)
+    %o6 = call @_check(%r6, %op, "/a/b")
+    %ok6 = eq i32 %o6, 1
+    br %ok6, @c7, @fail
+  @c7:
+    store i32 7, *%id
+    %r7 = call @std_io_path_dirname("abc", %op, 256)
+    %o7 = call @_check(%r7, %op, ".")
+    %ok7 = eq i32 %o7, 1
+    br %ok7, @c8, @fail
+  @c8:
+    store i32 8, *%id
+    %r8 = call @std_io_path_dirname("/a", %op, 256)
+    %o8 = call @_check(%r8, %op, "/")
+    %ok8 = eq i32 %o8, 1
+    br %ok8, @c9, @fail
+  @c9:
+    store i32 9, *%id
+    %r9 = call @std_io_path_dirname("/", %op, 256)
+    %o9 = call @_check(%r9, %op, "/")
+    %ok9 = eq i32 %o9, 1
+    br %ok9, @c10, @fail
+  @c10:
+    store i32 10, *%id
+    %r10 = call @std_io_path_dirname("a/b", %op, 256)
+    %o10 = call @_check(%r10, %op, "a")
+    %ok10 = eq i32 %o10, 1
+    br %ok10, @c11, @fail
+  @c11:
+    store i32 11, *%id
+    %r11 = call @std_io_path_extension("a.tar.gz", %op, 256)
+    %o11 = call @_check(%r11, %op, "gz")
+    %ok11 = eq i32 %o11, 1
+    br %ok11, @c12, @fail
+  @c12:
+    store i32 12, *%id
+    %r12 = call @std_io_path_extension(".bashrc", %op, 256)
+    %o12 = call @_check(%r12, %op, %ep)
+    %ok12 = eq i32 %o12, 1
+    br %ok12, @c13, @fail
+  @c13:
+    store i32 13, *%id
+    %r13 = call @std_io_path_extension("a.", %op, 256)
+    %o13 = call @_check(%r13, %op, %ep)
+    %ok13 = eq i32 %o13, 1
+    br %ok13, @c14, @fail
+  @c14:
+    store i32 14, *%id
+    %r14 = call @std_io_path_extension("dir/a.txt", %op, 256)
+    %o14 = call @_check(%r14, %op, "txt")
+    %ok14 = eq i32 %o14, 1
+    br %ok14, @c15, @fail
+  @c15:
+    store i32 15, *%id
+    %r15 = call @std_io_path_join("/a", "b", %op, 256)
+    %o15 = call @_check(%r15, %op, "/a/b")
+    %ok15 = eq i32 %o15, 1
+    br %ok15, @c16, @fail
+  @c16:
+    store i32 16, *%id
+    %r16 = call @std_io_path_join("/a/", "b", %op, 256)
+    %o16 = call @_check(%r16, %op, "/a/b")
+    %ok16 = eq i32 %o16, 1
+    br %ok16, @c17, @fail
+  @c17:
+    store i32 17, *%id
+    %r17 = call @std_io_path_join("/", "b", %op, 256)
+    %o17 = call @_check(%r17, %op, "/b")
+    %ok17 = eq i32 %o17, 1
+    br %ok17, @c18, @fail
+  @c18:
+    store i32 18, *%id
+    %r18 = call @std_io_path_join(%ep, "b", %op, 256)
+    %o18 = call @_check(%r18, %op, "b")
+    %ok18 = eq i32 %o18, 1
+    br %ok18, @c19, @fail
+  @c19:
+    store i32 19, *%id
+    %r19 = call @std_io_path_join("/a", "/b", %op, 256)
+    %o19 = call @_check(%r19, %op, "/b")
+    %ok19 = eq i32 %o19, 1
+    br %ok19, @c20, @fail
+  @c20:
+    store i32 20, *%id
+    %a20 = call @std_io_path_is_absolute("/a")
+    %ok20 = eq i1 %a20, true
+    br %ok20, @c21, @fail
+  @c21:
+    store i32 21, *%id
+    %a21 = call @std_io_path_is_absolute("a")
+    %ok21 = eq i1 %a21, false
+    br %ok21, @c22, @fail
+  @c22:
+    store i32 22, *%id
+    %a22 = call @std_io_path_is_absolute(%ep)
+    %ok22 = eq i1 %a22, false
+    br %ok22, @c23, @fail
+  @c23:
+    store i32 23, *%id
+    %r23 = call @std_io_path_basename("abcdef", %op, 3)
+    %ok23 = eq i32 %r23, -1
+    br %ok23, @pass, @fail
+
+  @pass:
+    call @printf("PASS path\n")
+    ret i32 0
+  @fail:
+    %fid = load i32, *%id
+    call @printf("FAIL path at case %d\n", %fid)
+    ret i32 1
+}

@@ -1,0 +1,106 @@
+// Socket platform layer test
+// Tests: create, bind, listen, accept, connect, send, recv, close
+//
+// Build & run:
+//   cd ssa/test
+//   ../c1/c1 test_socket.bx -L ../platform -l platform
+//   ./a.out
+
+extern @putchar(c: i32) -> i32
+
+extern @c1_socket_create(domain: i32, type: i32, protocol: i32) -> i32
+extern @c1_socket_bind(fd: i32, port: i32) -> i32
+extern @c1_socket_listen(fd: i32, backlog: i32) -> i32
+extern @c1_socket_accept(fd: i32) -> i32
+extern @c1_socket_connect_loopback(fd: i32, port: i32) -> i32
+extern @c1_socket_send(fd: i32, buf: *i8, len: i32) -> i32
+extern @c1_socket_recv(fd: i32, buf: *i8, len: i32) -> i32
+extern @c1_socket_close(fd: i32) -> i32
+
+const @msg: [i8, 5] = [104, 101, 108, 108, 111]  // "hello"
+
+fun @main() -> i32 {
+  @entry:
+    // 1. Create server TCP socket
+    %sfd = call @c1_socket_create(2, 1, 0)
+    %neg = slt i32 %sfd, 0
+    br %neg, @fail, @bind
+
+  @bind:
+    %r1 = call @c1_socket_bind(%sfd, 9990)
+    %nb = slt i32 %r1, 0
+    br %nb, @fail, @listen
+
+  @listen:
+    %r2 = call @c1_socket_listen(%sfd, 1)
+    %nl = slt i32 %r2, 0
+    br %nl, @fail, @cli_create
+
+  @cli_create:
+    // 2. Create client socket and connect
+    %cfd = call @c1_socket_create(2, 1, 0)
+    %nc = slt i32 %cfd, 0
+    br %nc, @fail, @conn
+
+  @conn:
+    %cr = call @c1_socket_connect_loopback(%cfd, 9990)
+    %ncon = slt i32 %cr, 0
+    br %ncon, @fail, @accept
+
+  @accept:
+    %acfd = call @c1_socket_accept(%sfd)
+    %nac = slt i32 %acfd, 0
+    br %nac, @fail, @send
+
+  @send:
+    // 3. Client sends "hello"
+    %mp = gep i8, *@msg, 0
+    %sent = call @c1_socket_send(%cfd, %mp, 5)
+    %ns = slt i32 %sent, 0
+    br %ns, @fail, @recv
+
+  @recv:
+    // 4. Server receives
+    %buf = let [i8, 256]
+    %bp = gep i8, *%buf, 0
+    %n = call @c1_socket_recv(%acfd, %bp, 256)
+    %nr = slt i32 %n, 0
+    br %nr, @fail, @verify
+
+  @verify:
+    // 5. Verify: received 5 bytes, starts with 'h'(104), ends with 'o'(111)
+    %len_ok = eq i32 %n, 5
+    br %len_ok, @v_h, @fail
+  @v_h:
+    %p0 = gep i8, *%buf, 0
+    %c0 = load i8, *%p0
+    %c0i = zext i8 %c0 to i32
+    %is_h = eq i32 %c0i, 104
+    br %is_h, @v_o, @fail
+  @v_o:
+    %p4 = gep i8, *%buf, 4
+    %c4 = load i8, *%p4
+    %c4i = zext i8 %c4 to i32
+    %is_o = eq i32 %c4i, 111
+    br %is_o, @pass, @fail
+
+  @pass:
+    call @c1_socket_close(%acfd)
+    call @c1_socket_close(%cfd)
+    call @c1_socket_close(%sfd)
+    call @putchar(79)
+    call @putchar(75)
+    call @putchar(10)
+    ret i32 0
+
+  @fail:
+    call @putchar(70)
+    call @putchar(65)
+    call @putchar(73)
+    call @putchar(76)
+    call @putchar(10)
+    call @c1_socket_close(%sfd)
+    call @c1_socket_close(%cfd)
+    call @c1_socket_close(%acfd)
+    ret i32 1
+}

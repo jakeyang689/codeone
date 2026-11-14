@@ -1,0 +1,361 @@
+// HTTP/1.0 and HTTP/1.1 request building — pure SSA, no extern calls.
+//
+// Requests are serialized into a caller-provided buffer. Functions return the
+// number of bytes written, or -1 if the buffer is too small.
+
+extern @std_text_str_append(dst: *i8, cap: i32, off: i32, src: *i8, len: i32) -> i32
+extern @std_text_str_append_cstr(dst: *i8, cap: i32, off: i32, s: *i8) -> i32
+extern @std_text_str_append_int(dst: *i8, cap: i32, off: i32, v: i32) -> i32
+extern @std_text_str_find_crlf(buf: *i8, start: i32, len: i32) -> i32
+extern @std_text_str_find_ci(buf: *i8, start: i32, end: i32, needle: *i8) -> i32
+extern @std_text_str_ncmp(s1: *i8, s2: *i8, n: i32) -> i32
+
+// Protocol version as a minor number: 10 for HTTP/1.0, 11 for HTTP/1.1.
+enum @HttpVersion: i32 {
+  @Http10 = 10,
+  @Http11 = 11
+}
+
+
+
+
+// Append "HTTP/1.0" or "HTTP/1.1".
+fun @_net_http_put_version(buf: *i8, cap: i32, off: i32, version: i32) -> i32 {
+  @entry:
+    %is11 = eq i32 %version, @HttpVersion.Http11
+    br %is11, @v11, @v10
+  @v11:
+    %r = call @std_text_str_append_cstr(%buf, %cap, %off, "HTTP/1.1")
+    ret i32 %r
+  @v10:
+    %r2 = call @std_text_str_append_cstr(%buf, %cap, %off, "HTTP/1.0")
+    ret i32 %r2
+}
+
+// Common request line and Host header.
+fun @_net_http_head(buf: *i8, cap: i32, method: *i8, host: *i8, path: *i8,
+                    version: i32) -> i32 {
+  @entry:
+    %o1 = call @std_text_str_append_cstr(%buf, %cap, 0, %method)
+    %b1 = slt i32 %o1, 0
+    br %b1, @fail, @s2
+  @s2:
+    %o2 = call @std_text_str_append_cstr(%buf, %cap, %o1, " ")
+    %b2 = slt i32 %o2, 0
+    br %b2, @fail, @s3
+  @s3:
+    %o3 = call @std_text_str_append_cstr(%buf, %cap, %o2, %path)
+    %b3 = slt i32 %o3, 0
+    br %b3, @fail, @s4
+  @s4:
+    %o4 = call @std_text_str_append_cstr(%buf, %cap, %o3, " ")
+    %b4 = slt i32 %o4, 0
+    br %b4, @fail, @s5
+  @s5:
+    %o5 = call @_net_http_put_version(%buf, %cap, %o4, %version)
+    %b5 = slt i32 %o5, 0
+    br %b5, @fail, @s6
+  @s6:
+    %o6 = call @std_text_str_append_cstr(%buf, %cap, %o5, "\r\n")
+    %b6 = slt i32 %o6, 0
+    br %b6, @fail, @s7
+  @s7:
+    %o7 = call @std_text_str_append_cstr(%buf, %cap, %o6, "Host: ")
+    %b7 = slt i32 %o7, 0
+    br %b7, @fail, @s8
+  @s8:
+    %o8 = call @std_text_str_append_cstr(%buf, %cap, %o7, %host)
+    %b8 = slt i32 %o8, 0
+    br %b8, @fail, @s9
+  @s9:
+    %o9 = call @std_text_str_append_cstr(%buf, %cap, %o8, "\r\n")
+    ret i32 %o9
+  @fail:
+    ret i32 -1
+}
+
+// Build a GET request. Returns bytes written, or -1.
+fun @net_http_build_get(buf: *i8, cap: i32, host: *i8, path: *i8,
+                        version: i32) -> i32 {
+  @entry:
+    %o1 = call @_net_http_head(%buf, %cap, "GET", %host, %path, %version)
+    %b1 = slt i32 %o1, 0
+    br %b1, @fail, @s2
+  @s2:
+    %o2 = call @std_text_str_append_cstr(%buf, %cap, %o1, "Connection: close\r\n\r\n")
+    ret i32 %o2
+  @fail:
+    ret i32 -1
+}
+
+// Build a POST request with an optional body. Returns bytes written, or -1.
+fun @net_http_build_post(buf: *i8, cap: i32, host: *i8, path: *i8,
+                         content_type: *i8, body: *i8, body_len: i32,
+                         version: i32) -> i32 {
+  @entry:
+    %o1 = call @_net_http_head(%buf, %cap, "POST", %host, %path, %version)
+    %b1 = slt i32 %o1, 0
+    br %b1, @fail, @s2
+  @s2:
+    %o2 = call @std_text_str_append_cstr(%buf, %cap, %o1, "Content-Type: ")
+    %b2 = slt i32 %o2, 0
+    br %b2, @fail, @s3
+  @s3:
+    %o3 = call @std_text_str_append_cstr(%buf, %cap, %o2, %content_type)
+    %b3 = slt i32 %o3, 0
+    br %b3, @fail, @s4
+  @s4:
+    %o4 = call @std_text_str_append_cstr(%buf, %cap, %o3, "\r\nContent-Length: ")
+    %b4 = slt i32 %o4, 0
+    br %b4, @fail, @s5
+  @s5:
+    %o5 = call @std_text_str_append_int(%buf, %cap, %o4, %body_len)
+    %b5 = slt i32 %o5, 0
+    br %b5, @fail, @s6
+  @s6:
+    %o6 = call @std_text_str_append_cstr(%buf, %cap, %o5, "\r\nConnection: close\r\n\r\n")
+    %b6 = slt i32 %o6, 0
+    br %b6, @fail, @s7
+  @s7:
+    %no_body = sle i32 %body_len, 0
+    br %no_body, @done, @s8
+  @s8:
+    %o7 = call @std_text_str_append(%buf, %cap, %o6, %body, %body_len)
+    ret i32 %o7
+  @done:
+    ret i32 %o6
+  @fail:
+    ret i32 -1
+}
+
+// Append one "Name: Value\r\n" line to a header buffer.
+// Returns the new offset, or -1 on overflow.
+fun @net_http_header_add(buf: *i8, cap: i32, off: i32, name: *i8, value: *i8) -> i32 {
+  @entry:
+    %o1 = call @std_text_str_append_cstr(%buf, %cap, %off, %name)
+    %b1 = slt i32 %o1, 0
+    br %b1, @fail, @s2
+  @s2:
+    %o2 = call @std_text_str_append_cstr(%buf, %cap, %o1, ": ")
+    %b2 = slt i32 %o2, 0
+    br %b2, @fail, @s3
+  @s3:
+    %o3 = call @std_text_str_append_cstr(%buf, %cap, %o2, %value)
+    %b3 = slt i32 %o3, 0
+    br %b3, @fail, @s4
+  @s4:
+    %o4 = call @std_text_str_append_cstr(%buf, %cap, %o3, "\r\n")
+    ret i32 %o4
+  @fail:
+    ret i32 -1
+}
+
+// Build any request with an explicit Connection header value.
+//
+//   headers    - optional NUL-terminated block of extra header lines, each
+//                already ending in CRLF (see net_http_header_add); NULL for none
+//   body       - optional request body, sent after the headers
+//   body_len   - bytes of body; a Content-Length header is added when > 0
+//   connection - Connection header value ("close", "Upgrade", "keep-alive")
+//
+// Returns bytes written, or -1 if the buffer is too small.
+fun @net_http_build_request_conn(buf: *i8, cap: i32, method: *i8, host: *i8,
+                                 path: *i8, headers: *i8, body: *i8,
+                                 body_len: i32, version: i32,
+                                 connection: *i8) -> i32 {
+  @entry:
+    %o1 = call @_net_http_head(%buf, %cap, %method, %host, %path, %version)
+    %b1 = slt i32 %o1, 0
+    br %b1, @fail, @s2
+  @s2:
+    %no_headers = eq *i8 %headers, null
+    br %no_headers, @s3, @add_headers
+  @add_headers:
+    %o2 = call @std_text_str_append_cstr(%buf, %cap, %o1, %headers)
+    %b2 = slt i32 %o2, 0
+    br %b2, @fail, @s3
+  @s3:
+    %off = phi i32 [ %o1, @s2 ], [ %o2, @add_headers ]
+    %has_body = sgt i32 %body_len, 0
+    br %has_body, @s5, @s6
+  @s5:
+    %o5 = call @std_text_str_append_cstr(%buf, %cap, %off, "Content-Length: ")
+    %b5 = slt i32 %o5, 0
+    br %b5, @fail, @s5b
+  @s5b:
+    %o5b = call @std_text_str_append_int(%buf, %cap, %o5, %body_len)
+    %b5b = slt i32 %o5b, 0
+    br %b5b, @fail, @s5c
+  @s5c:
+    %o5c = call @std_text_str_append_cstr(%buf, %cap, %o5b, "\r\n")
+    %b5c = slt i32 %o5c, 0
+    br %b5c, @fail, @s6
+  @s6:
+    %off2 = phi i32 [ %off, @s3 ], [ %o5c, @s5c ]
+    %o6 = call @std_text_str_append_cstr(%buf, %cap, %off2, "Connection: ")
+    %b6 = slt i32 %o6, 0
+    br %b6, @fail, @s6b
+  @s6b:
+    %o6b = call @std_text_str_append_cstr(%buf, %cap, %o6, %connection)
+    %b6b = slt i32 %o6b, 0
+    br %b6b, @fail, @s6c
+  @s6c:
+    %o6c = call @std_text_str_append_cstr(%buf, %cap, %o6b, "\r\n\r\n")
+    %b6c = slt i32 %o6c, 0
+    br %b6c, @fail, @s7
+  @s7:
+    br %has_body, @body, @done
+  @body:
+    %o7 = call @std_text_str_append(%buf, %cap, %o6c, %body, %body_len)
+    ret i32 %o7
+  @done:
+    ret i32 %o6c
+  @fail:
+    ret i32 -1
+}
+
+// Build any request. Same as net_http_build_request_conn with
+// "Connection: close".
+fun @net_http_build_request(buf: *i8, cap: i32, method: *i8, host: *i8, path: *i8,
+                            headers: *i8, body: *i8, body_len: i32,
+                            version: i32) -> i32 {
+  @entry:
+    %n = call @net_http_build_request_conn(%buf, %cap, %method, %host, %path,
+                                           %headers, %body, %body_len,
+                                           %version, "close")
+    ret i32 %n
+}
+
+// Parsed request line and header block. Offsets are relative to the input
+// buffer; the header block does not include the final blank line.
+struct @HttpRequest {
+  @method_off: i32,
+  @method_len: i32,
+  @path_off: i32,
+  @path_len: i32,
+  @version: i32,       // 10 or 11
+  @headers_off: i32,
+  @headers_len: i32
+}
+
+// Find the next occurrence of byte in buf[start, end). Returns -1 if absent.
+fun @_net_http_scan_byte(buf: *i8, start: i32, end: i32, byte: i8) -> i32 {
+  @entry:
+    %i = let i32
+    store i32 %start, *%i
+    jmp @cond
+  @cond:
+    %iv = load i32, *%i
+    %more = slt i32 %iv, %end
+    br %more, @body, @nf
+  @body:
+    %iv2 = load i32, *%i
+    %p = gep i8, *%buf, %iv2
+    %c = load i8, *%p
+    %hit = eq i8 %c, %byte
+    br %hit, @found, @next
+  @next:
+    %iv3 = load i32, *%i
+    %nx = add i32 %iv3, 1
+    store i32 %nx, *%i
+    jmp @cond
+  @found:
+    %r = load i32, *%i
+    ret i32 %r
+  @nf:
+    ret i32 -1
+}
+
+// Parse a request head:
+//
+//   METHOD SP PATH SP HTTP/1.x CRLF
+//   Name: Value CRLF*
+//   CRLF
+//
+// Returns 0 on success, -1 on a malformed request line or header block.
+fun @net_http_parse_request(buf: *i8, len: i32, req: *@HttpRequest) -> i32 {
+  @entry:
+    %short = slt i32 %len, 14
+    br %short, @fail, @find_line
+  @find_line:
+    %crlf = call @std_text_str_find_crlf(%buf, 0, %len)
+    %bad = slt i32 %crlf, 0
+    br %bad, @fail, @sp1
+  @sp1:
+    %s1 = call @_net_http_scan_byte(%buf, 0, %crlf, ' ')
+    %s1bad = slt i32 %s1, 0
+    br %s1bad, @fail, @m_nonzero
+  @m_nonzero:
+    %m_ok = sgt i32 %s1, 0
+    br %m_ok, @store_m, @fail
+  @store_m:
+    %mo = field @HttpRequest, *%req, 0
+    store i32 0, *%mo
+    %ml = field @HttpRequest, *%req, 1
+    store i32 %s1, *%ml
+    %ps = add i32 %s1, 1
+    %s2 = call @_net_http_scan_byte(%buf, %ps, %crlf, ' ')
+    %s2bad = slt i32 %s2, 0
+    br %s2bad, @fail, @p_nonzero
+  @p_nonzero:
+    %plen = sub i32 %s2, %ps
+    %p_ok = sgt i32 %plen, 0
+    br %p_ok, @store_p, @fail
+  @store_p:
+    %po = field @HttpRequest, *%req, 2
+    store i32 %ps, *%po
+    %pl_p = field @HttpRequest, *%req, 3
+    store i32 %plen, *%pl_p
+    %vstart = add i32 %s2, 1
+    %vend = add i32 %vstart, 8
+    %v_ok = sle i32 %vend, %len
+    br %v_ok, @vcheck, @fail
+  @vcheck:
+    %vp = gep i8, *%buf, %vstart
+    %vdiff = call @std_text_str_ncmp(%vp, "HTTP/1.", 7)
+    %v_ok2 = eq i32 %vdiff, 0
+    br %v_ok2, @vminor, @fail
+  @vminor:
+    %mip = add i32 %vstart, 7
+    %mp = gep i8, *%buf, %mip
+    %mc = load i8, *%mp
+    %is11 = eq i8 %mc, '1'
+    br %is11, @v11, @check10
+  @v11:
+    %ver11_p = field @HttpRequest, *%req, 4
+    store i32 @HttpVersion.Http11, *%ver11_p
+    jmp @headers
+  @check10:
+    %is10 = eq i8 %mc, '0'
+    br %is10, @v10, @fail
+  @v10:
+    %ver10_p = field @HttpRequest, *%req, 4
+    store i32 @HttpVersion.Http10, *%ver10_p
+    jmp @headers
+  @headers:
+    %h_off = add i32 %crlf, 2
+    %h_off_p = field @HttpRequest, *%req, 5
+    store i32 %h_off, *%h_off_p
+    %at_end = sge i32 %h_off, %len
+    br %at_end, @fail, @chk_empty
+  @chk_empty:
+    %hp = gep i8, *%buf, %h_off
+    %hc0 = load i8, *%hp
+    %is_cr = eq i8 %hc0, 13
+    br %is_cr, @empty_h, @scan_h
+  @empty_h:
+    %hl0 = field @HttpRequest, *%req, 6
+    store i32 0, *%hl0
+    ret i32 0
+  @scan_h:
+    %hc = call @std_text_str_find_ci(%buf, %h_off, %len, "\r\n\r\n")
+    %hc_bad = slt i32 %hc, 0
+    br %hc_bad, @fail, @have_h
+  @have_h:
+    %h_len = sub i32 %hc, %h_off
+    %hl_p = field @HttpRequest, *%req, 6
+    store i32 %h_len, *%hl_p
+    ret i32 0
+  @fail:
+    ret i32 -1
+}

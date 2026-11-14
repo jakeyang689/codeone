@@ -1,0 +1,35 @@
+// FNV-1a hash for strings (32-bit)
+// Good for hashmap string keys.
+
+fun @std_crypto_fnv1a_hash(data: *i8, len: i32) -> i32 {
+  @entry:
+    %hptr = let i32
+    %iptr = let i32
+    store i32 -2128831035, *%hptr   // FNV offset basis (0x811C9DC5)
+    store i32 0, *%iptr
+    jmp @fnv_cond
+
+  @fnv_cond:
+    %i = load i32, *%iptr
+    %c = slt i32 %i, %len
+    br %c, @fnv_body, @fnv_done
+
+  @fnv_body:
+    %iv = load i32, *%iptr
+    %p = gep i8, *%data, %iv
+    %b = load i8, *%p
+    %bi = zext i8 %b to i32
+
+    %hv = load i32, *%hptr
+    %xh = xor i32 %hv, %bi           // XOR with byte
+    %mul = mul i32 %xh, 16777619     // FNV prime (0x01000193)
+    store i32 %mul, *%hptr
+
+    %iv2 = add i32 %iv, 1
+    store i32 %iv2, *%iptr
+    jmp @fnv_cond
+
+  @fnv_done:
+    %h = load i32, *%hptr
+    ret i32 %h
+}

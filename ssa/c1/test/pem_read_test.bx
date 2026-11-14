@@ -1,0 +1,185 @@
+// PEM reading and RSA private-key parsing tests.
+// Prints "PASS pem_read" on success.
+
+extern @printf(fmt: *i8, ...) -> i32
+extern @std_io_file_open_read(path: *i8) -> *i8
+extern @std_io_file_read_all(fp: *i8, buf: *i8, cap: i32) -> i32
+extern @std_io_file_close(fp: *i8) -> i32
+extern @std_crypto_pem_find(pem: *i8, pem_len: i32, label: *i8, label_len: i32,
+                            out: *i8, out_cap: i32, out_len: *i32) -> i32
+extern @std_crypto_pem_read_cert(pem: *i8, pem_len: i32,
+                                 out: *i8, out_cap: i32, out_len: *i32) -> i32
+extern @std_crypto_pem_read_rsa_private(pem: *i8, pem_len: i32,
+                                        n: *i32, e: *i32, d: *i32,
+                                        limbs: i32) -> i32
+extern @x509_parse_rsa_pubkey(cert: *i8, cl: i32, no: *i32, eo: *i32,
+                              li: i32) -> i1
+extern @std_crypto_rsa_bn_cmp(a: *i32, b: *i32, limbs: i32) -> i32
+extern @std_crypto_sha256_compute(data: *i8, len: i32, digest: *i8) -> void
+extern @std_crypto_rsa_sign_pkcs1_v15(hash: *i8, d: *i32, n: *i32,
+                                       limbs: i32, signature: *i8) -> void
+extern @std_crypto_rsa_verify_pkcs1_v15(hash: *i8, signature: *i8,
+                                        e: *i32, n: *i32, limbs: i32) -> i1
+
+const @CERT_PATH = "certs/tls13.pem"
+const @KEY8_PATH = "certs/tls13.key"
+const @KEY1_PATH = "certs/tls13_pkcs1.key"
+
+fun @main() -> i32 {
+  @entry:
+    %id = let i32
+    %certpem = let [i8, 8192]
+    %key8pem = let [i8, 8192]
+    %key1pem = let [i8, 8192]
+    %der = let [i8, 8192]
+    %sig = let [i8, 512]
+    %hash = let [i8, 32]
+    %kn = let [i32, 64]
+    %ke = let [i32, 64]
+    %kd = let [i32, 64]
+    %cn = let [i32, 64]
+    %ce = let [i32, 64]
+    %clen = let i32
+    %dlen = let i32
+    %cp = gep i8, *%certpem, 0
+    %k8p = gep i8, *%key8pem, 0
+    %k1p = gep i8, *%key1pem, 0
+    %dp = gep i8, *%der, 0
+    %sp = gep i8, *%sig, 0
+    %hp = gep i8, *%hash, 0
+    %knp = gep i32, *%kn, 0
+    %kep = gep i32, *%ke, 0
+    %kdp = gep i32, *%kd, 0
+    %cnp = gep i32, *%cn, 0
+    %cep = gep i32, *%ce, 0
+    %clp = gep i32, *%clen, 0
+    %dlp = gep i32, *%dlen, 0
+    store i32 0, *%id
+    jmp @c1
+
+    // load the certificate file
+  @c1:
+    store i32 1, *%id
+    %cpf = gep i8, *@CERT_PATH, 0
+    %cf = call @std_io_file_open_read(%cpf)
+    %cfn = eq *i8 %cf, null
+    br %cfn, @fail, @read_cert_file
+  @read_cert_file:
+    %cplen = call @std_io_file_read_all(%cf, %cp, 8191)
+    call @std_io_file_close(%cf)
+    %cnok = sgt i32 %cplen, 0
+    br %cnok, @c2, @fail
+
+    // decode the CERTIFICATE block
+  @c2:
+    store i32 2, *%id
+    %r2 = call @std_crypto_pem_read_cert(%cp, %cplen, %dp, 8192, %dlp)
+    %r2ok = eq i32 %r2, 0
+    br %r2ok, @c3, @fail
+  @c3:
+    store i32 3, *%id
+    %der0 = load i8, *%dp
+    %der0ok = eq i8 %der0, 48
+    %dl = load i32, *%dlp
+    %dlok = sgt i32 %dl, 0
+    %a3 = and i1 %der0ok, %dlok
+    br %a3, @c4, @fail
+  @c4:
+    store i32 4, *%id
+    %pk = call @x509_parse_rsa_pubkey(%dp, %dl, %cnp, %cep, 64)
+    br %pk, @c5, @fail
+
+    // load the PKCS#8 key
+  @c5:
+    store i32 5, *%id
+    %k8f = gep i8, *@KEY8_PATH, 0
+    %f8 = call @std_io_file_open_read(%k8f)
+    %f8n = eq *i8 %f8, null
+    br %f8n, @fail, @read_key8
+  @read_key8:
+    %kn8 = call @std_io_file_read_all(%f8, %k8p, 8191)
+    call @std_io_file_close(%f8)
+    %kn8ok = sgt i32 %kn8, 0
+    br %kn8ok, @c6, @fail
+  @c6:
+    store i32 6, *%id
+    %r6 = call @std_crypto_pem_read_rsa_private(%k8p, %kn8, %knp, %kep, %kdp, 64)
+    %r6ok = eq i32 %r6, 0
+    br %r6ok, @c7, @fail
+  @c7:
+    store i32 7, *%id
+    %cmp_n = call @std_crypto_rsa_bn_cmp(%knp, %cnp, 64)
+    %cmp_e = call @std_crypto_rsa_bn_cmp(%kep, %cep, 64)
+    %nok = eq i32 %cmp_n, 0
+    %eok = eq i32 %cmp_e, 0
+    %b7 = and i1 %nok, %eok
+    br %b7, @c8, @fail
+
+    // prove d matches: sign and verify
+  @c8:
+    store i32 8, *%id
+    call @std_crypto_sha256_compute("abc", 3, %hp)
+    call @std_crypto_rsa_sign_pkcs1_v15(%hp, %kdp, %knp, 64, %sp)
+    %v8 = call @std_crypto_rsa_verify_pkcs1_v15(%hp, %sp, %kep, %knp, 64)
+    br %v8, @c9, @fail
+
+    // load the PKCS#1 key and check it parses too
+  @c9:
+    store i32 9, *%id
+    %k1f = gep i8, *@KEY1_PATH, 0
+    %f1 = call @std_io_file_open_read(%k1f)
+    %f1n = eq *i8 %f1, null
+    br %f1n, @fail, @read_key1
+  @read_key1:
+    %kn1 = call @std_io_file_read_all(%f1, %k1p, 8191)
+    call @std_io_file_close(%f1)
+    %kn1ok = sgt i32 %kn1, 0
+    br %kn1ok, @c10, @fail
+  @c10:
+    store i32 10, *%id
+    %r10 = call @std_crypto_pem_read_rsa_private(%k1p, %kn1, %knp, %kep, %kdp, 64)
+    %r10ok = eq i32 %r10, 0
+    br %r10ok, @c11, @fail
+  @c11:
+    store i32 11, *%id
+    %cmp_n1 = call @std_crypto_rsa_bn_cmp(%knp, %cnp, 64)
+    %n1ok = eq i32 %cmp_n1, 0
+    br %n1ok, @c12, @fail
+  @c12:
+    store i32 12, *%id
+    call @std_crypto_rsa_sign_pkcs1_v15(%hp, %kdp, %knp, 64, %sp)
+    %v12 = call @std_crypto_rsa_verify_pkcs1_v15(%hp, %sp, %kep, %knp, 64)
+    br %v12, @c13, @fail
+
+    // wrong label / wrong file errors
+  @c13:
+    store i32 13, *%id
+    %r13 = call @std_crypto_pem_read_rsa_private(%cp, %cplen, %knp, %kep, %kdp, 64)
+    %ok13 = eq i32 %r13, -1
+    br %ok13, @c14, @fail
+  @c14:
+    store i32 14, *%id
+    %r14 = call @std_crypto_pem_read_cert(%k8p, %kn8, %dp, 8192, %dlp)
+    %ok14 = eq i32 %r14, -1
+    br %ok14, @c15, @fail
+
+    // generic find with an explicit label
+  @c15:
+    store i32 15, *%id
+    %r15 = call @std_crypto_pem_find(%cp, %cplen, "CERTIFICATE", 11, %dp, 8192, %dlp)
+    %ok15 = eq i32 %r15, 0
+    br %ok15, @c16, @fail
+  @c16:
+    store i32 16, *%id
+    %dl2 = load i32, *%dlp
+    %ok16 = eq i32 %dl2, %dl
+    br %ok16, @pass, @fail
+
+  @pass:
+    call @printf("PASS pem_read\n")
+    ret i32 0
+  @fail:
+    %fid = load i32, *%id
+    call @printf("FAIL pem_read at case %d\n", %fid)
+    ret i32 1
+}

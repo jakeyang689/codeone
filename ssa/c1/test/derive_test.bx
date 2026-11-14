@@ -1,0 +1,224 @@
+// Key derivation known-answer test
+extern @putchar(c: i32) -> i32
+extern @memcpy(dst: *i8, src: *i8, n: i64) -> *i8
+
+extern @std_crypto_tls12_prf_sha256(secret: *i8, secret_len: i32,
+                                    seed: *i8, seed_len: i32,
+                                    out_len: i32, out: *i8) -> void
+
+fun @hex_byte(b: i8) -> void {
+  @e:
+    %bi = zext i8 %b to i32
+    %hi = lshr i32 %bi, 4
+    %lo = and i32 %bi, 15
+    %hch = add i32 %hi, 48
+    %h_gt9 = sgt i32 %hi, 9
+    br %h_gt9, @h_adj, @h_w
+  @h_adj:
+    %hch2 = add i32 %hch, 39
+    jmp @h_w
+  @h_w:
+    %hch_v = phi [%hch, @e], [%hch2, @h_adj]
+    call @putchar(%hch_v)
+    %lch = add i32 %lo, 48
+    %l_gt9 = sgt i32 %lo, 9
+    br %l_gt9, @l_adj, @l_w
+  @l_adj:
+    %lch2 = add i32 %lch, 39
+    jmp @l_w
+  @l_w:
+    %lch_v = phi [%lch, @h_w], [%lch2, @l_adj]
+    call @putchar(%lch_v)
+    ret void
+}
+
+fun @hex_dump(p: *i8, n: i32) -> void {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @hd_cond
+  @hd_cond:
+    %iv = load i32, *%i
+    %more = slt i32 %iv, %n
+    br %more, @hd_body, @hd_done
+  @hd_body:
+    %iv2 = load i32, *%i
+    %bp = gep i8, *%p, %iv2
+    %b = load i8, *%bp
+    call @hex_byte(%b)
+    %next = add i32 %iv2, 1
+    store i32 %next, *%i
+    jmp @hd_cond
+  @hd_done:
+    ret void
+}
+
+fun @main() -> i32 {
+  @entry:
+    // Known PMS = 48 bytes, first 2 bytes = 03 03
+    %pms = let [i8, 48]
+    %pms_p = gep i8, *%pms, 0
+    store i8 3, *%pms_p
+    %p1 = gep i8, *%pms_p, 1
+    store i8 3, *%p1
+    // Fill rest with 0xAB
+    %pi = let i32
+    store i32 2, *%pi
+    jmp @pms_cond
+  @pms_cond:
+    %piv = load i32, *%pi
+    %pmore = slt i32 %piv, 48
+    br %pmore, @pms_body, @pms_done
+  @pms_body:
+    %piv2 = load i32, *%pi
+    %pp = gep i8, *%pms_p, %piv2
+    store i8 0xAB, *%pp
+    %pnext = add i32 %piv2, 1
+    store i32 %pnext, *%pi
+    jmp @pms_cond
+  @pms_done:
+
+    // Known CR = 32 bytes of 0xCD
+    %cr = let [i8, 32]
+    %cr_p = gep i8, *%cr, 0
+    %n32 = let i64
+    store i64 32, *%n32
+    %n32v = load i64, *%n32
+    %ci = let i32
+    store i32 0, *%ci
+    jmp @cr_cond
+  @cr_cond:
+    %civ = load i32, *%ci
+    %cmore = slt i32 %civ, 32
+    br %cmore, @cr_body, @cr_done
+  @cr_body:
+    %civ2 = load i32, *%ci
+    %cp = gep i8, *%cr_p, %civ2
+    store i8 0xCD, *%cp
+    %cnext = add i32 %civ2, 1
+    store i32 %cnext, *%ci
+    jmp @cr_cond
+  @cr_done:
+
+    // Known SR = 32 bytes of 0xEF
+    %sr = let [i8, 32]
+    %sr_p = gep i8, *%sr, 0
+    %si = let i32
+    store i32 0, *%si
+    jmp @sr_cond
+  @sr_cond:
+    %siv = load i32, *%si
+    %smore = slt i32 %siv, 32
+    br %smore, @sr_body, @sr_done
+  @sr_body:
+    %siv2 = load i32, *%si
+    %sp = gep i8, *%sr_p, %siv2
+    store i8 0xEF, *%sp
+    %snext = add i32 %siv2, 1
+    store i32 %snext, *%si
+    jmp @sr_cond
+  @sr_done:
+
+    // master_seed = "master secret" || CR || SR
+    %ms_label = let [i8, 13]
+    %ml_p = gep i8, *%ms_label, 0
+    store i8 109, *%ml_p    // m
+    %ml1 = gep i8, *%ml_p, 1
+    store i8 97, *%ml1      // a
+    %ml2 = gep i8, *%ml_p, 2
+    store i8 115, *%ml2     // s
+    %ml3 = gep i8, *%ml_p, 3
+    store i8 116, *%ml3     // t
+    %ml4 = gep i8, *%ml_p, 4
+    store i8 101, *%ml4     // e
+    %ml5 = gep i8, *%ml_p, 5
+    store i8 114, *%ml5     // r
+    %ml6 = gep i8, *%ml_p, 6
+    store i8 32, *%ml6      // ' '
+    %ml7 = gep i8, *%ml_p, 7
+    store i8 115, *%ml7     // s
+    %ml8 = gep i8, *%ml_p, 8
+    store i8 101, *%ml8     // e
+    %ml9 = gep i8, *%ml_p, 9
+    store i8 99, *%ml9      // c
+    %ml10 = gep i8, *%ml_p, 10
+    store i8 114, *%ml10    // r
+    %ml11 = gep i8, *%ml_p, 11
+    store i8 101, *%ml11    // e
+    %ml12 = gep i8, *%ml_p, 12
+    store i8 116, *%ml12    // t
+
+    %ms_seed = let [i8, 77]
+    %msp = gep i8, *%ms_seed, 0
+    %n13 = let i64
+    store i64 13, *%n13
+    %n13v = load i64, *%n13
+    call @memcpy(%msp, %ml_p, %n13v)
+    %ms_cr = gep i8, *%msp, 13
+    call @memcpy(%ms_cr, %cr_p, %n32v)
+    %ms_sr = gep i8, *%msp, 45
+    call @memcpy(%ms_sr, %sr_p, %n32v)
+
+    // Compute master_secret
+    %ms = let [i8, 48]
+    %ms_p = gep i8, *%ms, 0
+    call @std_crypto_tls12_prf_sha256(%pms_p, 48, %msp, 77, 48, %ms_p)
+
+    call @putchar(77)  // 'M'
+    call @putchar(83)  // 'S'
+    call @putchar(58)
+    call @hex_dump(%ms_p, 8)
+    call @putchar(10)  // newline
+
+    // key_seed = "key expansion" || SR || CR
+    %ke_label = let [i8, 13]
+    %kl_p = gep i8, *%ke_label, 0
+    store i8 107, *%kl_p    // k
+    %kl1 = gep i8, *%kl_p, 1
+    store i8 101, *%kl1     // e
+    %kl2 = gep i8, *%kl_p, 2
+    store i8 121, *%kl2     // y
+    %kl3 = gep i8, *%kl_p, 3
+    store i8 32, *%kl3      // ' '
+    %kl4 = gep i8, *%kl_p, 4
+    store i8 101, *%kl4     // e
+    %kl5 = gep i8, *%kl_p, 5
+    store i8 120, *%kl5     // x
+    %kl6 = gep i8, *%kl_p, 6
+    store i8 112, *%kl6     // p
+    %kl7 = gep i8, *%kl_p, 7
+    store i8 97, *%kl7      // a
+    %kl8 = gep i8, *%kl_p, 8
+    store i8 110, *%kl8     // n
+    %kl9 = gep i8, *%kl_p, 9
+    store i8 115, *%kl9     // s
+    %kl10 = gep i8, *%kl_p, 10
+    store i8 105, *%kl10    // i
+    %kl11 = gep i8, *%kl_p, 11
+    store i8 111, *%kl11    // o
+    %kl12 = gep i8, *%kl_p, 12
+    store i8 110, *%kl12    // n
+
+    %kb_seed = let [i8, 77]
+    %ksp = gep i8, *%kb_seed, 0
+    call @memcpy(%ksp, %kl_p, %n13v)
+    %ke_sr = gep i8, *%ksp, 13
+    call @memcpy(%ke_sr, %sr_p, %n32v)
+    %ke_cr = gep i8, *%ksp, 45
+    call @memcpy(%ke_cr, %cr_p, %n32v)
+
+    %kb = let [i8, 40]
+    %kbp = gep i8, *%kb, 0
+    call @std_crypto_tls12_prf_sha256(%ms_p, 48, %ksp, 77, 40, %kbp)
+
+    call @putchar(75)  // 'K'
+    call @putchar(66)  // 'B'
+    call @putchar(58)
+    call @hex_dump(%kbp, 8)
+    call @putchar(10)
+
+    call @putchar(79)  // 'O'
+    call @putchar(75)
+    call @putchar(10)
+    ret i32 0
+}

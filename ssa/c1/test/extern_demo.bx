@@ -1,0 +1,12 @@
+// Demonstrate calling a libc function via extern declaration.
+
+extern @printf(fmt: *i8, ...) -> i32
+
+const @msg: [i8, 13] = "Hello, SSA!\n"
+
+fun @main() -> i32 {
+  @entry:
+    %fmt = gep i8, *@msg, 0
+    call @printf(%fmt)
+    ret i32 0
+}

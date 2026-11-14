@@ -1,0 +1,344 @@
+// TLS Algorithm Primitives Test
+// Tests: TLS 1.2 PRF, RSAES-PKCS1-v1_5, HKDF-SHA384, TLS 1.3 key schedule
+
+extern @putchar(c: i32) -> i32
+extern @printf(fmt: *i8, ...) -> i32
+extern @memcmp(a: *i8, b: *i8, n: i64) -> i32
+extern @memset(s: *i8, c: i32, n: i64) -> *i8
+extern @memcpy(dst: *i8, src: *i8, n: i64) -> *i8
+
+// === TLS 1.2 PRF ===
+extern @std_crypto_tls12_prf_sha256(secret: *i8, secret_len: i32,
+                                    seed: *i8, seed_len: i32,
+                                    out_len: i32, out: *i8) -> void
+
+// === RSAES-PKCS1-v1_5 ===
+extern @std_crypto_pkcs1_v15_encrypt_pad(msg: *i8, msg_len: i32, em: *i8, em_len: i32) -> i32
+extern @std_crypto_rsa_encrypt_pkcs1_v15(msg: *i8, msg_len: i32, e: *i32, n: *i32, limbs: i32, ciphertext: *i8) -> i32
+extern @std_crypto_rsa_decrypt_pkcs1_v15(ciphertext: *i8, d: *i32, n: *i32, limbs: i32, msg: *i8, msg_len: *i32) -> i32
+extern @std_crypto_rsa_gen_keypair(n: *i32, e: *i32, d: *i32, p: *i32, q: *i32, limbs: i32) -> void
+extern @std_crypto_rsa_bn_from_bytes(r: *i32, bytes: *i8, byte_len: i32, limbs: i32) -> void
+extern @std_crypto_rsa_bn_mod_pow(r: *i32, base: *i32, exp: *i32, exp_limbs: i32, m: *i32, limbs: i32) -> void
+extern @std_crypto_rsa_bn_to_bytes(bytes: *i8, a: *i32, byte_len: i32, limbs: i32) -> void
+extern @std_crypto_rsa_bn_zero(r: *i32, limbs: i32) -> void
+extern @std_crypto_rsa_bn_copy(r: *i32, a: *i32, limbs: i32) -> void
+extern @std_crypto_rsa_bn_is_one(a: *i32, limbs: i32) -> i1
+extern @std_crypto_rsa_encrypt(c: *i32, m: *i32, e_key: *i32, n_mod: *i32, limbs: i32) -> void
+extern @std_crypto_rsa_decrypt(m: *i32, c: *i32, d_key: *i32, n_mod: *i32, limbs: i32) -> void
+
+// === HKDF-SHA384 ===
+extern @std_crypto_hkdf_extract_sha384(salt: *i8, salt_len: i32, ikm: *i8, ikm_len: i32, prk: *i8) -> void
+extern @std_crypto_hkdf_expand_sha384(prk: *i8, info: *i8, info_len: i32, out_len: i32, okm: *i8) -> void
+
+// === TLS 1.3 Key Schedule ===
+extern @std_crypto_tls13_early_secret_sha256(psk: *i8, psk_len: i32, out: *i8) -> void
+extern @std_crypto_tls13_handshake_secret_sha256(early_secret: *i8, ecdhe_secret: *i8,
+                                                  ecdhe_len: i32, out: *i8) -> void
+extern @std_crypto_tls13_master_secret_sha256(handshake_secret: *i8, out: *i8) -> void
+extern @std_crypto_tls13_traffic_key_sha256(traffic_secret: *i8, out: *i8) -> void
+extern @std_crypto_tls13_traffic_iv_sha256(traffic_secret: *i8, out: *i8) -> void
+extern @std_crypto_tls13_finished_key_sha256(traffic_secret: *i8, out: *i8) -> void
+
+
+// ============================================================
+// Test 1: TLS 1.2 PRF
+// ============================================================
+fun @test_tls12_prf() -> void {
+  @entry:
+    %secret = let [i8, 32]
+    %seed = let [i8, 32]
+    %out = let [i8, 32]
+    %secret_p = gep i8, *%secret, 0
+    %seed_p = gep i8, *%seed, 0
+    %out_p = gep i8, *%out, 0
+    %n32 = let i64
+    store i64 32, *%n32
+    %n32v = load i64, *%n32
+    call @memset(%secret_p, 0xAB, %n32v)
+    call @memset(%seed_p, 0xCD, %n32v)
+
+    call @std_crypto_tls12_prf_sha256(%secret_p, 32, %seed_p, 32, 32, %out_p)
+
+    %i = let i32
+    store i32 0, *%i
+    jmp @t1_cond
+  @t1_cond:
+    %iv = load i32, *%i
+    %more = slt i32 %iv, 4
+    br %more, @t1_body, @t1_done
+  @t1_body:
+    %iv2 = load i32, *%i
+    %p = gep i8, *%out_p, %iv2
+    %v = load i8, *%p
+    %vi = zext i8 %v to i32
+    call @printf("%02x ", %vi)
+    %next = add i32 %iv2, 1
+    store i32 %next, *%i
+    jmp @t1_cond
+  @t1_done:
+    call @printf("\n")
+    ret void
+}
+
+
+// ============================================================
+// Test 2: RSAES-PKCS1-v1_5 encrypt padding
+// ============================================================
+fun @test_rsa_encrypt_pkcs1_v15() -> void {
+  @entry:
+    %msg = let [i8, 8]
+    %em = let [i8, 32]
+    %msg_p = gep i8, *%msg, 0
+    %em_p = gep i8, *%em, 0
+    %n8 = let i64
+    store i64 8, *%n8
+    %n8v = load i64, *%n8
+    call @memset(%msg_p, 0x41, %n8v)
+    call @memset(%em_p, 0, %n8v)
+
+    %ret = call @std_crypto_pkcs1_v15_encrypt_pad(%msg_p, 8, %em_p, 32)
+    %ok = eq i32 %ret, 0
+    br %ok, @pad_check, @pad_fail
+
+  @pad_check:
+    %b0 = load i8, *%em_p
+    %b0_ok = eq i8 %b0, 0
+    br %b0_ok, @check_type_b, @pad_fail
+
+  @check_type_b:
+    %em1 = gep i8, *%em_p, 1
+    %b1 = load i8, *%em1
+    %b1_ok = eq i8 %b1, 0x02
+    br %b1_ok, @check_sep, @pad_fail
+
+  @check_sep:
+    %sep_pos = let i32
+    store i32 2, *%sep_pos
+    jmp @sep_loop
+
+  @sep_loop:
+    %spos = load i32, *%sep_pos
+    %sp = gep i8, *%em_p, %spos
+    %sb = load i8, *%sp
+    %is_sep = eq i8 %sb, 0
+    br %is_sep, @check_ps, @sep_next
+
+  @sep_next:
+    %spos2 = add i32 %spos, 1
+    store i32 %spos2, *%sep_pos
+    jmp @sep_loop
+
+  @check_ps:
+    %spos_v = load i32, *%sep_pos
+    %ps_ok = sge i32 %spos_v, 10
+    br %ps_ok, @verify_msg, @pad_fail
+
+  @verify_msg:
+    %msg_start = add i32 %spos_v, 1
+    %first_msg_p = gep i8, *%em_p, %msg_start
+    %first_msg = load i8, *%first_msg_p
+    %msg_match = eq i8 %first_msg, 0x41
+    br %msg_match, @pass_pad, @pad_fail
+
+  @pass_pad:
+    call @printf("RSA-PAD OK\n")
+    ret void
+
+  @pad_fail:
+    call @printf("RSA-PAD FAIL\n")
+    ret void
+}
+
+
+// ============================================================
+// Test 3: HKDF-SHA384
+// ============================================================
+fun @test_hkdf_sha384() -> void {
+  @entry:
+    %ikm = let [i8, 8]
+    %salt = let [i8, 8]
+    %info = let [i8, 8]
+    %ikm_p = gep i8, *%ikm, 0
+    %salt_p = gep i8, *%salt, 0
+    %info_p = gep i8, *%info, 0
+    %n8 = let i64
+    store i64 8, *%n8
+    %n8v = load i64, *%n8
+    call @memset(%ikm_p, 0x01, %n8v)
+    call @memset(%salt_p, 0x08, %n8v)
+    call @memset(%info_p, 0xF0, %n8v)
+
+    %prk = let [i8, 48]
+    %okm = let [i8, 48]
+    %prk_p = gep i8, *%prk, 0
+    %okm_p = gep i8, *%okm, 0
+    %n48 = let i64
+    store i64 48, *%n48
+    %n48v = load i64, *%n48
+
+    call @std_crypto_hkdf_extract_sha384(%salt_p, 8, %ikm_p, 8, %prk_p)
+    call @std_crypto_hkdf_expand_sha384(%prk_p, %info_p, 8, 48, %okm_p)
+
+    %zeros = let [i8, 48]
+    %zeros_p = gep i8, *%zeros, 0
+    call @memset(%zeros_p, 0, %n48v)
+    %cmp = call @memcmp(%prk_p, %zeros_p, %n48v)
+    %non_zero = ne i32 %cmp, 0
+    br %non_zero, @h384_ok, @h384_fail
+
+  @h384_ok:
+    call @printf("HKDF-384 OK\n")
+    ret void
+  @h384_fail:
+    call @printf("HKDF-384 FAIL\n")
+    ret void
+}
+
+
+// ============================================================
+// Test 4: TLS 1.3 Key Schedule
+// ============================================================
+fun @test_tls13_key_schedule() -> void {
+  @entry:
+    %early = let [i8, 32]
+    %hs = let [i8, 32]
+    %ms = let [i8, 32]
+    %ecdhe = let [i8, 32]
+    %tk = let [i8, 16]
+    %tiv = let [i8, 12]
+    %fk = let [i8, 32]
+    %early_p = gep i8, *%early, 0
+    %hs_p = gep i8, *%hs, 0
+    %ms_p = gep i8, *%ms, 0
+    %ecdhe_p = gep i8, *%ecdhe, 0
+    %tk_p = gep i8, *%tk, 0
+    %tiv_p = gep i8, *%tiv, 0
+    %fk_p = gep i8, *%fk, 0
+
+    %empty = let [i8, 0]
+    %empty_p = gep i8, *%empty, 0
+    %n32 = let i64
+    store i64 32, *%n32
+    %n32v = load i64, *%n32
+    call @memset(%ecdhe_p, 0x42, %n32v)
+
+    call @std_crypto_tls13_early_secret_sha256(%empty_p, 0, %early_p)
+    call @std_crypto_tls13_handshake_secret_sha256(%early_p, %ecdhe_p, 32, %hs_p)
+    call @std_crypto_tls13_master_secret_sha256(%hs_p, %ms_p)
+    call @std_crypto_tls13_traffic_key_sha256(%hs_p, %tk_p)
+    call @std_crypto_tls13_traffic_iv_sha256(%hs_p, %tiv_p)
+    call @std_crypto_tls13_finished_key_sha256(%hs_p, %fk_p)
+
+    %zeros = let [i8, 32]
+    %zeros_p = gep i8, *%zeros, 0
+    call @memset(%zeros_p, 0, %n32v)
+    %cmp_e = call @memcmp(%early_p, %zeros_p, %n32v)
+    %e_ok = ne i32 %cmp_e, 0
+    br %e_ok, @check_hs2, @ks_fail
+
+  @check_hs2:
+    %cmp_h = call @memcmp(%hs_p, %zeros_p, %n32v)
+    %h_ok = ne i32 %cmp_h, 0
+    br %h_ok, @check_ms2, @ks_fail
+
+  @check_ms2:
+    %cmp_m = call @memcmp(%ms_p, %zeros_p, %n32v)
+    %m_ok = ne i32 %cmp_m, 0
+    br %m_ok, @check_fk, @ks_fail
+
+  @check_fk:
+    %cmp_f = call @memcmp(%fk_p, %zeros_p, %n32v)
+    %f_ok = ne i32 %cmp_f, 0
+    br %f_ok, @ks_pass, @ks_fail
+
+  @ks_pass:
+    call @printf("TLS13 KEY-SCHED OK\n")
+    ret void
+  @ks_fail:
+    call @printf("TLS13 KEY-SCHED FAIL\n")
+    ret void
+}
+
+
+// ============================================================
+// Test 5: RSA PKCS1-v1_5 encrypt/decrypt round-trip (256-bit key)
+// ============================================================
+fun @test_rsa_roundtrip() -> void {
+  @entry:
+    %n = let [i32, 16]
+    %e = let [i32, 16]
+    %d = let [i32, 16]
+    %p = let [i32, 16]
+    %q = let [i32, 16]
+    %np = gep i32, *%n, 0
+    %ep = gep i32, *%e, 0
+    %dp = gep i32, *%d, 0
+    %pp = gep i32, *%p, 0
+    %qp = gep i32, *%q, 0
+
+    call @printf("GEN...")
+    call @std_crypto_rsa_gen_keypair(%np, %ep, %dp, %pp, %qp, 8)
+    call @printf("OK ")
+
+    // Test PKCS1-v1_5 encrypt/decrypt
+    %msg = let [i8, 5]
+    %msg_p = gep i8, *%msg, 0
+    store i8 0x48, *%msg_p
+    %m1 = gep i8, *%msg_p, 1
+    store i8 0x65, *%m1
+    %m2 = gep i8, *%msg_p, 2
+    store i8 0x6C, *%m2
+    %m3 = gep i8, *%msg_p, 3
+    store i8 0x6C, *%m3
+    %m4 = gep i8, *%msg_p, 4
+    store i8 0x6F, *%m4
+
+    %ct = let [i8, 32]
+    %ct_p = gep i8, *%ct, 0
+    call @printf("ENC...")
+    %enc_r = call @std_crypto_rsa_encrypt_pkcs1_v15(%msg_p, 5, %ep, %np, 8, %ct_p)
+    %enc_ok = eq i32 %enc_r, 0
+    br %enc_ok, @do_dec, @rsa_fail
+
+  @do_dec:
+    %pt = let [i8, 32]
+    %pt_p = gep i8, *%pt, 0
+    %pt_len = let i32
+    %pt_len_p = gep i32, *%pt_len, 0
+    call @printf("DEC...")
+    %dec_r = call @std_crypto_rsa_decrypt_pkcs1_v15(%ct_p, %dp, %np, 8, %pt_p, %pt_len_p)
+    %dec_ok = eq i32 %dec_r, 0
+    br %dec_ok, @check_len, @rsa_fail
+
+  @check_len:
+    %lenv = load i32, *%pt_len_p
+    %len_ok = eq i32 %lenv, 5
+    br %len_ok, @check_data, @rsa_fail
+
+  @check_data:
+    %b0 = load i8, *%pt_p
+    %b0_ok = eq i8 %b0, 0x48
+    br %b0_ok, @rsa_pass, @rsa_fail
+
+  @rsa_pass:
+    call @printf("PASS\n")
+    ret void
+  @rsa_fail:
+    call @printf("FAIL\n")
+    ret void
+}
+
+
+// ============================================================
+// Main
+// ============================================================
+fun @main() -> i32 {
+  @entry:
+    call @test_tls12_prf()
+    call @test_rsa_encrypt_pkcs1_v15()
+    call @test_hkdf_sha384()
+    call @test_tls13_key_schedule()
+    call @test_rsa_roundtrip()
+    call @printf("DONE\n")
+    ret i32 0
+}

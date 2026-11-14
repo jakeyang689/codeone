@@ -1,0 +1,256 @@
+// TLS record layer tests over a loopback socket pair.
+//
+//   - net_tls_send splits payloads larger than one record
+//   - tls12_record_decrypt reassembles them and enforces buf_cap
+//   - net_tls_set_host clamps oversized SNI names
+//   - x509 rejects a certificate whose DER lengths exceed the buffer
+
+extern @printf(fmt: *i8, ...) -> i32
+extern @memcmp(a: *i8, b: *i8, n: i64) -> i32
+extern @memset(s: *i8, c: i32, n: i64) -> *i8
+
+extern @net_socket_tcp() -> i32
+extern @net_socket_bind(fd: i32, port: i32) -> i32
+extern @net_socket_listen(fd: i32) -> i32
+extern @net_socket_accept(fd: i32) -> i32
+extern @net_socket_connect(fd: i32, port: i32) -> i32
+extern @net_socket_close(fd: i32) -> i32
+
+extern @net_tls_send(ctx: *i8, data: *i8, len: i32) -> i32
+extern @net_tls_set_host(ctx: *i8, host: *i8, len: i32) -> void
+extern @tls12_record_decrypt(fd: i32, seq: *i64, write_key: *i8, write_iv: *i8,
+                             key_size: i32, buf: *i8, buf_cap: i32,
+                             out_typ: *i8, out_len: *i32) -> i32
+extern @x509_parse_rsa_pubkey(cert_der: *i8, cert_len: i32, n_out: *i32,
+                              e_out: *i32, limbs: i32) -> i1
+
+// Layouts must match net/tls/client_api.bx.
+struct @TLS12Context {
+  @fd: i32,
+  @state: i32,
+  @version: i32,
+  @key_size: i32,
+  @limbs: i32,
+  @cipher_suite: i32,
+  @client_seq: i64,
+  @server_seq: i64,
+  @client_random: [i8, 32],
+  @server_random: [i8, 32],
+  @client_write_key: [i8, 32],
+  @server_write_key: [i8, 32],
+  @client_write_iv: [i8, 12],
+  @server_write_iv: [i8, 12],
+  @pre_master_secret: [i8, 48],
+  @master_secret: [i8, 48]
+}
+
+struct @TLS13Extension {
+  @init_client_seq: i64,
+  @_pad: [i8, 24],
+  @ecdhe_private: [i8, 32],
+  @ecdhe_public_x: [i8, 32],
+  @ecdhe_public_y: [i8, 32],
+  @server_ec_x: [i8, 32],
+  @server_ec_y: [i8, 32],
+  @handshake_traffic: [i8, 48],
+  @application_traffic: [i8, 48],
+  @sni_host: [i8, 256],
+  @sni_len: i32,
+  @role: i32,
+  @trust_pool: *i8,
+  @trust_offsets: *i32,
+  @trust_lens: *i32,
+  @trust_count: i32
+}
+
+struct @TLSContext {
+  @tls12: @TLS12Context,
+  @tls13: @TLS13Extension
+}
+
+fun @main() -> i32 {
+  @entry:
+    %id = let i32
+    store i32 0, *%id
+
+    %srv = call @net_socket_tcp()
+    %srv_ok = sge i32 %srv, 0
+    br %srv_ok, @bind, @fail
+  @bind:
+    store i32 1, *%id
+    %b0 = call @net_socket_bind(%srv, 8795)
+    %b_ok = eq i32 %b0, 0
+    br %b_ok, @listen, @fail
+  @listen:
+    store i32 2, *%id
+    %l0 = call @net_socket_listen(%srv)
+    %l_ok = eq i32 %l0, 0
+    br %l_ok, @connect, @fail
+  @connect:
+    store i32 3, *%id
+    %cli = call @net_socket_tcp()
+    %c0 = call @net_socket_connect(%cli, 8795)
+    %c_ok = eq i32 %c0, 0
+    br %c_ok, @accept, @fail
+  @accept:
+    store i32 4, *%id
+    %sock = call @net_socket_accept(%srv)
+    %s_ok = sge i32 %sock, 0
+    br %s_ok, @setup, @fail
+
+  // --- set up a symmetric key/iv pair on both ends ---
+  @setup:
+    store i32 5, *%id
+    %ctx = let @TLSContext
+    %t12 = field @TLSContext, *%ctx, 0
+    %t13e = field @TLSContext, *%ctx, 1
+    %rolep = field @TLS13Extension, *%t13e, 11
+    store i32 0, *%rolep
+    %fdp = field @TLS12Context, *%t12, 0
+    store i32 %cli, *%fdp
+    %seqp = field @TLS12Context, *%t12, 6
+    store i64 0, *%seqp
+    %wk_arr = field @TLS12Context, *%t12, 10
+    %wk = gep i8, *%wk_arr, 0
+    call @memset(%wk, 0x2A, 16)
+    %wiv_arr = field @TLS12Context, *%t12, 12
+    %wiv = gep i8, *%wiv_arr, 0
+    call @memset(%wiv, 0x11, 12)
+    %rk = let [i8, 16]
+    %rkp = gep i8, *%rk, 0
+    call @memset(%rkp, 0x2A, 16)
+    %riv = let [i8, 4]
+    %rivp = gep i8, *%riv, 0
+    call @memset(%rivp, 0x11, 4)
+    %rseq = let i64
+    store i64 0, *%rseq
+    jmp @send_big
+
+  // --- 40000 bytes must cross three records ---
+  @send_big:
+    store i32 6, *%id
+    %big = let [i8, 40000]
+    %bigp = gep i8, *%big, 0
+    %fi = let i32
+    store i32 0, *%fi
+    jmp @fill_cond
+  @fill_cond:
+    %fiv = load i32, *%fi
+    %fmore = slt i32 %fiv, 40000
+    br %fmore, @fill, @send
+  @fill:
+    %fiv2 = load i32, *%fi
+    %fp = gep i8, *%big, %fiv2
+    %fv = and i32 %fiv2, 255
+    %fc = trunc i32 %fv to i8
+    store i8 %fc, *%fp
+    %fn = add i32 %fiv2, 1
+    store i32 %fn, *%fi
+    jmp @fill_cond
+  @send:
+    %sr = call @net_tls_send(%ctx, %bigp, 40000)
+    %sr_ok = eq i32 %sr, 0
+    br %sr_ok, @read_init, @fail
+
+  @read_init:
+    store i32 7, *%id
+    %out = let [i8, 40000]
+    %outp = gep i8, *%out, 0
+    %total = let i32
+    store i32 0, *%total
+    %olen = let i32
+    %olp = gep i32, *%olen, 0
+    %ct = let i8
+    %ctp = gep i8, *%ct, 0
+    jmp @read_loop
+  @read_loop:
+    %tv = load i32, *%total
+    %rmore = slt i32 %tv, 40000
+    br %rmore, @read_one, @read_done
+  @read_one:
+    %tv2 = load i32, *%total
+    %dst = gep i8, *%outp, %tv2
+    %cap = sub i32 40000, %tv2
+    %dr = call @tls12_record_decrypt(%sock, %rseq, %rkp, %rivp, 16, %dst, %cap, %ctp, %olp)
+    %dr_ok = eq i32 %dr, 0
+    br %dr_ok, @accum, @fail
+  @accum:
+    %tv3 = load i32, *%total
+    %g = load i32, *%olen
+    %nt = add i32 %tv3, %g
+    store i32 %nt, *%total
+    jmp @read_loop
+  @read_done:
+    %tv4 = load i32, *%total
+    %all = eq i32 %tv4, 40000
+    br %all, @cmp_big, @fail
+  @cmp_big:
+    store i32 8, *%id
+    %d0 = call @memcmp(%outp, %bigp, 40000)
+    %d0_ok = eq i32 %d0, 0
+    br %d0_ok, @cap_send, @fail
+
+  // --- decryption refuses to write past the caller's buffer ---
+  @cap_send:
+    store i32 9, *%id
+    %sm = call @net_tls_send(%ctx, %bigp, 100)
+    %sm_ok = eq i32 %sm, 0
+    br %sm_ok, @cap_check, @fail
+  @cap_check:
+    %small = let [i8, 50]
+    %smallp = gep i8, *%small, 0
+    %cr = call @tls12_record_decrypt(%sock, %rseq, %rkp, %rivp, 16, %smallp, 50, %ctp, %olp)
+    %cr_ok = eq i32 %cr, -1
+    br %cr_ok, @sni, @fail
+
+  // --- oversized SNI names are clamped to 255 bytes ---
+  @sni:
+    store i32 10, *%id
+    %long = let [i8, 300]
+    %longp = gep i8, *%long, 0
+    call @memset(%longp, 0x61, 300)
+    call @net_tls_set_host(%ctx, %longp, 300)
+    %t13 = field @TLSContext, *%ctx, 1
+    %slp = field @TLS13Extension, *%t13, 10
+    %sl = load i32, *%slp
+    %sl_ok = eq i32 %sl, 255
+    br %sl_ok, @sni_last, @fail
+  @sni_last:
+    %sb = field @TLS13Extension, *%t13, 9
+    %slast = gep i8, *%sb, 254
+    %slv = load i8, *%slast
+    %slv_ok = eq i8 %slv, 0x61
+    br %slv_ok, @x509, @fail
+
+  // --- DER lengths beyond the certificate buffer are rejected ---
+  @x509:
+    store i32 11, *%id
+    %cert = let [i8, 16]
+    %certp = gep i8, *%cert, 0
+    store i8 0x30, *%certp
+    %cl1 = gep i8, *%cert, 1
+    store i8 0x82, *%cl1
+    %cl2 = gep i8, *%cert, 2
+    store i8 0xFF, *%cl2
+    %cl3 = gep i8, *%cert, 3
+    store i8 0xFF, *%cl3
+    %n_out = let [i32, 64]
+    %n_outp = gep i32, *%n_out, 0
+    %e_out = let [i32, 64]
+    %e_outp = gep i32, *%e_out, 0
+    %pk = call @x509_parse_rsa_pubkey(%certp, 16, %n_outp, %e_outp, 64)
+    %pk_i = zext i1 %pk to i32
+    %pk_ok = eq i32 %pk_i, 0
+    br %pk_ok, @pass, @fail
+
+  @pass:
+    call @net_socket_close(%cli)
+    call @net_socket_close(%sock)
+    call @net_socket_close(%srv)
+    call @printf("PASS tls_record\n")
+    ret i32 0
+  @fail:
+    %cid = load i32, *%id
+    call @printf("FAIL tls_record at case %d\n", %cid)
+    ret i32 1
+}

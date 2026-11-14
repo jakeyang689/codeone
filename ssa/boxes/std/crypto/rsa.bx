@@ -1,0 +1,1284 @@
+// RSA public-key cryptosystem
+// Big-endian byte I/O, little-endian limb representation internally.
+// Limbs are i32, limbs parameter controls precision (e.g. 64 for 2048-bit).
+
+extern @memset(s: *i8, c: i32, n: i64) -> *i8
+extern @memcpy(dst: *i8, src: *i8, n: i64) -> *i8
+extern @fwrite(buf: *i8, size: i64, count: i64, fp: *i8) -> i64
+extern @fclose(fp: *i8) -> i32
+
+// Platform random (libplatform.a): cross-platform CSPRNG
+extern @c1_random_buf(buf: *i8, len: i64) -> void
+
+fun @std_crypto_rsa_bn_zero(r: *i32, limbs: i32) -> void {
+    @entry:
+      %iptr = let i32
+      store i32 0, *%iptr
+      jmp @z_cond
+    @z_cond:
+      %i = load i32, *%iptr
+      %c = slt i32 %i, %limbs
+      br %c, @z_body, @z_done
+    @z_body:
+      %iv = load i32, *%iptr
+      %p = gep i32, *%r, %iv
+      store i32 0, *%p
+      %iv2 = add i32 %iv, 1
+      store i32 %iv2, *%iptr
+      jmp @z_cond
+    @z_done: ret void
+}
+
+fun @std_crypto_rsa_bn_copy(r: *i32, a: *i32, limbs: i32) -> void {
+    @entry:
+      %iptr = let i32
+      store i32 0, *%iptr
+      jmp @c_cond
+    @c_cond:
+      %i = load i32, *%iptr
+      %c = slt i32 %i, %limbs
+      br %c, @c_body, @c_done
+    @c_body:
+      %iv = load i32, *%iptr
+      %ap = gep i32, *%a, %iv
+      %av = load i32, *%ap
+      %rp = gep i32, *%r, %iv
+      store i32 %av, *%rp
+      %iv2 = add i32 %iv, 1
+      store i32 %iv2, *%iptr
+      jmp @c_cond
+    @c_done: ret void
+}
+
+fun @std_crypto_rsa_bn_is_zero(a: *i32, limbs: i32) -> i1 {
+    @entry:
+      %iptr = let i32
+      store i32 0, *%iptr
+      jmp @iz_cond
+    @iz_cond:
+      %i = load i32, *%iptr
+      %c = slt i32 %i, %limbs
+      br %c, @iz_body, @iz_true
+    @iz_body:
+      %iv = load i32, *%iptr
+      %ap = gep i32, *%a, %iv
+      %av = load i32, *%ap
+      %nz = ne i32 %av, 0
+      br %nz, @iz_false, @iz_next
+    @iz_next:
+      %iv2 = add i32 %iv, 1
+      store i32 %iv2, *%iptr
+      jmp @iz_cond
+    @iz_true: ret i1 1
+    @iz_false: ret i1 0
+}
+
+fun @std_crypto_rsa_bn_is_one(a: *i32, limbs: i32) -> i1 {
+    @entry:
+      %ap0 = gep i32, *%a, 0
+      %av = load i32, *%ap0
+      %eq1 = eq i32 %av, 1
+      br %eq1, @io_rest, @io_false
+    @io_rest:
+      %iptr = let i32
+      store i32 1, *%iptr
+      jmp @io_cond
+    @io_cond:
+      %i = load i32, *%iptr
+      %c = slt i32 %i, %limbs
+      br %c, @io_body, @io_true
+    @io_body:
+      %iv = load i32, *%iptr
+      %ap = gep i32, *%a, %iv
+      %av2 = load i32, *%ap
+      %nz = ne i32 %av2, 0
+      br %nz, @io_false, @io_next
+    @io_next:
+      %iv2 = add i32 %iv, 1
+      store i32 %iv2, *%iptr
+      jmp @io_cond
+    @io_true: ret i1 1
+    @io_false: ret i1 0
+  }
+
+  fun @std_crypto_rsa_bn_is_odd(a: *i32, limbs: i32) -> i1 {
+    @entry:
+      %ap0 = gep i32, *%a, 0
+      %av = load i32, *%ap0
+      %odd = and i32 %av, 1
+      %r = ne i32 %odd, 0
+      ret i1 %r
+}
+
+fun @std_crypto_rsa_bn_cmp(a: *i32, b: *i32, limbs: i32) -> i32 {
+    @entry:
+      %iptr = let i32
+      %m1 = sub i32 %limbs, 1
+      store i32 %m1, *%iptr
+      jmp @cmp_cond
+    @cmp_cond:
+      %i = load i32, *%iptr
+      %neg = slt i32 %i, 0
+      br %neg, @cmp_eq, @cmp_lp
+    @cmp_lp:
+      %iv = load i32, *%iptr
+      %ap = gep i32, *%a, %iv
+      %av = load i32, *%ap
+      %bp = gep i32, *%b, %iv
+      %bv = load i32, *%bp
+      %av64 = zext i32 %av to i64
+      %bv64 = zext i32 %bv to i64
+      %gt = sgt i64 %av64, %bv64
+      br %gt, @cmp_gt, @cmp_lt_or_eq
+    @cmp_lt_or_eq:
+      %lt = slt i64 %av64, %bv64
+      br %lt, @cmp_lt, @cmp_dec
+    @cmp_dec:
+      %iv2 = sub i32 %iv, 1
+      store i32 %iv2, *%iptr
+      jmp @cmp_cond
+    @cmp_gt: ret i32 1
+    @cmp_lt: ret i32 -1
+    @cmp_eq: ret i32 0
+}
+
+fun @std_crypto_rsa_bn_add(r: *i32, a: *i32, b: *i32, limbs: i32) -> i32 {
+    @entry:
+      %iptr = let i32
+      %carry = let i64
+      store i32 0, *%iptr
+      store i64 0, *%carry
+      jmp @add_cond
+    @add_cond:
+      %i = load i32, *%iptr
+      %c = slt i32 %i, %limbs
+      br %c, @add_body, @add_done
+    @add_body:
+      %iv = load i32, *%iptr
+      %ap = gep i32, *%a, %iv
+      %av = load i32, *%ap
+      %av64 = zext i32 %av to i64
+      %bp = gep i32, *%b, %iv
+      %bv = load i32, *%bp
+      %bv64 = zext i32 %bv to i64
+      %carryv = load i64, *%carry
+      %sum = add i64 %av64, %bv64
+      %sum2 = add i64 %sum, %carryv
+      %new_carry = lshr i64 %sum2, 32
+      store i64 %new_carry, *%carry
+      %limb = trunc i64 %sum2 to i32
+      %rp = gep i32, *%r, %iv
+      store i32 %limb, *%rp
+      %iv2 = add i32 %iv, 1
+      store i32 %iv2, *%iptr
+      jmp @add_cond
+    @add_done:
+      %cv = load i64, *%carry
+      %cr = trunc i64 %cv to i32
+      ret i32 %cr
+}
+
+fun @std_crypto_rsa_bn_sub(r: *i32, a: *i32, b: *i32, limbs: i32) -> i32 {
+    @entry:
+      %iptr = let i32
+      %borrow = let i64
+      store i32 0, *%iptr
+      store i64 0, *%borrow
+      jmp @sub_cond
+    @sub_cond:
+      %i = load i32, *%iptr
+      %c = slt i32 %i, %limbs
+      br %c, @sub_body, @sub_done
+    @sub_body:
+      %iv = load i32, *%iptr
+      %ap = gep i32, *%a, %iv
+      %av = load i32, *%ap
+      %av64 = zext i32 %av to i64
+      %bp = gep i32, *%b, %iv
+      %bv = load i32, *%bp
+      %bv64 = zext i32 %bv to i64
+      %borrowv = load i64, *%borrow
+      %diff = sub i64 %av64, %bv64
+      %diff2 = sub i64 %diff, %borrowv
+      %new_borrow = lshr i64 %diff2, 63
+      store i64 %new_borrow, *%borrow
+      %limb = trunc i64 %diff2 to i32
+      %rp = gep i32, *%r, %iv
+      store i32 %limb, *%rp
+      %iv2 = add i32 %iv, 1
+      store i32 %iv2, *%iptr
+      jmp @sub_cond
+    @sub_done:
+      %borrow_final = load i64, *%borrow
+      %br = trunc i64 %borrow_final to i32
+      ret i32 %br
+}
+
+fun @std_crypto_rsa_bn_shl1(r: *i32, a: *i32, limbs: i32) -> i32 {
+    @entry:
+      %iptr = let i32
+      %carry = let i32
+      store i32 0, *%iptr
+      store i32 0, *%carry
+      jmp @shl_cond
+    @shl_cond:
+      %i = load i32, *%iptr
+      %c = slt i32 %i, %limbs
+      br %c, @shl_body, @shl_done
+    @shl_body:
+      %iv = load i32, *%iptr
+      %ap = gep i32, *%a, %iv
+      %av = load i32, *%ap
+      %carryv = load i32, *%carry
+      %sh = shl i32 %av, 1
+      %result = or i32 %sh, %carryv
+      %new_carry = lshr i32 %av, 31
+      store i32 %new_carry, *%carry
+      %rp = gep i32, *%r, %iv
+      store i32 %result, *%rp
+      %iv2 = add i32 %iv, 1
+      store i32 %iv2, *%iptr
+      jmp @shl_cond
+    @shl_done:
+      %cv = load i32, *%carry
+      ret i32 %cv
+}
+
+fun @std_crypto_rsa_bn_mul(r: *i32, a: *i32, b: *i32, limbs: i32) -> void {
+    @entry:
+      %dl = shl i32 %limbs, 1
+      call @std_crypto_rsa_bn_zero(%r, %dl)
+      %iptr = let i32
+      store i32 0, *%iptr
+      jmp @mul_oc
+    @mul_oc:
+      %i = load i32, *%iptr
+      %oc = slt i32 %i, %limbs
+      br %oc, @mul_ob, @mul_done
+    @mul_ob:
+      %iv = load i32, *%iptr
+      %ap = gep i32, *%a, %iv
+      %av = load i32, *%ap
+      %az = eq i32 %av, 0
+      br %az, @mul_on, @mul_ii
+    @mul_ii:
+      %av64 = zext i32 %av to i64
+      %jptr = let i32
+      %carry64 = let i64
+      store i32 0, *%jptr
+      store i64 0, *%carry64
+      jmp @mul_ic
+    @mul_ic:
+      %j = load i32, *%jptr
+      %ic = slt i32 %j, %limbs
+      br %ic, @mul_ib, @mul_id
+    @mul_ib:
+      %jv = load i32, *%jptr
+      %bp = gep i32, *%b, %jv
+      %bv = load i32, *%bp
+      %bv64 = zext i32 %bv to i64
+      %r_idx = add i32 %iv, %jv
+      %rp = gep i32, *%r, %r_idx
+      %r_val = load i32, *%rp
+      %r64 = zext i32 %r_val to i64
+      %prod = mul i64 %av64, %bv64
+      %carryv = load i64, *%carry64
+      %sum = add i64 %prod, %r64
+      %sum2 = add i64 %sum, %carryv
+      %new_c64 = lshr i64 %sum2, 32
+      store i64 %new_c64, *%carry64
+      %limb = trunc i64 %sum2 to i32
+      store i32 %limb, *%rp
+      %jv2 = add i32 %jv, 1
+      store i32 %jv2, *%jptr
+      jmp @mul_ic
+    @mul_id:
+      %cf = load i64, *%carry64
+      %r_c_idx = add i32 %iv, %limbs
+      %r_cp = gep i32, *%r, %r_c_idx
+      %cf32 = trunc i64 %cf to i32
+      store i32 %cf32, *%r_cp
+      jmp @mul_on
+    @mul_on:
+      %iv2 = add i32 %iv, 1
+      store i32 %iv2, *%iptr
+      jmp @mul_oc
+    @mul_done: ret void
+}
+
+
+
+// Right shift by 1 bit (logical)
+fun @std_crypto_rsa_bn_shr1(r: *i32, a: *i32, limbs: i32) -> void {
+    @entry:
+      %iptr = let i32
+      %carry = let i32
+      %last = sub i32 %limbs, 1
+      store i32 %last, *%iptr
+      store i32 0, *%carry
+      jmp @sr_cond
+    @sr_cond:
+      %i = load i32, *%iptr
+      %neg = slt i32 %i, 0
+      br %neg, @sr_done, @sr_body
+    @sr_body:
+      %iv = load i32, *%iptr
+      %ap = gep i32, *%a, %iv
+      %av = load i32, *%ap
+      %carryv = load i32, *%carry
+      %lsb = and i32 %av, 1
+      %new_carry = shl i32 %lsb, 31
+      store i32 %new_carry, *%carry
+      %sr = lshr i32 %av, 1
+      %new = or i32 %sr, %carryv
+      %rp = gep i32, *%r, %iv
+      store i32 %new, *%rp
+      %iv2 = sub i32 %iv, 1
+      store i32 %iv2, *%iptr
+      jmp @sr_cond
+    @sr_done: ret void
+}
+
+fun @std_crypto_rsa_bn_random(r: *i32, limbs: i32) -> void {
+    @entry:
+      %bc = shl i32 %limbs, 2
+      %bp = gep i8, *%r, 0
+      %bc64 = sext i32 %bc to i64
+      call @c1_random_buf(%bp, %bc64)
+      ret void
+}
+
+fun @std_crypto_rsa_bn_from_bytes(r: *i32, bytes: *i8, byte_len: i32, limbs: i32) -> void {
+    @entry:
+      call @std_crypto_rsa_bn_zero(%r, %limbs)
+      // Never write past r[0..limbs): inputs longer than the destination are
+      // truncated to their least significant limbs.
+      %use_len = let i32
+      store i32 %byte_len, *%use_len
+      %skip = let i32
+      store i32 0, *%skip
+      %max_bytes = mul i32 %limbs, 4
+      %too_long = sgt i32 %byte_len, %max_bytes
+      br %too_long, @fb_clamp, @fb_neg
+    @fb_clamp:
+      %skip_n = sub i32 %byte_len, %max_bytes
+      store i32 %skip_n, *%skip
+      store i32 %max_bytes, *%use_len
+      jmp @fb_init
+    @fb_neg:
+      %neg = slt i32 %byte_len, 0
+      br %neg, @fb_empty, @fb_init
+    @fb_empty:
+      store i32 0, *%use_len
+      jmp @fb_init
+    @fb_init:
+      %iptr = let i32
+      store i32 0, *%iptr
+      jmp @fb_cond
+    @fb_cond:
+      %i = load i32, *%iptr
+      %ul = load i32, *%use_len
+      %c = slt i32 %i, %ul
+      br %c, @fb_body, @fb_done
+    @fb_body:
+      %iv = load i32, *%iptr
+      %ul2 = load i32, *%use_len
+      %ri = sub i32 %ul2, %iv
+      %ri2 = sub i32 %ri, 1
+      %sk = load i32, *%skip
+      %si = add i32 %ri2, %sk
+      %bp = gep i8, *%bytes, %si
+      %bv = load i8, *%bp
+      %bz = zext i8 %bv to i32
+      %li = lshr i32 %iv, 2
+      %sa = and i32 %iv, 3
+      %sh = shl i32 %sa, 3
+      %val = shl i32 %bz, %sh
+      %lp = gep i32, *%r, %li
+      %lv = load i32, *%lp
+      %nv = or i32 %lv, %val
+      store i32 %nv, *%lp
+      %iv2 = add i32 %iv, 1
+      store i32 %iv2, *%iptr
+      jmp @fb_cond
+    @fb_done: ret void
+}
+
+fun @std_crypto_rsa_bn_to_bytes(bytes: *i8, a: *i32, byte_len: i32, limbs: i32) -> void {
+    @entry:
+      %bl64 = sext i32 %byte_len to i64
+      call @memset(%bytes, 0, %bl64)
+      %iptr = let i32
+      store i32 0, *%iptr
+      jmp @tb_cond
+    @tb_cond:
+      %i = load i32, *%iptr
+      %c = slt i32 %i, %byte_len
+      br %c, @tb_body, @tb_done
+    @tb_body:
+      %iv = load i32, *%iptr
+      %limb_max = sub i32 %limbs, 1
+      %li_tmp = lshr i32 %iv, 2
+      %li = sub i32 %limb_max, %li_tmp
+      %sa = and i32 %iv, 3
+      %sr = sub i32 3, %sa
+      %sh = shl i32 %sr, 3
+      %lp = gep i32, *%a, %li
+      %lv = load i32, *%lp
+      %sv = lshr i32 %lv, %sh
+      %b = trunc i32 %sv to i8
+      %bp = gep i8, *%bytes, %iv
+      store i8 %b, *%bp
+      %iv2 = add i32 %iv, 1
+      store i32 %iv2, *%iptr
+      jmp @tb_cond
+    @tb_done: ret void
+}
+
+
+// Count leading zeros on i32 (binary search)
+// Efficient bn_mod: double-align + subtract loop
+fun @std_crypto_rsa_bn_mod(r: *i32, a: *i32, a_limbs: i32, m: *i32, m_limbs: i32) -> void {
+    @entry:
+      // Check if any extra limbs (beyond m_limbs) are non-zero
+      %extra_start = let i32
+      store i32 %m_limbs, *%extra_start
+      jmp @mod_check_extra
+    @mod_check_extra:
+      %esv = load i32, *%extra_start
+      %more = slt i32 %esv, %a_limbs
+      br %more, @check_extra_limb, @mod_early_check
+    @check_extra_limb:
+      %esv2 = load i32, *%extra_start
+      %ep = gep i32, *%a, %esv2
+      %ev = load i32, *%ep
+      %nz = ne i32 %ev, 0
+      br %nz, @mod_init, @extra_next
+    @extra_next:
+      %esv3 = add i32 %esv2, 1
+      store i32 %esv3, *%extra_start
+      jmp @mod_check_extra
+
+    @mod_early_check:
+      %cmp = call @std_crypto_rsa_bn_cmp(%a, %m, %m_limbs)
+      %lt = slt i32 %cmp, 0
+      br %lt, @mod_early, @mod_init
+    @mod_early:
+      call @std_crypto_rsa_bn_copy(%r, %a, %m_limbs)
+      ret void
+
+    @mod_init:
+      %a1 = add i32 %a_limbs, 1
+      %temp = let [i32, 512]
+      %m_sh = let [i32, 512]
+      %tp = gep i32, *%temp, 0
+      %mp = gep i32, *%m_sh, 0
+      %cnt = let i32
+      call @std_crypto_rsa_bn_zero(%tp, %a1)
+      call @std_crypto_rsa_bn_copy(%tp, %a, %a_limbs)
+      call @std_crypto_rsa_bn_zero(%mp, %a1)
+      call @std_crypto_rsa_bn_copy(%mp, %m, %m_limbs)
+      store i32 0, *%cnt
+      jmp @align_cond
+    @align_cond:
+      %cmp_ta = call @std_crypto_rsa_bn_cmp(%tp, %mp, %a1)
+      %al_ge = sge i32 %cmp_ta, 0
+      br %al_ge, @align_dbl, @align_done
+    @align_dbl:
+      call @std_crypto_rsa_bn_shl1(%mp, %mp, %a1)
+      %cv = load i32, *%cnt
+      %cv2 = add i32 %cv, 1
+      store i32 %cv2, *%cnt
+      jmp @align_cond
+    @align_done:
+      call @std_crypto_rsa_bn_shr1(%mp, %mp, %a1)
+      %cv3 = load i32, *%cnt
+      %cv4 = sub i32 %cv3, 1
+      store i32 %cv4, *%cnt
+      jmp @main_cond
+    @main_cond:
+      %cntv = load i32, *%cnt
+      %nneg = sge i32 %cntv, 0
+      br %nneg, @main_body, @main_done
+    @main_body:
+      %cmp_ta2 = call @std_crypto_rsa_bn_cmp(%tp, %mp, %a1)
+      %ge = sge i32 %cmp_ta2, 0
+      br %ge, @do_sub, @skip
+    @do_sub:
+      call @std_crypto_rsa_bn_sub(%tp, %tp, %mp, %a1)
+      jmp @skip
+    @skip:
+      call @std_crypto_rsa_bn_shr1(%mp, %mp, %a1)
+      %cntv2 = load i32, *%cnt
+      %cntv3 = sub i32 %cntv2, 1
+      store i32 %cntv3, *%cnt
+      jmp @main_cond
+    @main_done:
+      call @std_crypto_rsa_bn_copy(%r, %tp, %m_limbs)
+      ret void
+}
+
+fun @std_crypto_rsa_bn_mod_mul(r: *i32, a: *i32, b: *i32, m: *i32, limbs: i32) -> void {
+    @entry:
+      %dl = shl i32 %limbs, 1
+      %prod = let [i32, 512]
+      %pp = gep i32, *%prod, 0
+      call @std_crypto_rsa_bn_mul(%pp, %a, %b, %limbs)
+      call @std_crypto_rsa_bn_mod(%r, %pp, %dl, %m, %limbs)
+      ret void
+}
+
+// Highest non-zero limb count of exp. Callers often pass the modulus limb
+// count; trimming leading zero limbs avoids squaring for unused exponent bits.
+fun @_bn_eff_limbs(exp: *i32, exp_limbs: i32) -> i32 {
+    @entry:
+      %eff = let i32
+      store i32 %exp_limbs, *%eff
+      jmp @eff_cond
+    @eff_cond:
+      %v = load i32, *%eff
+      %gt = sgt i32 %v, 0
+      br %gt, @eff_chk, @eff_done
+    @eff_chk:
+      %v2 = load i32, *%eff
+      %idx = sub i32 %v2, 1
+      %p = gep i32, *%exp, %idx
+      %lv = load i32, *%p
+      %zero = eq i32 %lv, 0
+      br %zero, @eff_drop, @eff_done
+    @eff_drop:
+      %v3 = load i32, *%eff
+      %n = sub i32 %v3, 1
+      store i32 %n, *%eff
+      jmp @eff_cond
+    @eff_done:
+      %r = load i32, *%eff
+      ret i32 %r
+}
+
+fun @std_crypto_rsa_bn_mod_pow(r: *i32, base: *i32, exp: *i32, exp_limbs: i32, m: *i32, limbs: i32) -> void {
+    @entry:
+      %tmp = let [i32, 256]
+      %tp = gep i32, *%tmp, 0
+      call @std_crypto_rsa_bn_zero(%r, %limbs)
+      %rp0 = gep i32, *%r, 0
+      store i32 1, *%rp0
+      call @std_crypto_rsa_bn_copy(%tp, %base, %limbs)
+      %bi = let i32
+      %eff = call @_bn_eff_limbs(%exp, %exp_limbs)
+      %mb = shl i32 %eff, 5
+      store i32 0, *%bi
+      jmp @pow_cond
+    @pow_cond:
+      %bv = load i32, *%bi
+      %bc = slt i32 %bv, %mb
+      br %bc, @pow_tb, @pow_done
+    @pow_tb:
+      %biv = load i32, *%bi
+      %eli = lshr i32 %biv, 5
+      %eb = and i32 %biv, 31
+      %ep = gep i32, *%exp, %eli
+      %ev = load i32, *%ep
+      %ob = shl i32 1, %eb
+      %bs = and i32 %ev, %ob
+      %bnz = ne i32 %bs, 0
+      br %bnz, @pow_sm, @pow_sq
+    @pow_sm:
+      call @std_crypto_rsa_bn_mod_mul(%r, %r, %tp, %m, %limbs)
+      jmp @pow_sq
+    @pow_sq:
+      call @std_crypto_rsa_bn_mod_mul(%tp, %tp, %tp, %m, %limbs)
+      %biv2 = add i32 %biv, 1
+      store i32 %biv2, *%bi
+      jmp @pow_cond
+    @pow_done: ret void
+}
+
+
+fun @std_crypto_rsa_gcd(r: *i32, a: *i32, b: *i32, limbs: i32) -> void {
+    @entry:
+      %ta = let [i32, 256]
+      %tb = let [i32, 256]
+      %tap = gep i32, *%ta, 0
+      %tbp = gep i32, *%tb, 0
+      call @std_crypto_rsa_bn_copy(%tap, %a, %limbs)
+      call @std_crypto_rsa_bn_copy(%tbp, %b, %limbs)
+      jmp @gcd_cond
+    @gcd_cond:
+      %z = call @std_crypto_rsa_bn_is_zero(%tbp, %limbs)
+      br %z, @gcd_done, @gcd_step
+    @gcd_step:
+      call @std_crypto_rsa_bn_mod(%r, %tap, %limbs, %tbp, %limbs)
+      call @std_crypto_rsa_bn_copy(%tap, %tbp, %limbs)
+      call @std_crypto_rsa_bn_copy(%tbp, %r, %limbs)
+      jmp @gcd_cond
+    @gcd_done:
+      call @std_crypto_rsa_bn_copy(%r, %tap, %limbs)
+      ret void
+  }
+
+fun @std_crypto_rsa_miller_rabin(n: *i32, limbs: i32) -> i1 {
+    @entry:
+      // Handle n < 3
+      %np0 = gep i32, *%n, 0
+      %n0 = load i32, *%np0
+      %even = and i32 %n0, 1
+      %even_z = eq i32 %even, 0
+      br %even_z, @mr_composite, @mr_prep
+
+    @mr_prep:
+      // Compute n-1 = d * 2^s
+      %n1 = let [i32, 256]
+      %n1p = gep i32, *%n1, 0
+      %d = let [i32, 256]
+      %dp = gep i32, *%d, 0
+      %s = let i32
+      call @std_crypto_rsa_bn_copy(%n1p, %n, %limbs)
+      // n1 = n - 1
+      %n1_0 = gep i32, *%n1, 0
+      %n1_0v = load i32, *%n1_0
+      %n1_dec = sub i32 %n1_0v, 1
+      store i32 %n1_dec, *%n1_0
+      call @std_crypto_rsa_bn_copy(%dp, %n1p, %limbs)
+      store i32 0, *%s
+      jmp @mr_factor
+
+    @mr_factor:
+      %do = call @std_crypto_rsa_bn_is_odd(%dp, %limbs)
+      br %do, @mr_test, @mr_halve
+
+    @mr_halve:
+      call @std_crypto_rsa_bn_shr1(%dp, %dp, %limbs)
+      %sv = load i32, *%s
+      %sv2 = add i32 %sv, 1
+      store i32 %sv2, *%s
+      jmp @mr_factor
+
+    @mr_test:
+      // Test witnesses: 2, 3, 5, 7, 11, 13
+      %w_i = let i32
+      store i32 0, *%w_i
+      jmp @mr_w_cond
+
+    @mr_w_cond:
+      %wiv = load i32, *%w_i
+      %wmore = slt i32 %wiv, 6
+      br %wmore, @mr_w_body, @mr_prob_prime
+
+    @mr_w_body:
+      %wiv2 = load i32, *%w_i
+      // Select witness value based on index
+      %w_val = let i32
+      %wc0 = eq i32 %wiv2, 0
+      br %wc0, @set_w2, @wchk1
+    @set_w2:
+      store i32 2, *%w_val
+      jmp @w_got
+    @wchk1:
+      %wc1 = eq i32 %wiv2, 1
+      br %wc1, @set_w3, @wchk2
+    @set_w3:
+      store i32 3, *%w_val
+      jmp @w_got
+    @wchk2:
+      %wc2 = eq i32 %wiv2, 2
+      br %wc2, @set_w5, @wchk3
+    @set_w5:
+      store i32 5, *%w_val
+      jmp @w_got
+    @wchk3:
+      %wc3 = eq i32 %wiv2, 3
+      br %wc3, @set_w7, @wchk4
+    @set_w7:
+      store i32 7, *%w_val
+      jmp @w_got
+    @wchk4:
+      %wc4 = eq i32 %wiv2, 4
+      br %wc4, @set_w11, @set_w13
+    @set_w11:
+      store i32 11, *%w_val
+      jmp @w_got
+    @set_w13:
+      store i32 13, *%w_val
+      jmp @w_got
+    @w_got:
+      // Convert witness to bigint
+      %w_bn = let [i32, 256]
+      %w_bnp = gep i32, *%w_bn, 0
+      call @std_crypto_rsa_bn_zero(%w_bnp, %limbs)
+      store i32 %w_val, *%w_bnp
+      // Skip if witness >= n
+      %wcmp = call @std_crypto_rsa_bn_cmp(%w_bnp, %n, %limbs)
+      %wge = sge i32 %wcmp, 0
+      br %wge, @mr_w_next, @mr_run_test
+
+    @mr_run_test:
+      // x = witness^d mod n
+      %x = let [i32, 256]
+      %xp = gep i32, *%x, 0
+      %w_bn2 = gep i32, *%w_bn, 0
+      call @std_crypto_rsa_bn_mod_pow(%xp, %w_bn2, %dp, %limbs, %n, %limbs)
+
+      // If x == 1 or x == n-1: next witness
+      %xis1 = call @std_crypto_rsa_bn_is_one(%xp, %limbs)
+      br %xis1, @mr_w_next, @mr_check_nm1
+
+    @mr_check_nm1:
+      %xnm1 = call @std_crypto_rsa_bn_cmp(%xp, %n1p, %limbs)
+      %xeqnm1 = eq i32 %xnm1, 0
+      br %xeqnm1, @mr_w_next, @mr_sq_loop
+
+    @mr_sq_loop:
+      // Square x repeatedly for s-1 rounds
+      %sq_i = let i32
+      store i32 0, *%sq_i
+      %sv3 = load i32, *%s
+      %smin1 = sub i32 %sv3, 1
+      jmp @mr_sq_cond
+
+    @mr_sq_cond:
+      %sqiv = load i32, *%sq_i
+      %sqmore = slt i32 %sqiv, %smin1
+      br %sqmore, @mr_sq_body, @mr_composite
+
+    @mr_sq_body:
+      // x = x^2 mod n
+      call @std_crypto_rsa_bn_mod_mul(%xp, %xp, %xp, %n, %limbs)
+
+      %xnm2 = call @std_crypto_rsa_bn_cmp(%xp, %n1p, %limbs)
+      %xeqnm2 = eq i32 %xnm2, 0
+      br %xeqnm2, @mr_w_next, @mr_sq_next
+
+    @mr_sq_next:
+      %sqiv2 = load i32, *%sq_i
+      %sqiv3 = add i32 %sqiv2, 1
+      store i32 %sqiv3, *%sq_i
+      jmp @mr_sq_cond
+
+    @mr_composite: ret i1 0
+
+    @mr_prob_prime:
+      // All witnesses passed — probably prime
+      ret i1 1
+
+    @mr_w_next:
+      %wiv3 = load i32, *%w_i
+      %wiv4 = add i32 %wiv3, 1
+      store i32 %wiv4, *%w_i
+      jmp @mr_w_cond
+  }
+
+fun @std_crypto_rsa_gen_prime(r: *i32, limbs: i32) -> void {
+    @entry: jmp @gp_loop
+    @gp_loop:
+      call @std_crypto_rsa_bn_random(%r, %limbs)
+      %last = sub i32 %limbs, 1
+      %lp = gep i32, *%r, %last
+      %lv = load i32, *%lp
+      %lv_top = or i32 %lv, 0x80000000
+      store i32 %lv_top, *%lp
+      %z0p = gep i32, *%r, 0
+      %z0 = load i32, *%z0p
+      %z0_odd = or i32 %z0, 1
+      store i32 %z0_odd, *%z0p
+      %mr = call @std_crypto_rsa_miller_rabin(%r, %limbs)
+      br %mr, @gp_done, @gp_loop
+    @gp_done: ret void
+  }
+
+  // Bigint + 1 (add small integer): r = a + k
+  fun @_bn_add_int(r: *i32, a: *i32, k: i32, limbs: i32) -> void {
+    @entry:
+      %carry = let i64
+      %av0 = load i32, *%a
+      %av064 = zext i32 %av0 to i64
+      %kv64 = zext i32 %k to i64
+      %sum0 = add i64 %av064, %kv64
+      %c0 = lshr i64 %sum0, 32
+      store i64 %c0, *%carry
+      %limb0 = trunc i64 %sum0 to i32
+      store i32 %limb0, *%r
+      %iptr = let i32
+      store i32 1, *%iptr
+      jmp @aicond
+    @aicond:
+      %i = load i32, *%iptr
+      %c = slt i32 %i, %limbs
+      br %c, @aibody, @aidone
+    @aibody:
+      %iv = load i32, *%iptr
+      %ap = gep i32, *%a, %iv
+      %av = load i32, *%ap
+      %av64 = zext i32 %av to i64
+      %cv = load i64, *%carry
+      %sum = add i64 %av64, %cv
+      %nc = lshr i64 %sum, 32
+      store i64 %nc, *%carry
+      %limb = trunc i64 %sum to i32
+      %rp = gep i32, *%r, %iv
+      store i32 %limb, *%rp
+      %iv2 = add i32 %iv, 1
+      store i32 %iv2, *%iptr
+      jmp @aicond
+    @aidone: ret void
+  }
+
+  // Bigint * int (small integer): r = a * k (space for limbs+1)
+  fun @_bn_mul_int(r: *i32, a: *i32, k: i32, limbs: i32) -> void {
+    @entry:
+      %carry = let i64
+      store i64 0, *%carry
+      %iptr = let i32
+      store i32 0, *%iptr
+      jmp @micond
+    @micond:
+      %i = load i32, *%iptr
+      %c = slt i32 %i, %limbs
+      br %c, @mibody, @midone
+    @mibody:
+      %iv = load i32, *%iptr
+      %ap = gep i32, *%a, %iv
+      %av = load i32, *%ap
+      %av64 = zext i32 %av to i64
+      %kv64 = zext i32 %k to i64
+      %cv = load i64, *%carry
+      %prod = mul i64 %av64, %kv64
+      %sum = add i64 %prod, %cv
+      %nc = lshr i64 %sum, 32
+      store i64 %nc, *%carry
+      %limb = trunc i64 %sum to i32
+      %rp = gep i32, *%r, %iv
+      store i32 %limb, *%rp
+      %iv2 = add i32 %iv, 1
+      store i32 %iv2, *%iptr
+      jmp @micond
+    @midone:
+      %cf = load i64, *%carry
+      %cf32 = trunc i64 %cf to i32
+      %rp_last = gep i32, *%r, %limbs
+      store i32 %cf32, *%rp_last
+      ret void
+  }
+
+  // Bigint / int (small integer divisor): q = a / d (space for limbs)
+  // Returns remainder (as i32)
+  fun @_bn_div_int(q: *i32, a: *i32, d: i32, limbs: i32) -> i32 {
+    @entry:
+      %rem = let i64
+      store i64 0, *%rem
+      %iptr = let i32
+      %last = sub i32 %limbs, 1
+      store i32 %last, *%iptr
+      jmp @dicond
+    @dicond:
+      %i = load i32, *%iptr
+      %neg = slt i32 %i, 0
+      br %neg, @didone, @dibody
+    @dibody:
+      %iv = load i32, *%iptr
+      %ap = gep i32, *%a, %iv
+      %av = load i32, *%ap
+      %av64 = zext i32 %av to i64
+      %remv = load i64, *%rem
+      %shifted = shl i64 %remv, 32
+      %num = or i64 %shifted, %av64
+      %dv64 = zext i32 %d to i64
+      %quot64 = udiv i64 %num, %dv64
+      %new_rem64 = urem i64 %num, %dv64
+      %quot32 = trunc i64 %quot64 to i32
+      %qp = gep i32, *%q, %iv
+      store i32 %quot32, *%qp
+      store i64 %new_rem64, *%rem
+      %iv2 = sub i32 %iv, 1
+      store i32 %iv2, *%iptr
+      jmp @dicond
+    @didone:
+      %r = load i64, *%rem
+      %r32 = trunc i64 %r to i32
+      ret i32 %r32
+  }
+
+  // 32-bit modular inverse: find x where a*x ≡ 1 (mod m)
+  // Uses brute-force iteration since m < 65537 (small)
+  fun @_mod_inv_32(a: i32, m: i32) -> i32 {
+    @entry:
+      %i = let i32
+      store i32 1, *%i
+      jmp @mi32_cond
+    @mi32_cond:
+      %iv = load i32, *%i
+      %iv64 = zext i32 %iv to i64
+      %a64 = zext i32 %a to i64
+      %prod64 = mul i64 %iv64, %a64
+      %m64 = zext i32 %m to i64
+      %rem64 = urem i64 %prod64, %m64
+      %found = eq i64 %rem64, 1
+      br %found, @mi32_done, @mi32_next
+    @mi32_next:
+      %iv2 = load i32, *%i
+      %iv3 = add i32 %iv2, 1
+      store i32 %iv3, *%i
+      jmp @mi32_cond
+    @mi32_done:
+      %r = load i32, *%i
+      ret i32 %r
+  }
+
+  // Modular inverse: r = a^(-1) mod m
+  // a is small (fits in 1 limb), m is a bigint
+  // Uses: compute k st (k*m + 1) % a == 0, then r = (k*m + 1) / a
+  fun @std_crypto_rsa_bn_mod_inv(r: *i32, a_small: i32, m: *i32, m_limbs: i32) -> void {
+    @entry:
+      // Compute m_mod_a = m % a_small using bn_mod
+      %a_bn = let [i32, 2]
+      %a_bnp = gep i32, *%a_bn, 0
+      store i32 %a_small, *%a_bnp
+      %m_mod_a = let [i32, 2]
+      %m_mod_ap = gep i32, *%m_mod_a, 0
+      call @std_crypto_rsa_bn_mod(%m_mod_ap, %m, %m_limbs, %a_bnp, 1)
+
+      %m_mod_av = load i32, *%m_mod_ap
+      %a_minus_1 = sub i32 %a_small, 1
+      // k = mod_inv_32(m_mod_a, a_small) * (a_small - 1) % a_small
+      %inv = call @_mod_inv_32(%m_mod_av, %a_small)
+      %k_unmod = mul i32 %inv, %a_minus_1
+      %k_unmod64 = zext i32 %k_unmod to i64
+      %a_small64 = zext i32 %a_small to i64
+      %k_rem64 = urem i64 %k_unmod64, %a_small64
+      %k = trunc i64 %k_rem64 to i32
+
+      // temp = k * m + 1
+      %temp = let [i32, 256]
+      %tempp = gep i32, *%temp, 0
+      %temp_limbs = add i32 %m_limbs, 2
+      call @std_crypto_rsa_bn_zero(%tempp, %temp_limbs)
+      call @_bn_mul_int(%tempp, %m, %k, %m_limbs)
+      %kp1 = let [i32, 256]
+      %kp1p = gep i32, *%kp1, 0
+      call @std_crypto_rsa_bn_zero(%kp1p, %temp_limbs)
+      call @_bn_add_int(%kp1p, %tempp, 1, %temp_limbs)
+
+      // r = temp / a_small
+      %rem = call @_bn_div_int(%r, %kp1p, %a_small, %temp_limbs)
+      ret void
+  }
+
+fun @bn_mont_nprime(n0: i32) -> i32 {
+    @entry:
+      %inv = sub i32 2, %n0
+      %p1 = mul i32 %n0, %inv
+      %t1 = sub i32 2, %p1
+      %i1 = mul i32 %inv, %t1
+      %p2 = mul i32 %n0, %i1
+      %t2 = sub i32 2, %p2
+      %i2 = mul i32 %i1, %t2
+      %p3 = mul i32 %n0, %i2
+      %t3 = sub i32 2, %p3
+      %i3 = mul i32 %i2, %t3
+      // one more Newton step: 24 -> 48 bits of precision, enough for 2^32
+      %p4 = mul i32 %n0, %i3
+      %t4 = sub i32 2, %p4
+      %i4 = mul i32 %i3, %t4
+      %n_prime = sub i32 0, %i4
+      ret i32 %n_prime
+}
+
+fun @bn_mont_reduce(r: *i32, t: *i32, n: *i32, n_prime: i32, limbs: i32) -> void {
+    @entry:
+      %dl = shl i32 %limbs, 1
+      %w_buf = let [i32, 512]
+      %wp = gep i32, *%w_buf, 0
+      call @std_crypto_rsa_bn_copy(%wp, %t, %dl)
+      // one spare limb so the carry chain has somewhere to go
+      %wend = gep i32, *%w_buf, %dl
+      store i32 0, *%wend
+      %iptr = let i32
+      %zero64 = let i64
+      store i64 0, *%zero64
+      store i32 0, *%iptr
+      jmp @mrc
+    @mrc:
+      %i = load i32, *%iptr
+      %occ = slt i32 %i, %limbs
+      br %occ, @mrb, @mrd
+    @mrb:
+      %iv = load i32, *%iptr
+      %tip = gep i32, *%w_buf, %iv
+      %tiv = load i32, *%tip
+      %m = mul i32 %tiv, %n_prime
+      %carry = load i64, *%zero64
+      store i64 0, *%zero64  // reset carry slot
+      // actually use a real carry variable
+      // We'll reuse the carry area
+      %jptr = let i32
+      %carry2 = let i64
+      store i32 0, *%jptr
+      store i64 0, *%carry2
+      jmp @mir
+    @mir:
+      %j = load i32, *%jptr
+      %icc = slt i32 %j, %limbs
+      br %icc, @mib, @mid
+    @mib:
+      %jv = load i32, *%jptr
+      %n_jp = gep i32, *%n, %jv
+      %njv = load i32, *%n_jp
+      %ij = add i32 %iv, %jv
+      %tijp = gep i32, *%w_buf, %ij
+      %tijv = load i32, *%tijp
+      %m64 = zext i32 %m to i64
+      %nj64 = zext i32 %njv to i64
+      %p = mul i64 %m64, %nj64
+      %t64 = zext i32 %tijv to i64
+      %cv = load i64, *%carry2
+      %s1 = add i64 %t64, %p
+      %s2 = add i64 %s1, %cv
+      %nc = lshr i64 %s2, 32
+      store i64 %nc, *%carry2
+      %limb = trunc i64 %s2 to i32
+      store i32 %limb, *%tijp
+      %jv2 = add i32 %jv, 1
+      store i32 %jv2, *%jptr
+      jmp @mir
+    @mid:
+      // Propagate the pending carry from position i+limbs upward
+      %ppos = let i32
+      %pcar = let i64
+      %ici = add i32 %iv, %limbs
+      store i32 %ici, *%ppos
+      %cv_end = load i64, *%carry2
+      store i64 %cv_end, *%pcar
+      jmp @prop_cond
+    @prop_cond:
+      %pv = load i64, *%pcar
+      %pz = eq i64 %pv, 0
+      br %pz, @advance, @prop_body
+    @prop_body:
+      %pidx = load i32, *%ppos
+      %pip = gep i32, *%w_buf, %pidx
+      %piv = load i32, *%pip
+      %piv64 = zext i32 %piv to i64
+      %psum = add i64 %piv64, %pv
+      %plimb = trunc i64 %psum to i32
+      store i32 %plimb, *%pip
+      %phi = lshr i64 %psum, 32
+      store i64 %phi, *%pcar
+      %pnx = add i32 %pidx, 1
+      store i32 %pnx, *%ppos
+      jmp @prop_cond
+    @advance:
+      %iv2 = add i32 %iv, 1
+      store i32 %iv2, *%iptr
+      jmp @mrc
+    @mrd:
+      // Copy t[limbs..2*limbs-1] to r
+      %adj = gep i32, *%w_buf, %limbs
+      call @std_crypto_rsa_bn_copy(%r, %adj, %limbs)
+      // REDC yields a value < 2n, which can need the spare limb at index 2L.
+      // In that case the true result is R + r and one subtraction of n brings
+      // it below n (the subtraction wraps, which is exactly what we want).
+      %xp = gep i32, *%w_buf, %dl
+      %xv = load i32, *%xp
+      %xnz = ne i32 %xv, 0
+      br %xnz, @mf_once, @mf_c
+    @mf_once:
+      call @std_crypto_rsa_bn_sub(%r, %r, %n, %limbs)
+      ret void
+      // Final subtraction if r >= n
+    @mf_c:
+      %fcmp = call @std_crypto_rsa_bn_cmp(%r, %n, %limbs)
+      %fge = sge i32 %fcmp, 0
+      br %fge, @mf_s, @mf_d
+    @mf_s:
+      call @std_crypto_rsa_bn_sub(%r, %r, %n, %limbs)
+      jmp @mf_c
+    @mf_d: ret void
+}
+
+fun @bn_mont_mul(r: *i32, a: *i32, b: *i32, n: *i32, n_prime: i32, limbs: i32) -> void {
+    @entry:
+      %dl = shl i32 %limbs, 1
+      %prod_buf = let [i32, 512]
+      %pp = gep i32, *%prod_buf, 0
+      call @std_crypto_rsa_bn_mul(%pp, %a, %b, %limbs)
+      call @bn_mont_reduce(%r, %pp, %n, %n_prime, %limbs)
+      ret void
+}
+
+fun @std_crypto_rsa_bn_mod_pow_mont(r: *i32, base: *i32, exp: *i32,
+    exp_limbs: i32, n: *i32, limbs: i32) -> void {
+    @entry:
+      %np0g = gep i32, *%n, 0
+      %n0v = load i32, *%np0g
+      %n_prime = call @bn_mont_nprime(%n0v)
+
+      // R mod n = 2^(32*limbs) mod n, by repeated doubling
+      %R_buf = let [i32, 256]
+      %R = gep i32, *%R_buf, 0
+      call @std_crypto_rsa_bn_zero(%R, %limbs)
+      %p0 = gep i32, *%R_buf, 0
+      store i32 1, *%p0
+      %ri = let i32
+      %total_bits = shl i32 %limbs, 5
+      store i32 0, *%ri
+      jmp @doub_c
+    @doub_c:
+      %riv = load i32, *%ri
+      %rc = slt i32 %riv, %total_bits
+      br %rc, @doub_b, @after_R
+    @doub_b:
+      %carryR = call @std_crypto_rsa_bn_shl1(%R, %R, %limbs)
+      %cmpR = call @std_crypto_rsa_bn_cmp(%R, %n, %limbs)
+      %geR = sge i32 %cmpR, 0
+      %ovR = ne i32 %carryR, 0
+      %needR = or i1 %geR, %ovR
+      br %needR, @doub_sub, @doub_next
+    @doub_sub:
+      call @std_crypto_rsa_bn_sub(%R, %R, %n, %limbs)
+      jmp @doub_next
+    @doub_next:
+      %rn = add i32 %riv, 1
+      store i32 %rn, *%ri
+      jmp @doub_c
+    @after_R:
+
+      // R2 mod n = 2^(2*32*limbs) mod n
+      %R2_buf = let [i32, 256]
+      %R2 = gep i32, *%R2_buf, 0
+      call @std_crypto_rsa_bn_zero(%R2, %limbs)
+      %q0 = gep i32, *%R2_buf, 0
+      store i32 1, *%q0
+      %qi = let i32
+      %total_bits2 = shl i32 %total_bits, 1
+      store i32 0, *%qi
+      jmp @d2_c
+    @d2_c:
+      %qiv = load i32, *%qi
+      %qc = slt i32 %qiv, %total_bits2
+      br %qc, @d2_b, @after_R2
+    @d2_b:
+      %carryQ = call @std_crypto_rsa_bn_shl1(%R2, %R2, %limbs)
+      %cmpQ = call @std_crypto_rsa_bn_cmp(%R2, %n, %limbs)
+      %geQ = sge i32 %cmpQ, 0
+      %ovQ = ne i32 %carryQ, 0
+      %needQ = or i1 %geQ, %ovQ
+      br %needQ, @d2_sub, @d2_next
+    @d2_sub:
+      call @std_crypto_rsa_bn_sub(%R2, %R2, %n, %limbs)
+      jmp @d2_next
+    @d2_next:
+      %qn = add i32 %qiv, 1
+      store i32 %qn, *%qi
+      jmp @d2_c
+    @after_R2:
+
+      // base_m = base * R mod n; reduce first since callers may pass base >= n
+      %br_buf = let [i32, 256]
+      %br = gep i32, *%br_buf, 0
+      call @std_crypto_rsa_bn_mod(%br, %base, %limbs, %n, %limbs)
+      %prod_buf = let [i32, 512]
+      %prod = gep i32, *%prod_buf, 0
+      call @std_crypto_rsa_bn_mul(%prod, %br, %R2, %limbs)
+      %base_m = let [i32, 256]
+      %bm = gep i32, *%base_m, 0
+      call @bn_mont_reduce(%bm, %prod, %n, %n_prime, %limbs)
+
+      // accumulator = Montgomery form of 1
+      %rm_buf = let [i32, 256]
+      %rm = gep i32, *%rm_buf, 0
+      call @std_crypto_rsa_bn_copy(%rm, %R, %limbs)
+
+      %gi = let i32
+      %eff = call @_bn_eff_limbs(%exp, %exp_limbs)
+      %mb = shl i32 %eff, 5
+      store i32 0, *%gi
+      jmp @pm_cond
+    @pm_cond:
+      %gv = load i32, *%gi
+      %gc = slt i32 %gv, %mb
+      br %gc, @pm_tb, @pm_done
+    @pm_tb:
+      %gvi = load i32, *%gi
+      %eli = lshr i32 %gvi, 5
+      %eb = and i32 %gvi, 31
+      %ep = gep i32, *%exp, %eli
+      %ev = load i32, *%ep
+      %ob = shl i32 1, %eb
+      %bs = and i32 %ev, %ob
+      %bnz = ne i32 %bs, 0
+      br %bnz, @pm_sm, @pm_sq
+    @pm_sm:
+      call @bn_mont_mul(%rm, %rm, %bm, %n, %n_prime, %limbs)
+      jmp @pm_sq
+    @pm_sq:
+      call @bn_mont_mul(%bm, %bm, %bm, %n, %n_prime, %limbs)
+      %gn = add i32 %gvi, 1
+      store i32 %gn, *%gi
+      jmp @pm_cond
+    @pm_done:
+      // convert back: r = r_m * R^-1 mod n = mont_mul(r_m, 1)
+      %one_buf = let [i32, 256]
+      %one = gep i32, *%one_buf, 0
+      call @std_crypto_rsa_bn_zero(%one, %limbs)
+      %op0 = gep i32, *%one_buf, 0
+      store i32 1, *%op0
+      call @bn_mont_mul(%r, %rm, %one, %n, %n_prime, %limbs)
+      ret void
+}
+
+
+fun @std_crypto_rsa_encrypt(c: *i32, m: *i32, e_key: *i32, n_mod: *i32, limbs: i32) -> void {
+    @entry:
+      call @std_crypto_rsa_bn_mod_pow_mont(%c, %m, %e_key, %limbs, %n_mod, %limbs)
+      ret void
+  }
+
+fun @std_crypto_rsa_decrypt(m: *i32, c: *i32, d_key: *i32, n_mod: *i32, limbs: i32) -> void {
+    @entry:
+      call @std_crypto_rsa_bn_mod_pow_mont(%m, %c, %d_key, %limbs, %n_mod, %limbs)
+      ret void
+  }
+
+fun @std_crypto_rsa_gen_keypair(n: *i32, e: *i32, d: *i32, p: *i32, q: *i32, limbs: i32) -> void {
+    @entry:
+      %half = lshr i32 %limbs, 1
+      call @std_crypto_rsa_gen_prime(%p, %half)
+      call @std_crypto_rsa_gen_prime(%q, %half)
+      call @std_crypto_rsa_bn_mul(%n, %p, %q, %half)
+      call @std_crypto_rsa_bn_zero(%e, %limbs)
+      %ep0 = gep i32, *%e, 0
+      store i32 65537, *%ep0
+
+      // Compute phi = (p-1)*(q-1)
+      %one = let [i32, 128]
+      %p1 = let [i32, 128]
+      %q1 = let [i32, 128]
+      %phi = let [i32, 256]
+      %onep = gep i32, *%one, 0
+      %p1p = gep i32, *%p1, 0
+      %q1p = gep i32, *%q1, 0
+      %phip = gep i32, *%phi, 0
+      call @std_crypto_rsa_bn_zero(%onep, %half)
+      store i32 1, *%onep
+      call @std_crypto_rsa_bn_copy(%p1p, %p, %half)
+      call @std_crypto_rsa_bn_sub(%p1p, %p1p, %onep, %half)
+      call @std_crypto_rsa_bn_copy(%q1p, %q, %half)
+      call @std_crypto_rsa_bn_sub(%q1p, %q1p, %onep, %half)
+      call @std_crypto_rsa_bn_zero(%phip, %limbs)
+      call @std_crypto_rsa_bn_mul(%phip, %p1p, %q1p, %half)
+
+      // d = e^(-1) mod phi
+      call @std_crypto_rsa_bn_mod_inv(%d, 65537, %phip, %limbs)
+      ret void
+  }
+
+// Compute -n[0]^-1 mod 2^32 (Montgomery constant)
+
+// Montgomery REDC: reduce T (2*limbs) to r (limbs): r = T * R^-1 mod n
+// n_prime = -n[0]^-1 mod 2^32 (from bn_mont_nprime)
+
+// r = base^exp mod n using Montgomery multiplication
+// precomputes R_mod = 2^(32*limbs) mod n and converts to Montgomery domain
+
+// r = a * b * R^-1 mod n (a, b are in Montgomery domain)
+

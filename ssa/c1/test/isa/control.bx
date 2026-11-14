@@ -1,0 +1,117 @@
+// jmp / br / phi / ret semantics.
+
+extern @printf(fmt: *i8, ...) -> i32
+
+fun @main() -> i32 {
+  @entry:
+    %id = let i32
+    store i32 0, *%id
+    %lv = let i32
+    %rv = let i32
+    store i32 0, *%lv
+    store i32 0, *%rv
+
+    // --- conditional branch ---
+    %c = slt i32 1, 2
+    br %c, @left, @right
+
+  @left:
+    store i32 111, *%lv
+    jmp @join
+
+  @right:
+    store i32 222, *%rv
+    jmp @join
+
+  @join:
+    %x = load i32, *%lv
+    %y = load i32, *%rv
+    %cx = eq i32 %x, 111
+    %cy = eq i32 %y, 0              // the untaken branch's slot is left alone
+    %c1 = and i1 %cx, %cy
+    br %c1, @t1, @fail
+
+  @t1:
+    store i32 1, *%id
+    // --- phi merging two predecessors ---
+    %d = sgt i32 5, 3
+    br %d, @pa, @pb
+
+  @pa:
+    jmp @pjoin
+
+  @pb:
+    jmp @pjoin
+
+  @pjoin:
+    %pv = phi i32 [ 10, @pa ], [ 20, @pb ]
+    %c2 = eq i32 %pv, 10
+    br %c2, @t2, @fail
+
+  @t2:
+    store i32 2, *%id
+    // --- loop: sum 1..10 ---
+    %i = let i32
+    %sum = let i32
+    store i32 1, *%i
+    store i32 0, *%sum
+    jmp @loop_cond
+
+  @loop_cond:
+    %iv = load i32, *%i
+    %more = sle i32 %iv, 10
+    br %more, @loop_body, @loop_done
+
+  @loop_body:
+    %sv = load i32, *%sum
+    %iv2 = load i32, *%i
+    %ns = add i32 %sv, %iv2
+    store i32 %ns, *%sum
+    %ni = add i32 %iv2, 1
+    store i32 %ni, *%i
+    jmp @loop_cond
+
+  @loop_done:
+    %total = load i32, *%sum
+    %c3 = eq i32 %total, 55
+    br %c3, @t3, @fail
+
+  @t3:
+    store i32 3, *%id
+    // --- loop with early exit ---
+    %j = let i32
+    store i32 0, *%j
+    jmp @search_cond
+
+  @search_cond:
+    %jv = load i32, *%j
+    %more2 = slt i32 %jv, 100
+    br %more2, @search_body, @not_found
+
+  @search_body:
+    %jv2 = load i32, *%j
+    %found = eq i32 %jv2, 37
+    br %found, @found_it, @search_next
+
+  @search_next:
+    %jn = add i32 %jv2, 1
+    store i32 %jn, *%j
+    jmp @search_cond
+
+  @found_it:
+    %fid = load i32, *%j
+    %c4 = eq i32 %fid, 37
+    br %c4, @pass, @fail
+
+  @not_found:
+    store i32 4, *%id
+    jmp @fail
+
+  @pass:
+    call @printf("PASS isa/control\n")
+    ret i32 0
+  @fail:
+    %n = load i32, *%id
+    call @printf("FAIL isa/control at case %d\n", %n)
+    ret i32 1
+}

@@ -1,0 +1,9 @@
+// Deliberately invalid: the template does not assemble, so c1 must fail
+// instead of silently dropping the instruction. run_all.sh checks the exit
+// status and never runs this file.
+
+fun @main() -> i32 {
+  @entry:
+    asm att void, "bogus_mnemonic x0, x0", ""
+    ret i32 0
+}
