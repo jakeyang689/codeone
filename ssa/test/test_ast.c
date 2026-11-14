@@ -871,6 +871,38 @@ TEST(parse_error_asm_raw_newline) {
     lexer_free(&lex);
 }
 
+TEST(insn_tensor) {
+    Program *p = parse_str(
+        "fun @f() -> void {\n"
+        "  @entry:\n"
+        "    tensor add, f32, [2, 3], *%d, *%a, *%b\n"
+        "    tensor matmul, f32, [2, 3, 4], *%d, *%a, *%b\n"
+        "    ret void\n"
+        "}"
+    );
+    ASSERT_NOT_NULL(p);
+    Insn *add = &p->functions[0].blocks[0].insns[0];
+    ASSERT_EQ(add->kind, INSN_TENSOR);
+    ASSERT_NULL(add->result);
+    ASSERT_EQ(add->data.tensor.op, TENSOR_OP_ADD);
+    ASSERT_EQ(add->data.tensor.elem_type->kind, AST_TYPE_F32);
+    ASSERT_EQ(add->data.tensor.ndim, 2);
+    ASSERT_EQ(add->data.tensor.dims[0].kind, OPERAND_INT);
+    ASSERT_EQ(add->data.tensor.dims[0].as.int_val, 2);
+    ASSERT_EQ(add->data.tensor.dims[1].as.int_val, 3);
+    ASSERT_EQ(add->data.tensor.dst.kind, OPERAND_LOCAL);
+    ASSERT_STR_EQ(add->data.tensor.dst.as.local_name, "d");
+    ASSERT_STR_EQ(add->data.tensor.lhs.as.local_name, "a");
+    ASSERT_STR_EQ(add->data.tensor.rhs.as.local_name, "b");
+
+    Insn *mm = &p->functions[0].blocks[0].insns[1];
+    ASSERT_EQ(mm->kind, INSN_TENSOR);
+    ASSERT_EQ(mm->data.tensor.op, TENSOR_OP_MATMUL);
+    ASSERT_EQ(mm->data.tensor.ndim, 3);
+    ASSERT_EQ(mm->data.tensor.dims[2].as.int_val, 4);
+    program_free(p);
+}
+
 TEST(insn_convert) {
     Program *p = parse_str(
         "fun @f() -> i64 {\n"
@@ -1385,6 +1417,7 @@ void run_ast_tests(void) {
     RUN_TEST(insn_asm_named_operands);
     RUN_TEST(insn_asm_struct_result);
     RUN_TEST(insn_convert);
+    RUN_TEST(insn_tensor);
 
     /* Types */
     RUN_TEST(type_pointer);

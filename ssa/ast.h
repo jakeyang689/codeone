@@ -106,6 +106,15 @@ typedef enum {
     ATOMICOP_XOR,
 } AtomicRmwOp;
 
+/* Tensor operation kinds for INSN_TENSOR */
+typedef enum {
+    TENSOR_OP_ADD,
+    TENSOR_OP_SUB,
+    TENSOR_OP_MUL,
+    TENSOR_OP_DIV,
+    TENSOR_OP_MATMUL,
+} TensorOp;
+
 typedef enum {
     INSN_LET,
 
@@ -132,6 +141,9 @@ typedef enum {
 
     /* Unsigned arithmetic */
     INSN_MULHI, INSN_UDIV, INSN_UREM,
+
+    /* Tensor */
+    INSN_TENSOR,
 } InsnKind;
 
 typedef struct Insn {
@@ -184,6 +196,14 @@ typedef struct Insn {
         } asm_insn;
         /* INSN_ZEXT, INSN_SEXT, INSN_TRUNC */
         struct { AstNode *from_type; Operand value; AstNode *to_type; } convert;
+        /* INSN_TENSOR */
+        struct {
+            int op;                 /* TensorOp */
+            AstNode *elem_type;     /* element type */
+            Operand dims[3];        /* shape; 2 dims elementwise, 3 for matmul */
+            int ndim;
+            Operand dst, lhs, rhs;  /* *elem_type pointers */
+        } tensor;
     } data;
 } Insn;
 
@@ -322,6 +342,9 @@ const char *ast_node_kind_name(AstNodeKind kind);
 
 /* Convert InsnKind to human-readable name. */
 const char *insn_kind_name(InsnKind kind);
+
+/* Convert a TensorOp to its source keyword. */
+const char *tensor_op_name(int op);
 
 /* Format a SourceLoc into a static buffer. */
 const char *source_loc_str(const SourceLoc *loc);

@@ -5,6 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 LLVM_DIR="$SCRIPT_DIR/llvm"
 LLVM_SRC="$LLVM_DIR/llvm"
 LLVM_BUILD="$LLVM_DIR/build"
+LLVM_MLIR_BUILD="$LLVM_DIR/build-mlir"
 C1_DIR="$SCRIPT_DIR/ssa/c1"
 PLATFORM_DIR="$SCRIPT_DIR/ssa/platform"
 HOST_CPU="$(uname -m)"
@@ -86,6 +87,7 @@ check_deps() {
 
   if [ "$REBUILD_LLVM" -eq 0 ]; then
     check_file "$LLVM_BUILD/lib/libLLVMCore.a" "LLVM static libraries"
+    check_file "$LLVM_MLIR_BUILD/lib/libMLIRIR.a" "MLIR static libraries"
   fi
 
   if [ "$REBUILD_LLVM" -eq 1 ]; then
@@ -150,9 +152,27 @@ if [ "$REBUILD_LLVM" -eq 1 ]; then
   CPU_COUNT="$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)"
   ninja -j"$CPU_COUNT" lld
 
+  # MLIR lives in its own build tree, and c1 links against that tree rather
+  # than llvm/build: the two differ in assertion settings and are not
+  # link-compatible, so every LLVM archive c1 uses comes from build-mlir.
+  echo ""
+  echo "=== Rebuilding MLIR for the tensor backend ==="
+  cmake "$LLVM_SRC" \
+    -B "$LLVM_DIR/build-mlir" \
+    -G Ninja \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DLLVM_ENABLE_PROJECTS="lld;mlir" \
+    -DLLVM_TARGETS_TO_BUILD="$LLVM_TARGETS" \
+    -DLLVM_INCLUDE_TESTS=OFF \
+    -DLLVM_INCLUDE_EXAMPLES=OFF \
+    -DLLVM_INCLUDE_DOCS=OFF \
+    -DLLVM_ENABLE_BINDINGS=OFF \
+    -DBUILD_SHARED_LIBS=OFF
+  ninja -C "$LLVM_DIR/build-mlir" -j"$CPU_COUNT"
+
   cd "$SCRIPT_DIR"
   echo ""
-  echo "LLVM rebuild complete."
+  echo "LLVM + MLIR rebuild complete."
   echo ""
 fi
 

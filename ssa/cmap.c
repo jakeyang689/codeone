@@ -1007,6 +1007,28 @@ static void render_insn_core(Ctx *ctx, const FuncDecl *fn, const Insn *in) {
         break;
     }
 
+    /* ---- tensor ---- */
+    case INSN_TENSOR: {
+        Str et;
+        str_init(&et);
+        type_expr(in->data.tensor.elem_type, &et);
+        str_printf(&code, "tensor_%s<%s, ", tensor_op_name(in->data.tensor.op), et.data);
+        for (int i = 0; i < in->data.tensor.ndim; i++) {
+            if (i) str_puts(&code, ", ");
+            operand(ctx, &in->data.tensor.dims[i], &code);
+        }
+        str_puts(&code, ">(");
+        operand(ctx, &in->data.tensor.dst, &code);
+        str_puts(&code, ", ");
+        operand(ctx, &in->data.tensor.lhs, &code);
+        str_puts(&code, ", ");
+        operand(ctx, &in->data.tensor.rhs, &code);
+        str_puts(&code, ");");
+        line_puts(ctx, code.data);
+        str_free(&et);
+        break;
+    }
+
     /* ---- conversions ---- */
     case INSN_ZEXT:
     case INSN_SEXT:
@@ -1654,6 +1676,13 @@ static int insn_refs(const Insn *in, const char *name) {
         break;
     case INSN_ZEXT: case INSN_SEXT: case INSN_TRUNC:
         n += op_refs(&in->data.convert.value, name);
+        break;
+    case INSN_TENSOR:
+        n += op_refs(&in->data.tensor.dst, name);
+        n += op_refs(&in->data.tensor.lhs, name);
+        n += op_refs(&in->data.tensor.rhs, name);
+        for (int i = 0; i < in->data.tensor.ndim; i++)
+            n += op_refs(&in->data.tensor.dims[i], name);
         break;
     default:
         break;

@@ -1,0 +1,99 @@
+// Tensor instruction tests: elementwise add/mul and matmul on f32.
+// Results are compared as raw IEEE-754 bit patterns because SSA comparisons
+// are integer-only. Prints "PASS tensor" on success.
+
+extern @printf(fmt: *i8, ...) -> i32
+
+fun @main() -> i32 {
+  @entry:
+    %id = let i32
+    %a = let [f32, 4]
+    %b = let [f32, 4]
+    %c = let [f32, 4]
+
+    %a0 = gep f32, *%a, 0
+    %a1 = gep f32, *%a, 1
+    %a2 = gep f32, *%a, 2
+    %a3 = gep f32, *%a, 3
+    store f32 1.0, *%a0
+    store f32 2.0, *%a1
+    store f32 3.0, *%a2
+    store f32 4.0, *%a3
+
+    %b0 = gep f32, *%b, 0
+    %b1 = gep f32, *%b, 1
+    %b2 = gep f32, *%b, 2
+    %b3 = gep f32, *%b, 3
+    store f32 10.0, *%b0
+    store f32 20.0, *%b1
+    store f32 30.0, *%b2
+    store f32 40.0, *%b3
+
+    store i32 1, *%id
+    tensor add, f32, [2, 2], *%c, *%a, *%b
+    %v0 = load i32, *%c
+    %c1 = gep i8, *%c, 4
+    %v1 = load i32, *%c1
+    %c2 = gep i8, *%c, 8
+    %v2 = load i32, *%c2
+    %c3 = gep i8, *%c, 12
+    %v3 = load i32, *%c3
+    %k0 = eq i32 %v0, 1093664768   // 11.0
+    %k1 = eq i32 %v1, 1102053376   // 22.0
+    %k2 = eq i32 %v2, 1107558400   // 33.0
+    %k3 = eq i32 %v3, 1110441984   // 44.0
+    %ka = and i1 %k0, %k1
+    %kb = and i1 %k2, %k3
+    %kab = and i1 %ka, %kb
+    br %kab, @mul, @fail
+
+  @mul:
+    store i32 2, *%id
+    tensor mul, f32, [2, 2], *%c, *%a, *%b
+    %m0 = load i32, *%c
+    %d1 = gep i8, *%c, 4
+    %m1 = load i32, *%d1
+    %d2 = gep i8, *%c, 8
+    %m2 = load i32, *%d2
+    %d3 = gep i8, *%c, 12
+    %m3 = load i32, *%d3
+    %j0 = eq i32 %m0, 1092616192   // 10.0
+    %j1 = eq i32 %m1, 1109393408   // 40.0
+    %j2 = eq i32 %m2, 1119092736   // 90.0
+    %j3 = eq i32 %m3, 1126170624   // 160.0
+    %ja = and i1 %j0, %j1
+    %jb = and i1 %j2, %j3
+    %jab = and i1 %ja, %jb
+    br %jab, @matmul, @fail
+
+  @matmul:
+    store i32 3, *%id
+    store f32 5.0, *%b0
+    store f32 6.0, *%b1
+    store f32 7.0, *%b2
+    store f32 8.0, *%b3
+    tensor matmul, f32, [2, 2, 2], *%c, *%a, *%b
+    %n0 = load i32, *%c
+    %e1 = gep i8, *%c, 4
+    %n1 = load i32, *%e1
+    %e2 = gep i8, *%c, 8
+    %n2 = load i32, *%e2
+    %e3 = gep i8, *%c, 12
+    %n3 = load i32, *%e3
+    %p0 = eq i32 %n0, 1100480512   // 19.0
+    %p1 = eq i32 %n1, 1102053376   // 22.0
+    %p2 = eq i32 %n2, 1110179840   // 43.0
+    %p3 = eq i32 %n3, 1112014848   // 50.0
+    %pa = and i1 %p0, %p1
+    %pb = and i1 %p2, %p3
+    %pab = and i1 %pa, %pb
+    br %pab, @pass, @fail
+
+  @pass:
+    call @printf("PASS tensor\n")
+    ret i32 0
+  @fail:
+    %fid = load i32, *%id
+    call @printf("FAIL tensor at case %d\n", %fid)
+    ret i32 1
+}

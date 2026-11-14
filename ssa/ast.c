@@ -907,6 +907,62 @@ static Insn parse_convert_insn(Parser *parser, InsnKind kind, const char *result
     return insn;
 }
 
+/* tensor <op>, <elemtype>, [d0, d1(, d2)], *%dst, *%a, *%b
+ *
+ * The operator token fixes the shape arity: elementwise ops take [rows, cols],
+ * matmul takes [M, K, N]. No result value: the destination buffer is explicit.
+ */
+static Insn parse_tensor_insn(Parser *parser) {
+    Insn insn;
+    memset(&insn, 0, sizeof(insn));
+    insn.kind = INSN_TENSOR;
+
+    switch (parser->current.kind) {
+        case TK_ADD:    insn.data.tensor.op = TENSOR_OP_ADD; break;
+        case TK_SUB:    insn.data.tensor.op = TENSOR_OP_SUB; break;
+        case TK_MUL:    insn.data.tensor.op = TENSOR_OP_MUL; break;
+        case TK_DIV:    insn.data.tensor.op = TENSOR_OP_DIV; break;
+        case TK_MATMUL: insn.data.tensor.op = TENSOR_OP_MATMUL; break;
+        default:
+            parser_error(parser,
+                         "expected tensor op (add, sub, mul, div, matmul), got %s",
+                         token_kind_name(parser->current.kind));
+            return insn;
+    }
+    advance(parser);
+
+    if (!expect(parser, TK_COMMA)) return insn;
+    insn.data.tensor.elem_type = parse_type(parser);
+    if (!insn.data.tensor.elem_type) return insn;
+
+    if (!expect(parser, TK_COMMA)) return insn;
+    if (!expect(parser, TK_LBRACK)) return insn;
+
+    int ndim = (insn.data.tensor.op == TENSOR_OP_MATMUL) ? 3 : 2;
+    for (int i = 0; i < ndim; i++) {
+        if (i > 0 && !expect(parser, TK_COMMA)) return insn;
+        insn.data.tensor.dims[i] = parse_operand(parser);
+        if (parser->has_error) return insn;
+    }
+    insn.data.tensor.ndim = ndim;
+    if (!expect(parser, TK_RBRACK)) return insn;
+
+    if (!expect(parser, TK_COMMA)) return insn;
+    if (!expect(parser, TK_STAR)) return insn;
+    insn.data.tensor.dst = parse_operand(parser);
+    if (parser->has_error) return insn;
+
+    if (!expect(parser, TK_COMMA)) return insn;
+    if (!expect(parser, TK_STAR)) return insn;
+    insn.data.tensor.lhs = parse_operand(parser);
+    if (parser->has_error) return insn;
+
+    if (!expect(parser, TK_COMMA)) return insn;
+    if (!expect(parser, TK_STAR)) return insn;
+    insn.data.tensor.rhs = parse_operand(parser);
+    return insn;
+}
+
 /* ==================================================================
  * Main instruction dispatcher
  * ================================================================== */
@@ -1033,6 +1089,14 @@ static void parse_insn(Parser *parser, BasicBlock *block) {
             SourceLoc loc = {parser->current.line, parser->current.column};
             advance(parser);
             Insn insn = parse_asm_insn(parser, NULL);
+            insn.loc = loc;
+            block_add_insn(block, insn);
+            break;
+        }
+        case TK_TENSOR: {
+            SourceLoc loc = {parser->current.line, parser->current.column};
+            advance(parser);
+            Insn insn = parse_tensor_insn(parser);
             insn.loc = loc;
             block_add_insn(block, insn);
             break;
@@ -1862,6 +1926,7 @@ const char *insn_kind_name(InsnKind kind) {
         case INSN_MULHI:      return "mulhi";
         case INSN_UDIV:       return "udiv";
         case INSN_UREM:       return "urem";
+        case INSN_TENSOR:     return "tensor";
         default:         return "?";
     }
 }
@@ -1873,6 +1938,17 @@ const char *insn_kind_name(InsnKind kind) {
 void operand_free(Operand *op) {
     if (op->kind == OPERAND_LOCAL)  free(op->as.local_name);
     if (op->kind == OPERAND_GLOBAL) free(op->as.global_name);
+}
+
+const char *tensor_op_name(int op) {
+    switch (op) {
+        case TENSOR_OP_ADD:    return "add";
+        case TENSOR_OP_SUB:    return "sub";
+        case TENSOR_OP_MUL:    return "mul";
+        case TENSOR_OP_DIV:    return "div";
+        case TENSOR_OP_MATMUL: return "matmul";
+        default:               return "?";
+    }
 }
 
 const char *source_loc_str(const SourceLoc *loc) {
@@ -1985,6 +2061,14 @@ void insn_free(Insn *insn) {
             node_free(insn->data.convert.from_type);
             operand_free(&insn->data.convert.value);
             node_free(insn->data.convert.to_type);
+            break;
+        case INSN_TENSOR:
+            node_free(insn->data.tensor.elem_type);
+            for (int i = 0; i < insn->data.tensor.ndim; i++)
+                operand_free(&insn->data.tensor.dims[i]);
+            operand_free(&insn->data.tensor.dst);
+            operand_free(&insn->data.tensor.lhs);
+            operand_free(&insn->data.tensor.rhs);
             break;
     }
 }
@@ -2128,6 +2212,21 @@ static void print_insn(const Insn *insn, int indent) {
             print_operand(&insn->data.field.base);
             printf(", ");
             print_operand(&insn->data.field.field_index);
+            break;
+        case INSN_TENSOR:
+            printf("%s, ", tensor_op_name(insn->data.tensor.op));
+            print_type(insn->data.tensor.elem_type);
+            printf(", [");
+            for (int i = 0; i < insn->data.tensor.ndim; i++) {
+                if (i > 0) printf(", ");
+                print_operand(&insn->data.tensor.dims[i]);
+            }
+            printf("], *");
+            print_operand(&insn->data.tensor.dst);
+            printf(", *");
+            print_operand(&insn->data.tensor.lhs);
+            printf(", *");
+            print_operand(&insn->data.tensor.rhs);
             break;
         case INSN_LOAD_ATOMIC:
             print_type(insn->type);

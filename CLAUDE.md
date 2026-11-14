@@ -55,7 +55,7 @@ Two-layer system:
 - `@name` — global symbols (functions, block labels, globals)
 - `%name` — local SSA values (each defined once)
 - Types: `i1/i8/i16/i32/i64/f32/f64`, `*T` (pointer), `[T, N]` (array), `@Name` (struct)
-- 38 instructions: arithmetic (incl. unsigned udiv/urem/mulhi), bitops (incl. lshr/ashr), compare, memory (load/store/gep/field/let), control flow, call, type conversions, atomic (load atomic/store atomic/atomicrmw/cmpxchg), and `asm` for target inline assembly (att/intel dialects, optional `alignstack`, `${name}` named operands, struct result for multiple outputs; no asm goto). Hardware crypto is not exposed as SSA instructions; the std library calls `ssa/platform/crypto_hw.c` directly
+- 39 instructions: arithmetic (incl. unsigned udiv/urem/mulhi), bitops (incl. lshr/ashr), compare, memory (load/store/gep/field/let), control flow, call, type conversions, atomic (load atomic/store atomic/atomicrmw/cmpxchg), `tensor` (f32 elementwise/matmul over static shapes, lowered via MLIR — see below), and `asm` for target inline assembly (att/intel dialects, optional `alignstack`, `${name}` named operands, struct result for multiple outputs; no asm goto). Hardware crypto is not exposed as SSA instructions; the std library calls `ssa/platform/crypto_hw.c` directly
 - `const @name: type = value` for read-only globals; `[T, N] = [ val, ... ]` array initializer; string literals `"..."` with `\n`/`\r`/`\t`/`\0`/`\\`/`\"`/`\xNN` escapes (auto-null-terminated); `const @x = "..."` infers `[i8, N]`
 - character literals: `'A'` equivalent to `65`, supports same escapes as strings (`'\n'`, `'\x41'` etc.) — lowered to integer constants
 - enums: `enum @Color: i32 { @Red = 0, @Green = 1 }` — each member becomes an internal const global named `@Color.Red`, usable anywhere an integer operand is expected; values must be integer literals (no auto-increment), and the enum name is not a type
@@ -76,18 +76,36 @@ Two-layer system:
 | **Lowering** | `ssa/lowering_ir.c/h` | AST → LLVM. `lower_to_llvm_module` (direct) and `lower_to_llvm_ir` (text). 3-pass: phis → non-terminators → terminators. Struct type map for named structs |
 | **Codec** | `ssa/codec.c/h` | LLVM → `.o`. Three paths: from IR text, from module, or from AST (skips IR serialization) |
 | **c1 CLI** | `ssa/c1/main.c` | `.bx` → executable or `.a` static lib. Flags: `--cpu`, `--os`, `--mattr`, `-O`, `-o`, `-c`, `--static`, `-l`, `-L`, `--ld`, `--link-flag`, `-I`, `--cmap` |
+| **Tensor backend** | `ssa/hir/tensor.cpp` | `tensor` instructions become calls to generated kernels. `lowering_ir.c` collects them and calls `c1_emit_tensor_kernels`, a C entry in this C++ file that builds linalg kernels, lowers them to LLVM IR and hands back an `LLVMModuleRef` in the caller's context. MLIR is linked into c1 (in-process), so there is no helper binary |
 | **Std lib** | `ssa/boxes/std/` | core/math, core/convert, core/random, mem/memops, mem/alloc, io/print, io/file (open/read/write/append, read_all/write_all/read_line, seek/tell), **io/stdio** (stdin/stdout/stderr), **io/path** (basename/dirname/extension/join), **io/fs** (exists/stat/mkdir/remove/rename/dir iteration), **process/process** (getenv/exit/system), text/str (incl. starts_with/trim/split_next/replace), text/fmt, **text/hex**, **text/utf8**, data/stack, data/bitset, **data/vector** (growable elements), **data/hashmap** (byte keys/values), **data/hashset**, **json/json** (parse, tree builders, serializer, free), **ui/widget** (widget tree, column/row layout, rect/text/button nodes, pre-order paint, hit test, button press state), **time/time** (wall/monotonic ms, ISO 8601 format/parse), **thread/thread** (spawn/join/detach), **thread/sync** (mutex incl. trylock, condvar incl. timedwait, yield/sleep/self/cpu_count), crypto/crc32, crypto/fnv1a, crypto/md5, **crypto/sha256**, **crypto/aes**, **crypto/rsa**, **crypto/rsa_pss**, **crypto/base64**, **crypto/pem** (read/write), **crypto/oaep**, **crypto/util** (constant-time compare, secure zero) |
 | **Net lib** | `ssa/boxes/std/net/` | `socket.bx`, `url.bx`, `ioselect.bx`, `http/request.bx` + `http/response.bx` (HTTP/1.0/1.1 request building/parsing, chunked decoding), `http/websocket/` (RFC 6455 client: handshake, frame codec, masked connection), `tls/` (TLS 1.2 client and server, TLS 1.3 client; HTTP falls back to 1.2; optional trust-store chain validation) |
 | **Platform** | `ssa/platform/` | C wrappers for non-ISO-C system APIs. `socket.c`, `ioselect.c`, `cpu.c` (CPU crypto feature detection), `crypto_hw.c` (hardware AES-CBC/GCM with 4-way PMULL/PCLMULQDQ GHASH, and SHA-256 compression, built with -O3), `thread.c`/`sync.c` (POSIX pthreads: thread create/join/detach, mutex, condvar, scheduling helpers), `time.c` (wall-clock and monotonic milliseconds via POSIX `clock_gettime`), `fs.c` (stat, mkdir, remove, rename, directory iteration), `stdio.c` (stdin/stdout/stderr FILE* handles), `secure.c` (zeroing that resists dead-store elimination), `ui.c` (raylib window, frame loop and flat draw calls; built only when `thirdparty/raylib` has been unpacked). Compiled to `libplatform.a` with `-pthread` |
-| **Test programs** | `ssa/c1/test/` | `run_all.sh` drives four groups (unit/fast/crypto/net/online). `isa/` covers instruction semantics; crypto/TLS/HTTP tests: hello.bx, file_test.bx, extern_demo.bx, hashmap.bx, sort.bx, atomic_test.bx, json_test.bx, base64_test.bx, crypto_util_test.bx, pem_read_test.bx, rsa_pss_sign_test.bx, oaep_test.bx, hex_test.bx, text_test.bx, utf8_test.bx, io_test.bx, stdio_test.bx, process_test.bx, argv_test.bx, path_test.bx, fs_test.bx, vector_test.bx, hashmap_test.bx, hashset_test.bx, time_test.bx, thread_test.bx, std_test.bx, url_test.bx, http_test.bx, ws_frame_test.bx, ws_echo_test.bx, https_example_test.bx, tls_client_test.bx, tls_local_test.bx, rsa_test.bx, rsa_enc_test.bx, rsa_rt_test.bx, rsa_pss_test.bx, x509_algs_test.bx, tls13_kdf_test.bx, tls13_client_test.bx, tls13_record_test.bx, tls13_record_vector_test.bx, tls_server_test.bx, tls_trust_test.bx, x509_chain_test.bx, https13_test.bx, genkey_test.bx, genkey_2048.bx, test_sha256.bx, test_hmac.bx, test_hkdf.bx, test_gcm.bx, str_call_test.bx, ui_demo.bx (window + PNG screenshot), ui_layout_test.bx (layout/hit test with stubbed drawing) |
+| **Test programs** | `ssa/c1/test/` | `run_all.sh` drives four groups (unit/fast/crypto/net/online). `isa/` covers instruction semantics; crypto/TLS/HTTP tests: hello.bx, file_test.bx, extern_demo.bx, hashmap.bx, sort.bx, atomic_test.bx, json_test.bx, base64_test.bx, crypto_util_test.bx, pem_read_test.bx, rsa_pss_sign_test.bx, oaep_test.bx, hex_test.bx, text_test.bx, utf8_test.bx, io_test.bx, stdio_test.bx, process_test.bx, argv_test.bx, path_test.bx, fs_test.bx, vector_test.bx, hashmap_test.bx, hashset_test.bx, time_test.bx, thread_test.bx, std_test.bx, url_test.bx, http_test.bx, ws_frame_test.bx, ws_echo_test.bx, https_example_test.bx, tls_client_test.bx, tls_local_test.bx, rsa_test.bx, rsa_enc_test.bx, rsa_rt_test.bx, rsa_pss_test.bx, x509_algs_test.bx, tls13_kdf_test.bx, tls13_client_test.bx, tls13_record_test.bx, tls13_record_vector_test.bx, tls_server_test.bx, tls_trust_test.bx, x509_chain_test.bx, https13_test.bx, genkey_test.bx, genkey_2048.bx, test_sha256.bx, test_hmac.bx, test_hkdf.bx, test_gcm.bx, str_call_test.bx, tensor_test.bx (add/mul/matmul bit-exact checks), ui_demo.bx (window + PNG screenshot), ui_layout_test.bx (layout/hit test with stubbed drawing) |
 
 ### LLVM
 
-At `llvm/`, prebuilt static libs in `llvm/build/lib/*.a`. LLVM 23 C API, opaque pointers. Needs `-Wl,-all_load` + ~40 `.a` libs for linking.
+At `llvm/`, two static-lib trees: `llvm/build/lib/*.a` (plain LLVM) and `llvm/build-mlir/lib/*.a` (LLVM + MLIR). LLVM 23 C API, opaque pointers. `c1` links only against `build-mlir`, since the two trees differ in assertion settings and are not link-compatible; its LLVM archives are `-force_load`ed (ELF: `--whole-archive`) while MLIR archives are loaded lazily.
 
 Makefiles auto-detect the project root via `$(abspath $(dir $(lastword $(MAKEFILE_LIST)))/../..)`. LLVM path is relative: `$(ROOT)/llvm`. Building currently requires macOS with Xcode CLT (for `xcrun --show-sdk-version`); on Linux you'd need to set a `MACOS_DEPLOYMENT_TARGET` default or adjust the Makefile.
 
 Object files go to `build/<component>/` at the project root (`build/c1`, `build/test`, `build/codec_test`, `build/platform`). Binaries (`c1`, `test_ssa`, `test_codec`, `libplatform.a`) stay in their source directories; `build/` is gitignored and removed by `./build.sh --clean`.
+
+### MLIR (tensor backend)
+
+`tensor` lowering needs MLIR, which is built separately in `llvm/build-mlir` (an LLVM build with `-DLLVM_ENABLE_PROJECTS="lld;mlir"`). `./build.sh --rebuild-llvm` sets this tree up; for a one-off build:
+
+```bash
+cmake -S llvm/llvm -B llvm/build-mlir -G Ninja \
+  -DLLVM_ENABLE_PROJECTS="lld;mlir" -DLLVM_TARGETS_TO_BUILD="AArch64;X86" \
+  -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF
+ninja -C llvm/build-mlir
+```
+
+`ssa/hir/tensor.cpp` is compiled as C++ and linked into `c1` together with the MLIR archives from `llvm/build-mlir`; MLIR is required to build `c1` at all. It also needs zstd (`brew install zstd` on macOS, `libzstd-dev` on Debian), because this LLVM tree is built with zstd support.
+
+Design notes: static memrefs (`memref<4x4xf32>`) cross the ABI as a plain pointer (`convert-func-to-llvm` with `useBarePtrCallConv`), so the generated kernel signature is `void <symbol>(ptr dst, ptr lhs, ptr rhs)` and the call site needs no descriptor. `matmul` zero-fills `dst` with `linalg.fill` before `linalg.matmul`; elementwise ops use `linalg.generic` with identity maps. A `matmul` declares `[M, K, N]` but its three buffers are 2-D (`M×K`, `K×N`, `M×N`). The pipeline is `linalg-to-loops` → `scf-to-cf` → `convert-to-llvm` → `reconcile-unrealized-casts`, then `mlirTranslateModuleToLLVMIR`; the result links straight into the module being lowered.
+
+A custom MLIR dialect that covers every SSA instruction lives in `ssa/hir/` (`c1_dialect.*`, `build.cpp`, `lower.cpp`). `c1 --backend=mlir` selects it; the default stays the direct LLVM lowering. Only the float/pointer conversion group (`fptosi`, `sitofp`, `ptrtoint`, `bitcast`, ...) is still missing there. The dialect, its ops and the lowering are described in `hir.md`.
 
 ### Third-party (thirdparty/)
 
@@ -154,7 +172,7 @@ them. No client certificates, session resumption, or renegotiation.
 
 Custom framework (`test.h`): `TEST(name)`, `ASSERT`/`ASSERT_EQ`/`ASSERT_STR_EQ`, `RUN_TEST(name)`.
 
-214 C unit tests + `.bx` integration tests:
+218 C unit tests + `.bx` integration tests:
 - `test/test_lex.c` (93 tests) — keywords, symbols, literals (incl. string/char literals, character escape sequences), comments, errors
 - `test/test_ast.c` (78 tests) — each instruction, types, extern, struct, enum, string init, null, complete programs
 - `test/test_lowering_ir.c` (43 tests) — lowered instructions, string globals, null, error handling

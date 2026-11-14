@@ -65,6 +65,8 @@ static const KeywordEntry keywords[] = {
     {"ret",    3, TK_RET},
     {"call",   4, TK_CALL},
     {"asm",    3, TK_ASM},
+    {"tensor", 6, TK_TENSOR},
+    {"matmul", 6, TK_MATMUL},
     {"att",    3, TK_ATT},
     {"intel",  5, TK_INTEL},
     {"alignstack", 10, TK_ALIGNSTACK},
@@ -573,6 +575,8 @@ const char *token_kind_name(TokenKind kind) {
         case TK_RET:    return "ret";
         case TK_CALL:   return "call";
         case TK_ASM:    return "asm";
+        case TK_TENSOR: return "tensor";
+        case TK_MATMUL: return "matmul";
         case TK_ATT:    return "att";
         case TK_INTEL:  return "intel";
         case TK_ALIGNSTACK: return "alignstack";

@@ -752,6 +752,49 @@ When the template writes multiple outputs before all inputs have been read, the 
 
 ---
 
+## Tensor Instruction
+
+### `tensor` — Tensor Arithmetic
+
+```
+tensor op, elemtype, [dims], *%dst, *%lhs, *%rhs
+```
+
+| Parameter | Description |
+|------|------|
+| `op` | `add`, `sub`, `mul`, `div` (elementwise) or `matmul` |
+| `elemtype` | Element type of all three buffers; currently only `f32` |
+| `[dims]` | Static shape: `[R, C]` for elementwise, `[M, K, N]` for `matmul`; positive integer literals |
+| `*%dst` | Output buffer, row-major, `R*C` (or `M*N`) elements |
+| `*%lhs`, `*%rhs` | Input buffers, same layout; for `matmul`, `lhs` is `[M, K]` and `rhs` is `[K, N]` |
+
+The instruction has **no result value**; results are written through `%dst`.
+The rank is fixed by the op (2 for elementwise, 3 for `matmul`), so no rank
+inference is needed.
+
+```ssa
+%a = let [f32, 4]
+%b = let [f32, 4]
+%c = let [f32, 4]
+%ap = gep f32, *%a, 0
+...
+tensor add, f32, [2, 2], *%c, *%a, *%b
+tensor matmul, f32, [2, 2, 2], *%c, *%a, *%b
+```
+
+**Lowering:** each `tensor` instruction becomes a call to a generated kernel
+`void __c1_tensor_<function>_<n>(ptr dst, ptr lhs, ptr rhs)`. `c1` builds the
+kernels with in-process MLIR (`linalg.generic` / `linalg.matmul` /
+`linalg.fill`, in `ssa/hir/tensor.cpp`), lowers them through `linalg-to-loops`
+and `convert-to-llvm`, and links the resulting module into the main one.
+Because the shapes are fully static, the memref arguments lower to plain
+pointers — the call site needs no descriptor.
+
+**Validation:** shapes must be positive integer literals and the element type
+must be `f32`; both are checked before the kernels are built.
+
+---
+
 ## Instruction Quick Reference Table
 
 | Category | Instruction | Form | Meaning |
@@ -794,6 +837,7 @@ When the template writes multiple outputs before all inputs have been read, the 
 | | `sext` | `%r = sext T %v to T2` | sign extension |
 | | `trunc` | `%r = trunc T %v to T2` | truncation |
 | Inline assembly | `asm` | `%r = asm [alignstack] att T, "tpl", "cons", T %a` | embed target assembly |
+| Tensor | `tensor` | `tensor op, T, [dims], *%d, *%a, *%b` | tensor arithmetic (MLIR kernels) |
 
 ## SSA Rules Summary
 

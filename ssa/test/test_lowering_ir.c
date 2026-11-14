@@ -673,6 +673,48 @@ TEST(lower_error_undefined_value) {
     ASSERT(strlen(err) > 0);
 }
 
+TEST(lower_error_tensor_bad_rank) {
+    char err[256] = "";
+    char *ir = lower_str(
+        "fun @f() -> void {\n"
+        "  @entry:\n"
+        "    tensor add, f32, [2, 3, 4], *%d, *%a, *%b\n"
+        "    ret void\n"
+        "}",
+        err, sizeof(err));
+    ASSERT_NULL(ir);
+    /* The parser derives the rank from the op, so a third dimension is a
+       syntax error rather than a lowering error. */
+    ASSERT(strstr(err, "parse error") != NULL);
+}
+
+TEST(lower_error_tensor_dtype) {
+    char err[256] = "";
+    char *ir = lower_str(
+        "fun @f() -> void {\n"
+        "  @entry:\n"
+        "    tensor add, f64, [2, 3], *%d, *%a, *%b\n"
+        "    ret void\n"
+        "}",
+        err, sizeof(err));
+    ASSERT_NULL(ir);
+    ASSERT(strstr(err, "only f32") != NULL);
+}
+
+TEST(lower_error_tensor_dynamic_shape) {
+    char err[256] = "";
+    char *ir = lower_str(
+        "fun @f() -> void {\n"
+        "  @entry:\n"
+        "    %n = let i32\n"
+        "    tensor add, f32, [%n, 3], *%d, *%a, *%b\n"
+        "    ret void\n"
+        "}",
+        err, sizeof(err));
+    ASSERT_NULL(ir);
+    ASSERT(strstr(err, "positive integer literals") != NULL);
+}
+
 /* ==================================================================
  * Run all lowering IR tests
  * ================================================================== */
@@ -725,4 +767,7 @@ void run_lowering_tests(void) {
     /* Error cases */
     RUN_TEST(lower_error_null_program);
     RUN_TEST(lower_error_undefined_value);
+    RUN_TEST(lower_error_tensor_bad_rank);
+    RUN_TEST(lower_error_tensor_dtype);
+    RUN_TEST(lower_error_tensor_dynamic_shape);
 }

@@ -9,6 +9,8 @@
 #include "../lowering_ir.h"
 #include "../codec.h"
 #include "../cmap.h"
+#include "../hir/backend.h"
+#include <llvm-c/Core.h>
 
 /* ==================================================================
  * Host detection
@@ -358,6 +360,8 @@ static void print_usage(const char *prog) {
         "                   (e.g. --link-flag \"-framework Cocoa\")\n"
         "  -I <dir>         Add .bx file search path\n"
         "  --cmap           Emit a .cmap pseudo-C view per input (no compile)\n"
+        "  --backend <b>    Code generation backend: llvm (default) or mlir\n"
+        "  --emit-mlir      Emit a .mlir c1 dialect view per input (no compile)\n"
         "  --version        Show version info\n"
         "  --help           Show this help\n"
         "\n"
@@ -452,6 +456,55 @@ static bool emit_cmap_file(const char *input, const char **inc_dirs, int inc_cou
     return ok;
 }
 
+/* Render one .bx file to its c1 dialect module (sibling .mlir file).
+   No compilation happens. Returns false on error. */
+static bool emit_mlir_file(const char *input, const char **inc_dirs, int inc_count) {
+    FILE *fp = open_with_include(input, inc_dirs, inc_count);
+    if (!fp) {
+        fprintf(stderr, "error: cannot open: %s\n", input);
+        return false;
+    }
+    fseek(fp, 0, SEEK_END);
+    long sz = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+    char *source = (char *)malloc((size_t)sz + 1);
+    if (!source) { fclose(fp); return false; }
+    fread(source, 1, (size_t)sz, fp);
+    fclose(fp);
+    source[sz] = '\0';
+
+    Lexer lex;
+    lexer_init(&lex, source);
+    lex.filename = input;
+    Parser parser;
+    ast_init(&parser, &lex);
+    Program *prog = ast_parse(&parser);
+
+    bool ok = false;
+
+    if (ast_has_error(&parser)) {
+        fprintf(stderr, "parse error: %s: %s\n", input, ast_get_error(&parser));
+    } else {
+        char out_path[1024];
+        const char *dot = strrchr(input, '.');
+        if (dot && strcmp(dot, ".bx") == 0)
+            snprintf(out_path, sizeof(out_path), "%.*s.mlir", (int)(dot - input), input);
+        else
+            snprintf(out_path, sizeof(out_path), "%s.mlir", input);
+
+        char err[512] = "";
+        ok = c1_hir_emit_text(prog, out_path, err, sizeof(err));
+        if (ok) fprintf(stdout, "mlir: %s -> %s\n", input, out_path);
+        else    fprintf(stderr, "error: %s: %s\n", input, err);
+    }
+
+    if (prog) program_free(prog);
+    ast_free(&parser);
+    lexer_free(&lex);
+    free(source);
+    return ok;
+}
+
 /* ==================================================================
  * Main
  * ================================================================== */
@@ -469,6 +522,8 @@ int main(int argc, char **argv) {
     int show_version = 0;
     int test_mode = 0;
     int cmap_mode = 0;
+    int mlir_backend = 0;
+    int emit_mlir = 0;
     const char *linker = NULL;
     int link_flag_count = 0;
     const char *link_flags[64];
@@ -541,6 +596,29 @@ int main(int argc, char **argv) {
             test_mode = 1;
         } else if (strcmp(argv[i], "--cmap") == 0) {
             cmap_mode = 1;
+        } else if (strcmp(argv[i], "--backend") == 0) {
+            if (i + 1 >= argc) { fprintf(stderr, "error: --backend requires an argument\n"); return 1; }
+            i++;
+            if (strcmp(argv[i], "mlir") == 0) {
+                mlir_backend = 1;
+            } else if (strcmp(argv[i], "llvm") == 0) {
+                mlir_backend = 0;
+            } else {
+                fprintf(stderr, "error: unknown backend: %s (use llvm or mlir)\n", argv[i]);
+                return 1;
+            }
+        } else if (strncmp(argv[i], "--backend=", 10) == 0) {
+            const char *val = argv[i] + 10;
+            if (strcmp(val, "mlir") == 0) {
+                mlir_backend = 1;
+            } else if (strcmp(val, "llvm") == 0) {
+                mlir_backend = 0;
+            } else {
+                fprintf(stderr, "error: unknown backend: %s (use llvm or mlir)\n", val);
+                return 1;
+            }
+        } else if (strcmp(argv[i], "--emit-mlir") == 0) {
+            emit_mlir = 1;
         } else if (argv[i][0] == '-') {
             fprintf(stderr, "error: unknown option: %s\n", argv[i]);
             print_usage(argv[0]);
@@ -573,6 +651,14 @@ int main(int argc, char **argv) {
         int rc = 0;
         for (int i = 0; i < input_count; i++)
             if (!emit_cmap_file(inputs[i], include_dirs, include_dir_count)) rc = 1;
+        return rc;
+    }
+
+    /* --emit-mlir: render each input to its c1 dialect module, no compile. */
+    if (emit_mlir) {
+        int rc = 0;
+        for (int i = 0; i < input_count; i++)
+            if (!emit_mlir_file(inputs[i], include_dirs, include_dir_count)) rc = 1;
         return rc;
     }
 
@@ -693,7 +779,8 @@ int main(int argc, char **argv) {
     else if (static_lib)
         fprintf(stdout, "Mode:      static library\n");
     fprintf(stdout, "Output:    %s\n", exe_path);
-    fprintf(stdout, "Optimize:  O%d\n\n", (int)opt_level);
+    fprintf(stdout, "Optimize:  O%d\n", (int)opt_level);
+    fprintf(stdout, "Backend:   %s\n\n", mlir_backend ? "mlir" : "llvm");
 
     /* --- Compile each .bx to its own .o --- */
     char *obj_paths[64];
@@ -737,6 +824,7 @@ int main(int argc, char **argv) {
         /* Parse */
         Lexer lex;
         lexer_init(&lex, source);
+        lex.filename = inputs[i];   /* for diagnostics; the path outlives compilation */
         Parser parser;
         ast_init(&parser, &lex);
         Program *prog = ast_parse(&parser);
@@ -748,8 +836,24 @@ int main(int argc, char **argv) {
             failed = true;
         } else {
             /* Compile to .o */
-            char err[256] = "";
-            if (!codec_compile_program(prog, triple, target_features, opt_level, obj_buf, err, sizeof(err))) {
+            char err[512] = "";
+            if (mlir_backend) {
+                LLVMContextRef llvm_ctx = LLVMContextCreate();
+                LLVMModuleRef mod = c1_hir_build_llvm_module(
+                    prog, llvm_ctx, triple, err, sizeof(err));
+                bool ok = false;
+                if (!mod) {
+                    fprintf(stderr, "error: %s: %s\n", inputs[i], err);
+                } else {
+                    ok = codec_compile_module(mod, triple, target_features,
+                                              opt_level, obj_buf, err,
+                                              sizeof(err));
+                    if (!ok) fprintf(stderr, "error: %s: %s\n", inputs[i], err);
+                    LLVMDisposeModule(mod);
+                }
+                LLVMContextDispose(llvm_ctx);
+                if (!ok) failed = true;
+            } else if (!codec_compile_program(prog, triple, target_features, opt_level, obj_buf, err, sizeof(err))) {
                 fprintf(stderr, "error: %s: %s\n", inputs[i], err);
                 failed = true;
             }

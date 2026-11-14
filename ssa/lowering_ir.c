@@ -1,4 +1,5 @@
 #include "lowering_ir.h"
+#include "hir/tensor.h"
 #include "ast.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -6,6 +7,7 @@
 #include <stdarg.h>
 #include <inttypes.h>
 #include <llvm-c/Core.h>
+#include <llvm-c/Linker.h>
 #include <llvm-c/Types.h>
 
 /* Module name for the generated LLVM IR */
@@ -144,6 +146,16 @@ static LLVMTypeRef lower_type(LLVMContextRef ctx, const AstNode *t,
  * Operand lowering
  * ================================================================== */
 
+/* Integer literals are two's-complement bit patterns of the target width.
+   LLVMConstInt rejects values that do not fit the TypeRef, so mask first:
+   0x80000000 in i32 and -1 in i32 both become valid bit patterns. */
+static LLVMValueRef const_int(LLVMTypeRef type, int64_t value) {
+    unsigned bits = LLVMGetIntTypeWidth(type);
+    unsigned long long v = (unsigned long long)value;
+    if (bits < 64) v &= (1ULL << bits) - 1;
+    return LLVMConstInt(type, v, false);
+}
+
 static LLVMValueRef lower_op(LLVMContextRef ctx, LLVMModuleRef mod,
                               const ValueMap *vm, const Operand *op,
                               LLVMTypeRef expected, char *err, size_t err_sz) {
@@ -194,7 +206,7 @@ static LLVMValueRef lower_op(LLVMContextRef ctx, LLVMModuleRef mod,
             return g;
         }
         case OPERAND_INT:
-            return LLVMConstInt(expected, (long long)op->as.int_val, true);
+            return const_int(expected, op->as.int_val);
         case OPERAND_FLOAT:
             return LLVMConstReal(expected, op->as.float_val);
         case OPERAND_BOOL:
@@ -206,6 +218,138 @@ static LLVMValueRef lower_op(LLVMContextRef ctx, LLVMModuleRef mod,
             set_err(err, err_sz, "unknown operand kind");
             return NULL;
     }
+}
+
+/* ==================================================================
+ * Tensor kernels
+ *
+ * Each `tensor` instruction lowers to a call into a kernel that the MLIR
+ * bridge compiles in a separate module. The bridge needs the full list up
+ * front, so the program is scanned before lowering starts.
+ * ================================================================== */
+
+typedef struct {
+    const Insn *insn;
+    int index;
+} TensorInsnEntry;
+
+static C1TensorKernel *g_tensor_kernels = NULL;
+static TensorInsnEntry *g_tensor_entries = NULL;
+static int g_tensor_count = 0;
+
+static void tensor_state_free(void) {
+    free(g_tensor_kernels);
+    free(g_tensor_entries);
+    g_tensor_kernels = NULL;
+    g_tensor_entries = NULL;
+    g_tensor_count = 0;
+}
+
+static int tensor_kernel_index(const Insn *insn) {
+    for (int i = 0; i < g_tensor_count; i++)
+        if (g_tensor_entries[i].insn == insn)
+            return g_tensor_entries[i].index;
+    return -1;
+}
+
+static bool tensor_dtype_of(const AstNode *t, int *out) {
+    if (!t) return false;
+    switch (t->kind) {
+        case AST_TYPE_F32: *out = C1_DT_F32; return true;
+        case AST_TYPE_F64: *out = C1_DT_F64; return true;
+        case AST_TYPE_I8:  *out = C1_DT_I8;  return true;
+        case AST_TYPE_I16: *out = C1_DT_I16; return true;
+        case AST_TYPE_I32: *out = C1_DT_I32; return true;
+        case AST_TYPE_I64: *out = C1_DT_I64; return true;
+        default: return false;
+    }
+}
+
+/* M0 scope: f32 only. The bridge has the same restriction. */
+static bool tensor_dtype_supported(int dtype) {
+    return dtype == C1_DT_F32;
+}
+
+static bool tensor_collect(const Program *prog, char *err, size_t err_sz) {
+    int count = 0;
+    for (int i = 0; i < prog->func_count; i++)
+        for (int j = 0; j < prog->functions[i].block_count; j++)
+            for (int k = 0; k < prog->functions[i].blocks[j].insn_count; k++)
+                if (prog->functions[i].blocks[j].insns[k].kind == INSN_TENSOR)
+                    count++;
+
+    if (count == 0) return true;
+
+    g_tensor_kernels = (C1TensorKernel *)calloc((size_t)count, sizeof(C1TensorKernel));
+    g_tensor_entries = (TensorInsnEntry *)calloc((size_t)count, sizeof(TensorInsnEntry));
+    if (!g_tensor_kernels || !g_tensor_entries) {
+        tensor_state_free();
+        set_err(err, err_sz, "out of memory for tensor kernels");
+        return false;
+    }
+
+    int n = 0;
+    for (int i = 0; i < prog->func_count; i++) {
+        const FuncDecl *func = &prog->functions[i];
+        for (int j = 0; j < func->block_count; j++) {
+            const BasicBlock *bb = &func->blocks[j];
+            for (int k = 0; k < bb->insn_count; k++) {
+                const Insn *in = &bb->insns[k];
+                if (in->kind != INSN_TENSOR) continue;
+
+                int ndim = (in->data.tensor.op == TENSOR_OP_MATMUL) ? 3 : 2;
+                if (in->data.tensor.ndim != ndim) {
+                    set_err(err, err_sz,
+                            "%s:%d:%d: tensor %s expects %d shape dimensions",
+                            prog->filename ? prog->filename : "<input>",
+                            in->loc.line, in->loc.column,
+                            tensor_op_name(in->data.tensor.op), ndim);
+                    tensor_state_free();
+                    return false;
+                }
+
+                C1TensorKernel *t = &g_tensor_kernels[n];
+                t->op = in->data.tensor.op;
+                t->ndims = ndim;
+
+                if (!tensor_dtype_of(in->data.tensor.elem_type, &t->dtype) ||
+                    !tensor_dtype_supported(t->dtype)) {
+                    set_err(err, err_sz,
+                            "%s:%d:%d: tensor currently supports only f32",
+                            prog->filename ? prog->filename : "<input>",
+                            in->loc.line, in->loc.column);
+                    tensor_state_free();
+                    return false;
+                }
+
+                for (int d = 0; d < ndim; d++) {
+                    const Operand *dim = &in->data.tensor.dims[d];
+                    if (dim->kind != OPERAND_INT || dim->as.int_val <= 0) {
+                        set_err(err, err_sz,
+                                "%s:%d:%d: tensor shape must be positive integer literals",
+                                prog->filename ? prog->filename : "<input>",
+                                in->loc.line, in->loc.column);
+                        tensor_state_free();
+                        return false;
+                    }
+                    t->dims[d] = dim->as.int_val;
+                }
+
+                snprintf(t->symbol, sizeof(t->symbol),
+                         "__c1_tensor_%s_%d", func->name, n);
+                t->file = prog->filename;
+                t->line = in->loc.line;
+                t->column = in->loc.column;
+
+                g_tensor_entries[n].insn = in;
+                g_tensor_entries[n].index = n;
+                n++;
+            }
+        }
+    }
+
+    g_tensor_count = count;
+    return true;
 }
 
 /* ==================================================================
@@ -711,6 +855,32 @@ static bool lower_insn(LLVMContextRef ctx, LLVMModuleRef mod,
                                           insn->result ? insn->result : "");
             break;
         }
+        case INSN_TENSOR: {
+            int idx = tensor_kernel_index(insn);
+            if (idx < 0) {
+                set_err(err, err_sz, "tensor: kernel was not collected");
+                return false;
+            }
+            const char *sym = g_tensor_kernels[idx].symbol;
+            LLVMTypeRef ptr = LLVMPointerTypeInContext(ctx, 0);
+            LLVMTypeRef params[3] = { ptr, ptr, ptr };
+            LLVMTypeRef fn_ty = LLVMFunctionType(
+                LLVMVoidTypeInContext(ctx), params, 3, 0);
+
+            /* The kernel module has not been linked yet, so create the
+               declaration here; the linker folds in the definition later. */
+            LLVMValueRef fn = LLVMGetNamedFunction(mod, sym);
+            if (!fn) fn = LLVMAddFunction(mod, sym, fn_ty);
+
+            LLVMValueRef args[3];
+            args[0] = lower_op(ctx, mod, vm, &insn->data.tensor.dst, ptr, err, err_sz);
+            args[1] = lower_op(ctx, mod, vm, &insn->data.tensor.lhs, ptr, err, err_sz);
+            args[2] = lower_op(ctx, mod, vm, &insn->data.tensor.rhs, ptr, err, err_sz);
+            if (!args[0] || !args[1] || !args[2]) return false;
+
+            LLVMBuildCall2(builder, fn_ty, fn, args, 3, "");
+            break;
+        }
         default:
             set_err(err, err_sz, "unhandled instruction kind %d", insn->kind);
             return false;
@@ -731,8 +901,20 @@ LLVMModuleRef lower_to_llvm_module(const Program *prog, LLVMContextRef ctx,
                                     char *err, size_t err_sz) {
     if (!prog) { set_err(err, err_sz, "null program"); return NULL; }
     if (!ctx) { set_err(err, err_sz, "null context"); return NULL; }
-    (void)target_triple;
 
+    tensor_state_free();
+    if (!tensor_collect(prog, err, err_sz))
+        return NULL;
+
+    LLVMModuleRef kernel_mod = NULL;
+    if (g_tensor_count > 0) {
+        kernel_mod = c1_emit_tensor_kernels(g_tensor_kernels, g_tensor_count,
+                                            ctx, target_triple, err, err_sz);
+        if (!kernel_mod) {
+            tensor_state_free();
+            return NULL;
+        }
+    }
 
     LLVMModuleRef mod = LLVMModuleCreateWithNameInContext(LLVM_MODULE_NAME, ctx);
     LLVMBuilderRef builder = LLVMCreateBuilderInContext(ctx);
@@ -799,14 +981,14 @@ LLVMModuleRef lower_to_llvm_module(const Program *prog, LLVMContextRef ctx,
                 LLVMValueRef *vals = (LLVMValueRef *)malloc(
                     (size_t)gd->array_count * sizeof(LLVMValueRef));
                 for (int j = 0; j < gd->array_count; j++) {
-                    vals[j] = LLVMConstInt(elem_t, (long long)gd->array_init[j], true);
+                    vals[j] = const_int(elem_t, gd->array_init[j]);
                 }
                 init = LLVMConstArray2(elem_t, vals, (unsigned)gd->array_count);
                 free(vals);
             } else {
                 switch (gd->init_value.kind) {
                     case OPERAND_INT:
-                        init = LLVMConstInt(t, (long long)gd->init_value.as.int_val, true);
+                        init = const_int(t, gd->init_value.as.int_val);
                         break;
                     case OPERAND_FLOAT:
                         init = LLVMConstReal(t, gd->init_value.as.float_val);
@@ -1025,6 +1207,20 @@ MODULE_CLEANUP:
     free(func_refs);
     lower_struct_type_map_clear();
     LLVMDisposeBuilder(builder);
+    if (kernel_mod) {
+        if (ok) {
+            /* LLVMLinkModules2 destroys the source module whether or not it
+               succeeds, so it must not be disposed afterwards. */
+            if (LLVMLinkModules2(mod, kernel_mod) != 0) {
+                set_err(err, err_sz, "failed to link tensor kernels into module");
+                ok = false;
+            }
+        } else {
+            LLVMDisposeModule(kernel_mod);
+        }
+        kernel_mod = NULL;
+    }
+    tensor_state_free();
     if (!ok) {
         LLVMDisposeModule(mod);
         return NULL;

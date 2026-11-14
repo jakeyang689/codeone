@@ -13,7 +13,7 @@
 set -u
 cd "$(dirname "$0")"
 
-C1=../c1
+C1=${C1:-../c1}
 BOX=../../boxes
 PLAT=../../platform
 OUT=$(mktemp -d)
@@ -142,6 +142,8 @@ group_fast() {
     # The layout engine is checked without a window: the platform drawing
     # externs are stubbed inside the test.
     run_one ui_layout       ui_layout_test.bx "$BOX/std/ui/widget.bx"
+    # Tensor kernels are generated in-process by MLIR, which every c1 has.
+    run_one tensor          tensor_test.bx
     run_one vector          vector_test.bx "$BOX/std/data/vector.bx"
     run_one hashmap_std     hashmap_test.bx "$BOX/std/data/hashmap.bx"
     run_one hashset         hashset_test.bx "$BOX/std/data/hashmap.bx" "$BOX/std/data/hashset.bx"

@@ -237,3 +237,15 @@ Rules:
 - With many inputs, prefer `${name}` to reference `%name`; it is less error-prone than counting `$N`. `${name:mod}` may carry a modifier
 - Use a struct result for multiple outputs, with the number of output constraints matching the number of fields; the result is an aggregate value, so it must be `store`d and then read field by field
 - When a template writes multiple outputs before reading all inputs, the outputs must use `=&`; otherwise the allocator may let an output share a register with an input
+
+## 12. Tensor Constraints
+
+`tensor` is for whole-buffer arithmetic, not a replacement for scalar loops:
+
+- Buffers are row-major and contiguous; `dst`, `lhs`, `rhs` are ordinary pointers obtained with `let` + `gep`
+- Shapes are **static positive integer literals** — no `%values` and no runtime shapes
+- The rank is fixed by the op: `[R, C]` for `add`/`sub`/`mul`/`div`, `[M, K, N]` for `matmul`
+- Element type is currently `f32` only; other dtypes are rejected at compile time
+- `tensor` has no result value; results are written through `dst`
+- `matmul` **overwrites** `dst` (it zero-fills the accumulator first), while elementwise ops also fully overwrite `dst`
+- Kernels are generated in-process by MLIR, which is linked into `c1`; nothing extra to install or locate at compile time
