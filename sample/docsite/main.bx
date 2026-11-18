@@ -1,0 +1,187 @@
+// docsite — 入口：ioselect 接入 + 每连接一个线程
+
+extern @printf(fmt: *i8, ...) -> i32
+extern @getenv(name: *i8) -> *i8
+
+extern @net_socket_tcp() -> i32
+extern @net_socket_bind(fd: i32, port: i32) -> i32
+extern @net_socket_listen(fd: i32) -> i32
+extern @net_socket_accept(fd: i32) -> i32
+extern @net_socket_close(fd: i32) -> i32
+
+extern @net_ioselect_create() -> i32
+extern @net_ioselect_add_read(ioselect_fd: i32, fd: i32, ident: i32) -> i32
+extern @net_ioselect_wait(ioselect_fd: i32, buf: *i8, max: i32, timeout_ms: i32) -> i32
+
+extern @std_thread_spawn(task_id: i32, arg: *i8) -> *i8
+extern @std_thread_detach(t: *i8) -> i32
+
+extern @hs_atoi(s: *i8) -> i32
+extern @log_init() -> i32
+extern @log_loop() -> void
+extern @log_enqueue(msg: *i8, len: i32) -> void
+extern @tls_init() -> i32
+extern @tls_handshake(fd: i32, slot: i32) -> i32
+extern @tls_ready(slot: i32) -> i32
+extern @tls_close_notify(slot: i32) -> i32
+extern @http_handle_conn(slot: i32) -> i32
+
+const @MAX_CONN: i32 = 64
+const @DEFAULT_PORT: i32 = 8443
+
+global @g_slot_busy: [i32, 64]
+global @g_slot_fd: [i32, 64]
+
+// 原子占用一个连接槽位；返回槽位号，-1 表示已满
+fun @slot_alloc() -> i32 {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @sa_cond
+  @sa_cond:
+    %iv = load i32, *%i
+    %over = sge i32 %iv, @MAX_CONN
+    br %over, @sa_full, @sa_body
+  @sa_body:
+    %p = gep i32, *@g_slot_busy, %iv
+    %old = atomicrmw xchg, i32, *%p, 1, seq_cst
+    %free = eq i32 %old, 0
+    br %free, @sa_got, @sa_next
+  @sa_next:
+    %n = add i32 %iv, 1
+    store i32 %n, *%i
+    jmp @sa_cond
+  @sa_got:
+    ret i32 %iv
+  @sa_full:
+    ret i32 -1
+}
+
+fun @slot_free(slot: i32) -> void {
+  @entry:
+    %p = gep i32, *@g_slot_busy, %slot
+    store atomic i32 0, *%p, seq_cst
+    ret void
+}
+
+// 线程入口：task_id = -1 为日志线程，否则为连接槽位号
+fun @thread_run(task_id: i32, arg: *i8) -> i32 {
+  @entry:
+    %islog = eq i32 %task_id, -1
+    br %islog, @tr_log, @tr_conn
+  @tr_log:
+    call @log_loop()
+    ret i32 0
+  @tr_conn:
+    %fp = gep i32, *@g_slot_fd, %task_id
+    %fd = load i32, *%fp
+    %hsr = call @tls_handshake(%fd, %task_id)
+    %hsok = eq i32 %hsr, 0
+    br %hsok, @tr_serve, @tr_hsfail
+  @tr_hsfail:
+    call @log_enqueue("TLS handshake failed", 20)
+    jmp @tr_done
+  @tr_serve:
+    %hr = call @http_handle_conn(%task_id)
+    jmp @tr_done
+  @tr_done:
+    %rdy = call @tls_ready(%task_id)
+    %isready = eq i32 %rdy, 1
+    br %isready, @tr_notify, @tr_close
+  @tr_notify:
+    %nf = call @tls_close_notify(%task_id)
+    jmp @tr_close
+  @tr_close:
+    %cl = call @net_socket_close(%fd)
+    call @slot_free(%task_id)
+    ret i32 0
+}
+
+fun @main() -> i32 {
+  @entry:
+    %port = let i32
+    %portp = gep i32, *%port, 0
+    %evbuf = let [i8, 256]
+    %evp = gep i8, *%evbuf, 0
+    %li = call @log_init()
+    %liok = eq i32 %li, 0
+    br %liok, @m_init, @m_load_fail
+  @m_init:
+    %loaded = call @tls_init()
+    %lok = eq i32 %loaded, 0
+    br %lok, @m_port, @m_load_fail
+  @m_load_fail:
+    %mf = call @printf("codeone site: cannot open logs/ or load the certificate (SITE_CERT/SITE_KEY, default certs/server.crt and certs/server.key)\n")
+    ret i32 1
+  @m_port:
+    %env = call @getenv("PORT")
+    %isn = eq *i8 %env, null
+    br %isn, @m_default, @m_env
+  @m_default:
+    store i32 @DEFAULT_PORT, *%portp
+    jmp @m_listen
+  @m_env:
+    %pv = call @hs_atoi(%env)
+    %pz = eq i32 %pv, 0
+    br %pz, @m_default2, @m_set
+  @m_default2:
+    store i32 @DEFAULT_PORT, *%portp
+    jmp @m_listen
+  @m_set:
+    store i32 %pv, *%portp
+    jmp @m_listen
+  @m_listen:
+    %fd = call @net_socket_tcp()
+    %pv2 = load i32, *%portp
+    %b = call @net_socket_bind(%fd, %pv2)
+    %bok = eq i32 %b, 0
+    br %bok, @m_listen2, @m_bind_fail
+  @m_bind_fail:
+    %bf = call @printf("codeone site: bind failed (port in use?)\n")
+    ret i32 1
+  @m_listen2:
+    %l = call @net_socket_listen(%fd)
+    %lok2 = eq i32 %l, 0
+    br %lok2, @m_poll, @m_bind_fail
+  @m_poll:
+    %sel = call @net_ioselect_create()
+    %selok = sge i32 %sel, 0
+    br %selok, @m_poll_add, @m_bind_fail
+  @m_poll_add:
+    %add = call @net_ioselect_add_read(%sel, %fd, 0)
+    %addok = eq i32 %add, 0
+    br %addok, @m_log, @m_bind_fail
+  @m_log:
+    %pv3 = load i32, *%portp
+    %lg = call @printf("codeone site listening on port %d (https)\n", %pv3)
+    call @log_enqueue("server listening", 16)
+    jmp @m_wait
+  @m_wait:
+    %n = call @net_ioselect_wait(%sel, %evp, 8, 1000)
+    %none = sle i32 %n, 0
+    br %none, @m_wait, @m_accept
+  @m_accept:
+    %cfd = call @net_socket_accept(%fd)
+    %cerr = slt i32 %cfd, 0
+    br %cerr, @m_wait, @m_slot
+  @m_slot:
+    %slot = call @slot_alloc()
+    %sok = sge i32 %slot, 0
+    br %sok, @m_spawn, @m_reject
+  @m_reject:
+    %rc = call @net_socket_close(%cfd)
+    jmp @m_wait
+  @m_spawn:
+    %sfp = gep i32, *@g_slot_fd, %slot
+    store i32 %cfd, *%sfp
+    %t = call @std_thread_spawn(%slot, null)
+    %tisnull = eq *i8 %t, null
+    br %tisnull, @m_spawn_fail, @m_spawn_ok
+  @m_spawn_fail:
+    %sf = call @net_socket_close(%cfd)
+    call @slot_free(%slot)
+    jmp @m_wait
+  @m_spawn_ok:
+    %dt = call @std_thread_detach(%t)
+    jmp @m_wait
+}

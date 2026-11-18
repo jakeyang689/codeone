@@ -1,0 +1,446 @@
+// HTTP/1.1 静态文件服务（运行在 TLS 连接之上）
+
+extern @fopen(path: *i8, mode: *i8) -> *i8
+extern @fread(buf: *i8, size: i64, count: i64, fp: *i8) -> i64
+extern @fseek(fp: *i8, off: i64, whence: i32) -> i32
+extern @ftell(fp: *i8) -> i64
+extern @fclose(fp: *i8) -> i32
+
+extern @hs_strlen(s: *i8) -> i32
+extern @hs_str_eq(a: *i8, b: *i8) -> i1
+extern @hs_starts_with(s: *i8, prefix: *i8) -> i1
+extern @hs_ends_with(s: *i8, suffix: *i8) -> i1
+extern @hs_contains_dotdot(s: *i8) -> i1
+extern @hs_path_ok(s: *i8) -> i1
+extern @hs_find_byte(buf: *i8, start: i32, end: i32, ch: i32) -> i32
+extern @hs_append(dst: *i8, off: i32, src: *i8, len: i32) -> i32
+extern @hs_append_cstr(dst: *i8, off: i32, src: *i8) -> i32
+extern @hs_append_int(dst: *i8, off: i32, v: i32) -> i32
+
+extern @tls_read_app(slot: i32, buf: *i8, cap: i32, outtyp: *i8, outlen: *i32) -> i32
+extern @tls_send_app(slot: i32, data: *i8, len: i32) -> i32
+extern @log_enqueue(msg: *i8, len: i32) -> void
+
+const @CT_HTML: [i8, 25] = "text/html; charset=utf-8"
+const @CT_CSS: [i8, 24] = "text/css; charset=utf-8"
+const @CT_JS: [i8, 23] = "application/javascript"
+const @CT_MD: [i8, 29] = "text/markdown; charset=utf-8"
+const @CT_GZ: [i8, 17] = "application/gzip"
+const @CT_PNG: [i8, 10] = "image/png"
+const @CT_SVG: [i8, 14] = "image/svg+xml"
+const @CT_ICO: [i8, 13] = "image/x-icon"
+const @CT_BIN: [i8, 25] = "application/octet-stream"
+
+// Document root and the two HTML entry points served from routes.
+const @SITE_ROOT: [i8, 7] = "public"
+const @INDEX_PATH: [i8, 18] = "public/index.html"
+const @DOCS_PATH: [i8, 17] = "public/docs.html"
+const @REQ_MAX: i32 = 16384
+const @URI_MAX: i32 = 200
+
+fun @hs_ctype(path: *i8) -> *i8 {
+  @entry:
+    %h = call @hs_ends_with(%path, ".html")
+    br %h, @ct_html, @ct2
+  @ct_html:
+    %p = gep i8, *@CT_HTML, 0
+    ret *i8 %p
+  @ct2:
+    %c = call @hs_ends_with(%path, ".css")
+    br %c, @ct_css, @ct3
+  @ct_css:
+    %p2 = gep i8, *@CT_CSS, 0
+    ret *i8 %p2
+  @ct3:
+    %j = call @hs_ends_with(%path, ".js")
+    br %j, @ct_js, @ct4
+  @ct_js:
+    %p3 = gep i8, *@CT_JS, 0
+    ret *i8 %p3
+  @ct4:
+    %m = call @hs_ends_with(%path, ".md")
+    br %m, @ct_md, @ct5
+  @ct_md:
+    %p4 = gep i8, *@CT_MD, 0
+    ret *i8 %p4
+  @ct5:
+    %g = call @hs_ends_with(%path, ".gz")
+    br %g, @ct_gz, @ct6
+  @ct_gz:
+    %p5 = gep i8, *@CT_GZ, 0
+    ret *i8 %p5
+  @ct6:
+    %pn = call @hs_ends_with(%path, ".png")
+    br %pn, @ct_png, @ct7
+  @ct_png:
+    %p6 = gep i8, *@CT_PNG, 0
+    ret *i8 %p6
+  @ct7:
+    %sv = call @hs_ends_with(%path, ".svg")
+    br %sv, @ct_svg, @ct8
+  @ct_svg:
+    %p7 = gep i8, *@CT_SVG, 0
+    ret *i8 %p7
+  @ct8:
+    %ic = call @hs_ends_with(%path, ".ico")
+    br %ic, @ct_ico, @ct_bin
+  @ct_ico:
+    %p8 = gep i8, *@CT_ICO, 0
+    ret *i8 %p8
+  @ct_bin:
+    %p9 = gep i8, *@CT_BIN, 0
+    ret *i8 %p9
+}
+
+fun @hs_log_access(path: *i8, status: i32, bytes: i32) -> void {
+  @entry:
+    %buf = let [i8, 320]
+    %bp = gep i8, *%buf, 0
+    %o1 = call @hs_append_cstr(%bp, 0, "ACCESS GET ")
+    %o2 = call @hs_append_cstr(%bp, %o1, %path)
+    %sp1 = gep i8, *%bp, %o2
+    store i8 32, *%sp1
+    %o3 = add i32 %o2, 1
+    %o4 = call @hs_append_int(%bp, %o3, %status)
+    %sp2 = gep i8, *%bp, %o4
+    store i8 32, *%sp2
+    %o5 = add i32 %o4, 1
+    %o6 = call @hs_append_int(%bp, %o5, %bytes)
+    call @log_enqueue(%bp, %o6)
+    ret void
+}
+
+fun @hs_simple(slot: i32, status: *i8, ctype: *i8, body: *i8) -> i32 {
+  @entry:
+    %h = let [i8, 1024]
+    %hp = gep i8, *%h, 0
+    %o1 = call @hs_append_cstr(%hp, 0, %status)
+    %o2 = call @hs_append_cstr(%hp, %o1, "Content-Type: ")
+    %o3 = call @hs_append_cstr(%hp, %o2, %ctype)
+    %o4 = call @hs_append_cstr(%hp, %o3, "\r\nContent-Length: ")
+    %bl = call @hs_strlen(%body)
+    %o5 = call @hs_append_int(%hp, %o4, %bl)
+    %o6 = call @hs_append_cstr(%hp, %o5, "\r\nConnection: close\r\n\r\n")
+    %r1 = call @tls_send_app(%slot, %hp, %o6)
+    %r2 = call @tls_send_app(%slot, %body, %bl)
+    ret i32 %r2
+}
+
+fun @hs_serve_file(slot: i32, path: *i8, reqpath: *i8, ctype: *i8, attach: i1) -> i32 {
+  @entry:
+    %h = let [i8, 1024]
+    %hp = gep i8, *%h, 0
+    %chunk = let [i8, 16384]
+    %cp = gep i8, *%chunk, 0
+    %ho = let i32
+    %fp = call @fopen(%path, "rb")
+    %isn = eq *i8 %fp, null
+    br %isn, @sf_404, @sf_size
+  @sf_404:
+    %nr = call @hs_simple(%slot, "HTTP/1.1 404 Not Found\r\n",
+      "text/plain; charset=utf-8", "Not Found\n")
+    call @hs_log_access(%reqpath, 404, 10)
+    ret i32 %nr
+  @sf_size:
+    %f1 = call @fseek(%fp, 0, 2)
+    %sz64 = call @ftell(%fp)
+    %sz = trunc i64 %sz64 to i32
+    %f2 = call @fseek(%fp, 0, 0)
+    call @hs_log_access(%reqpath, 200, %sz)
+    %o1 = call @hs_append_cstr(%hp, 0, "HTTP/1.1 200 OK\r\nContent-Type: ")
+    %o2 = call @hs_append_cstr(%hp, %o1, %ctype)
+    %o3 = call @hs_append_cstr(%hp, %o2, "\r\nContent-Length: ")
+    %o4 = call @hs_append_int(%hp, %o3, %sz)
+    %o5 = call @hs_append_cstr(%hp, %o4, "\r\nConnection: close\r\n")
+    store i32 %o5, *%ho
+    br %attach, @sf_att, @sf_hdr
+  @sf_att:
+    %a1 = call @hs_append_cstr(%hp, %o5, "Content-Disposition: attachment\r\n")
+    store i32 %a1, *%ho
+    jmp @sf_hdr
+  @sf_hdr:
+    %hv = load i32, *%ho
+    %h2 = call @hs_append_cstr(%hp, %hv, "\r\n")
+    %sr = call @tls_send_app(%slot, %hp, %h2)
+    %serr = slt i32 %sr, 0
+    br %serr, @sf_close, @sf_body
+  @sf_body:
+    %n64 = call @fread(%cp, 1, 16384, %fp)
+    %n = trunc i64 %n64 to i32
+    %z = sle i32 %n, 0
+    br %z, @sf_close_ok, @sf_send
+  @sf_send:
+    %br1 = call @tls_send_app(%slot, %cp, %n)
+    %berr = slt i32 %br1, 0
+    br %berr, @sf_close, @sf_body
+  @sf_close_ok:
+    call @fclose(%fp)
+    ret i32 0
+  @sf_close:
+    call @fclose(%fp)
+    ret i32 -1
+}
+
+fun @hs_find_hdr_end(buf: *i8, n: i32) -> i32 {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @fh_cond
+  @fh_cond:
+    %iv = load i32, *%i
+    %p3 = add i32 %iv, 3
+    %room = slt i32 %p3, %n
+    br %room, @fh_body, @fh_tail
+  @fh_body:
+    %p = gep i8, *%buf, %iv
+    %c0 = load i8, *%p
+    %is13 = eq i8 %c0, 13
+    br %is13, @fh_crlf, @fh_ln
+  @fh_crlf:
+    %p1 = gep i8, *%p, 1
+    %c1 = load i8, *%p1
+    %p2 = gep i8, *%p, 2
+    %c2 = load i8, *%p2
+    %p3b = gep i8, *%p, 3
+    %c3 = load i8, *%p3b
+    %e1 = eq i8 %c1, 10
+    %e2 = eq i8 %c2, 13
+    %e3 = eq i8 %c3, 10
+    %a1 = and i1 %e1, %e2
+    %all = and i1 %a1, %e3
+    br %all, @fh_crlf_yes, @fh_next
+  @fh_crlf_yes:
+    %r = add i32 %iv, 4
+    ret i32 %r
+  @fh_ln:
+    %is10 = eq i8 %c0, 10
+    br %is10, @fh_ln_room, @fh_next
+  @fh_ln_room:
+    %n1 = add i32 %iv, 1
+    %room2 = slt i32 %n1, %n
+    br %room2, @fh_ln2, @fh_next
+  @fh_ln2:
+    %lp = gep i8, *%p, 1
+    %lc = load i8, *%lp
+    %is10b = eq i8 %lc, 10
+    br %is10b, @fh_ln_yes, @fh_next
+  @fh_ln_yes:
+    %r2 = add i32 %iv, 2
+    ret i32 %r2
+  @fh_next:
+    %n2 = add i32 %iv, 1
+    store i32 %n2, *%i
+    jmp @fh_cond
+  @fh_tail:
+    ret i32 -1
+}
+
+fun @http_handle_conn(slot: i32) -> i32 {
+  @entry:
+    %r = call @hs_handle_conn(%slot)
+    ret i32 %r
+}
+
+fun @hs_handle_conn(slot: i32) -> i32 {
+  @entry:
+    %req = let [i8, 16384]
+    %rp = gep i8, *%req, 0
+    %path = let [i8, 256]
+    %pathp = gep i8, *%path, 0
+    %pathnul = gep i8, *%pathp, 1
+    store i8 45, *%pathp
+    store i8 0, *%pathnul
+    %full = let [i8, 512]
+    %fullp = gep i8, *%full, 0
+    %off = let i32
+    %reads = let i32
+    %have = let i32
+    %typ = let i8
+    %rlen = let i32
+    %typp = gep i8, *%typ, 0
+    %rlenp = gep i32, *%rlen, 0
+    %route = let i32
+    %pl = let i32
+    store i32 0, *%off
+    store i32 0, *%reads
+    store i32 0, *%have
+    jmp @hc_read_cond
+  @hc_read_cond:
+    %hv = load i32, *%have
+    %done = ne i32 %hv, 0
+    br %done, @hc_parse, @hc_read_one
+  @hc_read_one:
+    %rv = load i32, *%reads
+    %many = sge i32 %rv, 6
+    br %many, @hc_bad, @hc_read_call
+  @hc_read_call:
+    %o = load i32, *%off
+    %cap = sub i32 @REQ_MAX, %o
+    %small = slt i32 %cap, 16
+    br %small, @hc_bad, @hc_read_do
+  @hc_read_do:
+    %dst = gep i8, *%rp, %o
+    %rr = call @tls_read_app(%slot, %dst, %cap, %typp, %rlenp)
+    %rerr = slt i32 %rr, 0
+    br %rerr, @hc_fail, @hc_read_type
+  @hc_read_type:
+    %rt = load i8, *%typp
+    %isapp = eq i8 %rt, 23
+    br %isapp, @hc_count, @hc_other
+  @hc_other:
+    %isalert = eq i8 %rt, 21
+    br %isalert, @hc_fail, @hc_read_cond
+  @hc_count:
+    %ln = load i32, *%rlenp
+    %o2 = load i32, *%off
+    %no = add i32 %o2, %ln
+    store i32 %no, *%off
+    %rc = load i32, *%reads
+    %rc2 = add i32 %rc, 1
+    store i32 %rc2, *%reads
+    %fe = call @hs_find_hdr_end(%rp, %no)
+    %found = sge i32 %fe, 0
+    br %found, @hc_mark, @hc_read_cond
+  @hc_mark:
+    store i32 1, *%have
+    jmp @hc_parse
+  @hc_parse:
+    %n = load i32, *%off
+    %m0 = load i8, *%rp
+    %m1p = gep i8, *%rp, 1
+    %m1 = load i8, *%m1p
+    %m2p = gep i8, *%rp, 2
+    %m2 = load i8, *%m2p
+    %m3p = gep i8, *%rp, 3
+    %m3 = load i8, *%m3p
+    %g = eq i8 %m0, 71
+    %e = eq i8 %m1, 69
+    %t = eq i8 %m2, 84
+    %ge = and i1 %g, %e
+    %get = and i1 %ge, %t
+    br %get, @hc_path, @hc_method
+  @hc_method:
+    %mr = call @hs_simple(%slot, "HTTP/1.1 405 Method Not Allowed\r\n",
+      "text/plain; charset=utf-8", "Method Not Allowed\n")
+    call @hs_log_access(%pathp, 405, 19)
+    ret i32 %mr
+  @hc_path:
+    %sp1 = call @hs_find_byte(%rp, 0, %n, 32)
+    %sp1ok = sge i32 %sp1, 0
+    br %sp1ok, @hc_path2, @hc_bad
+  @hc_path2:
+    %ps = add i32 %sp1, 1
+    %sp2 = call @hs_find_byte(%rp, %ps, %n, 32)
+    %sp2ok = sge i32 %sp2, 0
+    br %sp2ok, @hc_path3, @hc_bad
+  @hc_path3:
+    %plen = sub i32 %sp2, %ps
+    %toolong = sgt i32 %plen, @URI_MAX
+    br %toolong, @hc_uri, @hc_copy_init
+  @hc_copy_init:
+    store i32 0, *%pl
+    jmp @hc_copy_cond
+  @hc_copy_cond:
+    %ci = load i32, *%pl
+    %more = slt i32 %ci, %plen
+    br %more, @hc_copy_body, @hc_copy_done
+  @hc_copy_body:
+    %src = add i32 %ps, %ci
+    %srcp = gep i8, *%rp, %src
+    %cv = load i8, *%srcp
+    %dstp = gep i8, *%pathp, %ci
+    store i8 %cv, *%dstp
+    %ci2 = add i32 %ci, 1
+    store i32 %ci2, *%pl
+    jmp @hc_copy_cond
+  @hc_copy_done:
+    %pp = gep i8, *%pathp, %plen
+    store i8 0, *%pp
+    %qq = call @hs_find_byte(%pathp, 0, %plen, 63)
+    %hasq = sge i32 %qq, 0
+    br %hasq, @hc_cut_query, @hc_validate
+  @hc_cut_query:
+    %qp = gep i8, *%pathp, %qq
+    store i8 0, *%qp
+    store i32 %qq, *%pl
+    jmp @hc_validate
+  @hc_validate:
+    %dd = call @hs_contains_dotdot(%pathp)
+    br %dd, @hc_bad, @hc_pok
+  @hc_pok:
+    %pok = call @hs_path_ok(%pathp)
+    br %pok, @hc_route, @hc_bad
+  @hc_route:
+    store i32 0, *%route
+    %isroot = call @hs_str_eq(%pathp, "/")
+    br %isroot, @hc_r_root, @hc_r_docs
+  @hc_r_root:
+    store i32 1, *%route
+    jmp @hc_dispatch
+  @hc_r_docs:
+    %d1 = call @hs_str_eq(%pathp, "/docs")
+    %d2 = call @hs_str_eq(%pathp, "/docs/")
+    %dd2 = or i1 %d1, %d2
+    br %dd2, @hc_r_docs_set, @hc_r_static
+  @hc_r_docs_set:
+    store i32 2, *%route
+    jmp @hc_dispatch
+  @hc_r_static:
+    %a = call @hs_starts_with(%pathp, "/assets/")
+    %d = call @hs_starts_with(%pathp, "/docs/")
+    %l = call @hs_starts_with(%pathp, "/downloads/")
+    %ad = or i1 %a, %d
+    %any = or i1 %ad, %l
+    br %any, @hc_r_static_set, @hc_dispatch
+  @hc_r_static_set:
+    store i32 3, *%route
+    jmp @hc_dispatch
+  @hc_dispatch:
+    %rt2 = load i32, *%route
+    %r1 = eq i32 %rt2, 1
+    br %r1, @hc_serve_root, @hc_d2
+  @hc_d2:
+    %r2 = eq i32 %rt2, 2
+    br %r2, @hc_serve_docs, @hc_d3
+  @hc_d3:
+    %r3 = eq i32 %rt2, 3
+    br %r3, @hc_serve_static, @hc_serve_404
+  @hc_serve_root:
+    %ctp = gep i8, *@CT_HTML, 0
+    %ip = gep i8, *@INDEX_PATH, 0
+    %sr = call @hs_serve_file(%slot, %ip, "/", %ctp, false)
+    ret i32 %sr
+  @hc_serve_docs:
+    %ctp2 = gep i8, *@CT_HTML, 0
+    %dp = gep i8, *@DOCS_PATH, 0
+    %sr2 = call @hs_serve_file(%slot, %dp, "/docs", %ctp2, false)
+    ret i32 %sr2
+  @hc_serve_static:
+    %rootp = gep i8, *@SITE_ROOT, 0
+    %so1 = call @hs_append_cstr(%fullp, 0, %rootp)
+    %plv = call @hs_strlen(%pathp)
+    %so2 = call @hs_append(%fullp, %so1, %pathp, %plv)
+    %so3 = gep i8, *%fullp, %so2
+    store i8 0, *%so3
+    %ct = call @hs_ctype(%pathp)
+    %dl = call @hs_starts_with(%pathp, "/downloads/")
+    %sr3 = call @hs_serve_file(%slot, %fullp, %pathp, %ct, %dl)
+    ret i32 %sr3
+  @hc_serve_404:
+    %sr4 = call @hs_simple(%slot, "HTTP/1.1 404 Not Found\r\n",
+      "text/plain; charset=utf-8", "Not Found\n")
+    call @hs_log_access(%pathp, 404, 10)
+    ret i32 %sr4
+  @hc_uri:
+    %ur = call @hs_simple(%slot, "HTTP/1.1 414 URI Too Long\r\n",
+      "text/plain; charset=utf-8", "URI Too Long\n")
+    call @hs_log_access(%pathp, 414, 13)
+    ret i32 %ur
+  @hc_bad:
+    %brr = call @hs_simple(%slot, "HTTP/1.1 400 Bad Request\r\n",
+      "text/plain; charset=utf-8", "Bad Request\n")
+    call @hs_log_access(%pathp, 400, 12)
+    ret i32 %brr
+  @hc_fail:
+    ret i32 -1
+}

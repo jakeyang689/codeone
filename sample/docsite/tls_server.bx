@@ -1,0 +1,155 @@
+// TLS 服务端适配层：使用标准库 net/tls/server_api.bx
+// 每个连接槽位持有 1024 字节的 TLS 上下文
+
+extern @fopen(path: *i8, mode: *i8) -> *i8
+extern @fread(buf: *i8, size: i64, count: i64, fp: *i8) -> i64
+extern @fclose(fp: *i8) -> i32
+extern @getenv(name: *i8) -> *i8
+
+extern @net_tls_server_accept(ctx: *i8, fd: i32,
+                              cert: *i8, cert_len: i32,
+                              key: *i8, key_len: i32,
+                              limbs: i32) -> i32
+extern @net_tls_send(ctx: *i8, data: *i8, len: i32) -> i32
+extern @net_tls_recv(ctx: *i8, buf: *i8, cap: i32, out_len: *i32) -> i32
+extern @net_tls_close(ctx: *i8) -> i32
+
+const @TLS_SLOTS: i32 = 64
+const @TLS_SLOT_SZ: i32 = 1024
+const @TLS_LIMBS: i32 = 64
+// Default certificate locations for local runs; SITE_CERT / SITE_KEY point
+// the server at another key pair without recompiling.
+const @CERT_PATH: [i8, 17] = "certs/server.crt"
+const @KEY_PATH: [i8, 17] = "certs/server.key"
+
+global @g_tls_ctx: [i8, 65536]
+global @g_tls_ready: [i32, 64]
+global @g_cert: [i8, 8192]
+global @g_cert_len: i32
+global @g_key: [i8, 8192]
+global @g_key_len: i32
+
+fun @tls_init() -> i32 {
+  @entry:
+    %i = let i32
+    %certp = let *i8
+    %keyp = let *i8
+    %ce = call @getenv("SITE_CERT")
+    %cen = eq *i8 %ce, null
+    br %cen, @ti_cert_def, @ti_cert_set
+  @ti_cert_def:
+    %cd = gep i8, *@CERT_PATH, 0
+    store *i8 %cd, *%certp
+    jmp @ti_key_env
+  @ti_cert_set:
+    store *i8 %ce, *%certp
+    jmp @ti_key_env
+  @ti_key_env:
+    %ke = call @getenv("SITE_KEY")
+    %ken = eq *i8 %ke, null
+    br %ken, @ti_key_def, @ti_key_set
+  @ti_key_def:
+    %kd = gep i8, *@KEY_PATH, 0
+    store *i8 %kd, *%keyp
+    jmp @ti_open
+  @ti_key_set:
+    store *i8 %ke, *%keyp
+    jmp @ti_open
+  @ti_open:
+    %crp = load *i8, *%certp
+    %fp = call @fopen(%crp, "rb")
+    %isn = eq *i8 %fp, null
+    br %isn, @ti_fail, @ti_cert
+  @ti_cert:
+    %cp = gep i8, *@g_cert, 0
+    %n = call @fread(%cp, 1, 8192, %fp)
+    %n32 = trunc i64 %n to i32
+    store i32 %n32, *@g_cert_len
+    call @fclose(%fp)
+    %krp = load *i8, *%keyp
+    %kfp = call @fopen(%krp, "rb")
+    %isn2 = eq *i8 %kfp, null
+    br %isn2, @ti_fail, @ti_key
+  @ti_key:
+    %kp = gep i8, *@g_key, 0
+    %kn = call @fread(%kp, 1, 8192, %kfp)
+    %kn32 = trunc i64 %kn to i32
+    store i32 %kn32, *@g_key_len
+    call @fclose(%kfp)
+    store i32 0, *%i
+    jmp @ti_clr_cond
+  @ti_clr_cond:
+    %iv = load i32, *%i
+    %over = sge i32 %iv, @TLS_SLOTS
+    br %over, @ti_ok, @ti_clr
+  @ti_clr:
+    %rp = gep i32, *@g_tls_ready, %iv
+    store i32 0, *%rp
+    %n2 = add i32 %iv, 1
+    store i32 %n2, *%i
+    jmp @ti_clr_cond
+  @ti_ok:
+    ret i32 0
+  @ti_fail:
+    ret i32 -1
+}
+
+fun @tls_ctx_ptr(slot: i32) -> *i8 {
+  @entry:
+    %off = mul i32 %slot, @TLS_SLOT_SZ
+    %p = gep i8, *@g_tls_ctx, %off
+    ret *i8 %p
+}
+
+fun @tls_handshake(fd: i32, slot: i32) -> i32 {
+  @entry:
+    %ctx = call @tls_ctx_ptr(%slot)
+    %rd = gep i32, *@g_tls_ready, %slot
+    store i32 0, *%rd
+    %cp = gep i8, *@g_cert, 0
+    %kp = gep i8, *@g_key, 0
+    %cl = load i32, *@g_cert_len
+    %kl = load i32, *@g_key_len
+    %r = call @net_tls_server_accept(%ctx, %fd, %cp, %cl, %kp, %kl, @TLS_LIMBS)
+    %ok = eq i32 %r, 0
+    br %ok, @hs_ok, @hs_fail
+  @hs_ok:
+    store i32 1, *%rd
+    ret i32 0
+  @hs_fail:
+    ret i32 -1
+}
+
+fun @tls_read_app(slot: i32, buf: *i8, cap: i32, outtyp: *i8, outlen: *i32) -> i32 {
+  @entry:
+    %ctx = call @tls_ctx_ptr(%slot)
+    %r = call @net_tls_recv(%ctx, %buf, %cap, %outlen)
+    %err = slt i32 %r, 0
+    br %err, @ra_fail, @ra_ok
+  @ra_ok:
+    store i8 23, *%outtyp
+    ret i32 0
+  @ra_fail:
+    ret i32 -1
+}
+
+fun @tls_send_app(slot: i32, data: *i8, len: i32) -> i32 {
+  @entry:
+    %ctx = call @tls_ctx_ptr(%slot)
+    %r = call @net_tls_send(%ctx, %data, %len)
+    ret i32 %r
+}
+
+fun @tls_close_notify(slot: i32) -> i32 {
+  @entry:
+    %ctx = call @tls_ctx_ptr(%slot)
+    %r = call @net_tls_close(%ctx)
+    ret i32 %r
+}
+
+fun @tls_ready(slot: i32) -> i32 {
+  @entry:
+    %rd = gep i32, *@g_tls_ready, %slot
+    %v = load i32, *%rd
+    ret i32 %v
+}

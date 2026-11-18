@@ -1,0 +1,8 @@
+app
+*.o
+logs/
+# The certificate is public and ships with the site; the private key does not.
+# The root .gitignore ignores *.crt globally, so re-include this one.
+!certs/server.crt
+certs/server.key
+certs/server.key.der

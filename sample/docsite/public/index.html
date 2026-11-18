@@ -1,0 +1,236 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>codeone — 用 SSA 构建系统软件</title>
+  <meta name="description" content="codeone 是一套以 SSA 为源语言的工具链：SSA 先降低为 LLVM IR，再生成目标平台机器码。38 条显式类型指令，以及覆盖网络、TLS、密码学与系统编程的标准库。">
+  <link rel="icon" href="/assets/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/assets/style.css">
+</head>
+<body>
+  <div class="page-glow" aria-hidden="true"></div>
+
+  <header class="nav">
+    <a class="brand" href="/">
+      <span class="brand-mark" aria-hidden="true">
+        <svg viewBox="0 0 32 32" fill="none"><path d="M11.5 9 4.5 16l7 7M20.5 9l7 7-7 7M18.5 6l-5 20" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </span>
+      <span class="brand-name">codeone</span>
+    </a>
+    <nav class="nav-links" aria-label="主导航">
+      <a href="#features">特性</a>
+      <a href="#workflow">工作流</a>
+      <a href="#download">下载</a>
+      <a href="/docs">文档</a>
+    </nav>
+    <a class="btn btn-ghost nav-cta" href="/docs">阅读文档</a>
+  </header>
+
+  <main>
+    <section class="hero">
+      <div class="hero-copy">
+        <p class="eyebrow"><span class="dot"></span> codeone 官方网站</p>
+        <h1>用 <span class="grad">SSA</span><br>直接构建系统软件</h1>
+        <p class="lead">codeone 是一套以 SSA 为源语言的工具链：SSA 先降低为 LLVM IR，再生成目标平台机器码。38 条显式类型指令，以及覆盖网络、TLS、密码学与系统编程的标准库。</p>
+        <div class="actions">
+          <a class="btn btn-primary" href="#download">
+            <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 3v12m0 0 4.5-4.5M12 15l-4.5-4.5M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            下载工具链
+          </a>
+          <a class="btn btn-secondary" href="/docs">查阅文档</a>
+        </div>
+        <p class="hero-meta">macOS · Apple Silicon · 73 MB · <span class="mono">sha256 db09a4a1…</span></p>
+      </div>
+
+      <div class="hero-visual" aria-label="SSA 代码示例">
+        <div class="window">
+          <div class="window-bar">
+            <span class="lights"><i></i><i></i><i></i></span>
+            <span class="window-title">main.bx</span>
+            <span class="window-tag">SSA</span>
+          </div>
+          <pre class="code"><code><span class="ln">1</span><span class="kw">extern</span> @puts(s: *i8) -&gt; i32
+<span class="ln">2</span>
+<span class="ln">3</span><span class="kw">fun</span> @main() -&gt; i32 {
+<span class="ln">4</span>  @entry:
+<span class="ln">5</span>    call @puts(<span class="str">"Hello, codeone"</span>)
+<span class="ln">6</span>    <span class="kw">ret</span> i32 0
+<span class="ln">7</span>}</code></pre>
+          <div class="window-foot">
+            <span class="pill">-O2</span>
+            <span class="pill">LLVM</span>
+            <span class="pill">AArch64</span>
+          </div>
+        </div>
+        <div class="float-card fc-a">
+          <span class="fc-icon">38</span>
+          <span><b>条指令</b><small>最小完备指令集</small></span>
+        </div>
+        <div class="float-card fc-b">
+          <span class="fc-icon">0</span>
+          <span><b>隐式转换</b><small>每个类型都显式写出</small></span>
+        </div>
+      </div>
+    </section>
+
+    <section class="stats" aria-label="项目概览">
+      <div><b>38</b><span>条 SSA 指令</span></div>
+      <div><b>60+</b><span>标准库 Box</span></div>
+      <div><b>2</b><span>macOS / Linux</span></div>
+      <div><b>1</b><span>编译器即工具链</span></div>
+    </section>
+
+    <section class="section" id="features">
+      <div class="section-head">
+        <p class="eyebrow">为什么选择 codeone</p>
+        <h2>为人类与 AI 同时设计的系统语言</h2>
+        <p class="section-lead">没有隐藏的默认值，没有类型推导的猜测。每一行 SSA 都只表达一件事，编译器与读者看到的是同一份事实。</p>
+      </div>
+      <div class="cards">
+        <article class="card">
+          <span class="card-icon">
+            <svg viewBox="0 0 24 24" fill="none"><path d="M8 6 3 12l5 6M16 6l5 6-5 6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </span>
+          <h3>极简 SSA</h3>
+          <p>38 条指令覆盖算术、内存、原子操作、控制流、调用与内联汇编。语法固定，看到关键字就能确定整行结构。</p>
+        </article>
+        <article class="card">
+          <span class="card-icon">
+            <svg viewBox="0 0 24 24" fill="none"><path d="M4 7.5 12 3l8 4.5v9L12 21l-8-4.5v-9Z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="m4 7.5 8 4.5 8-4.5M12 12v9" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></svg>
+          </span>
+          <h3>标准库 Box</h3>
+          <p>套接字、HTTP/WebSocket、TLS 1.2/1.3、AES、SHA、RSA、P-256、JSON、文件系统、线程与数据结构，以可组合的 <span class="mono">.bx</span> 模块提供。</p>
+        </article>
+        <article class="card">
+          <span class="card-icon">
+            <svg viewBox="0 0 24 24" fill="none"><path d="M13 2 4 14h6l-1 8 9-12h-6l1-8Z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></svg>
+          </span>
+          <h3>原生性能</h3>
+          <p>直接降低到 LLVM IR，<span class="mono">-O2</span> 生成目标平台机器码，无虚拟机、无运行时解释开销。</p>
+        </article>
+        <article class="card">
+          <span class="card-icon">
+            <svg viewBox="0 0 24 24" fill="none"><path d="M12 3 5 6v5c0 4.5 3 8 7 10 4-2 7-5.5 7-10V6l-7-3Z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="m9 12 2 2 4-4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </span>
+          <h3>硬件加速密码学</h3>
+          <p>AES、SHA-256 与 GHASH 在 ARMv8 Crypto 与 AES-NI 上直接调用硬件指令，TLS 握手与批量加密都不妥协。</p>
+        </article>
+        <article class="card">
+          <span class="card-icon">
+            <svg viewBox="0 0 24 24" fill="none"><rect x="3" y="4" width="18" height="14" rx="2" stroke="currentColor" stroke-width="1.8"/><path d="M8 21h8M12 18v3" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+          </span>
+          <h3>跨平台</h3>
+          <p>平台库封装 BSD sockets、kqueue / epoll、CSPRNG 与 CPU 特性检测，同一份 SSA 面向 macOS 与 Linux。</p>
+        </article>
+        <article class="card">
+          <span class="card-icon">
+            <svg viewBox="0 0 24 24" fill="none"><path d="M7 8h10M7 12h6M5 4h14a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H9l-4 3V6a2 2 0 0 1 2-2Z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></svg>
+          </span>
+          <h3>面向 AI 的语法</h3>
+          <p>模式复用、严格固定、单前缀约定，让 LLM 能以更高准确率生成和修改 SSA 代码。</p>
+        </article>
+      </div>
+    </section>
+
+    <section class="section workflow" id="workflow">
+      <div class="section-head left">
+        <p class="eyebrow">工作流</p>
+        <h2>从一行 SSA 到可执行文件</h2>
+        <p class="section-lead">一个编译器驱动完成编译与链接，标准库模块按需传入。</p>
+      </div>
+      <div class="steps">
+        <div class="step">
+          <span class="step-no">01</span>
+          <h3>编写 <span class="mono">.bx</span></h3>
+          <p>用 SSA 描述函数、结构体与全局数据。每个基本块以 <span class="mono">jmp</span>、<span class="mono">br</span> 或 <span class="mono">ret</span> 结束。</p>
+        </div>
+        <div class="step">
+          <span class="step-no">02</span>
+          <h3>链接 Box</h3>
+          <p>需要什么就传入什么：<span class="mono">io/print.bx</span>、<span class="mono">net/socket.bx</span>、<span class="mono">crypto/sha.bx</span>。</p>
+        </div>
+        <div class="step">
+          <span class="step-no">03</span>
+          <h3><span class="mono">c1</span> 编译</h3>
+          <p>SSA 先降低为 LLVM IR，<span class="mono">-O2</span> 优化后交给系统链接器，产物是原生可执行文件。</p>
+        </div>
+      </div>
+      <div class="terminal">
+        <div class="terminal-bar"><span class="lights"><i></i><i></i><i></i></span><span>终端</span></div>
+        <pre><code><span class="prompt">$</span> ~/.codeone/toolchain/bin/c1 main.bx \
+    ~/.codeone/toolchain/boxes/std/io/print.bx \
+    -O2 -o app
+<span class="prompt">$</span> ./app
+<span class="out">Hello, codeone</span></code></pre>
+      </div>
+    </section>
+
+    <section class="section download" id="download">
+      <div class="section-head">
+        <p class="eyebrow">下载</p>
+        <h2>获取 codeone 工具链</h2>
+        <p class="section-lead">包含编译器 <span class="mono">c1</span>、标准库 boxes、平台库与完整文档。</p>
+      </div>
+      <div class="download-card">
+        <div class="dl-main">
+          <span class="dl-icon">
+            <svg viewBox="0 0 24 24" fill="none"><path d="M12 3v10m0 0 4-4m-4 4-4-4M5 16v3a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-3" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </span>
+          <div>
+            <h3>macOS · Apple Silicon</h3>
+            <p class="mono file">codeone-toolchain-darwin-arm64.tar.gz</p>
+            <p class="dl-meta">73 MB · 2026-11-17 · <span class="mono">sha256 db09a4a16b9ecdea76d43dc0015d2ea2c1e2717167652a8097cf60d37cf265df</span></p>
+          </div>
+        </div>
+        <a class="btn btn-primary" href="/downloads/codeone-toolchain-darwin-arm64.tar.gz">
+          <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 3v12m0 0 4.5-4.5M12 15l-4.5-4.5M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          下载 .tar.gz
+        </a>
+      </div>
+      <div class="install">
+        <h3>安装</h3>
+        <pre><code><span class="prompt">$</span> tar -xzf codeone-toolchain-darwin-arm64.tar.gz
+<span class="prompt">$</span> mkdir -p ~/.codeone
+<span class="prompt">$</span> mv toolchain ~/.codeone/toolchain
+<span class="prompt">$</span> ~/.codeone/toolchain/bin/c1 --help</code></pre>
+      </div>
+    </section>
+
+    <section class="section docs-cta">
+      <div class="docs-cta-inner">
+        <div>
+          <p class="eyebrow">文档</p>
+          <h2>从语言规范到标准库</h2>
+          <p class="section-lead">在浏览器中直接查阅 SSA 语言规范、Box 标准库、编码规则与指令速查。</p>
+        </div>
+        <a class="btn btn-secondary" href="/docs">打开文档 →</a>
+      </div>
+      <div class="doc-links">
+        <a href="/docs#ssa"><b>SSA 语言规范</b><span>类型、指令与语法约定</span></a>
+        <a href="/docs#box"><b>标准库 Box</b><span>网络、TLS、加密与系统接口</span></a>
+        <a href="/docs#agents"><b>AI 编码规则</b><span>生成 SSA 的模式与反模式</span></a>
+        <a href="/docs#cmap"><b>指令速查</b><span>伪 C 视角下的 SSA 结构</span></a>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <div class="footer-inner">
+      <a class="brand" href="/">
+        <span class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 32 32" fill="none"><path d="M11.5 9 4.5 16l7 7M20.5 9l7 7-7 7M18.5 6l-5 20" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </span>
+        <span class="brand-name">codeone</span>
+      </a>
+      <p>以 SSA 为源语言、生成 LLVM IR 的系统软件工具链。</p>
+      <nav class="footer-links">
+        <a href="#features">特性</a>
+        <a href="#download">下载</a>
+        <a href="/docs">文档</a>
+      </nav>
+    </div>
+    <div class="footer-bottom">© 2026 codeone · Built with codeone</div>
+  </footer>
+</body>
+</html>

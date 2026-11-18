@@ -1,0 +1,352 @@
+// 通用工具：大端整数、字符串、路径校验与格式化
+
+extern @memcpy(dst: *i8, src: *i8, n: i64) -> *i8
+
+fun @hs_put24(p: *i8, v: i32) -> void {
+  @entry:
+    %s0 = lshr i32 %v, 16
+    %b0 = trunc i32 %s0 to i8
+    store i8 %b0, *%p
+    %s1 = lshr i32 %v, 8
+    %b1 = trunc i32 %s1 to i8
+    %p1 = gep i8, *%p, 1
+    store i8 %b1, *%p1
+    %b2 = trunc i32 %v to i8
+    %p2 = gep i8, *%p, 2
+    store i8 %b2, *%p2
+    ret void
+}
+
+fun @hs_get16(p: *i8) -> i32 {
+  @entry:
+    %b0 = load i8, *%p
+    %i0 = zext i8 %b0 to i32
+    %p1 = gep i8, *%p, 1
+    %b1 = load i8, *%p1
+    %i1 = zext i8 %b1 to i32
+    %s = shl i32 %i0, 8
+    %r = or i32 %s, %i1
+    ret i32 %r
+}
+
+fun @hs_get24(p: *i8) -> i32 {
+  @entry:
+    %b0 = load i8, *%p
+    %i0 = zext i8 %b0 to i32
+    %p1 = gep i8, *%p, 1
+    %b1 = load i8, *%p1
+    %i1 = zext i8 %b1 to i32
+    %p2 = gep i8, *%p, 2
+    %b2 = load i8, *%p2
+    %i2 = zext i8 %b2 to i32
+    %s0 = shl i32 %i0, 16
+    %s1 = shl i32 %i1, 8
+    %a = or i32 %s0, %s1
+    %r = or i32 %a, %i2
+    ret i32 %r
+}
+
+fun @hs_strlen(s: *i8) -> i32 {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @len_cond
+  @len_cond:
+    %iv = load i32, *%i
+    %p = gep i8, *%s, %iv
+    %c = load i8, *%p
+    %z = eq i8 %c, 0
+    br %z, @len_done, @len_body
+  @len_body:
+    %n = add i32 %iv, 1
+    store i32 %n, *%i
+    jmp @len_cond
+  @len_done:
+    %rv = load i32, *%i
+    ret i32 %rv
+}
+
+fun @hs_str_eq(a: *i8, b: *i8) -> i1 {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @eq_cond
+  @eq_cond:
+    %iv = load i32, *%i
+    %pa = gep i8, *%a, %iv
+    %pb = gep i8, *%b, %iv
+    %ca = load i8, *%pa
+    %cb = load i8, *%pb
+    %same = eq i8 %ca, %cb
+    br %same, @eq_same, @eq_no
+  @eq_same:
+    %end = eq i8 %ca, 0
+    br %end, @eq_yes, @eq_next
+  @eq_next:
+    %n = add i32 %iv, 1
+    store i32 %n, *%i
+    jmp @eq_cond
+  @eq_yes:
+    ret i1 1
+  @eq_no:
+    ret i1 0
+}
+
+fun @hs_starts_with(s: *i8, prefix: *i8) -> i1 {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @sw_cond
+  @sw_cond:
+    %iv = load i32, *%i
+    %pp = gep i8, *%prefix, %iv
+    %pc = load i8, *%pp
+    %end = eq i8 %pc, 0
+    br %end, @sw_yes, @sw_cmp
+  @sw_cmp:
+    %sp = gep i8, *%s, %iv
+    %sc = load i8, *%sp
+    %same = eq i8 %sc, %pc
+    br %same, @sw_next, @sw_no
+  @sw_next:
+    %n = add i32 %iv, 1
+    store i32 %n, *%i
+    jmp @sw_cond
+  @sw_yes:
+    ret i1 1
+  @sw_no:
+    ret i1 0
+}
+
+fun @hs_ends_with(s: *i8, suffix: *i8) -> i1 {
+  @entry:
+    %sl = call @hs_strlen(%s)
+    %pl = call @hs_strlen(%suffix)
+    %fits = sge i32 %sl, %pl
+    br %fits, @ew_calc, @ew_no
+  @ew_calc:
+    %start = sub i32 %sl, %pl
+    %iv = let i32
+    store i32 0, *%iv
+    %base = let i32
+    store i32 %start, *%base
+    jmp @ew_cond
+  @ew_cond:
+    %i = load i32, *%iv
+    %pl2 = call @hs_strlen(%suffix)
+    %more = slt i32 %i, %pl2
+    br %more, @ew_body, @ew_yes
+  @ew_body:
+    %b = load i32, *%base
+    %idx = add i32 %b, %i
+    %sp = gep i8, *%s, %idx
+    %pp = gep i8, *%suffix, %i
+    %sc = load i8, *%sp
+    %pc = load i8, *%pp
+    %same = eq i8 %sc, %pc
+    br %same, @ew_next, @ew_no
+  @ew_next:
+    %n = add i32 %i, 1
+    store i32 %n, *%iv
+    jmp @ew_cond
+  @ew_yes:
+    ret i1 1
+  @ew_no:
+    ret i1 0
+}
+
+fun @hs_contains_dotdot(s: *i8) -> i1 {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @dd_cond
+  @dd_cond:
+    %iv = load i32, *%i
+    %p = gep i8, *%s, %iv
+    %c = load i8, *%p
+    %z = eq i8 %c, 0
+    br %z, @dd_no, @dd_chk
+  @dd_chk:
+    %isdot = eq i8 %c, 46
+    br %isdot, @dd_second, @dd_next
+  @dd_second:
+    %p2 = gep i8, *%p, 1
+    %c2 = load i8, *%p2
+    %isdot2 = eq i8 %c2, 46
+    br %isdot2, @dd_yes, @dd_next
+  @dd_next:
+    %n = add i32 %iv, 1
+    store i32 %n, *%i
+    jmp @dd_cond
+  @dd_yes:
+    ret i1 1
+  @dd_no:
+    ret i1 0
+}
+
+// 只允许可打印 ASCII，且拒绝反斜杠与百分号，避免路径穿越和编码歧义
+fun @hs_path_ok(s: *i8) -> i1 {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @po_cond
+  @po_cond:
+    %iv = load i32, *%i
+    %p = gep i8, *%s, %iv
+    %c = load i8, *%p
+    %z = eq i8 %c, 0
+    br %z, @po_yes, @po_chk
+  @po_chk:
+    %ci = zext i8 %c to i32
+    %lo = slt i32 %ci, 32
+    %del = eq i32 %ci, 127
+    %bad1 = or i1 %lo, %del
+    %bs = eq i8 %c, 92
+    %pct = eq i8 %c, 37
+    %bad2 = or i1 %bs, %pct
+    %bad = or i1 %bad1, %bad2
+    br %bad, @po_no, @po_next
+  @po_next:
+    %n = add i32 %iv, 1
+    store i32 %n, *%i
+    jmp @po_cond
+  @po_yes:
+    ret i1 1
+  @po_no:
+    ret i1 0
+}
+
+fun @hs_find_byte(buf: *i8, start: i32, end: i32, ch: i32) -> i32 {
+  @entry:
+    %i = let i32
+    store i32 %start, *%i
+    jmp @fb_cond
+  @fb_cond:
+    %iv = load i32, *%i
+    %over = sge i32 %iv, %end
+    br %over, @fb_none, @fb_body
+  @fb_body:
+    %p = gep i8, *%buf, %iv
+    %c = load i8, *%p
+    %ci = zext i8 %c to i32
+    %same = eq i32 %ci, %ch
+    br %same, @fb_yes, @fb_next
+  @fb_next:
+    %n = add i32 %iv, 1
+    store i32 %n, *%i
+    jmp @fb_cond
+  @fb_yes:
+    ret i32 %iv
+  @fb_none:
+    ret i32 -1
+}
+
+fun @hs_append(dst: *i8, off: i32, src: *i8, len: i32) -> i32 {
+  @entry:
+    %d = gep i8, *%dst, %off
+    %l64 = sext i32 %len to i64
+    call @memcpy(%d, %src, %l64)
+    %n = add i32 %off, %len
+    ret i32 %n
+}
+
+fun @hs_append_cstr(dst: *i8, off: i32, src: *i8) -> i32 {
+  @entry:
+    %l = call @hs_strlen(%src)
+    %n = call @hs_append(%dst, %off, %src, %l)
+    ret i32 %n
+}
+
+fun @hs_append_int(dst: *i8, off: i32, v: i32) -> i32 {
+  @entry:
+    %digits = let [i8, 12]
+    %dp = gep i8, *%digits, 0
+    %vv = let i32
+    store i32 %v, *%vv
+    %ci = let i32
+    store i32 0, *%ci
+    %j = let i32
+    %outoff = let i32
+    store i32 %off, *%outoff
+    %iszero = eq i32 %v, 0
+    br %iszero, @ai_zero, @ai_ex
+  @ai_zero:
+    %zp = gep i8, *%dst, %off
+    store i8 48, *%zp
+    %zo = add i32 %off, 1
+    ret i32 %zo
+  @ai_ex:
+    jmp @ai_cond
+  @ai_cond:
+    %cur = load i32, *%vv
+    %z = eq i32 %cur, 0
+    br %z, @ai_rev_init, @ai_body
+  @ai_body:
+    %d = rem i32 %cur, 10
+    %ch = add i32 %d, 48
+    %ch8 = trunc i32 %ch to i8
+    %idx = load i32, *%ci
+    %pp = gep i8, *%dp, %idx
+    store i8 %ch8, *%pp
+    %q = div i32 %cur, 10
+    store i32 %q, *%vv
+    %idx2 = add i32 %idx, 1
+    store i32 %idx2, *%ci
+    jmp @ai_cond
+  @ai_rev_init:
+    %len = load i32, *%ci
+    %lm1 = sub i32 %len, 1
+    store i32 %lm1, *%j
+    jmp @ai_rev_cond
+  @ai_rev_cond:
+    %jv = load i32, *%j
+    %neg = slt i32 %jv, 0
+    br %neg, @ai_done, @ai_rev_body
+  @ai_rev_body:
+    %jp = gep i8, *%dp, %jv
+    %cv = load i8, *%jp
+    %oo = load i32, *%outoff
+    %op = gep i8, *%dst, %oo
+    store i8 %cv, *%op
+    %oo2 = add i32 %oo, 1
+    store i32 %oo2, *%outoff
+    %jv2 = sub i32 %jv, 1
+    store i32 %jv2, *%j
+    jmp @ai_rev_cond
+  @ai_done:
+    %oo3 = load i32, *%outoff
+    ret i32 %oo3
+}
+
+fun @hs_atoi(s: *i8) -> i32 {
+  @entry:
+    %i = let i32
+    %v = let i32
+    store i32 0, *%i
+    store i32 0, *%v
+    jmp @atoi_cond
+  @atoi_cond:
+    %iv = load i32, *%i
+    %p = gep i8, *%s, %iv
+    %c = load i8, *%p
+    %z = eq i8 %c, 0
+    br %z, @atoi_done, @atoi_chk
+  @atoi_chk:
+    %ci = zext i8 %c to i32
+    %ge0 = sge i32 %ci, 48
+    %le9 = sle i32 %ci, 57
+    %digit = and i1 %ge0, %le9
+    br %digit, @atoi_add, @atoi_done
+  @atoi_add:
+    %vv = load i32, *%v
+    %x10 = mul i32 %vv, 10
+    %d = sub i32 %ci, 48
+    %nv = add i32 %x10, %d
+    store i32 %nv, *%v
+    %ni = add i32 %iv, 1
+    store i32 %ni, *%i
+    jmp @atoi_cond
+  @atoi_done:
+    %rv = load i32, *%v
+    ret i32 %rv
+}

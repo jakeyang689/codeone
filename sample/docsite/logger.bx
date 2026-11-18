@@ -1,0 +1,247 @@
+// 后台日志：生产者写入环形队列，独立日志线程落盘
+// 单文件上限 50 MB，超过后归档为 logs/site-<epoch>.log 并新建 logs/site.log
+
+extern @memcpy(dst: *i8, src: *i8, n: i64) -> *i8
+extern @fopen(path: *i8, mode: *i8) -> *i8
+extern @fwrite(buf: *i8, size: i64, count: i64, fp: *i8) -> i64
+extern @fseek(fp: *i8, off: i64, whence: i32) -> i32
+extern @ftell(fp: *i8) -> i64
+extern @fflush(fp: *i8) -> i32
+extern @fclose(fp: *i8) -> i32
+extern @rename(old: *i8, new: *i8) -> i32
+extern @mkdir(path: *i8, mode: i32) -> i32
+extern @time(t: *i64) -> i64
+extern @localtime(t: *i64) -> *i8
+extern @strftime(s: *i8, max: i64, fmt: *i8, tm: *i8) -> i64
+
+extern @std_thread_mutex_new() -> *i8
+extern @std_thread_mutex_lock(m: *i8) -> i32
+extern @std_thread_mutex_unlock(m: *i8) -> i32
+extern @std_thread_cond_new() -> *i8
+extern @std_thread_cond_wait(c: *i8, m: *i8) -> i32
+extern @std_thread_cond_signal(c: *i8) -> i32
+extern @std_thread_spawn(task_id: i32, arg: *i8) -> *i8
+extern @std_thread_detach(t: *i8) -> i32
+
+extern @hs_append_cstr(dst: *i8, off: i32, src: *i8) -> i32
+extern @hs_append_int(dst: *i8, off: i32, v: i32) -> i32
+
+const @LOG_MAX: i64 = 52428800
+const @LOG_SLOTS: i32 = 256
+const @LOG_SLOT_SZ: i32 = 256
+const @LOG_MASK: i32 = 255
+const @LOG_TASK: i32 = -1
+
+global @g_log_ring: [i8, 65536]
+global @g_log_len: [i32, 256]
+global @g_log_head: i32
+global @g_log_tail: i32
+global @g_log_drops: i32
+global @g_log_mtx: *i8
+global @g_log_cond: *i8
+global @g_log_fp: *i8
+global @g_log_size: i64
+
+fun @log_clamp(len: i32) -> i32 {
+  @entry:
+    %neg = slt i32 %len, 0
+    br %neg, @lc_zero, @lc_high
+  @lc_zero:
+    ret i32 0
+  @lc_high:
+    %big = sgt i32 %len, @LOG_MASK
+    br %big, @lc_max, @lc_ok
+  @lc_max:
+    ret i32 255
+  @lc_ok:
+    ret i32 %len
+}
+
+fun @log_rotate() -> void {
+  @entry:
+    %pathbuf = let [i8, 256]
+    %pp = gep i8, *%pathbuf, 0
+    %fp = load *i8, *@g_log_fp
+    %isn = eq *i8 %fp, null
+    br %isn, @lr_reopen, @lr_close
+  @lr_close:
+    %fc = call @fclose(%fp)
+    jmp @lr_reopen
+  @lr_reopen:
+    %t64 = call @time(null)
+    %epoch = trunc i64 %t64 to i32
+    %o1 = call @hs_append_cstr(%pp, 0, "logs/site-")
+    %o2 = call @hs_append_int(%pp, %o1, %epoch)
+    %o3 = call @hs_append_cstr(%pp, %o2, ".log")
+    %np = gep i8, *%pp, %o3
+    store i8 0, *%np
+    %rn = call @rename("logs/site.log", %pp)
+    %nf = call @fopen("logs/site.log", "a")
+    store *i8 %nf, *@g_log_fp
+    store i64 0, *@g_log_size
+    ret void
+}
+
+fun @log_emit(msg: *i8, len: i32) -> void {
+  @entry:
+    %line = let [i8, 384]
+    %lp = gep i8, *%line, 0
+    %tstamp = let i64
+    %tsp = gep i64, *%tstamp, 0
+    %t64 = call @time(null)
+    store i64 %t64, *%tsp
+    %tm = call @localtime(%tsp)
+    %ts64 = call @strftime(%lp, 32, "%Y-%m-%d %H:%M:%S", %tm)
+    %ts = trunc i64 %ts64 to i32
+    %sp = gep i8, *%lp, %ts
+    store i8 32, *%sp
+    %mo = add i32 %ts, 1
+    %md = gep i8, *%lp, %mo
+    %n64 = sext i32 %len to i64
+    call @memcpy(%md, %msg, %n64)
+    %nl = add i32 %mo, %len
+    %nlp = gep i8, *%lp, %nl
+    store i8 10, *%nlp
+    %total = add i32 %nl, 1
+    %sz = load i64, *@g_log_size
+    %tot64 = sext i32 %total to i64
+    %nsz = add i64 %sz, %tot64
+    %over = sgt i64 %nsz, @LOG_MAX
+    br %over, @le_rot, @le_write
+  @le_rot:
+    call @log_rotate()
+    jmp @le_write
+  @le_write:
+    %fp = load *i8, *@g_log_fp
+    %t64b = sext i32 %total to i64
+    %w = call @fwrite(%lp, 1, %t64b, %fp)
+    %fl = call @fflush(%fp)
+    %sz2 = load i64, *@g_log_size
+    %sz3 = add i64 %sz2, %t64b
+    store i64 %sz3, *@g_log_size
+    ret void
+}
+
+fun @log_dropped(n: i32) -> void {
+  @entry:
+    %buf = let [i8, 64]
+    %bp = gep i8, *%buf, 0
+    %o1 = call @hs_append_cstr(%bp, 0, "WARN dropped ")
+    %o2 = call @hs_append_int(%bp, %o1, %n)
+    %o3 = call @hs_append_cstr(%bp, %o2, " log lines")
+    call @log_emit(%bp, %o3)
+    ret void
+}
+
+fun @log_enqueue(msg: *i8, len: i32) -> void {
+  @entry:
+    %m = load *i8, *@g_log_mtx
+    %isn = eq *i8 %m, null
+    br %isn, @le_ret, @le_lock
+  @le_lock:
+    %lr = call @std_thread_mutex_lock(%m)
+    %tail = load i32, *@g_log_tail
+    %head = load i32, *@g_log_head
+    %count = sub i32 %tail, %head
+    %full = sge i32 %count, @LOG_SLOTS
+    br %full, @le_drop, @le_put
+  @le_drop:
+    %d = load i32, *@g_log_drops
+    %dn = add i32 %d, 1
+    store i32 %dn, *@g_log_drops
+    %ur0 = call @std_thread_mutex_unlock(%m)
+    ret void
+  @le_put:
+    %n = call @log_clamp(%len)
+    %slot = and i32 %tail, @LOG_MASK
+    %base = mul i32 %slot, @LOG_SLOT_SZ
+    %dst = gep i8, *@g_log_ring, %base
+    %n64 = sext i32 %n to i64
+    call @memcpy(%dst, %msg, %n64)
+    %lenp = gep i32, *@g_log_len, %slot
+    store i32 %n, *%lenp
+    %t2 = add i32 %tail, 1
+    store i32 %t2, *@g_log_tail
+    %c = load *i8, *@g_log_cond
+    %sg = call @std_thread_cond_signal(%c)
+    %ur = call @std_thread_mutex_unlock(%m)
+    ret void
+  @le_ret:
+    ret void
+}
+
+fun @log_loop() -> void {
+  @entry:
+    %msg = let [i8, 256]
+    %mp = gep i8, *%msg, 0
+    %m = load *i8, *@g_log_mtx
+    %c = load *i8, *@g_log_cond
+    jmp @ll_lock
+  @ll_lock:
+    %lr = call @std_thread_mutex_lock(%m)
+    jmp @ll_cond
+  @ll_cond:
+    %head = load i32, *@g_log_head
+    %tail = load i32, *@g_log_tail
+    %empty = eq i32 %head, %tail
+    br %empty, @ll_wait, @ll_take
+  @ll_wait:
+    %w = call @std_thread_cond_wait(%c, %m)
+    jmp @ll_cond
+  @ll_take:
+    %slot = and i32 %head, @LOG_MASK
+    %lenp = gep i32, *@g_log_len, %slot
+    %n = load i32, *%lenp
+    %base = mul i32 %slot, @LOG_SLOT_SZ
+    %src = gep i8, *@g_log_ring, %base
+    %n64 = sext i32 %n to i64
+    call @memcpy(%mp, %src, %n64)
+    %h2 = add i32 %head, 1
+    store i32 %h2, *@g_log_head
+    %drops = load i32, *@g_log_drops
+    store i32 0, *@g_log_drops
+    %ur = call @std_thread_mutex_unlock(%m)
+    %hasd = sgt i32 %drops, 0
+    br %hasd, @ll_warn, @ll_emit
+  @ll_warn:
+    call @log_dropped(%drops)
+    jmp @ll_emit
+  @ll_emit:
+    call @log_emit(%mp, %n)
+    jmp @ll_lock
+}
+
+fun @log_init() -> i32 {
+  @entry:
+    %mk = call @mkdir("logs", 493)
+    %m = call @std_thread_mutex_new()
+    store *i8 %m, *@g_log_mtx
+    %c = call @std_thread_cond_new()
+    store *i8 %c, *@g_log_cond
+    store i32 0, *@g_log_head
+    store i32 0, *@g_log_tail
+    store i32 0, *@g_log_drops
+    store i64 0, *@g_log_size
+    %fp = call @fopen("logs/site.log", "a")
+    %isn = eq *i8 %fp, null
+    br %isn, @li_fail, @li_size
+  @li_size:
+    store *i8 %fp, *@g_log_fp
+    %f1 = call @fseek(%fp, 0, 2)
+    %sz = call @ftell(%fp)
+    store i64 %sz, *@g_log_size
+    %over = sge i64 %sz, @LOG_MAX
+    br %over, @li_rotate, @li_thread
+  @li_rotate:
+    call @log_rotate()
+    jmp @li_thread
+  @li_thread:
+    %t = call @std_thread_spawn(@LOG_TASK, null)
+    %tnull = eq *i8 %t, null
+    br %tnull, @li_fail, @li_ok
+  @li_ok:
+    %dt = call @std_thread_detach(%t)
+    ret i32 0
+  @li_fail:
+    ret i32 -1
+}
