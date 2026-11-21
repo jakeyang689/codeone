@@ -1,0 +1,474 @@
+// widget.bx - retained widget list: windows, text labels and buttons
+//
+// A fixed table of records. Layout is computed by the caller; this module owns
+// registration, hover/press state, hit testing and draw dispatch. Appearance
+// comes from render.bx.
+
+extern @render_window(x: i32, y: i32, w: i32, h: i32, accent: i32, title: *i8, alpha: i32) -> void
+extern @render_text(x: i32, y: i32, s: *i8, color: i32, scale: i32, alpha: i32) -> void
+extern @render_button(x: i32, y: i32, w: i32, h: i32, label: *i8, color: i32, state: i32, alpha: i32) -> void
+
+const @widget_KIND_WINDOW: i32 = 0
+const @widget_KIND_TEXT: i32 = 1
+const @widget_KIND_BUTTON: i32 = 2
+
+// State bits, shared with render.bx.
+const @widget_ST_HOVER: i32 = 1
+const @widget_ST_DOWN: i32 = 2
+const @widget_ST_SELECTED: i32 = 4
+const @widget_ST_DISABLED: i32 = 8
+
+const @widget_NONE: i32 = -1
+
+struct @widget_Item {
+  @kind: i32,
+  @id: i32,
+  @x: i32,
+  @y: i32,
+  @w: i32,
+  @h: i32,
+  @color: i32,
+  @flags: i32,
+  @scale: i32,
+  @label: *i8,
+  @alpha: i32
+}
+
+global @widget_ITEMS: [@widget_Item, 48]
+global @widget_N: i32
+global @widget_HOVER: i32
+global @widget_PRESSED: i32
+
+fun @widget_item(i: i32) -> *@widget_Item {
+  @entry:
+    %p = gep @widget_Item, *@widget_ITEMS, %i
+    ret *@widget_Item %p
+}
+
+fun @widget_reset() -> void {
+  @entry:
+    store i32 0, *@widget_N
+    store i32 @widget_NONE, *@widget_HOVER
+    store i32 @widget_NONE, *@widget_PRESSED
+    ret void
+}
+
+fun @widget_add(kind: i32, id: i32, x: i32, y: i32, w: i32, h: i32, color: i32, scale: i32, label: *i8) -> i32 {
+  @entry:
+    %n = load i32, *@widget_N
+    %full = sge i32 %n, 48
+    br %full, @full_slot, @store_slot
+  @store_slot:
+    %p = call @widget_item(%n)
+    %f0 = field @widget_Item, *%p, 0
+    store i32 %kind, *%f0
+    %f1 = field @widget_Item, *%p, 1
+    store i32 %id, *%f1
+    %f2 = field @widget_Item, *%p, 2
+    store i32 %x, *%f2
+    %f3 = field @widget_Item, *%p, 3
+    store i32 %y, *%f3
+    %f4 = field @widget_Item, *%p, 4
+    store i32 %w, *%f4
+    %f5 = field @widget_Item, *%p, 5
+    store i32 %h, *%f5
+    %f6 = field @widget_Item, *%p, 6
+    store i32 %color, *%f6
+    %f7 = field @widget_Item, *%p, 7
+    store i32 0, *%f7
+    %f8 = field @widget_Item, *%p, 8
+    store i32 %scale, *%f8
+    %f9 = field @widget_Item, *%p, 9
+    store *i8 %label, *%f9
+    %f10 = field @widget_Item, *%p, 10
+    store i32 255, *%f10
+    %n1 = add i32 %n, 1
+    store i32 %n1, *@widget_N
+    ret i32 %n
+  @full_slot:
+    ret i32 @widget_NONE
+}
+
+fun @widget_add_window(id: i32, x: i32, y: i32, w: i32, h: i32, accent: i32, title: *i8) -> i32 {
+  @entry:
+    %i = call @widget_add(@widget_KIND_WINDOW, %id, %x, %y, %w, %h, %accent, 1, %title)
+    ret i32 %i
+}
+
+fun @widget_add_text(id: i32, x: i32, y: i32, color: i32, scale: i32, s: *i8) -> i32 {
+  @entry:
+    %i = call @widget_add(@widget_KIND_TEXT, %id, %x, %y, 0, 0, %color, %scale, %s)
+    ret i32 %i
+}
+
+fun @widget_add_button(id: i32, x: i32, y: i32, w: i32, h: i32, color: i32, label: *i8) -> i32 {
+  @entry:
+    %i = call @widget_add(@widget_KIND_BUTTON, %id, %x, %y, %w, %h, %color, 1, %label)
+    ret i32 %i
+}
+
+fun @widget_find(id: i32) -> i32 {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @cond
+  @cond:
+    %iv = load i32, *%i
+    %n = load i32, *@widget_N
+    %done = sge i32 %iv, %n
+    br %done, @none, @body
+  @body:
+    %p = call @widget_item(%iv)
+    %f1 = field @widget_Item, *%p, 1
+    %wid = load i32, *%f1
+    %hit = eq i32 %wid, %id
+    br %hit, @found, @next
+  @found:
+    %fv = load i32, *%i
+    ret i32 %fv
+  @next:
+    %iv2 = load i32, *%i
+    %iv3 = add i32 %iv2, 1
+    store i32 %iv3, *%i
+    jmp @cond
+  @none:
+    ret i32 @widget_NONE
+}
+
+fun @widget_set_color(id: i32, color: i32) -> void {
+  @entry:
+    %i = call @widget_find(%id)
+    %none = eq i32 %i, @widget_NONE
+    br %none, @done, @set
+  @set:
+    %p = call @widget_item(%i)
+    %f6 = field @widget_Item, *%p, 6
+    store i32 %color, *%f6
+    jmp @done
+  @done:
+    ret void
+}
+
+fun @widget_alpha(i: i32) -> i32 {
+  @entry:
+    %p = call @widget_item(%i)
+    %f10 = field @widget_Item, *%p, 10
+    %v = load i32, *%f10
+    ret i32 %v
+}
+
+// 0 is invisible, 255 is opaque.
+fun @widget_set_alpha(id: i32, alpha: i32) -> void {
+  @entry:
+    %i = call @widget_find(%id)
+    %none = eq i32 %i, @widget_NONE
+    br %none, @done, @set
+  @set:
+    %p = call @widget_item(%i)
+    %f10 = field @widget_Item, *%p, 10
+    store i32 %alpha, *%f10
+    jmp @done
+  @done:
+    ret void
+}
+
+fun @widget_flags(i: i32) -> i32 {
+  @entry:
+    %p = call @widget_item(%i)
+    %f7 = field @widget_Item, *%p, 7
+    %v = load i32, *%f7
+    ret i32 %v
+}
+
+fun @widget_set_flags(i: i32, flags: i32) -> void {
+  @entry:
+    %p = call @widget_item(%i)
+    %f7 = field @widget_Item, *%p, 7
+    store i32 %flags, *%f7
+    ret void
+}
+
+fun @widget_in_rect(x: i32, y: i32, w: i32, h: i32, px: i32, py: i32) -> i32 {
+  @entry:
+    %xok = sge i32 %px, %x
+    br %xok, @chkx, @no
+  @chkx:
+    %x2 = add i32 %x, %w
+    %xin = slt i32 %px, %x2
+    br %xin, @chky, @no
+  @chky:
+    %yok = sge i32 %py, %y
+    br %yok, @chky2, @no
+  @chky2:
+    %y2 = add i32 %y, %h
+    %yin = slt i32 %py, %y2
+    br %yin, @yes, @no
+  @yes:
+    ret i32 1
+  @no:
+    ret i32 0
+}
+
+// Index of the topmost enabled button under the point, or @widget_NONE.
+fun @widget_hit(px: i32, py: i32) -> i32 {
+  @entry:
+    %n = load i32, *@widget_N
+    %i = let i32
+    %last = sub i32 %n, 1
+    store i32 %last, *%i
+    jmp @cond
+  @cond:
+    %iv = load i32, *%i
+    %neg = slt i32 %iv, 0
+    br %neg, @none, @body
+  @body:
+    %p = call @widget_item(%iv)
+    %f0 = field @widget_Item, *%p, 0
+    %kind = load i32, *%f0
+    %isbtn = eq i32 %kind, @widget_KIND_BUTTON
+    br %isbtn, @chk_flags, @next
+  @chk_flags:
+    %fl = call @widget_flags(%iv)
+    %dis = and i32 %fl, @widget_ST_DISABLED
+    %isdis = ne i32 %dis, 0
+    br %isdis, @next, @chk_rect
+  @chk_rect:
+    %p2 = call @widget_item(%iv)
+    %f2 = field @widget_Item, *%p2, 2
+    %x = load i32, *%f2
+    %f3 = field @widget_Item, *%p2, 3
+    %y = load i32, *%f3
+    %f4 = field @widget_Item, *%p2, 4
+    %w = load i32, *%f4
+    %f5 = field @widget_Item, *%p2, 5
+    %h = load i32, *%f5
+    %in = call @widget_in_rect(%x, %y, %w, %h, %px, %py)
+    %isin = eq i32 %in, 1
+    br %isin, @found, @next
+  @found:
+    %fv = load i32, *%i
+    ret i32 %fv
+  @next:
+    %iv2 = load i32, *%i
+    %iv3 = sub i32 %iv2, 1
+    store i32 %iv3, *%i
+    jmp @cond
+  @none:
+    ret i32 @widget_NONE
+}
+
+fun @widget_clear_bit(i: i32, bit: i32) -> void {
+  @entry:
+    %fl = call @widget_flags(%i)
+    %nb = xor i32 %bit, -1
+    %nf = and i32 %fl, %nb
+    call @widget_set_flags(%i, %nf)
+    ret void
+}
+
+fun @widget_apply_hover(active: i32) -> void {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @cond
+  @cond:
+    %iv = load i32, *%i
+    %n = load i32, *@widget_N
+    %done = sge i32 %iv, %n
+    br %done, @ret, @body
+  @body:
+    %on = eq i32 %iv, %active
+    br %on, @set_bit, @clear
+  @set_bit:
+    %fl = call @widget_flags(%iv)
+    %nf = or i32 %fl, @widget_ST_HOVER
+    call @widget_set_flags(%iv, %nf)
+    jmp @next
+  @clear:
+    call @widget_clear_bit(%iv, @widget_ST_HOVER)
+    jmp @next
+  @next:
+    %iv2 = load i32, *%i
+    %iv3 = add i32 %iv2, 1
+    store i32 %iv3, *%i
+    jmp @cond
+  @ret:
+    ret void
+}
+
+fun @widget_apply_down(active: i32) -> void {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @cond
+  @cond:
+    %iv = load i32, *%i
+    %n = load i32, *@widget_N
+    %done = sge i32 %iv, %n
+    br %done, @ret, @body
+  @body:
+    %on = eq i32 %iv, %active
+    br %on, @set_bit, @clear
+  @set_bit:
+    %fl = call @widget_flags(%iv)
+    %nf = or i32 %fl, @widget_ST_DOWN
+    call @widget_set_flags(%iv, %nf)
+    jmp @next
+  @clear:
+    call @widget_clear_bit(%iv, @widget_ST_DOWN)
+    jmp @next
+  @next:
+    %iv2 = load i32, *%i
+    %iv3 = add i32 %iv2, 1
+    store i32 %iv3, *%i
+    jmp @cond
+  @ret:
+    ret void
+}
+
+// Pointer moved to (px, py). Returns 1 when the hover target changed.
+fun @widget_pointer_move(px: i32, py: i32) -> i32 {
+  @entry:
+    %idx = call @widget_hit(%px, %py)
+    %prev = load i32, *@widget_HOVER
+    %same = eq i32 %idx, %prev
+    br %same, @unchanged, @changed
+  @changed:
+    store i32 %idx, *@widget_HOVER
+    call @widget_apply_hover(%idx)
+    ret i32 1
+  @unchanged:
+    ret i32 0
+}
+
+// Pointer pressed at (px, py). Returns the pressed widget id, or -1.
+fun @widget_pointer_down(px: i32, py: i32) -> i32 {
+  @entry:
+    %idx = call @widget_hit(%px, %py)
+    store i32 %idx, *@widget_PRESSED
+    call @widget_apply_hover(%idx)
+    call @widget_apply_down(%idx)
+    %none = eq i32 %idx, @widget_NONE
+    br %none, @miss, @hit
+  @hit:
+    %p = call @widget_item(%idx)
+    %f1 = field @widget_Item, *%p, 1
+    %id = load i32, *%f1
+    ret i32 %id
+  @miss:
+    ret i32 @widget_NONE
+}
+
+// Pointer released at (px, py). Returns the clicked widget id when press and
+// release land on the same widget, or -1.
+fun @widget_pointer_up(px: i32, py: i32) -> i32 {
+  @entry:
+    %pr = load i32, *@widget_PRESSED
+    %none = eq i32 %pr, @widget_NONE
+    br %none, @miss, @release
+  @release:
+    call @widget_apply_down(@widget_NONE)
+    store i32 @widget_NONE, *@widget_PRESSED
+    %idx = call @widget_hit(%px, %py)
+    %same = eq i32 %idx, %pr
+    br %same, @click, @miss
+  @click:
+    %p = call @widget_item(%pr)
+    %f1 = field @widget_Item, *%p, 1
+    %id = load i32, *%f1
+    ret i32 %id
+  @miss:
+    ret i32 @widget_NONE
+}
+
+// Marks the widget with this id selected and clears the bit on the others.
+fun @widget_select(id: i32) -> void {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @cond
+  @cond:
+    %iv = load i32, *%i
+    %n = load i32, *@widget_N
+    %done = sge i32 %iv, %n
+    br %done, @ret, @body
+  @body:
+    %p = call @widget_item(%iv)
+    %f1 = field @widget_Item, *%p, 1
+    %wid = load i32, *%f1
+    %on = eq i32 %wid, %id
+    br %on, @set_bit, @clear
+  @set_bit:
+    %fl = call @widget_flags(%iv)
+    %nf = or i32 %fl, @widget_ST_SELECTED
+    call @widget_set_flags(%iv, %nf)
+    jmp @next
+  @clear:
+    call @widget_clear_bit(%iv, @widget_ST_SELECTED)
+    jmp @next
+  @next:
+    %iv2 = load i32, *%i
+    %iv3 = add i32 %iv2, 1
+    store i32 %iv3, *%i
+    jmp @cond
+  @ret:
+    ret void
+}
+
+fun @widget_draw_item(i: i32) -> void {
+  @entry:
+    %p = call @widget_item(%i)
+    %f0 = field @widget_Item, *%p, 0
+    %kind = load i32, *%f0
+    %f2 = field @widget_Item, *%p, 2
+    %x = load i32, *%f2
+    %f3 = field @widget_Item, *%p, 3
+    %y = load i32, *%f3
+    %f4 = field @widget_Item, *%p, 4
+    %w = load i32, *%f4
+    %f5 = field @widget_Item, *%p, 5
+    %h = load i32, *%f5
+    %f6 = field @widget_Item, *%p, 6
+    %color = load i32, *%f6
+    %fl = call @widget_flags(%i)
+    %f8 = field @widget_Item, *%p, 8
+    %scale = load i32, *%f8
+    %f9 = field @widget_Item, *%p, 9
+    %label = load *i8, *%f9
+    %alpha = call @widget_alpha(%i)
+
+    %iswin = eq i32 %kind, @widget_KIND_WINDOW
+    br %iswin, @win, @chk_text
+  @chk_text:
+    %istext = eq i32 %kind, @widget_KIND_TEXT
+    br %istext, @text, @button
+  @win:
+    call @render_window(%x, %y, %w, %h, %color, %label, %alpha)
+    ret void
+  @text:
+    call @render_text(%x, %y, %label, %color, %scale, %alpha)
+    ret void
+  @button:
+    call @render_button(%x, %y, %w, %h, %label, %color, %fl, %alpha)
+    ret void
+}
+
+fun @widget_draw() -> void {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @cond
+  @cond:
+    %iv = load i32, *%i
+    %n = load i32, *@widget_N
+    %done = sge i32 %iv, %n
+    br %done, @ret, @body
+  @body:
+    call @widget_draw_item(%iv)
+    %iv2 = load i32, *%i
+    %iv3 = add i32 %iv2, 1
+    store i32 %iv3, *%i
+    jmp @cond
+  @ret:
+    ret void
+}

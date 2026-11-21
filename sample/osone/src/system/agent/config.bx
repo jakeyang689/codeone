@@ -1,0 +1,339 @@
+// config.bx - boot configuration for the osone agent
+//
+// There is no libc getenv() in a freestanding kernel, and QEMU does not hand
+// an ELF kernel a device tree pointer. The virt machine does expose its fw_cfg
+// device at 0x09020000, so `make run` forwards host environment variables by
+// adding an `opt/osone/bootargs` item there, and the walk below reads it back
+// into a space-separated key=value string.
+//
+// No third-party code is involved: fw_cfg is a selector register plus a data
+// register, and its file directory is a flat big-endian list.
+
+const @agentcfg_ITEM: [i8, 19] = "opt/osone/bootargs"
+const @agentcfg_FILE_DIR: i32 = 0x19
+const @agentcfg_ENTRY_MAX: i32 = 64
+
+global @agentcfg_BOOTARGS: i64 = 0
+global @agentcfg_ENTRY: [i8, 64]
+global @agentcfg_TEXT: [i8, 512]
+
+fun @agentcfg_strlen(s: *i8) -> i32 {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @cond
+  @cond:
+    %iv = load i32, *%i
+    %p = gep i8, *%s, %iv
+    %c = load i8, *%p
+    %end = eq i8 %c, 0
+    br %end, @done, @body
+  @body:
+    %n = add i32 %iv, 1
+    store i32 %n, *%i
+    jmp @cond
+  @done:
+    %r = load i32, *%i
+    ret i32 %r
+}
+
+fun @agentcfg_streq(a: *i8, b: *i8) -> i32 {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @cond
+  @cond:
+    %iv = load i32, *%i
+    %ap = gep i8, *%a, %iv
+    %ac = load i8, *%ap
+    %bp = gep i8, *%b, %iv
+    %bc = load i8, *%bp
+    %diff = ne i8 %ac, %bc
+    br %diff, @no, @same
+  @same:
+    %end = eq i8 %ac, 0
+    br %end, @yes, @next
+  @next:
+    %n = add i32 %iv, 1
+    store i32 %n, *%i
+    jmp @cond
+  @yes:
+    ret i32 1
+  @no:
+    ret i32 0
+}
+
+fun @agentcfg_to_ptr(a: i64) -> *i8 {
+  @entry:
+    %p = asm att *i8, "mov $0, ${a}", "=r,r", i64 %a
+    ret *i8 %p
+}
+
+// Big-endian 32-bit load (FDT stores every header word that way).
+fun @agentcfg_be32(p: *i8) -> i32 {
+  @entry:
+    %b0 = load i8, *%p
+    %p1 = gep i8, *%p, 1
+    %b1 = load i8, *%p1
+    %p2 = gep i8, *%p, 2
+    %b2 = load i8, *%p2
+    %p3 = gep i8, *%p, 3
+    %b3 = load i8, *%p3
+    %z0 = zext i8 %b0 to i32
+    %z1 = zext i8 %b1 to i32
+    %z2 = zext i8 %b2 to i32
+    %z3 = zext i8 %b3 to i32
+    %s0 = shl i32 %z0, 24
+    %s1 = shl i32 %z1, 16
+    %s2 = shl i32 %z2, 8
+    %r0 = or i32 %s0, %s1
+    %r1 = or i32 %r0, %s2
+    %r2 = or i32 %r1, %z3
+    ret i32 %r2
+}
+
+// Big-endian 16-bit load (fw_cfg directory stores select keys that way).
+fun @agentcfg_be16(p: *i8) -> i32 {
+  @entry:
+    %b0 = load i8, *%p
+    %p1 = gep i8, *%p, 1
+    %b1 = load i8, *%p1
+    %z0 = zext i8 %b0 to i32
+    %z1 = zext i8 %b1 to i32
+    %s0 = shl i32 %z0, 8
+    %r = or i32 %s0, %z1
+    ret i32 %r
+}
+
+// Point fw_cfg at item `key`; subsequent data reads walk that item. The
+// selector register is 16-bit big-endian, so the bytes are swapped first.
+fun @agentcfg_fwsel(key: i32) -> void {
+  @entry:
+    %lo = and i32 %key, 0xFF
+    %hi = shl i32 %lo, 8
+    %sh = lshr i32 %key, 8
+    %v = or i32 %hi, %sh
+    %p = call @agentcfg_to_ptr(0x09020008)
+    asm att void, "strh ${v:w}, [${p}]", "r,r,~{memory}", *i8 %p, i32 %v
+    ret void
+}
+
+fun @agentcfg_fwread(out: *i8, n: i32) -> void {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @cond
+  @cond:
+    %iv = load i32, *%i
+    %full = sge i32 %iv, %n
+    br %full, @done, @body
+  @body:
+    %p = call @agentcfg_to_ptr(0x09020000)
+    %v = asm att i32, "ldrb ${0:w}, [${p}]", "=r,r,~{memory}", *i8 %p
+    %b = trunc i32 %v to i8
+    %dp = gep i8, *%out, %iv
+    store i8 %b, *%dp
+    %nxt = add i32 %iv, 1
+    store i32 %nxt, *%i
+    jmp @cond
+  @done:
+    ret void
+}
+
+// Read the fw_cfg file directory and copy the opt/osone/bootargs item into
+// @agentcfg_TEXT. Entries are 64 bytes: size (u32 BE), select (u16 BE),
+// reserved (u16), name (56 bytes, NUL padded).
+fun @agentcfg_init() -> void {
+  @entry:
+    %idx = let i32
+    %count = let i32
+    %size = let i32
+    %ep = gep i8, *@agentcfg_ENTRY, 0
+    store i64 0, *@agentcfg_BOOTARGS
+    call @agentcfg_fwsel(@agentcfg_FILE_DIR)
+    call @agentcfg_fwread(%ep, 4)
+    %cnt = call @agentcfg_be32(%ep)
+    %many = sgt i32 %cnt, @agentcfg_ENTRY_MAX
+    br %many, @cap, @keep
+  @cap:
+    store i32 @agentcfg_ENTRY_MAX, *%count
+    jmp @zero
+  @keep:
+    store i32 %cnt, *%count
+    jmp @zero
+  @zero:
+    store i32 0, *%idx
+    jmp @cond
+  @cond:
+    %iv = load i32, *%idx
+    %cv = load i32, *%count
+    %done = sge i32 %iv, %cv
+    br %done, @done, @body
+  @body:
+    call @agentcfg_fwread(%ep, 64)
+    %sz = call @agentcfg_be32(%ep)
+    %selp = gep i8, *@agentcfg_ENTRY, 4
+    %sel = call @agentcfg_be16(%selp)
+    %np = gep i8, *@agentcfg_ENTRY, 8
+    %want = gep i8, *@agentcfg_ITEM, 0
+    %same = call @agentcfg_streq(%np, %want)
+    %hit = eq i32 %same, 1
+    store i32 %sz, *%size
+    br %hit, @found, @next
+  @next:
+    %iv2 = load i32, *%idx
+    %i2n = add i32 %iv2, 1
+    store i32 %i2n, *%idx
+    jmp @cond
+  @found:
+    %sv = load i32, *%size
+    %big = sgt i32 %sv, 511
+    br %big, @clamp, @use
+  @clamp:
+    store i32 511, *%size
+    jmp @use
+  @use:
+    %nv = load i32, *%size
+    %tp = gep i8, *@agentcfg_TEXT, 0
+    call @agentcfg_fwsel(%sel)
+    call @agentcfg_fwread(%tp, %nv)
+    %endp = gep i8, *@agentcfg_TEXT, %nv
+    store i8 0, *%endp
+    %addr = asm att i64, "mov $0, ${tp}", "=r,r", *i8 %tp
+    store i64 %addr, *@agentcfg_BOOTARGS
+    ret void
+  @done:
+    ret void
+}
+
+// 1 when p starts with name followed by '='.
+fun @agentcfg_prefix_eq(p: *i8, name: *i8) -> i32 {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @cond
+  @cond:
+    %iv = load i32, *%i
+    %kp = gep i8, *%name, %iv
+    %kc = load i8, *%kp
+    %kend = eq i8 %kc, 0
+    br %kend, @after, @cmp
+  @cmp:
+    %pp = gep i8, *%p, %iv
+    %pc = load i8, *%pp
+    %same = eq i8 %pc, %kc
+    br %same, @next, @no
+  @next:
+    %n = add i32 %iv, 1
+    store i32 %n, *%i
+    jmp @cond
+  @after:
+    %iv2 = load i32, *%i
+    %ep = gep i8, *%p, %iv2
+    %ec = load i8, *%ep
+    %iseq = eq i8 %ec, 61
+    br %iseq, @yes, @no
+  @yes:
+    ret i32 1
+  @no:
+    ret i32 0
+}
+
+fun @agentcfg_env_get(name: *i8, out: *i8, cap: i32) -> i32 {
+  @entry:
+    %pos = let i32
+    %k = let i32
+    %base = load i64, *@agentcfg_BOOTARGS
+    %nz = ne i64 %base, 0
+    store i32 0, *%pos
+    br %nz, @scan, @miss
+  @scan:
+    %bv = load i64, *@agentcfg_BOOTARGS
+    %iv = load i32, *%pos
+    %iv64 = sext i32 %iv to i64
+    %addr = add i64 %bv, %iv64
+    %p = call @agentcfg_to_ptr(%addr)
+    %c = load i8, *%p
+    %end = eq i8 %c, 0
+    br %end, @miss, @chkspace
+  @chkspace:
+    %sp = eq i8 %c, 32
+    br %sp, @skip, @try
+  @skip:
+    %iv2 = load i32, *%pos
+    %ivn = add i32 %iv2, 1
+    store i32 %ivn, *%pos
+    jmp @scan
+  @try:
+    %bv2 = load i64, *@agentcfg_BOOTARGS
+    %iv3 = load i32, *%pos
+    %iv364 = sext i32 %iv3 to i64
+    %a3 = add i64 %bv2, %iv364
+    %tp = call @agentcfg_to_ptr(%a3)
+    %m = call @agentcfg_prefix_eq(%tp, %name)
+    %hit = eq i32 %m, 1
+    br %hit, @copy, @seek
+  @seek:
+    %bv3 = load i64, *@agentcfg_BOOTARGS
+    %iv4 = load i32, *%pos
+    %iv464 = sext i32 %iv4 to i64
+    %a4 = add i64 %bv3, %iv464
+    %p4 = call @agentcfg_to_ptr(%a4)
+    %c4 = load i8, *%p4
+    %s4 = eq i8 %c4, 32
+    %e4 = eq i8 %c4, 0
+    %fin = or i1 %s4, %e4
+    br %fin, @seek_next, @seek_adv
+  @seek_adv:
+    %iv5 = load i32, *%pos
+    %iv5n = add i32 %iv5, 1
+    store i32 %iv5n, *%pos
+    jmp @seek
+  @seek_next:
+    %iv6 = load i32, *%pos
+    %iv6n = add i32 %iv6, 1
+    store i32 %iv6n, *%pos
+    jmp @scan
+  @copy:
+    %kl = call @agentcfg_strlen(%name)
+    %iv7 = load i32, *%pos
+    %vo = add i32 %iv7, %kl
+    %vo2 = add i32 %vo, 1
+    store i32 0, *%k
+    %vo3 = add i32 %vo2, 0
+    store i32 %vo3, *%pos
+    jmp @copy_cond
+  @copy_cond:
+    %kv = load i32, *%k
+    %lim = sub i32 %cap, 1
+    %full = sge i32 %kv, %lim
+    br %full, @copy_term, @copy_body
+  @copy_body:
+    %bv4 = load i64, *@agentcfg_BOOTARGS
+    %iv8 = load i32, *%pos
+    %iv864 = sext i32 %iv8 to i64
+    %a8 = add i64 %bv4, %iv864
+    %p8 = call @agentcfg_to_ptr(%a8)
+    %c8 = load i8, *%p8
+    %nul8 = eq i8 %c8, 0
+    %sp8 = eq i8 %c8, 32
+    %stop8 = or i1 %nul8, %sp8
+    br %stop8, @copy_term, @copy_put
+  @copy_put:
+    %kv2 = load i32, *%k
+    %dp = gep i8, *%out, %kv2
+    store i8 %c8, *%dp
+    %kn = add i32 %kv2, 1
+    store i32 %kn, *%k
+    %iv9 = load i32, *%pos
+    %iv9n = add i32 %iv9, 1
+    store i32 %iv9n, *%pos
+    jmp @copy_cond
+  @copy_term:
+    %kv3 = load i32, *%k
+    %tp2 = gep i8, *%out, %kv3
+    store i8 0, *%tp2
+    ret i32 %kv3
+  @miss:
+    ret i32 -1
+}

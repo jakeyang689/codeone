@@ -1,0 +1,175 @@
+// render.bx - widget appearance: window chrome, labels and buttons
+//
+// Built on the draw.bx primitives. The widget layer owns layout and state and
+// passes colors in; everything that is chrome only (borders, shadows, title
+// bars) uses the palette defined here.
+
+extern @gui_fill_rect_alpha(x: i32, y: i32, w: i32, h: i32, color: i32, alpha: i32) -> void
+extern @gui_rect_outline_alpha(x: i32, y: i32, w: i32, h: i32, color: i32, alpha: i32) -> void
+extern @gui_text_scale_alpha(x: i32, y: i32, s: *i8, color: i32, scale: i32, alpha: i32) -> void
+extern @gui_strlen(s: *i8) -> i32
+
+const @rnd_C_WINDOW: i32 = 0xEEF1F5
+const @rnd_C_BORDER: i32 = 0x303A4D
+const @rnd_C_SHADOW: i32 = 0x141922
+const @rnd_C_TEXT: i32 = 0x1A1F29
+const @rnd_C_LIGHT: i32 = 0xF2F5FA
+
+// Button state bits, mirrored by widget.bx.
+const @rnd_ST_HOVER: i32 = 1
+const @rnd_ST_DOWN: i32 = 2
+const @rnd_ST_SELECTED: i32 = 4
+
+const @rnd_TITLE_H: i32 = 34
+const @rnd_GLYPH: i32 = 8
+
+fun @render_text_width(s: *i8, scale: i32) -> i32 {
+  @entry:
+    %n = call @gui_strlen(%s)
+    %w = mul i32 %n, @rnd_GLYPH
+    %sw = mul i32 %w, %scale
+    ret i32 %sw
+}
+
+fun @render_text_height(scale: i32) -> i32 {
+  @entry:
+    %h = mul i32 @rnd_GLYPH, %scale
+    ret i32 %h
+}
+
+fun @render_text(x: i32, y: i32, s: *i8, color: i32, scale: i32, alpha: i32) -> void {
+  @entry:
+    call @gui_text_scale_alpha(%x, %y, %s, %color, %scale, %alpha)
+    ret void
+}
+
+fun @render_text_centered(x: i32, y: i32, w: i32, s: *i8, color: i32, scale: i32, alpha: i32) -> void {
+  @entry:
+    %tw = call @render_text_width(%s, %scale)
+    %diff = sub i32 %w, %tw
+    %neg = slt i32 %diff, 0
+    br %neg, @flush_left, @center
+  @flush_left:
+    call @gui_text_scale_alpha(%x, %y, %s, %color, %scale, %alpha)
+    ret void
+  @center:
+    %half = udiv i32 %diff, 2
+    %tx = add i32 %x, %half
+    call @gui_text_scale_alpha(%tx, %y, %s, %color, %scale, %alpha)
+    ret void
+}
+
+fun @render_alpha_mul(alpha: i32, percent: i32) -> i32 {
+  @entry:
+    %v = mul i32 %alpha, %percent
+    %a = udiv i32 %v, 255
+    ret i32 %a
+}
+
+fun @render_clamp8(v: i32) -> i32 {
+  @entry:
+    %neg = slt i32 %v, 0
+    br %neg, @zero, @chk
+  @zero:
+    ret i32 0
+  @chk:
+    %over = sgt i32 %v, 255
+    br %over, @full, @ok
+  @full:
+    ret i32 255
+  @ok:
+    ret i32 %v
+}
+
+fun @render_shade(color: i32, delta: i32) -> i32 {
+  @entry:
+    %r = lshr i32 %color, 16
+    %r2 = and i32 %r, 0xFF
+    %g = lshr i32 %color, 8
+    %g2 = and i32 %g, 0xFF
+    %b = and i32 %color, 0xFF
+    %nr = add i32 %r2, %delta
+    %ng = add i32 %g2, %delta
+    %nb = add i32 %b, %delta
+    %cr = call @render_clamp8(%nr)
+    %cg = call @render_clamp8(%ng)
+    %cb = call @render_clamp8(%nb)
+    %rs = shl i32 %cr, 16
+    %gs = shl i32 %cg, 8
+    %rg = or i32 %rs, %gs
+    %out = or i32 %rg, %cb
+    ret i32 %out
+}
+
+fun @render_window(x: i32, y: i32, w: i32, h: i32, accent: i32, title: *i8, alpha: i32) -> void {
+  @entry:
+    %sa = call @render_alpha_mul(%alpha, 128)
+    %sx = add i32 %x, 8
+    %sy = add i32 %y, 8
+    call @gui_fill_rect_alpha(%sx, %sy, %w, %h, @rnd_C_SHADOW, %sa)
+    call @gui_fill_rect_alpha(%x, %y, %w, %h, @rnd_C_WINDOW, %alpha)
+    call @gui_rect_outline_alpha(%x, %y, %w, %h, @rnd_C_BORDER, %alpha)
+
+    %tbx = add i32 %x, 1
+    %tby = add i32 %y, 1
+    %tbw = sub i32 %w, 2
+    call @gui_fill_rect_alpha(%tbx, %tby, %tbw, @rnd_TITLE_H, %accent, %alpha)
+
+    %tx = add i32 %x, 16
+    %ty = add i32 %y, 13
+    call @gui_text_scale_alpha(%tx, %ty, %title, @rnd_C_LIGHT, 1, %alpha)
+    ret void
+}
+
+fun @render_button_fill(color: i32, state: i32) -> i32 {
+  @entry:
+    %down = and i32 %state, @rnd_ST_DOWN
+    %isd = ne i32 %down, 0
+    br %isd, @pressed, @check_hover
+  @pressed:
+    %d = call @render_shade(%color, -40)
+    ret i32 %d
+  @check_hover:
+    %hov = and i32 %state, @rnd_ST_HOVER
+    %ish = ne i32 %hov, 0
+    br %ish, @hover, @plain
+  @hover:
+    %u = call @render_shade(%color, 24)
+    ret i32 %u
+  @plain:
+    ret i32 %color
+}
+
+fun @render_button(x: i32, y: i32, w: i32, h: i32, label: *i8, color: i32, state: i32, alpha: i32) -> void {
+  @entry:
+    %fill = call @render_button_fill(%color, %state)
+    call @gui_fill_rect_alpha(%x, %y, %w, %h, %fill, %alpha)
+
+    %sel = and i32 %state, @rnd_ST_SELECTED
+    %issel = ne i32 %sel, 0
+    br %issel, @selected, @bordered
+  @selected:
+    %ox = sub i32 %x, 2
+    %oy = sub i32 %y, 2
+    %ow = add i32 %w, 4
+    %oh = add i32 %h, 4
+    call @gui_rect_outline_alpha(%ox, %oy, %ow, %oh, @rnd_C_TEXT, %alpha)
+    jmp @label
+  @bordered:
+    call @gui_rect_outline_alpha(%x, %y, %w, %h, @rnd_C_BORDER, %alpha)
+    jmp @label
+
+  @label:
+    %lh = call @render_text_height(1)
+    %pad = sub i32 %h, %lh
+    %neg = slt i32 %pad, 0
+    br %neg, @top, @mid
+  @top:
+    call @render_text_centered(%x, %y, %w, %label, @rnd_C_LIGHT, 1, %alpha)
+    ret void
+  @mid:
+    %half = udiv i32 %pad, 2
+    %ty = add i32 %y, %half
+    call @render_text_centered(%x, %ty, %w, %label, @rnd_C_LIGHT, 1, %alpha)
+    ret void
+}

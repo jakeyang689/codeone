@@ -1,0 +1,762 @@
+// cmd_fs.bx - filesystem shell commands: ls / cd / pwd / cat / mkdir / touch / cp / rm / rmdir / mv
+//
+// Owns the shell working directory.  The VFS accepts only absolute paths, so
+// relative arguments are joined onto the cwd and normalized here.
+
+extern @console_putc(ch: i32) -> void
+extern @console_puts(s: *i8) -> void
+extern @console_printf(fmt: *i8, a: i64, b: i64, c: i64, d: i64, s1: *i8, s2: *i8) -> void
+extern @vfs_lookup(path: *i8) -> i32
+extern @vfs_open(path: *i8, flags: i32) -> i32
+extern @vfs_close(fd: i32) -> i32
+extern @vfs_readdir(fd: i32, idx: i32) -> i32
+extern @vfs_read(fd: i32, buf: *i8, len: i64) -> i64
+extern @vfs_write(fd: i32, buf: *i8, len: i64) -> i64
+extern @vfs_create(path: *i8, type: i32) -> i32
+extern @vfs_mkdir(path: *i8) -> i32
+extern @vfs_remove(path: *i8) -> i32
+extern @vfs_rename(oldpath: *i8, newpath: *i8) -> i32
+extern @vfs_name(ino: i32) -> *i8
+extern @vfs_size(ino: i32) -> i64
+extern @vfs_type(ino: i32) -> i32
+
+const @cmdfs_NL: [i8, 2] = "\n"
+const @cmdfs_NOT_FOUND: [i8, 19] = "sh: %s: not found\n"
+const @cmdfs_NOT_DIR: [i8, 25] = "sh: %s: not a directory\n"
+const @cmdfs_NOT_FILE: [i8, 20] = "sh: %s: not a file\n"
+const @cmdfs_CAT_USAGE: [i8, 19] = "usage: cat <file>\n"
+const @cmdfs_MKDIR_USAGE: [i8, 20] = "usage: mkdir <dir>\n"
+const @cmdfs_TOUCH_USAGE: [i8, 21] = "usage: touch <file>\n"
+const @cmdfs_CP_USAGE: [i8, 23] = "usage: cp <src> <dst>\n"
+const @cmdfs_RM_USAGE: [i8, 18] = "usage: rm <file>\n"
+const @cmdfs_RMDIR_USAGE: [i8, 20] = "usage: rmdir <dir>\n"
+const @cmdfs_MV_USAGE: [i8, 23] = "usage: mv <src> <dst>\n"
+const @cmdfs_IS_DIR: [i8, 24] = "sh: %s: is a directory\n"
+const @cmdfs_NOT_EMPTY: [i8, 29] = "sh: %s: directory not empty\n"
+const @cmdfs_CANNOT_RM: [i8, 23] = "sh: %s: cannot remove\n"
+const @cmdfs_CANNOT_MV: [i8, 21] = "sh: %s: cannot move\n"
+const @cmdfs_EXISTS: [i8, 16] = "sh: %s: exists\n"
+const @cmdfs_CANNOT: [i8, 23] = "sh: %s: cannot create\n"
+const @cmdfs_WRITE_FAIL: [i8, 22] = "sh: %s: write failed\n"
+const @cmdfs_DIR_FMT: [i8, 7] = "  %s/\n"
+const @cmdfs_FILE_FMT: [i8, 10] = "  %s  %d\n"
+const @cmdfs_ROOT: [i8, 2] = "/"
+
+global @cmdfs_cwd: [i8, 256]
+global @cmdfs_raw: [i8, 512]
+global @cmdfs_path: [i8, 256]
+global @cmdfs_comp: [i32, 128]
+global @cmdfs_iobuf: [i8, 128]
+
+fun @cmdfs_strlen(s: *i8) -> i32 {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @cond
+  @cond:
+    %iv = load i32, *%i
+    %p = gep i8, *%s, %iv
+    %c = load i8, *%p
+    %z = eq i8 %c, 0
+    br %z, @done, @body
+  @body:
+    %n = add i32 %iv, 1
+    store i32 %n, *%i
+    jmp @cond
+  @done:
+    %r = load i32, *%i
+    ret i32 %r
+}
+
+fun @cmdfs_strcpy(dst: *i8, src: *i8) -> void {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @cond
+  @cond:
+    %iv = load i32, *%i
+    %sp = gep i8, *%src, %iv
+    %c = load i8, *%sp
+    %dp = gep i8, *%dst, %iv
+    store i8 %c, *%dp
+    %z = eq i8 %c, 0
+    br %z, @done, @body
+  @body:
+    %n = add i32 %iv, 1
+    store i32 %n, *%i
+    jmp @cond
+  @done:
+    ret void
+}
+
+// Normalize src into an absolute path in dst: collapse repeated slashes, resolve "." and "..".
+fun @cmdfs_normalize(src: *i8, dst: *i8) -> void {
+  @entry:
+    %i = let i32
+    %j = let i32
+    %out = let i32
+    %depth = let i32
+    store i32 0, *%i
+    store i32 0, *%out
+    store i32 0, *%depth
+    %d0 = gep i8, *%dst, 0
+    store i8 0, *%d0
+    jmp @skip
+  @skip:
+    %i0 = load i32, *%i
+    %p0 = gep i8, *%src, %i0
+    %c0 = load i8, *%p0
+    %z0 = eq i8 %c0, 0
+    br %z0, @finish, @chk_sl
+  @chk_sl:
+    %issl = eq i8 %c0, 47
+    br %issl, @skip_one, @comp
+  @skip_one:
+    %i1 = add i32 %i0, 1
+    store i32 %i1, *%i
+    jmp @skip
+  @comp:
+    store i32 %i0, *%j
+    jmp @comp_scan
+  @comp_scan:
+    %jv = load i32, *%j
+    %jp = gep i8, *%src, %jv
+    %jc = load i8, *%jp
+    %jz = eq i8 %jc, 0
+    br %jz, @comp_end, @comp_sl
+  @comp_sl:
+    %jsl = eq i8 %jc, 47
+    br %jsl, @comp_end, @comp_next
+  @comp_next:
+    %jn = add i32 %jv, 1
+    store i32 %jn, *%j
+    jmp @comp_scan
+  @comp_end:
+    %jend = load i32, *%j
+    %ib = load i32, *%i
+    %len = sub i32 %jend, %ib
+    %is1 = eq i32 %len, 1
+    br %is1, @chk_dot, @chk_dd
+  @chk_dot:
+    %dp = gep i8, *%src, %ib
+    %dc = load i8, *%dp
+    %isdot = eq i8 %dc, 46
+    br %isdot, @consume, @push
+  @chk_dd:
+    %is2 = eq i32 %len, 2
+    br %is2, @chk_dd1, @push
+  @chk_dd1:
+    %dp1 = gep i8, *%src, %ib
+    %dc1 = load i8, *%dp1
+    %ok1 = eq i8 %dc1, 46
+    br %ok1, @chk_dd2, @push
+  @chk_dd2:
+    %ib1 = add i32 %ib, 1
+    %dp2 = gep i8, *%src, %ib1
+    %dc2 = load i8, *%dp2
+    %ok2 = eq i8 %dc2, 46
+    br %ok2, @pop, @push
+  @pop:
+    %dv = load i32, *%depth
+    %has = sge i32 %dv, 1
+    br %has, @pop_do, @consume
+  @pop_do:
+    %dv2 = sub i32 %dv, 1
+    store i32 %dv2, *%depth
+    %cp = gep i32, *@cmdfs_comp, %dv2
+    %ov = load i32, *%cp
+    store i32 %ov, *%out
+    %op = gep i8, *%dst, %ov
+    store i8 0, *%op
+    jmp @consume
+  @push:
+    %di = load i32, *%depth
+    %cp2 = gep i32, *@cmdfs_comp, %di
+    %ov2 = load i32, *%out
+    store i32 %ov2, *%cp2
+    %di2 = add i32 %di, 1
+    store i32 %di2, *%depth
+    %op2 = gep i8, *%dst, %ov2
+    store i8 47, *%op2
+    %ov3 = add i32 %ov2, 1
+    store i32 %ov3, *%out
+    jmp @copy_cond
+  @copy_cond:
+    %ib2 = load i32, *%i
+    %jend2 = load i32, *%j
+    %cd = sge i32 %ib2, %jend2
+    br %cd, @copy_done, @copy_body
+  @copy_body:
+    %sp = gep i8, *%src, %ib2
+    %sc = load i8, *%sp
+    %ov4 = load i32, *%out
+    %dp3 = gep i8, *%dst, %ov4
+    store i8 %sc, *%dp3
+    %ov5 = add i32 %ov4, 1
+    store i32 %ov5, *%out
+    %ib3 = add i32 %ib2, 1
+    store i32 %ib3, *%i
+    jmp @copy_cond
+  @copy_done:
+    %ov6 = load i32, *%out
+    %dp4 = gep i8, *%dst, %ov6
+    store i8 0, *%dp4
+    jmp @consume
+  @consume:
+    %jf = load i32, *%j
+    store i32 %jf, *%i
+    jmp @skip
+  @finish:
+    %ovf = load i32, *%out
+    %isroot = eq i32 %ovf, 0
+    br %isroot, @set_root, @done
+  @set_root:
+    %rp = gep i8, *%dst, 0
+    store i8 47, *%rp
+    %rp1 = gep i8, *%dst, 1
+    store i8 0, *%rp1
+    jmp @done
+  @done:
+    ret void
+}
+
+// Join a relative path onto the cwd and normalize the result into @cmdfs_path.
+fun @cmdfs_abspath(arg: *i8) -> *i8 {
+  @entry:
+    %off = let i32
+    %raw = gep i8, *@cmdfs_raw, 0
+    %a0 = gep i8, *%arg, 0
+    %c0 = load i8, *%a0
+    %empty = eq i8 %c0, 0
+    br %empty, @use_cwd, @chk_abs
+  @use_cwd:
+    %cwd = gep i8, *@cmdfs_cwd, 0
+    call @cmdfs_strcpy(%raw, %cwd)
+    jmp @norm
+  @chk_abs:
+    %isabs = eq i8 %c0, 47
+    br %isabs, @copy_arg, @rel
+  @copy_arg:
+    call @cmdfs_strcpy(%raw, %arg)
+    jmp @norm
+  @rel:
+    %cwd2 = gep i8, *@cmdfs_cwd, 0
+    call @cmdfs_strcpy(%raw, %cwd2)
+    %n = call @cmdfs_strlen(%raw)
+    %last = sub i32 %n, 1
+    %lp = gep i8, *%raw, %last
+    %lc = load i8, *%lp
+    %issl = eq i8 %lc, 47
+    br %issl, @join_arg, @add_slash
+  @add_slash:
+    %sp = gep i8, *%raw, %n
+    store i8 47, *%sp
+    %n1 = add i32 %n, 1
+    %zp = gep i8, *%raw, %n1
+    store i8 0, *%zp
+    store i32 %n1, *%off
+    jmp @copy_rel
+  @join_arg:
+    store i32 %n, *%off
+    jmp @copy_rel
+  @copy_rel:
+    %ov = load i32, *%off
+    %dp = gep i8, *%raw, %ov
+    call @cmdfs_strcpy(%dp, %arg)
+    jmp @norm
+  @norm:
+    %dst = gep i8, *@cmdfs_path, 0
+    call @cmdfs_normalize(%raw, %dst)
+    ret *i8 %dst
+}
+
+// Set the working directory to the filesystem root.
+fun @cmdfs_init() -> void {
+  @entry:
+    %cwd = gep i8, *@cmdfs_cwd, 0
+    store i8 47, *%cwd
+    %cwd1 = gep i8, *@cmdfs_cwd, 1
+    store i8 0, *%cwd1
+    ret void
+}
+
+fun @cmdfs_ls(arg: *i8) -> void {
+  @entry:
+    %i = let i32
+    %path = call @cmdfs_abspath(%arg)
+    %ino = call @vfs_lookup(%path)
+    %ok = sge i32 %ino, 0
+    br %ok, @found, @missing
+  @missing:
+    %nf = gep i8, *@cmdfs_NOT_FOUND, 0
+    call @console_printf(%nf, 0, 0, 0, 0, %path, null)
+    ret void
+  @found:
+    %ty = call @vfs_type(%ino)
+    %isdir = eq i32 %ty, 2
+    br %isdir, @listdir, @listfile
+  @listfile:
+    %nm = call @vfs_name(%ino)
+    %sz = call @vfs_size(%ino)
+    %ff = gep i8, *@cmdfs_FILE_FMT, 0
+    call @console_printf(%ff, %sz, 0, 0, 0, %nm, null)
+    ret void
+  @listdir:
+    %fd = call @vfs_open(%path, 0)
+    %fok = sge i32 %fd, 0
+    br %fok, @scan, @missing
+  @scan:
+    store i32 0, *%i
+    jmp @cond
+  @cond:
+    %iv = load i32, *%i
+    %child = call @vfs_readdir(%fd, %iv)
+    %none = slt i32 %child, 0
+    br %none, @close, @show
+  @show:
+    %nm2 = call @vfs_name(%child)
+    %ty2 = call @vfs_type(%child)
+    %dir2 = eq i32 %ty2, 2
+    br %dir2, @pdir, @pfile
+  @pdir:
+    %df = gep i8, *@cmdfs_DIR_FMT, 0
+    call @console_printf(%df, 0, 0, 0, 0, %nm2, null)
+    jmp @next
+  @pfile:
+    %sz2 = call @vfs_size(%child)
+    %ff2 = gep i8, *@cmdfs_FILE_FMT, 0
+    call @console_printf(%ff2, %sz2, 0, 0, 0, %nm2, null)
+    jmp @next
+  @next:
+    %iv2 = load i32, *%i
+    %in = add i32 %iv2, 1
+    store i32 %in, *%i
+    jmp @cond
+  @close:
+    call @vfs_close(%fd)
+    ret void
+}
+
+fun @cmdfs_cd(arg: *i8) -> void {
+  @entry:
+    %a0 = gep i8, *%arg, 0
+    %c0 = load i8, *%a0
+    %empty = eq i8 %c0, 0
+    br %empty, @to_root, @resolve
+  @to_root:
+    %root = gep i8, *@cmdfs_ROOT, 0
+    %rpath = call @cmdfs_abspath(%root)
+    %rino = call @vfs_lookup(%rpath)
+    %rok = sge i32 %rino, 0
+    br %rok, @set_root, @notfound
+  @resolve:
+    %path = call @cmdfs_abspath(%arg)
+    %ino = call @vfs_lookup(%path)
+    %ok = sge i32 %ino, 0
+    br %ok, @check, @notfound
+  @check:
+    %ty = call @vfs_type(%ino)
+    %isdir = eq i32 %ty, 2
+    br %isdir, @ok, @notdir
+  @ok:
+    %cwd = gep i8, *@cmdfs_cwd, 0
+    call @cmdfs_strcpy(%cwd, %path)
+    ret void
+  @set_root:
+    %cwd2 = gep i8, *@cmdfs_cwd, 0
+    %root2 = gep i8, *@cmdfs_ROOT, 0
+    call @cmdfs_strcpy(%cwd2, %root2)
+    ret void
+  @notfound:
+    %nf = gep i8, *@cmdfs_NOT_FOUND, 0
+    call @console_printf(%nf, 0, 0, 0, 0, %arg, null)
+    ret void
+  @notdir:
+    %nd = gep i8, *@cmdfs_NOT_DIR, 0
+    call @console_printf(%nd, 0, 0, 0, 0, %arg, null)
+    ret void
+}
+
+fun @cmdfs_cat(arg: *i8) -> void {
+  @entry:
+    %k = let i32
+    %a0 = gep i8, *%arg, 0
+    %c0 = load i8, *%a0
+    %empty = eq i8 %c0, 0
+    br %empty, @usage, @go
+  @usage:
+    %us = gep i8, *@cmdfs_CAT_USAGE, 0
+    call @console_puts(%us)
+    ret void
+  @go:
+    %path = call @cmdfs_abspath(%arg)
+    %ino = call @vfs_lookup(%path)
+    %ok = sge i32 %ino, 0
+    br %ok, @found, @missing
+  @missing:
+    %nf = gep i8, *@cmdfs_NOT_FOUND, 0
+    call @console_printf(%nf, 0, 0, 0, 0, %path, null)
+    ret void
+  @found:
+    %ty = call @vfs_type(%ino)
+    %isfile = eq i32 %ty, 1
+    br %isfile, @openit, @notfile
+  @notfile:
+    %nff = gep i8, *@cmdfs_NOT_FILE, 0
+    call @console_printf(%nff, 0, 0, 0, 0, %path, null)
+    ret void
+  @openit:
+    %fd = call @vfs_open(%path, 0)
+    %fok = sge i32 %fd, 0
+    br %fok, @loop, @missing
+  @loop:
+    %buf = gep i8, *@cmdfs_iobuf, 0
+    %n = call @vfs_read(%fd, %buf, 128)
+    %none = sle i64 %n, 0
+    br %none, @close, @emit_start
+  @emit_start:
+    store i32 0, *%k
+    jmp @emit_cond
+  @emit_cond:
+    %kv = load i32, *%k
+    %n32 = trunc i64 %n to i32
+    %done = sge i32 %kv, %n32
+    br %done, @loop, @emit_body
+  @emit_body:
+    %bp = gep i8, *%buf, %kv
+    %ch = load i8, *%bp
+    %ci = zext i8 %ch to i32
+    call @console_putc(%ci)
+    %kn = add i32 %kv, 1
+    store i32 %kn, *%k
+    jmp @emit_cond
+  @close:
+    call @vfs_close(%fd)
+    ret void
+}
+
+fun @cmdfs_mkdir(arg: *i8) -> void {
+  @entry:
+    %a0 = gep i8, *%arg, 0
+    %c0 = load i8, *%a0
+    %empty = eq i8 %c0, 0
+    br %empty, @usage, @go
+  @usage:
+    %us = gep i8, *@cmdfs_MKDIR_USAGE, 0
+    call @console_puts(%us)
+    ret void
+  @go:
+    %path = call @cmdfs_abspath(%arg)
+    %ino = call @vfs_lookup(%path)
+    %exists = sge i32 %ino, 0
+    br %exists, @have, @make
+  @have:
+    %ef = gep i8, *@cmdfs_EXISTS, 0
+    call @console_printf(%ef, 0, 0, 0, 0, %path, null)
+    ret void
+  @make:
+    %r = call @vfs_mkdir(%path)
+    %ok = sge i32 %r, 0
+    br %ok, @done, @fail
+  @fail:
+    %cf = gep i8, *@cmdfs_CANNOT, 0
+    call @console_printf(%cf, 0, 0, 0, 0, %path, null)
+    jmp @done
+  @done:
+    ret void
+}
+
+fun @cmdfs_touch(arg: *i8) -> void {
+  @entry:
+    %a0 = gep i8, *%arg, 0
+    %c0 = load i8, *%a0
+    %empty = eq i8 %c0, 0
+    br %empty, @usage, @go
+  @usage:
+    %us = gep i8, *@cmdfs_TOUCH_USAGE, 0
+    call @console_puts(%us)
+    ret void
+  @go:
+    %path = call @cmdfs_abspath(%arg)
+    %ino = call @vfs_lookup(%path)
+    %exists = sge i32 %ino, 0
+    br %exists, @done, @make
+  @make:
+    %r = call @vfs_create(%path, 1)
+    %ok = sge i32 %r, 0
+    br %ok, @done, @fail
+  @fail:
+    %cf = gep i8, *@cmdfs_CANNOT, 0
+    call @console_printf(%cf, 0, 0, 0, 0, %path, null)
+    jmp @done
+  @done:
+    ret void
+}
+
+// Split "<first> <rest>" in place: terminate the first word and return a
+// pointer to the first non-space character of the rest, or null.
+fun @cmdfs_split2(arg: *i8) -> *i8 {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @scond
+  @scond:
+    %iv = load i32, *%i
+    %cp0 = gep i8, *%arg, %iv
+    %ch = load i8, *%cp0
+    %z = eq i8 %ch, 0
+    br %z, @none, @chk_sep
+  @chk_sep:
+    %spc = eq i8 %ch, 32
+    %tab = eq i8 %ch, 9
+    %sep = or i1 %spc, %tab
+    br %sep, @split, @snext
+  @snext:
+    %sn = add i32 %iv, 1
+    store i32 %sn, *%i
+    jmp @scond
+  @split:
+    store i8 0, *%cp0
+    %after = add i32 %iv, 1
+    store i32 %after, *%i
+    jmp @skipws
+  @skipws:
+    %wv = load i32, *%i
+    %wp = gep i8, *%arg, %wv
+    %wc = load i8, *%wp
+    %wz = eq i8 %wc, 0
+    br %wz, @none, @chk_ws
+  @chk_ws:
+    %wspc = eq i8 %wc, 32
+    %wtab = eq i8 %wc, 9
+    %ws = or i1 %wspc, %wtab
+    br %ws, @ws_next, @have_dst
+  @ws_next:
+    %wn = add i32 %wv, 1
+    store i32 %wn, *%i
+    jmp @skipws
+  @have_dst:
+    %dv = load i32, *%i
+    %darg = gep i8, *%arg, %dv
+    ret *i8 %darg
+  @none:
+    ret *i8 null
+}
+
+// Split "<src> <dst>" in place, resolve both paths, then stream the copy.
+fun @cmdfs_cp(arg: *i8) -> void {
+  @entry:
+    %spath = let [i8, 256]
+    %dpath = let [i8, 256]
+    %darg = call @cmdfs_split2(%arg)
+    %nodst = eq *i8 %darg, null
+    br %nodst, @usage, @resolve
+  @usage:
+    %us = gep i8, *@cmdfs_CP_USAGE, 0
+    call @console_puts(%us)
+    ret void
+  @resolve:
+    %sabs = call @cmdfs_abspath(%arg)
+    %sp0 = gep i8, *%spath, 0
+    call @cmdfs_strcpy(%sp0, %sabs)
+    %dabs = call @cmdfs_abspath(%darg)
+    %dp0 = gep i8, *%dpath, 0
+    call @cmdfs_strcpy(%dp0, %dabs)
+    %si = call @vfs_lookup(%sp0)
+    %sexists = sge i32 %si, 0
+    br %sexists, @chksrc, @src_missing
+  @src_missing:
+    %nf = gep i8, *@cmdfs_NOT_FOUND, 0
+    call @console_printf(%nf, 0, 0, 0, 0, %sp0, null)
+    ret void
+  @chksrc:
+    %sty = call @vfs_type(%si)
+    %isfile = eq i32 %sty, 1
+    br %isfile, @chkdst, @src_notfile
+  @src_notfile:
+    %nff = gep i8, *@cmdfs_NOT_FILE, 0
+    call @console_printf(%nff, 0, 0, 0, 0, %sp0, null)
+    ret void
+  @chkdst:
+    %di = call @vfs_lookup(%dp0)
+    %dexists = sge i32 %di, 0
+    br %dexists, @dst_exists, @open_src
+  @dst_exists:
+    %ef = gep i8, *@cmdfs_EXISTS, 0
+    call @console_printf(%ef, 0, 0, 0, 0, %dp0, null)
+    ret void
+  @open_src:
+    %sfd = call @vfs_open(%sp0, 0)
+    %sfok = sge i32 %sfd, 0
+    br %sfok, @open_dst, @src_missing
+  @open_dst:
+    %dfd = call @vfs_open(%dp0, 1)
+    %dfok = sge i32 %dfd, 0
+    br %dfok, @copy_loop, @dst_fail
+  @dst_fail:
+    call @vfs_close(%sfd)
+    %cf = gep i8, *@cmdfs_CANNOT, 0
+    call @console_printf(%cf, 0, 0, 0, 0, %dp0, null)
+    ret void
+  @copy_loop:
+    %buf = gep i8, *@cmdfs_iobuf, 0
+    %n = call @vfs_read(%sfd, %buf, 128)
+    %none = sle i64 %n, 0
+    br %none, @copy_done, @copy_write
+  @copy_write:
+    %w = call @vfs_write(%dfd, %buf, %n)
+    %short = slt i64 %w, %n
+    br %short, @write_fail, @copy_loop
+  @write_fail:
+    %wf = gep i8, *@cmdfs_WRITE_FAIL, 0
+    call @console_printf(%wf, 0, 0, 0, 0, %dp0, null)
+    jmp @copy_done
+  @copy_done:
+    call @vfs_close(%sfd)
+    call @vfs_close(%dfd)
+    ret void
+}
+
+fun @cmdfs_rm(arg: *i8) -> void {
+  @entry:
+    %a0 = gep i8, *%arg, 0
+    %c0 = load i8, *%a0
+    %empty = eq i8 %c0, 0
+    br %empty, @usage, @go
+  @usage:
+    %us = gep i8, *@cmdfs_RM_USAGE, 0
+    call @console_puts(%us)
+    ret void
+  @go:
+    %path = call @cmdfs_abspath(%arg)
+    %ino = call @vfs_lookup(%path)
+    %ok = sge i32 %ino, 0
+    br %ok, @chk, @missing
+  @missing:
+    %nf = gep i8, *@cmdfs_NOT_FOUND, 0
+    call @console_printf(%nf, 0, 0, 0, 0, %path, null)
+    ret void
+  @chk:
+    %ty = call @vfs_type(%ino)
+    %isdir = eq i32 %ty, 2
+    br %isdir, @is_dir, @remove
+  @is_dir:
+    %df = gep i8, *@cmdfs_IS_DIR, 0
+    call @console_printf(%df, 0, 0, 0, 0, %path, null)
+    ret void
+  @remove:
+    %rc = call @vfs_remove(%path)
+    %done = eq i32 %rc, 0
+    br %done, @ok, @fail
+  @ok:
+    ret void
+  @fail:
+    %cf = gep i8, *@cmdfs_CANNOT_RM, 0
+    call @console_printf(%cf, 0, 0, 0, 0, %path, null)
+    ret void
+}
+
+fun @cmdfs_rmdir(arg: *i8) -> void {
+  @entry:
+    %a0 = gep i8, *%arg, 0
+    %c0 = load i8, *%a0
+    %empty = eq i8 %c0, 0
+    br %empty, @usage, @go
+  @usage:
+    %us = gep i8, *@cmdfs_RMDIR_USAGE, 0
+    call @console_puts(%us)
+    ret void
+  @go:
+    %path = call @cmdfs_abspath(%arg)
+    %ino = call @vfs_lookup(%path)
+    %ok = sge i32 %ino, 0
+    br %ok, @chk, @missing
+  @missing:
+    %nf = gep i8, *@cmdfs_NOT_FOUND, 0
+    call @console_printf(%nf, 0, 0, 0, 0, %path, null)
+    ret void
+  @chk:
+    %ty = call @vfs_type(%ino)
+    %isdir = eq i32 %ty, 2
+    br %isdir, @remove, @not_dir
+  @not_dir:
+    %nd = gep i8, *@cmdfs_NOT_DIR, 0
+    call @console_printf(%nd, 0, 0, 0, 0, %path, null)
+    ret void
+  @remove:
+    %rc = call @vfs_remove(%path)
+    %done = eq i32 %rc, 0
+    br %done, @ok, @chk_empty
+  @ok:
+    ret void
+  @chk_empty:
+    %ne = eq i32 %rc, -2
+    br %ne, @not_empty, @fail
+  @not_empty:
+    %ef = gep i8, *@cmdfs_NOT_EMPTY, 0
+    call @console_printf(%ef, 0, 0, 0, 0, %path, null)
+    ret void
+  @fail:
+    %cf = gep i8, *@cmdfs_CANNOT_RM, 0
+    call @console_printf(%cf, 0, 0, 0, 0, %path, null)
+    ret void
+}
+
+fun @cmdfs_mv(arg: *i8) -> void {
+  @entry:
+    %spath = let [i8, 256]
+    %dpath = let [i8, 256]
+    %darg = call @cmdfs_split2(%arg)
+    %none = eq *i8 %darg, null
+    br %none, @usage, @resolve
+  @usage:
+    %us = gep i8, *@cmdfs_MV_USAGE, 0
+    call @console_puts(%us)
+    ret void
+  @resolve:
+    %sabs = call @cmdfs_abspath(%arg)
+    %sp0 = gep i8, *%spath, 0
+    call @cmdfs_strcpy(%sp0, %sabs)
+    %dabs = call @cmdfs_abspath(%darg)
+    %dp0 = gep i8, *%dpath, 0
+    call @cmdfs_strcpy(%dp0, %dabs)
+    %rc = call @vfs_rename(%sp0, %dp0)
+    %done = eq i32 %rc, 0
+    br %done, @ok, @chk1
+  @ok:
+    ret void
+  @chk1:
+    %snf = eq i32 %rc, -1
+    br %snf, @src_missing, @chk2
+  @src_missing:
+    %nf = gep i8, *@cmdfs_NOT_FOUND, 0
+    call @console_printf(%nf, 0, 0, 0, 0, %sp0, null)
+    ret void
+  @chk2:
+    %dnf = eq i32 %rc, -4
+    br %dnf, @dst_missing, @chk3
+  @dst_missing:
+    %nf2 = gep i8, *@cmdfs_NOT_FOUND, 0
+    call @console_printf(%nf2, 0, 0, 0, 0, %dp0, null)
+    ret void
+  @chk3:
+    %dex = eq i32 %rc, -2
+    br %dex, @dst_exists, @fail
+  @dst_exists:
+    %ef = gep i8, *@cmdfs_EXISTS, 0
+    call @console_printf(%ef, 0, 0, 0, 0, %dp0, null)
+    ret void
+  @fail:
+    %cf = gep i8, *@cmdfs_CANNOT_MV, 0
+    call @console_printf(%cf, 0, 0, 0, 0, %dp0, null)
+    ret void
+}
+
+fun @cmdfs_pwd() -> void {
+  @entry:
+    %cwd = gep i8, *@cmdfs_cwd, 0
+    call @console_puts(%cwd)
+    %nl = gep i8, *@cmdfs_NL, 0
+    call @console_puts(%nl)
+    ret void
+}

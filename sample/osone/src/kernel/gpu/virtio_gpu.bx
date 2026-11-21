@@ -1,0 +1,548 @@
+// virtio_gpu.bx - legacy virtio-mmio 2D display driver
+//
+// QEMU virt exposes virtio-mmio slots at the same addresses as the NIC driver (from 0x0a000000, stride 0x200).
+// This driver uses only control queue 0 and works with 2D resources: create a resource,
+// attach the framebuffer to the resource, set the scanout, then on each flush do TRANSFER_TO_HOST_2D
+// followed by RESOURCE_FLUSH. Commands are sent serially and completed by polling the used ring; interrupts are not enabled.
+
+extern @kmem_alloc(size: i64) -> *i8
+extern @kmem_memset(p: *i8, v: i32, n: i64) -> void
+extern @kmem_ptr_addr(p: *i8) -> i64
+extern @console_puts(s: *i8) -> void
+extern @console_printf(fmt: *i8, a: i64, b: i64, c: i64, d: i64, s1: *i8, s2: *i8) -> void
+extern @timer_now() -> i64
+extern @timer_freq() -> i64
+
+const @gpu_MMIO_BASE: i64 = 0x0A000000
+const @gpu_MMIO_STEP: i64 = 0x200
+const @gpu_SLOTS: i32 = 32
+
+const @gpu_REG_MAGIC: i64 = 0x000
+const @gpu_REG_VERSION: i64 = 0x004
+const @gpu_REG_DEVICEID: i64 = 0x008
+const @gpu_REG_HOSTFEAT: i64 = 0x010
+const @gpu_REG_HOSTFEATSEL: i64 = 0x014
+const @gpu_REG_GUESTFEAT: i64 = 0x020
+const @gpu_REG_GUESTFEATSEL: i64 = 0x024
+const @gpu_REG_QUEUESEL: i64 = 0x030
+const @gpu_REG_QUEUENUMMAX: i64 = 0x034
+const @gpu_REG_QUEUENUM: i64 = 0x038
+const @gpu_REG_QUEUEALIGN: i64 = 0x03C
+const @gpu_REG_QUEUEPFN: i64 = 0x040
+const @gpu_REG_QUEUENOTIFY: i64 = 0x050
+const @gpu_REG_STATUS: i64 = 0x070
+
+const @gpu_MAGIC: i32 = 0x74726976
+const @gpu_DEV_GPU: i32 = 16
+const @gpu_QSIZE: i32 = 32
+const @gpu_RESP_LEN: i32 = 512
+const @gpu_RID: i32 = 1
+const @gpu_FMT_B8G8R8X8: i32 = 2
+const @gpu_TIMEOUT_MS: i64 = 500
+
+const @gpu_CMD_GET_INFO: i32 = 0x0100
+const @gpu_CMD_CREATE_2D: i32 = 0x0101
+const @gpu_CMD_SET_SCANOUT: i32 = 0x0103
+const @gpu_CMD_FLUSH: i32 = 0x0104
+const @gpu_CMD_TRANSFER: i32 = 0x0105
+const @gpu_CMD_ATTACH: i32 = 0x0106
+const @gpu_RESP_OK_NODATA: i32 = 0x1100
+const @gpu_RESP_OK_INFO: i32 = 0x1101
+
+const @gpu_MSG_OK: [i8, 23] = "gpu: virtio-gpu %dx%d\n"
+const @gpu_MSG_NONE: [i8, 11] = "gpu: none\n"
+const @gpu_MSG_FAIL: [i8, 29] = "gpu: init failed at step %d\n"
+
+global @gpu_BASE: i64
+global @gpu_READY: i32
+global @gpu_PRESENT: i32
+global @gpu_STAGE: i32
+global @gpu_Q: i64
+global @gpu_AVAIL: i32
+global @gpu_DONE: i32
+global @gpu_W: i32
+global @gpu_H: i32
+global @gpu_FB: *i8
+global @gpu_CMD: [i8, 64]
+global @gpu_RESP: [i8, 512]
+
+fun @gpu_r32(off: i64) -> i32 {
+  @entry:
+    %base = load i64, *@gpu_BASE
+    %addr = add i64 %base, %off
+    %v = asm att i32, "ldr ${0:w}, [${addr}]", "=r,r,~{memory}", i64 %addr
+    ret i32 %v
+}
+
+fun @gpu_w32(off: i64, val: i32) -> void {
+  @entry:
+    %base = load i64, *@gpu_BASE
+    %addr = add i64 %base, %off
+    asm att void, "str ${val:w}, [${addr}]", "r,r,~{memory}", i64 %addr, i32 %val
+    ret void
+}
+
+fun @gpu_ptr(addr: i64) -> *i8 {
+  @entry:
+    %p = asm att *i8, "mov $0, ${addr}", "=r,r", i64 %addr
+    ret *i8 %p
+}
+
+fun @gpu_cast32(addr: i64) -> *i32 {
+  @entry:
+    %p = asm att *i32, "mov $0, ${addr}", "=r,r", i64 %addr
+    ret *i32 %p
+}
+
+fun @gpu_cast16(addr: i64) -> *i16 {
+  @entry:
+    %p = asm att *i16, "mov $0, ${addr}", "=r,r", i64 %addr
+    ret *i16 %p
+}
+
+fun @gpu_barrier() -> void {
+  @entry:
+    asm att void, "dsb sy", "~{memory}"
+    ret void
+}
+
+fun @gpu_st32(addr: i64, v: i32) -> void {
+  @entry:
+    %p = call @gpu_cast32(%addr)
+    store i32 %v, *%p
+    ret void
+}
+
+fun @gpu_st16(addr: i64, v: i32) -> void {
+  @entry:
+    %p = call @gpu_cast16(%addr)
+    %v16 = trunc i32 %v to i16
+    store i16 %v16, *%p
+    ret void
+}
+
+fun @gpu_st64(addr: i64, v: i64) -> void {
+  @entry:
+    %p = asm att *i64, "mov $0, ${addr}", "=r,r", i64 %addr
+    store i64 %v, *%p
+    ret void
+}
+
+fun @gpu_buf32(base: *i8, off: i32, v: i32) -> void {
+  @entry:
+    %p = gep i8, *%base, %off
+    %a = call @kmem_ptr_addr(%p)
+    call @gpu_st32(%a, %v)
+    ret void
+}
+
+fun @gpu_buf64(base: *i8, off: i32, v: i64) -> void {
+  @entry:
+    %p = gep i8, *%base, %off
+    %a = call @kmem_ptr_addr(%p)
+    call @gpu_st64(%a, %v)
+    ret void
+}
+
+fun @gpu_resp32(off: i32) -> i32 {
+  @entry:
+    %p = gep i8, *@gpu_RESP, %off
+    %a = call @kmem_ptr_addr(%p)
+    %ap = call @gpu_cast32(%a)
+    %v = load i32, *%ap
+    ret i32 %v
+}
+
+fun @gpu_now_ms() -> i64 {
+  @entry:
+    %f = call @timer_freq()
+    %z = eq i64 %f, 0
+    br %z, @none, @calc
+  @none:
+    ret i64 0
+  @calc:
+    %t = call @timer_now()
+    %k = mul i64 %t, 1000
+    %ms = udiv i64 %k, %f
+    ret i64 %ms
+}
+
+// Set up a queue using the legacy layout and return the 4KB-aligned queue address.
+fun @gpu_setup_queue(qsel: i32) -> i64 {
+  @entry:
+    call @gpu_w32(@gpu_REG_QUEUESEL, %qsel)
+    %max = call @gpu_r32(@gpu_REG_QUEUENUMMAX)
+    %ok = sge i32 %max, @gpu_QSIZE
+    br %ok, @alloc, @fail
+  @alloc:
+    %raw = call @kmem_alloc(12288)
+    %isnull = eq *i8 %raw, null
+    br %isnull, @fail, @align
+  @align:
+    %ra = call @kmem_ptr_addr(%raw)
+    %up = add i64 %ra, 4095
+    %al = asm att i64, "and $0, ${up}, #0xfffffffffffff000", "=r,r", i64 %up
+    %al32 = trunc i64 %al to i32
+    %ptr = call @gpu_ptr(%al)
+    call @kmem_memset(%ptr, 0, 8192)
+    call @gpu_w32(@gpu_REG_QUEUENUM, @gpu_QSIZE)
+    call @gpu_w32(@gpu_REG_QUEUEALIGN, 4096)
+    // This QEMU's legacy QueuePFN takes a byte address rather than a page number.
+    call @gpu_w32(@gpu_REG_QUEUEPFN, %al32)
+    ret i64 %al
+  @fail:
+    ret i64 0
+}
+
+fun @gpu_used_idx() -> i32 {
+  @entry:
+    call @gpu_barrier()
+    %q = load i64, *@gpu_Q
+    %a = add i64 %q, 4098
+    %p = call @gpu_cast16(%a)
+    %v = load i16, *%p
+    %v32 = zext i16 %v to i32
+    ret i32 %v32
+}
+
+// Fill in the 24-byte command header.
+fun @gpu_hdr(cmd: *i8, ctype: i32) -> void {
+  @entry:
+    call @gpu_buf32(%cmd, 0, %ctype)
+    call @gpu_buf32(%cmd, 4, 0)
+    call @gpu_buf64(%cmd, 8, 0)
+    call @gpu_buf32(%cmd, 16, 0)
+    call @gpu_buf32(%cmd, 20, 0)
+    ret void
+}
+
+fun @gpu_rect(cmd: *i8, off: i32, x: i32, y: i32, w: i32, h: i32) -> void {
+  @entry:
+    call @gpu_buf32(%cmd, %off, %x)
+    %o1 = add i32 %off, 4
+    call @gpu_buf32(%cmd, %o1, %y)
+    %o2 = add i32 %off, 8
+    call @gpu_buf32(%cmd, %o2, %w)
+    %o3 = add i32 %off, 12
+    call @gpu_buf32(%cmd, %o3, %h)
+    ret void
+}
+
+// Send the command in @gpu_CMD with length len and return the response type; -1 on timeout.
+fun @gpu_cmd(len: i32) -> i32 {
+  @entry:
+    %q = load i64, *@gpu_Q
+    %rbase = gep i8, *@gpu_RESP, 0
+    call @kmem_memset(%rbase, 0, 512)
+    %cbase = gep i8, *@gpu_CMD, 0
+    %ca = call @kmem_ptr_addr(%cbase)
+    %ra = call @kmem_ptr_addr(%rbase)
+
+    // desc0: command, with NEXT
+    call @gpu_st64(%q, %ca)
+    %q8 = add i64 %q, 8
+    call @gpu_st32(%q8, %len)
+    %q12 = add i64 %q, 12
+    call @gpu_st16(%q12, 1)
+    %q14 = add i64 %q, 14
+    call @gpu_st16(%q14, 1)
+    // desc1: response, with WRITE
+    %q16 = add i64 %q, 16
+    call @gpu_st64(%q16, %ra)
+    %q24 = add i64 %q, 24
+    call @gpu_st32(%q24, @gpu_RESP_LEN)
+    %q28 = add i64 %q, 28
+    call @gpu_st16(%q28, 2)
+    %q30 = add i64 %q, 30
+    call @gpu_st16(%q30, 0)
+
+    // avail ring
+    %av = load i32, *@gpu_AVAIL
+    %slot = and i32 %av, 31
+    %so = mul i32 %slot, 2
+    %so64 = zext i32 %so to i64
+    %rp = add i64 %q, 516
+    %re = add i64 %rp, %so64
+    call @gpu_st16(%re, 0)
+    %avn = add i32 %av, 1
+    store i32 %avn, *@gpu_AVAIL
+    %ain = add i64 %q, 514
+    call @gpu_st16(%ain, %avn)
+    call @gpu_barrier()
+    call @gpu_w32(@gpu_REG_QUEUENOTIFY, 0)
+
+    %avlow = and i32 %avn, 0xFFFF
+    %start = call @gpu_now_ms()
+    jmp @wait
+  @wait:
+    %used = call @gpu_used_idx()
+    %uslow = and i32 %used, 0xFFFF
+    // Only one command is in flight: completion requires used to catch up with avail. The difference
+    // is computed with 16-bit wraparound; otherwise used lagging avail would look like a huge positive number.
+    %diff = sub i32 %uslow, %avlow
+    %diffm = and i32 %diff, 0xFFFF
+    %arrived = eq i32 %diffm, 0
+    br %arrived, @done, @timeout
+  @timeout:
+    %f = call @timer_freq()
+    %fz = eq i64 %f, 0
+    br %fz, @wait, @chk
+  @chk:
+    %now = call @gpu_now_ms()
+    %el = sub i64 %now, %start
+    %to = sge i64 %el, @gpu_TIMEOUT_MS
+    br %to, @fail, @wait
+  @done:
+    call @gpu_barrier()
+    %donec = load i32, *@gpu_DONE
+    %dslot = and i32 %donec, 31
+    %deo = mul i32 %dslot, 8
+    %deo64 = zext i32 %deo to i64
+    %ue = add i64 %q, 4100
+    %uep = add i64 %ue, %deo64
+    %uidp = call @gpu_cast32(%uep)
+    %uid = load i32, *%uidp
+    %dnext = add i32 %donec, 1
+    store i32 %dnext, *@gpu_DONE
+    %rt = call @gpu_resp32(0)
+    ret i32 %rt
+  @fail:
+    ret i32 -1
+}
+
+fun @gpu_ready() -> i32 {
+  @entry:
+    %v = load i32, *@gpu_READY
+    ret i32 %v
+}
+
+fun @gpu_present() -> i32 {
+  @entry:
+    %v = load i32, *@gpu_PRESENT
+    ret i32 %v
+}
+
+fun @gpu_width() -> i32 {
+  @entry:
+    %v = load i32, *@gpu_W
+    ret i32 %v
+}
+
+fun @gpu_height() -> i32 {
+  @entry:
+    %v = load i32, *@gpu_H
+    ret i32 %v
+}
+
+fun @gpu_fb() -> *i8 {
+  @entry:
+    %v = load *i8, *@gpu_FB
+    ret *i8 %v
+}
+
+// TRANSFER first, then FLUSH; returns 0 on success.
+fun @gpu_flush() -> i32 {
+  @entry:
+    %ready = load i32, *@gpu_READY
+    %rok = eq i32 %ready, 1
+    br %rok, @go, @fail
+  @go:
+    %w = load i32, *@gpu_W
+    %h = load i32, *@gpu_H
+    %cmd = gep i8, *@gpu_CMD, 0
+    call @gpu_hdr(%cmd, @gpu_CMD_TRANSFER)
+    call @gpu_rect(%cmd, 24, 0, 0, %w, %h)
+    call @gpu_buf64(%cmd, 40, 0)
+    call @gpu_buf32(%cmd, 48, @gpu_RID)
+    call @gpu_buf32(%cmd, 52, 0)
+    %tr = call @gpu_cmd(56)
+    %trok = eq i32 %tr, @gpu_RESP_OK_NODATA
+    br %trok, @flush, @fail
+  @flush:
+    %cmd2 = gep i8, *@gpu_CMD, 0
+    call @gpu_hdr(%cmd2, @gpu_CMD_FLUSH)
+    call @gpu_rect(%cmd2, 24, 0, 0, %w, %h)
+    call @gpu_buf32(%cmd2, 40, @gpu_RID)
+    call @gpu_buf32(%cmd2, 44, 0)
+    %fr = call @gpu_cmd(48)
+    %frok = eq i32 %fr, @gpu_RESP_OK_NODATA
+    br %frok, @ok, @fail
+  @ok:
+    ret i32 0
+  @fail:
+    ret i32 -1
+}
+
+fun @gpu_init() -> i32 {
+  @entry:
+    store i32 0, *@gpu_READY
+    store i32 0, *@gpu_PRESENT
+    store i32 0, *@gpu_STAGE
+    %i = let i32
+    store i32 0, *%i
+    jmp @scan
+  @scan:
+    %iv = load i32, *%i
+    %scanend = sge i32 %iv, @gpu_SLOTS
+    br %scanend, @none, @probe
+  @probe:
+    %off = mul i32 %iv, 0x200
+    %off64 = zext i32 %off to i64
+    %base = add i64 @gpu_MMIO_BASE, %off64
+    store i64 %base, *@gpu_BASE
+    %magic = call @gpu_r32(@gpu_REG_MAGIC)
+    %isv = eq i32 %magic, @gpu_MAGIC
+    br %isv, @ver, @next
+  @ver:
+    %ver = call @gpu_r32(@gpu_REG_VERSION)
+    %v1 = eq i32 %ver, 1
+    br %v1, @dev, @next
+  @dev:
+    %dev = call @gpu_r32(@gpu_REG_DEVICEID)
+    %isgpu = eq i32 %dev, @gpu_DEV_GPU
+    br %isgpu, @found, @next
+  @next:
+    %in = add i32 %iv, 1
+    store i32 %in, *%i
+    jmp @scan
+  @found:
+    store i32 1, *@gpu_PRESENT
+    store i32 1, *@gpu_STAGE
+    call @gpu_w32(@gpu_REG_STATUS, 0)
+    call @gpu_w32(@gpu_REG_STATUS, 1)
+    call @gpu_w32(@gpu_REG_STATUS, 3)
+    call @gpu_w32(@gpu_REG_GUESTFEATSEL, 0)
+    call @gpu_w32(@gpu_REG_GUESTFEAT, 0)
+    call @gpu_w32(@gpu_REG_GUESTFEATSEL, 1)
+    call @gpu_w32(@gpu_REG_GUESTFEAT, 0)
+    %q = call @gpu_setup_queue(0)
+    %qz = eq i64 %q, 0
+    br %qz, @none, @queued
+  @queued:
+    store i64 %q, *@gpu_Q
+    store i32 0, *@gpu_AVAIL
+    store i32 0, *@gpu_DONE
+    // Control commands may only be sent after entering DRIVER_OK.
+    call @gpu_w32(@gpu_REG_STATUS, 7)
+    store i32 2, *@gpu_STAGE
+    %cmd = gep i8, *@gpu_CMD, 0
+    call @gpu_hdr(%cmd, @gpu_CMD_GET_INFO)
+    %rt = call @gpu_cmd(24)
+    %diok = eq i32 %rt, @gpu_RESP_OK_INFO
+    br %diok, @mode_start, @fail
+  @mode_start:
+    %k = let i32
+    store i32 0, *%k
+    jmp @mode_cond
+  @mode_cond:
+    %kv = load i32, *%k
+    %kend = sge i32 %kv, 16
+    br %kend, @mode_default, @mode_body
+  @mode_body:
+    %bo = mul i32 %kv, 24
+    %bo2 = add i32 %bo, 24
+    %en_off = add i32 %bo2, 16
+    %en = call @gpu_resp32(%en_off)
+    %enz = eq i32 %en, 0
+    br %enz, @mode_next, @mode_get
+  @mode_get:
+    %w_off = add i32 %bo2, 8
+    %h_off = add i32 %bo2, 12
+    %mw = call @gpu_resp32(%w_off)
+    %mh = call @gpu_resp32(%h_off)
+    %wpos = sgt i32 %mw, 0
+    br %wpos, @mode_h, @mode_next
+  @mode_h:
+    %hpos = sgt i32 %mh, 0
+    br %hpos, @mode_have, @mode_next
+  @mode_have:
+    store i32 %mw, *@gpu_W
+    store i32 %mh, *@gpu_H
+    jmp @alloc_fb
+  @mode_next:
+    %kn = add i32 %kv, 1
+    store i32 %kn, *%k
+    jmp @mode_cond
+  @mode_default:
+    store i32 1024, *@gpu_W
+    store i32 768, *@gpu_H
+    jmp @alloc_fb
+  @alloc_fb:
+    %w2 = load i32, *@gpu_W
+    %h2 = load i32, *@gpu_H
+    %px = mul i32 %w2, %h2
+    %bytes = mul i32 %px, 4
+    %bytes64 = sext i32 %bytes to i64
+    %fb = call @kmem_alloc(%bytes64)
+    %fbn = eq *i8 %fb, null
+    br %fbn, @fail, @fb_ok
+  @fb_ok:
+    store *i8 %fb, *@gpu_FB
+    call @kmem_memset(%fb, 0, %bytes64)
+    store i32 3, *@gpu_STAGE
+    %cmd2 = gep i8, *@gpu_CMD, 0
+    call @gpu_hdr(%cmd2, @gpu_CMD_CREATE_2D)
+    call @gpu_buf32(%cmd2, 24, @gpu_RID)
+    call @gpu_buf32(%cmd2, 28, @gpu_FMT_B8G8R8X8)
+    call @gpu_buf32(%cmd2, 32, %w2)
+    call @gpu_buf32(%cmd2, 36, %h2)
+    %r1 = call @gpu_cmd(40)
+    %ok1 = eq i32 %r1, @gpu_RESP_OK_NODATA
+    br %ok1, @attach, @fail
+  @attach:
+    %fb2 = load *i8, *@gpu_FB
+    %fba = call @kmem_ptr_addr(%fb2)
+    %w3 = load i32, *@gpu_W
+    %h3 = load i32, *@gpu_H
+    %px3 = mul i32 %w3, %h3
+    %len3 = mul i32 %px3, 4
+    store i32 4, *@gpu_STAGE
+    %cmd3 = gep i8, *@gpu_CMD, 0
+    call @gpu_hdr(%cmd3, @gpu_CMD_ATTACH)
+    call @gpu_buf32(%cmd3, 24, @gpu_RID)
+    call @gpu_buf32(%cmd3, 28, 1)
+    call @gpu_buf64(%cmd3, 32, %fba)
+    call @gpu_buf32(%cmd3, 40, %len3)
+    call @gpu_buf32(%cmd3, 44, 0)
+    %r2 = call @gpu_cmd(48)
+    %ok2 = eq i32 %r2, @gpu_RESP_OK_NODATA
+    br %ok2, @scanout, @fail
+  @scanout:
+    %w4 = load i32, *@gpu_W
+    %h4 = load i32, *@gpu_H
+    store i32 5, *@gpu_STAGE
+    %cmd4 = gep i8, *@gpu_CMD, 0
+    call @gpu_hdr(%cmd4, @gpu_CMD_SET_SCANOUT)
+    call @gpu_rect(%cmd4, 24, 0, 0, %w4, %h4)
+    call @gpu_buf32(%cmd4, 40, 0)
+    call @gpu_buf32(%cmd4, 44, @gpu_RID)
+    %r3 = call @gpu_cmd(48)
+    %ok3 = eq i32 %r3, @gpu_RESP_OK_NODATA
+    br %ok3, @up, @fail
+  @up:
+    store i32 1, *@gpu_READY
+    store i32 6, *@gpu_STAGE
+    %fl = call @gpu_flush()
+    %flz = slt i32 %fl, 0
+    br %flz, @fail, @ok
+  @ok:
+    %w5 = load i32, *@gpu_W
+    %h5 = load i32, *@gpu_H
+    %w564 = sext i32 %w5 to i64
+    %h564 = sext i32 %h5 to i64
+    %fmt = gep i8, *@gpu_MSG_OK, 0
+    call @console_printf(%fmt, %w564, %h564, 0, 0, null, null)
+    ret i32 1
+  @fail:
+    store i32 0, *@gpu_READY
+    %st = load i32, *@gpu_STAGE
+    %st64 = sext i32 %st to i64
+    %fm = gep i8, *@gpu_MSG_FAIL, 0
+    call @console_printf(%fm, %st64, 0, 0, 0, null, null)
+    ret i32 0
+  @none:
+    store i32 0, *@gpu_READY
+    %nm = gep i8, *@gpu_MSG_NONE, 0
+    call @console_puts(%nm)
+    ret i32 0
+}

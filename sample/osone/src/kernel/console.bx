@@ -1,0 +1,346 @@
+// console.bx - PL011 UART (QEMU virt) and kernel formatted output
+//
+// MMIO must go through asm: SSA has no volatile, so plain loads/stores may be optimized or merged.
+
+const @console_UART_BASE: i64 = 0x09000000
+const @console_REG_DR: i64 = 0x00
+const @console_REG_FR: i64 = 0x18
+const @console_REG_IBRD: i64 = 0x24
+const @console_REG_FBRD: i64 = 0x28
+const @console_REG_LCRH: i64 = 0x2C
+const @console_REG_CR: i64 = 0x30
+const @console_REG_ICR: i64 = 0x38
+
+fun @console_mmio_w32(addr: i64, val: i32) -> void {
+  @entry:
+    asm att void, "str ${val:w}, [${addr}]", "r,r,~{memory}", i64 %addr, i32 %val
+    ret void
+}
+
+fun @console_mmio_r32(addr: i64) -> i32 {
+  @entry:
+    %v = asm att i32, "ldr ${0:w}, [${addr}]", "=r,r,~{memory}", i64 %addr
+    ret i32 %v
+}
+
+fun @console_init() -> void {
+  @entry:
+    %base = load i64, *@console_UART_BASE
+    %cr = add i64 %base, 0x30
+    call @console_mmio_w32(%cr, 0)
+    %ibrd = add i64 %base, 0x24
+    call @console_mmio_w32(%ibrd, 13)
+    %fbrd = add i64 %base, 0x28
+    call @console_mmio_w32(%fbrd, 1)
+    %lcrh = add i64 %base, 0x2C
+    call @console_mmio_w32(%lcrh, 0x70)
+    %icr = add i64 %base, 0x38
+    call @console_mmio_w32(%icr, 0x7FF)
+    %cr2 = add i64 %base, 0x30
+    call @console_mmio_w32(%cr2, 0x301)
+    ret void
+}
+
+// Non-blocking single-character read; returns -1 when no data is available. PL011 FR bit4 = RX FIFO empty.
+fun @console_getc() -> i32 {
+  @entry:
+    %fr = call @console_mmio_r32(0x09000018)
+    %empty = and i32 %fr, 16
+    %none = ne i32 %empty, 0
+    br %none, @noch, @got
+  @noch:
+    ret i32 -1
+  @got:
+    %dr = call @console_mmio_r32(0x09000000)
+    %ch = and i32 %dr, 255
+    ret i32 %ch
+}
+
+fun @console_putc(ch: i32) -> void {
+  @entry:
+    jmp @cond
+  @cond:
+    %fr = call @console_mmio_r32(0x09000018)
+    %full = and i32 %fr, 32
+    %busy = ne i32 %full, 0
+    br %busy, @cond, @wr
+  @wr:
+    call @console_mmio_w32(0x09000000, %ch)
+    ret void
+}
+
+fun @console_puts(s: *i8) -> void {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @cond
+  @cond:
+    %iv = load i32, *%i
+    %cp = gep i8, *%s, %iv
+    %ch = load i8, *%cp
+    %end = eq i8 %ch, 0
+    br %end, @done, @body
+  @body:
+    %cv = zext i8 %ch to i32
+    call @console_putc(%cv)
+    %n = add i32 %iv, 1
+    store i32 %n, *%i
+    jmp @cond
+  @done:
+    ret void
+}
+
+fun @console_put_dec(v: i64) -> void {
+  @entry:
+    %buf = let [i8, 24]
+    %n = let i32
+    %neg = let i32
+    %val = let i64
+    %oi = let i32
+    store i32 0, *%n
+    store i32 0, *%neg
+    store i64 %v, *%val
+    %isneg = slt i64 %v, 0
+    br %isneg, @neg_case, @mag
+  @neg_case:
+    store i32 1, *%neg
+    %nv = sub i64 0, %v
+    store i64 %nv, *%val
+    jmp @mag
+  @mag:
+    %mv = load i64, *%val
+    %mz = eq i64 %mv, 0
+    br %mz, @zero_case, @digits
+  @zero_case:
+    %zp = gep i8, *%buf, 0
+    store i8 48, *%zp
+    store i32 1, *%n
+    jmp @out
+  @digits:
+    jmp @dcond
+  @dcond:
+    %dv = load i64, *%val
+    %dz = eq i64 %dv, 0
+    br %dz, @out, @dbody
+  @dbody:
+    %dv2 = load i64, *%val
+    %rem = urem i64 %dv2, 10
+    %rem8 = trunc i64 %rem to i8
+    %ch = add i8 %rem8, 48
+    %dn2 = load i32, *%n
+    %bp = gep i8, *%buf, %dn2
+    store i8 %ch, *%bp
+    %dn3 = add i32 %dn2, 1
+    store i32 %dn3, *%n
+    %dv3 = load i64, *%val
+    %q = udiv i64 %dv3, 10
+    store i64 %q, *%val
+    jmp @dcond
+  @out:
+    %negv = load i32, *%neg
+    %negg = eq i32 %negv, 1
+    br %negg, @minus, @emit_setup
+  @minus:
+    call @console_putc(45)
+    jmp @emit_setup
+  @emit_setup:
+    %cnt = load i32, *%n
+    %start = sub i32 %cnt, 1
+    store i32 %start, *%oi
+    jmp @econd
+  @econd:
+    %ov = load i32, *%oi
+    %odone = slt i32 %ov, 0
+    br %odone, @edone, @ebody
+  @ebody:
+    %cp = gep i8, *%buf, %ov
+    %cv = load i8, *%cp
+    %ci = zext i8 %cv to i32
+    call @console_putc(%ci)
+    %ov2 = sub i32 %ov, 1
+    store i32 %ov2, *%oi
+    jmp @econd
+  @edone:
+    ret void
+}
+
+fun @console_put_hex(v: i64) -> void {
+  @entry:
+    %started = let i32
+    %shift = let i32
+    %vp = let i64
+    %nibv = let i32
+    store i32 0, *%started
+    store i32 60, *%shift
+    store i64 %v, *%vp
+    store i32 0, *%nibv
+    %isz = eq i64 %v, 0
+    br %isz, @zero, @hcond
+  @zero:
+    call @console_putc(48)
+    ret void
+  @hcond:
+    %sh = load i32, *%shift
+    %neg = slt i32 %sh, 0
+    br %neg, @hdone, @hbody
+  @hbody:
+    %val = load i64, *%vp
+    %shv = load i32, *%shift
+    %sh64 = zext i32 %shv to i64
+    %shifted = lshr i64 %val, %sh64
+    %nib = and i64 %shifted, 15
+    %nib32 = trunc i64 %nib to i32
+    store i32 %nib32, *%nibv
+    %st = load i32, *%started
+    %stb = ne i32 %st, 0
+    br %stb, @emit_nib, @maybe_first
+  @maybe_first:
+    %nzb = ne i32 %nib32, 0
+    br %nzb, @mark, @skip
+  @mark:
+    store i32 1, *%started
+    jmp @emit_nib
+  @skip:
+    jmp @hnext
+  @emit_nib:
+    %nv = load i32, *%nibv
+    %lt10 = slt i32 %nv, 10
+    br %lt10, @digit, @alpha
+  @digit:
+    %dc = add i32 %nv, 48
+    call @console_putc(%dc)
+    jmp @hnext
+  @alpha:
+    %ac = add i32 %nv, 87
+    call @console_putc(%ac)
+    jmp @hnext
+  @hnext:
+    %sh2 = load i32, *%shift
+    %nsh = sub i32 %sh2, 4
+    store i32 %nsh, *%shift
+    jmp @hcond
+  @hdone:
+    ret void
+}
+
+// Supports %d %x %c %s %% ; at most 4 integer arguments and 2 string arguments (matching s1/s2 in order of appearance).
+fun @console_printf(fmt: *i8, a: i64, b: i64, c: i64, d: i64, s1: *i8, s2: *i8) -> void {
+  @entry:
+    %args = let [i64, 4]
+    %ap0 = gep i64, *%args, 0
+    store i64 %a, *%ap0
+    %ap1 = gep i64, *%args, 1
+    store i64 %b, *%ap1
+    %ap2 = gep i64, *%args, 2
+    store i64 %c, *%ap2
+    %ap3 = gep i64, *%args, 3
+    store i64 %d, *%ap3
+    %i = let i32
+    %ai = let i32
+    %sidx = let i32
+    store i32 0, *%i
+    store i32 0, *%ai
+    store i32 0, *%sidx
+    jmp @loop
+  @loop:
+    %iv = load i32, *%i
+    %cp = gep i8, *%fmt, %iv
+    %ch = load i8, *%cp
+    %end = eq i8 %ch, 0
+    br %end, @done, @chk_pct
+  @chk_pct:
+    %ispct = eq i8 %ch, 37
+    br %ispct, @spec, @emit
+  @emit:
+    %cv = zext i8 %ch to i32
+    call @console_putc(%cv)
+    %iv2 = load i32, *%i
+    %nidx = add i32 %iv2, 1
+    store i32 %nidx, *%i
+    jmp @loop
+  @spec:
+    %iv3 = load i32, *%i
+    %nidx2 = add i32 %iv3, 1
+    %scp = gep i8, *%fmt, %nidx2
+    %sc = load i8, *%scp
+    %isd = eq i8 %sc, 100
+    br %isd, @do_dec, @chk_hex
+  @chk_hex:
+    %isx = eq i8 %sc, 120
+    br %isx, @do_hex, @chk_chr
+  @chk_chr:
+    %isc = eq i8 %sc, 99
+    br %isc, @do_chr, @chk_str
+  @chk_str:
+    %iss = eq i8 %sc, 115
+    br %iss, @do_str, @chk_lit
+  @chk_lit:
+    %isp = eq i8 %sc, 37
+    br %isp, @do_pct, @do_unknown
+  @do_pct:
+    call @console_putc(37)
+    %i_pct = load i32, *%i
+    %i_pct2 = add i32 %i_pct, 2
+    store i32 %i_pct2, *%i
+    jmp @loop
+  @do_unknown:
+    call @console_putc(63)
+    %i_u = load i32, *%i
+    %i_u2 = add i32 %i_u, 2
+    store i32 %i_u2, *%i
+    jmp @loop
+  @do_dec:
+    %aiv = load i32, *%ai
+    %avp = gep i64, *%args, %aiv
+    %av = load i64, *%avp
+    %ain = add i32 %aiv, 1
+    store i32 %ain, *%ai
+    call @console_put_dec(%av)
+    %i_d = load i32, *%i
+    %i_d2 = add i32 %i_d, 2
+    store i32 %i_d2, *%i
+    jmp @loop
+  @do_hex:
+    %biv = load i32, *%ai
+    %bvp = gep i64, *%args, %biv
+    %bv = load i64, *%bvp
+    %bin = add i32 %biv, 1
+    store i32 %bin, *%ai
+    call @console_put_hex(%bv)
+    %i_h = load i32, *%i
+    %i_h2 = add i32 %i_h, 2
+    store i32 %i_h2, *%i
+    jmp @loop
+  @do_chr:
+    %civ = load i32, *%ai
+    %cvp = gep i64, *%args, %civ
+    %cv64 = load i64, *%cvp
+    %cin = add i32 %civ, 1
+    store i32 %cin, *%ai
+    %c32 = trunc i64 %cv64 to i32
+    call @console_putc(%c32)
+    %i_c = load i32, *%i
+    %i_c2 = add i32 %i_c, 2
+    store i32 %i_c2, *%i
+    jmp @loop
+  @do_str:
+    %sv = load i32, *%sidx
+    %isfirst = eq i32 %sv, 0
+    br %isfirst, @str1, @str2
+  @str1:
+    call @console_puts(%s1)
+    jmp @str_done
+  @str2:
+    call @console_puts(%s2)
+    jmp @str_done
+  @str_done:
+    %sv2 = load i32, *%sidx
+    %svn = add i32 %sv2, 1
+    store i32 %svn, *%sidx
+    %i_s = load i32, *%i
+    %i_s2 = add i32 %i_s, 2
+    store i32 %i_s2, *%i
+    jmp @loop
+  @done:
+    ret void
+}

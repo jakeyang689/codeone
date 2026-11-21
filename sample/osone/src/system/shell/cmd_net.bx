@@ -1,0 +1,148 @@
+// cmd_net.bx - network shell commands: ifconfig / arp / dhcp / ping / nslookup / nettest
+
+extern @console_puts(s: *i8) -> void
+extern @console_printf(fmt: *i8, a: i64, b: i64, c: i64, d: i64, s1: *i8, s2: *i8) -> void
+extern @net_ifconfig() -> void
+extern @arp_dump() -> void
+extern @net_parse_ip(s: *i8) -> i32
+extern @net_print_ip(ip: i32) -> void
+extern @icmp_ping(dst: i32, seq: i32, timeout_ms: i32) -> i32
+extern @dns_resolve(name: *i8, timeout_ms: i32) -> i32
+extern @nettest_run() -> i32
+extern @dhcp_acquire() -> i32
+
+const @cmdnet_NS_USAGE: [i8, 24] = "usage: nslookup <host>\n"
+const @cmdnet_NS_OK: [i8, 19] = "%s -> %d.%d.%d.%d\n"
+const @cmdnet_NS_FAIL: [i8, 26] = "nslookup: %s: no address\n"
+const @cmdnet_PING_USAGE: [i8, 23] = "usage: ping <host|ip>\n"
+const @cmdnet_PING_FAIL: [i8, 26] = "ping: %s: cannot resolve\n"
+const @cmdnet_PING_FROM: [i8, 15] = "64 bytes from "
+const @cmdnet_PING_REPLY: [i8, 10] = ": seq=%d\n"
+const @cmdnet_PING_TIMEOUT: [i8, 24] = "ping: seq=%d timed out\n"
+const @cmdnet_PING_NOROUTE: [i8, 37] = "ping: no route to host (ARP failed)\n"
+
+fun @cmdnet_ifconfig() -> void {
+  @entry:
+    call @net_ifconfig()
+    ret void
+}
+
+fun @cmdnet_dhcp() -> void {
+  @entry:
+    call @dhcp_acquire()
+    ret void
+}
+
+fun @cmdnet_arp() -> void {
+  @entry:
+    call @arp_dump()
+    ret void
+}
+
+fun @cmdnet_nettest() -> void {
+  @entry:
+    call @nettest_run()
+    ret void
+}
+
+fun @cmdnet_ping(arg: *i8) -> void {
+  @entry:
+    %dst = let i32
+    %c0 = load i8, *%arg
+    %empty = eq i8 %c0, 0
+    br %empty, @usage, @tryip
+  @usage:
+    %u = gep i8, *@cmdnet_PING_USAGE, 0
+    call @console_puts(%u)
+    ret void
+  @tryip:
+    %ip = call @net_parse_ip(%arg)
+    %bad = eq i32 %ip, 0
+    br %bad, @resolve, @gotip
+  @gotip:
+    store i32 %ip, *%dst
+    jmp @run
+  @resolve:
+    %dip = call @dns_resolve(%arg, 1500)
+    %dok = ne i32 %dip, 0
+    br %dok, @gotdns, @fail
+  @gotdns:
+    store i32 %dip, *%dst
+    jmp @run
+  @fail:
+    %ff = gep i8, *@cmdnet_PING_FAIL, 0
+    call @console_printf(%ff, 0, 0, 0, 0, %arg, null)
+    ret void
+  @run:
+    %addr = load i32, *%dst
+    %seq = let i32
+    store i32 1, *%seq
+    jmp @cond
+  @cond:
+    %sv = load i32, *%seq
+    %done = sgt i32 %sv, 4
+    br %done, @out, @body
+  @body:
+    %ok = call @icmp_ping(%addr, %sv, 1000)
+    %got = eq i32 %ok, 1
+    %nr = slt i32 %ok, 0
+    %sv64 = sext i32 %sv to i64
+    br %got, @hit, @chkroute
+  @chkroute:
+    br %nr, @noroute, @miss
+  @noroute:
+    %nrm = gep i8, *@cmdnet_PING_NOROUTE, 0
+    call @console_puts(%nrm)
+    ret void
+  @hit:
+    %from = gep i8, *@cmdnet_PING_FROM, 0
+    call @console_puts(%from)
+    call @net_print_ip(%addr)
+    %rf = gep i8, *@cmdnet_PING_REPLY, 0
+    call @console_printf(%rf, %sv64, 0, 0, 0, null, null)
+    jmp @next
+  @miss:
+    %tf = gep i8, *@cmdnet_PING_TIMEOUT, 0
+    call @console_printf(%tf, %sv64, 0, 0, 0, null, null)
+    jmp @next
+  @next:
+    %sv2 = load i32, *%seq
+    %sn = add i32 %sv2, 1
+    store i32 %sn, *%seq
+    jmp @cond
+  @out:
+    ret void
+}
+
+fun @cmdnet_nslookup(arg: *i8) -> void {
+  @entry:
+    %c0 = load i8, *%arg
+    %empty = eq i8 %c0, 0
+    br %empty, @usage, @run
+  @usage:
+    %u = gep i8, *@cmdnet_NS_USAGE, 0
+    call @console_puts(%u)
+    ret void
+  @run:
+    %ip = call @dns_resolve(%arg, 1500)
+    %ok = ne i32 %ip, 0
+    br %ok, @hit, @miss
+  @hit:
+    %fmt = gep i8, *@cmdnet_NS_OK, 0
+    %b0 = lshr i32 %ip, 24
+    %b1m = and i32 %ip, 0x00FF0000
+    %b1 = lshr i32 %b1m, 16
+    %b2m = and i32 %ip, 0x0000FF00
+    %b2 = lshr i32 %b2m, 8
+    %b3 = and i32 %ip, 0xFF
+    %a0 = sext i32 %b0 to i64
+    %a1 = sext i32 %b1 to i64
+    %a2 = sext i32 %b2 to i64
+    %a3 = sext i32 %b3 to i64
+    call @console_printf(%fmt, %a0, %a1, %a2, %a3, %arg, null)
+    ret void
+  @miss:
+    %fmt2 = gep i8, *@cmdnet_NS_FAIL, 0
+    call @console_printf(%fmt2, 0, 0, 0, 0, %arg, null)
+    ret void
+}

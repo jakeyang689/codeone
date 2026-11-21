@@ -1,0 +1,345 @@
+// arp.bx - ARP request/reply and neighbor cache
+
+extern @eth_send(dst: *i8, etype: i32, payload: *i8, len: i32) -> i32
+extern @net_my_mac() -> *i8
+extern @net_my_ip() -> i32
+extern @net_be16(p: *i8, off: i32) -> i32
+extern @net_be32(p: *i8, off: i32) -> i32
+extern @net_ld8(p: *i8, off: i32) -> i32
+extern @net_st8(p: *i8, off: i32, v: i32) -> void
+extern @net_stbe16(p: *i8, off: i32, v: i32) -> void
+extern @net_stbe32(p: *i8, off: i32, v: i32) -> void
+extern @net_wait_ms(ms: i32) -> void
+extern @net_print_ip(ip: i32) -> void
+extern @net_format_mac(mac: *i8, out: *i8) -> void
+extern @console_putc(ch: i32) -> void
+extern @console_puts(s: *i8) -> void
+
+const @arp_TYPE: i32 = 0x0806
+const @arp_HTYPE: i32 = 1
+const @arp_PTYPE: i32 = 0x0800
+const @arp_OP_REQ: i32 = 1
+const @arp_OP_REP: i32 = 2
+const @arp_CAP: i32 = 8
+const @arp_HDR_LEN: i32 = 28
+const @arp_FRAME_LEN: i32 = 42
+const @arp_DUMP_HDR: [i8, 12] = "arp cache:\n"
+const @arp_DUMP_EMPTY: [i8, 9] = "(empty)\n"
+const @arp_DUMP_SEP: [i8, 3] = "  "
+const @arp_DUMP_NL: [i8, 2] = "\n"
+
+// Field indices: 0 ip, 1 valid, 2 mac[6]
+struct @arp_Entry {
+  @ip: i32,
+  @valid: i32,
+  @mac: [i8, 6]
+}
+
+global @arp_ENTRIES: [@arp_Entry, 8]
+global @arp_NEXT: i32
+global @arp_TX: [i8, 28]
+global @arp_BCAST: [i8, 6]
+
+fun @arp_entry(i: i32) -> *@arp_Entry {
+  @entry:
+    %p = gep @arp_Entry, *@arp_ENTRIES, %i
+    ret *@arp_Entry %p
+}
+
+fun @arp_mac_copy(dst: *i8, src: *i8) -> void {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @cond
+  @cond:
+    %iv = load i32, *%i
+    %done = sge i32 %iv, 6
+    br %done, @out, @body
+  @body:
+    %sp = gep i8, *%src, %iv
+    %b = load i8, *%sp
+    %dp = gep i8, *%dst, %iv
+    store i8 %b, *%dp
+    %in = add i32 %iv, 1
+    store i32 %in, *%i
+    jmp @cond
+  @out:
+    ret void
+}
+
+fun @arp_lookup(ip: i32) -> *i8 {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @cond
+  @cond:
+    %iv = load i32, *%i
+    %done = sge i32 %iv, @arp_CAP
+    br %done, @miss, @body
+  @body:
+    %ep = call @arp_entry(%iv)
+    %vp = field @arp_Entry, *%ep, 1
+    %v = load i32, *%vp
+    %valid = eq i32 %v, 1
+    br %valid, @chkip, @next
+  @chkip:
+    %ipv = field @arp_Entry, *%ep, 0
+    %found = load i32, *%ipv
+    %eqip = eq i32 %found, %ip
+    br %eqip, @hit, @next
+  @hit:
+    %mp = field @arp_Entry, *%ep, 2
+    %m = gep i8, *%mp, 0
+    ret *i8 %m
+  @next:
+    %in = add i32 %iv, 1
+    store i32 %in, *%i
+    jmp @cond
+  @miss:
+    ret *i8 null
+}
+
+fun @arp_cache(ip: i32, mac: *i8) -> void {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @find
+  @find:
+    %iv = load i32, *%i
+    %done = sge i32 %iv, @arp_CAP
+    br %done, @newslot, @findbody
+  @findbody:
+    %ep = call @arp_entry(%iv)
+    %vp = field @arp_Entry, *%ep, 1
+    %v = load i32, *%vp
+    %valid = eq i32 %v, 1
+    br %valid, @findip, @fnext
+  @findip:
+    %ipv = field @arp_Entry, *%ep, 0
+    %found = load i32, *%ipv
+    %eqip = eq i32 %found, %ip
+    br %eqip, @update, @fnext
+  @fnext:
+    %in = add i32 %iv, 1
+    store i32 %in, *%i
+    jmp @find
+  @newslot:
+    %j = let i32
+    store i32 0, *%j
+    jmp @free
+  @free:
+    %jv = load i32, *%j
+    %jdone = sge i32 %jv, @arp_CAP
+    br %jdone, @evict, @freebody
+  @freebody:
+    %ep2 = call @arp_entry(%jv)
+    %vp2 = field @arp_Entry, *%ep2, 1
+    %v2 = load i32, *%vp2
+    %isv = eq i32 %v2, 1
+    br %isv, @fnext2, @store
+  @fnext2:
+    %jn = add i32 %jv, 1
+    store i32 %jn, *%j
+    jmp @free
+  @evict:
+    %nx = load i32, *@arp_NEXT
+    %ni = add i32 %nx, 1
+    %ni2 = urem i32 %ni, @arp_CAP
+    store i32 %ni2, *@arp_NEXT
+    store i32 %nx, *%j
+    jmp @store
+  @update:
+    %ep3 = call @arp_entry(%iv)
+    jmp @store_ep
+  @store:
+    %jv2 = load i32, *%j
+    %ep4 = call @arp_entry(%jv2)
+    jmp @store_ep
+  @store_ep:
+    %ep5 = phi *@arp_Entry [%ep3, @update], [%ep4, @store]
+    %ipp = field @arp_Entry, *%ep5, 0
+    store i32 %ip, *%ipp
+    %vpp = field @arp_Entry, *%ep5, 1
+    store i32 1, *%vpp
+    %mpp = field @arp_Entry, *%ep5, 2
+    %mpp8 = gep i8, *%mpp, 0
+    call @arp_mac_copy(%mpp8, %mac)
+    ret void
+}
+
+fun @arp_input(frame: *i8, len: i32) -> void {
+  @entry:
+    %short = slt i32 %len, @arp_FRAME_LEN
+    br %short, @done, @parse
+  @parse:
+    %op = call @net_be16(%frame, 20)
+    %spa = call @net_be32(%frame, 28)
+    %tpa = call @net_be32(%frame, 38)
+    %sha = gep i8, *%frame, 22
+    %spaz = eq i32 %spa, 0
+    br %spaz, @maybe_reply, @cache
+  @cache:
+    call @arp_cache(%spa, %sha)
+    jmp @maybe_reply
+  @maybe_reply:
+    %isreq = eq i32 %op, @arp_OP_REQ
+    br %isreq, @chk_tpa, @done
+  @chk_tpa:
+    %myip = call @net_my_ip()
+    %form = eq i32 %tpa, %myip
+    br %form, @reply, @done
+  @reply:
+    %tx = gep i8, *@arp_TX, 0
+    call @net_stbe16(%tx, 0, @arp_HTYPE)
+    call @net_stbe16(%tx, 2, @arp_PTYPE)
+    call @net_st8(%tx, 4, 6)
+    call @net_st8(%tx, 5, 4)
+    call @net_stbe16(%tx, 6, @arp_OP_REP)
+    %mymac = call @net_my_mac()
+    %txsha = gep i8, *%tx, 8
+    call @arp_mac_copy(%txsha, %mymac)
+    %myip2 = call @net_my_ip()
+    call @net_stbe32(%tx, 14, %myip2)
+    %txtha = gep i8, *%tx, 18
+    %sha2 = gep i8, *%frame, 22
+    call @arp_mac_copy(%txtha, %sha2)
+    call @net_stbe32(%tx, 24, %spa)
+    %sha3 = gep i8, *%frame, 22
+    call @eth_send(%sha3, @arp_TYPE, %tx, @arp_HDR_LEN)
+    jmp @done
+  @done:
+    ret void
+}
+
+fun @arp_send_request(ip: i32) -> void {
+  @entry:
+    %bc = gep i8, *@arp_BCAST, 0
+    %b0 = gep i8, *@arp_BCAST, 0
+    store i8 255, *%b0
+    %b1 = gep i8, *@arp_BCAST, 1
+    store i8 255, *%b1
+    %b2 = gep i8, *@arp_BCAST, 2
+    store i8 255, *%b2
+    %b3 = gep i8, *@arp_BCAST, 3
+    store i8 255, *%b3
+    %b4 = gep i8, *@arp_BCAST, 4
+    store i8 255, *%b4
+    %b5 = gep i8, *@arp_BCAST, 5
+    store i8 255, *%b5
+    %tx = gep i8, *@arp_TX, 0
+    call @net_stbe16(%tx, 0, @arp_HTYPE)
+    call @net_stbe16(%tx, 2, @arp_PTYPE)
+    call @net_st8(%tx, 4, 6)
+    call @net_st8(%tx, 5, 4)
+    call @net_stbe16(%tx, 6, @arp_OP_REQ)
+    %mymac = call @net_my_mac()
+    %txsha = gep i8, *%tx, 8
+    call @arp_mac_copy(%txsha, %mymac)
+    %myip = call @net_my_ip()
+    call @net_stbe32(%tx, 14, %myip)
+    %tha = gep i8, *%tx, 18
+    %t0 = gep i8, *%tha, 0
+    store i8 0, *%t0
+    %t1 = gep i8, *%tha, 1
+    store i8 0, *%t1
+    %t2 = gep i8, *%tha, 2
+    store i8 0, *%t2
+    %t3 = gep i8, *%tha, 3
+    store i8 0, *%t3
+    %t4 = gep i8, *%tha, 4
+    store i8 0, *%t4
+    %t5 = gep i8, *%tha, 5
+    store i8 0, *%t5
+    call @net_stbe32(%tx, 24, %ip)
+    call @eth_send(%bc, @arp_TYPE, %tx, @arp_HDR_LEN)
+    ret void
+}
+
+// Resolve a neighbor MAC; returns null on failure.
+fun @arp_resolve(ip: i32) -> *i8 {
+  @entry:
+    %hit = call @arp_lookup(%ip)
+    %has = ne *i8 %hit, null
+    br %has, @found, @try
+  @try:
+    %att = let i32
+    store i32 0, *%att
+    jmp @cond
+  @cond:
+    %av = load i32, *%att
+    %done = sge i32 %av, 3
+    br %done, @miss, @send
+  @send:
+    call @arp_send_request(%ip)
+    call @net_wait_ms(300)
+    %p = call @arp_lookup(%ip)
+    %ok = ne *i8 %p, null
+    br %ok, @found, @next
+  @next:
+    %av2 = load i32, *%att
+    %an = add i32 %av2, 1
+    store i32 %an, *%att
+    jmp @cond
+  @found:
+    %r = call @arp_lookup(%ip)
+    ret *i8 %r
+  @miss:
+    ret *i8 null
+}
+
+// Print the valid neighbor cache entries: "  <ip>  <mac>".
+fun @arp_dump() -> void {
+  @entry:
+    %i = let i32
+    %n = let i32
+    %macbuf = let [i8, 18]
+    store i32 0, *%i
+    store i32 0, *%n
+    %hdr = gep i8, *@arp_DUMP_HDR, 0
+    call @console_puts(%hdr)
+    jmp @cond
+  @cond:
+    %iv = load i32, *%i
+    %done = sge i32 %iv, @arp_CAP
+    br %done, @fin, @body
+  @body:
+    %ep = call @arp_entry(%iv)
+    %vp = field @arp_Entry, *%ep, 1
+    %v = load i32, *%vp
+    %valid = eq i32 %v, 1
+    br %valid, @show, @next
+  @show:
+    %nv = load i32, *%n
+    %nn = add i32 %nv, 1
+    store i32 %nn, *%n
+    call @console_putc(32)
+    call @console_putc(32)
+    %ipp = field @arp_Entry, *%ep, 0
+    %ip = load i32, *%ipp
+    call @net_print_ip(%ip)
+    %sep = gep i8, *@arp_DUMP_SEP, 0
+    call @console_puts(%sep)
+    %mp = field @arp_Entry, *%ep, 2
+    %m8 = gep i8, *%mp, 0
+    %out = gep i8, *%macbuf, 0
+    call @net_format_mac(%m8, %out)
+    call @console_puts(%out)
+    %nl = gep i8, *@arp_DUMP_NL, 0
+    call @console_puts(%nl)
+    jmp @next
+  @next:
+    %niv = load i32, *%i
+    %in = add i32 %niv, 1
+    store i32 %in, *%i
+    jmp @cond
+  @fin:
+    %cnt = load i32, *%n
+    %zero = eq i32 %cnt, 0
+    br %zero, @empty, @ret
+  @empty:
+    %e = gep i8, *@arp_DUMP_EMPTY, 0
+    call @console_puts(%e)
+    jmp @ret
+  @ret:
+    ret void
+}

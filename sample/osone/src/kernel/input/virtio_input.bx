@@ -1,0 +1,580 @@
+// virtio_input.bx - legacy virtio-mmio keyboard and tablet driver
+//
+// Both the keyboard and the tablet are virtio-input devices with Device ID 18. Both report EV_KEY,
+// so they are distinguished by whether EV_BITS/EV_ABS is non-empty: the tablet has absolute axes, the keyboard does not.
+// Each device uses event queue 0, pre-filled with 32 eight-byte event buffers; the used ring is polled for recycling.
+
+extern @kmem_alloc(size: i64) -> *i8
+extern @kmem_memset(p: *i8, v: i32, n: i64) -> void
+extern @kmem_ptr_addr(p: *i8) -> i64
+extern @console_puts(s: *i8) -> void
+
+const @input_MMIO_BASE: i64 = 0x0A000000
+const @input_MMIO_STEP: i64 = 0x200
+const @input_SLOTS: i32 = 32
+
+const @input_REG_MAGIC: i64 = 0x000
+const @input_REG_VERSION: i64 = 0x004
+const @input_REG_DEVICEID: i64 = 0x008
+const @input_REG_GUESTFEAT: i64 = 0x020
+const @input_REG_GUESTFEATSEL: i64 = 0x024
+const @input_REG_QUEUESEL: i64 = 0x030
+const @input_REG_QUEUENUMMAX: i64 = 0x034
+const @input_REG_QUEUENUM: i64 = 0x038
+const @input_REG_QUEUEALIGN: i64 = 0x03C
+const @input_REG_QUEUEPFN: i64 = 0x040
+const @input_REG_QUEUENOTIFY: i64 = 0x050
+const @input_REG_STATUS: i64 = 0x070
+const @input_REG_CONFIG: i64 = 0x100
+
+const @input_MAGIC: i32 = 0x74726976
+const @input_DEV_INPUT: i32 = 18
+const @input_MAXDEV: i32 = 2
+const @input_QSIZE: i32 = 32
+const @input_EVSZ: i32 = 8
+
+const @input_CFG_SELECT: i64 = 0x100
+const @input_CFG_SUBSEL: i64 = 0x101
+const @input_CFG_SIZE: i64 = 0x102
+const @input_CFG_DATA: i64 = 0x108
+const @input_CFG_EV_BITS: i32 = 0x11
+const @input_CFG_ABS_INFO: i32 = 0x12
+
+const @input_EV_KEY: i32 = 1
+const @input_EV_ABS: i32 = 3
+const @input_ABS_X: i32 = 0
+const @input_ABS_Y: i32 = 1
+const @input_ABS_DEFAULT_MAX: i32 = 32767
+
+const @input_MSG_BOTH: [i8, 24] = "input: keyboard+tablet\n"
+const @input_MSG_KBD: [i8, 17] = "input: keyboard\n"
+const @input_MSG_TAB: [i8, 15] = "input: tablet\n"
+const @input_MSG_NONE: [i8, 13] = "input: none\n"
+
+global @input_N: i32
+global @input_BASE: [i64, 2]
+global @input_Q: [i64, 2]
+global @input_KIND: [i32, 2]
+global @input_AVAIL: [i32, 2]
+global @input_DONE: [i32, 2]
+global @input_MINX: [i32, 2]
+global @input_MAXX: [i32, 2]
+global @input_MINY: [i32, 2]
+global @input_MAXY: [i32, 2]
+global @input_BUF: [i8, 512]
+
+fun @input_r8(base: i64, off: i64) -> i32 {
+  @entry:
+    %addr = add i64 %base, %off
+    %v = asm att i32, "ldrb ${0:w}, [${addr}]", "=r,r,~{memory}", i64 %addr
+    ret i32 %v
+}
+
+fun @input_w8(base: i64, off: i64, val: i32) -> void {
+  @entry:
+    %addr = add i64 %base, %off
+    asm att void, "strb ${val:w}, [${addr}]", "r,r,~{memory}", i64 %addr, i32 %val
+    ret void
+}
+
+fun @input_r32(base: i64, off: i64) -> i32 {
+  @entry:
+    %addr = add i64 %base, %off
+    %v = asm att i32, "ldr ${0:w}, [${addr}]", "=r,r,~{memory}", i64 %addr
+    ret i32 %v
+}
+
+fun @input_w32(base: i64, off: i64, val: i32) -> void {
+  @entry:
+    %addr = add i64 %base, %off
+    asm att void, "str ${val:w}, [${addr}]", "r,r,~{memory}", i64 %addr, i32 %val
+    ret void
+}
+
+fun @input_ptr(addr: i64) -> *i8 {
+  @entry:
+    %p = asm att *i8, "mov $0, ${addr}", "=r,r", i64 %addr
+    ret *i8 %p
+}
+
+fun @input_cast16(addr: i64) -> *i16 {
+  @entry:
+    %p = asm att *i16, "mov $0, ${addr}", "=r,r", i64 %addr
+    ret *i16 %p
+}
+
+fun @input_cast32(addr: i64) -> *i32 {
+  @entry:
+    %p = asm att *i32, "mov $0, ${addr}", "=r,r", i64 %addr
+    ret *i32 %p
+}
+
+fun @input_cast64(addr: i64) -> *i64 {
+  @entry:
+    %p = asm att *i64, "mov $0, ${addr}", "=r,r", i64 %addr
+    ret *i64 %p
+}
+
+fun @input_barrier() -> void {
+  @entry:
+    asm att void, "dsb sy", "~{memory}"
+    ret void
+}
+
+fun @input_st16(addr: i64, v: i32) -> void {
+  @entry:
+    %p = call @input_cast16(%addr)
+    %v16 = trunc i32 %v to i16
+    store i16 %v16, *%p
+    ret void
+}
+
+fun @input_st32(addr: i64, v: i32) -> void {
+  @entry:
+    %p = call @input_cast32(%addr)
+    store i32 %v, *%p
+    ret void
+}
+
+fun @input_st64(addr: i64, v: i64) -> void {
+  @entry:
+    %p = call @input_cast64(%addr)
+    store i64 %v, *%p
+    ret void
+}
+
+// Config space: write select/subsel, then read size.
+fun @input_cfg_size(base: i64, sel: i32, subsel: i32) -> i32 {
+  @entry:
+    call @input_w8(%base, @input_CFG_SELECT, %sel)
+    call @input_w8(%base, @input_CFG_SUBSEL, %subsel)
+    %s = call @input_r8(%base, @input_CFG_SIZE)
+    ret i32 %s
+}
+
+fun @input_cfg_u32(base: i64, off: i64) -> i32 {
+  @entry:
+    %o = add i64 @input_CFG_DATA, %off
+    %v = call @input_r32(%base, %o)
+    ret i32 %v
+}
+
+fun @input_setup_queue(base: i64, qsel: i32) -> i64 {
+  @entry:
+    call @input_w32(%base, @input_REG_QUEUESEL, %qsel)
+    %max = call @input_r32(%base, @input_REG_QUEUENUMMAX)
+    %ok = sge i32 %max, @input_QSIZE
+    br %ok, @alloc, @fail
+  @alloc:
+    %raw = call @kmem_alloc(12288)
+    %isnull = eq *i8 %raw, null
+    br %isnull, @fail, @align
+  @align:
+    %ra = call @kmem_ptr_addr(%raw)
+    %up = add i64 %ra, 4095
+    %al = asm att i64, "and $0, ${up}, #0xfffffffffffff000", "=r,r", i64 %up
+    %al32 = trunc i64 %al to i32
+    %ptr = call @input_ptr(%al)
+    call @kmem_memset(%ptr, 0, 8192)
+    call @input_w32(%base, @input_REG_QUEUENUM, @input_QSIZE)
+    call @input_w32(%base, @input_REG_QUEUEALIGN, 4096)
+    // This QEMU's legacy QueuePFN takes a byte address rather than a page number.
+    call @input_w32(%base, @input_REG_QUEUEPFN, %al32)
+    ret i64 %al
+  @fail:
+    ret i64 0
+}
+
+// Pre-fill event queue 0 with 32 event buffers.
+fun @input_prime(base: i64, q: i64, dev: i32) -> void {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @cond
+  @cond:
+    %iv = load i32, *%i
+    %end = sge i32 %iv, @input_QSIZE
+    br %end, @ring, @body
+  @body:
+    %bi = mul i32 %dev, @input_QSIZE
+    %bsum = add i32 %bi, %iv
+    %boff = mul i32 %bsum, @input_EVSZ
+    %buf = gep i8, *@input_BUF, %boff
+    %ba = call @kmem_ptr_addr(%buf)
+    %doff = mul i32 %iv, 16
+    %doff64 = zext i32 %doff to i64
+    %dq = add i64 %q, %doff64
+    call @input_st64(%dq, %ba)
+    %lq = add i64 %dq, 8
+    call @input_st32(%lq, @input_EVSZ)
+    %fq = add i64 %dq, 12
+    call @input_st16(%fq, 2)
+    %nq = add i64 %dq, 14
+    call @input_st16(%nq, 0)
+    %ao = mul i32 %iv, 2
+    %ao64 = zext i32 %ao to i64
+    %ar = add i64 %q, 516
+    %ae = add i64 %ar, %ao64
+    call @input_st16(%ae, %iv)
+    %in = add i32 %iv, 1
+    store i32 %in, *%i
+    jmp @cond
+  @ring:
+    %idx = add i64 %q, 514
+    call @input_st16(%idx, @input_QSIZE)
+    call @input_barrier()
+    call @input_w32(%base, @input_REG_QUEUENOTIFY, 0)
+    ret void
+}
+
+fun @input_classify(base: i64) -> i32 {
+  @entry:
+    %abs = call @input_cfg_size(%base, @input_CFG_EV_BITS, @input_EV_ABS)
+    %hasabs = sgt i32 %abs, 0
+    br %hasabs, @tablet, @chkkey
+  @chkkey:
+    %key = call @input_cfg_size(%base, @input_CFG_EV_BITS, @input_EV_KEY)
+    %haskey = sgt i32 %key, 0
+    br %haskey, @keyboard, @none
+  @tablet:
+    ret i32 2
+  @keyboard:
+    ret i32 1
+  @none:
+    ret i32 0
+}
+
+// Read the range of one tablet axis; keep the default 0..32767 on failure.
+fun @input_abs_range(base: i64, dev: i32, axis: i32) -> void {
+  @entry:
+    %size = call @input_cfg_size(%base, @input_CFG_ABS_INFO, %axis)
+    %ok = sge i32 %size, 8
+    br %ok, @read, @done
+  @read:
+    %min = call @input_cfg_u32(%base, 0)
+    %max = call @input_cfg_u32(%base, 4)
+    %valid = sgt i32 %max, %min
+    br %valid, @store, @done
+  @store:
+    %isx = eq i32 %axis, @input_ABS_X
+    br %isx, @sx, @sy
+  @sx:
+    %minp = gep i32, *@input_MINX, %dev
+    store i32 %min, *%minp
+    %maxp = gep i32, *@input_MAXX, %dev
+    store i32 %max, *%maxp
+    ret void
+  @sy:
+    %minp2 = gep i32, *@input_MINY, %dev
+    store i32 %min, *%minp2
+    %maxp2 = gep i32, *@input_MAXY, %dev
+    store i32 %max, *%maxp2
+    ret void
+  @done:
+    ret void
+}
+
+fun @input_init_one(base: i64, kind: i32, dev: i32) -> i32 {
+  @entry:
+    call @input_w32(%base, @input_REG_STATUS, 0)
+    call @input_w32(%base, @input_REG_STATUS, 1)
+    call @input_w32(%base, @input_REG_STATUS, 3)
+    call @input_w32(%base, @input_REG_GUESTFEATSEL, 0)
+    call @input_w32(%base, @input_REG_GUESTFEAT, 0)
+    call @input_w32(%base, @input_REG_GUESTFEATSEL, 1)
+    call @input_w32(%base, @input_REG_GUESTFEAT, 0)
+    %q = call @input_setup_queue(%base, 0)
+    %qz = eq i64 %q, 0
+    br %qz, @fail, @queued
+  @queued:
+    %bp = gep i64, *@input_BASE, %dev
+    store i64 %base, *%bp
+    %qp = gep i64, *@input_Q, %dev
+    store i64 %q, *%qp
+    %kp = gep i32, *@input_KIND, %dev
+    store i32 %kind, *%kp
+    %ap = gep i32, *@input_AVAIL, %dev
+    store i32 @input_QSIZE, *%ap
+    %dp = gep i32, *@input_DONE, %dev
+    store i32 0, *%dp
+    %minxp = gep i32, *@input_MINX, %dev
+    store i32 0, *%minxp
+    %maxxp = gep i32, *@input_MAXX, %dev
+    store i32 @input_ABS_DEFAULT_MAX, *%maxxp
+    %minyp = gep i32, *@input_MINY, %dev
+    store i32 0, *%minyp
+    %maxyp = gep i32, *@input_MAXY, %dev
+    store i32 @input_ABS_DEFAULT_MAX, *%maxyp
+    // Fill avail first, then enter DRIVER_OK, and finally notify the device.
+    call @input_prime(%base, %q, %dev)
+    call @input_w32(%base, @input_REG_STATUS, 7)
+    call @input_w32(%base, @input_REG_QUEUENOTIFY, 0)
+    %istab = eq i32 %kind, 2
+    br %istab, @tab, @kbd
+  @tab:
+    call @input_abs_range(%base, %dev, @input_ABS_X)
+    call @input_abs_range(%base, %dev, @input_ABS_Y)
+    ret i32 1
+  @kbd:
+    ret i32 1
+  @fail:
+    ret i32 0
+}
+
+fun @input_init() -> i32 {
+  @entry:
+    store i32 0, *@input_N
+    %haskbd = let i32
+    %hastab = let i32
+    store i32 0, *%haskbd
+    store i32 0, *%hastab
+    %i = let i32
+    store i32 0, *%i
+    jmp @scan
+  @scan:
+    %iv = load i32, *%i
+    %scanend = sge i32 %iv, @input_SLOTS
+    br %scanend, @summary, @probe
+  @probe:
+    %off = mul i32 %iv, 0x200
+    %off64 = zext i32 %off to i64
+    %base = add i64 @input_MMIO_BASE, %off64
+    %magic = call @input_r32(%base, @input_REG_MAGIC)
+    %isv = eq i32 %magic, @input_MAGIC
+    br %isv, @ver, @next
+  @ver:
+    %ver = call @input_r32(%base, @input_REG_VERSION)
+    %v1 = eq i32 %ver, 1
+    br %v1, @dev, @next
+  @dev:
+    %devid = call @input_r32(%base, @input_REG_DEVICEID)
+    %isin = eq i32 %devid, @input_DEV_INPUT
+    br %isin, @classify, @next
+  @classify:
+    %kind = call @input_classify(%base)
+    %kz = eq i32 %kind, 0
+    br %kz, @next, @chkdup
+  @chkdup:
+    %iskey = eq i32 %kind, 1
+    br %iskey, @dupkey, @duptab
+  @dupkey:
+    %hk = load i32, *%haskbd
+    %has1 = eq i32 %hk, 1
+    br %has1, @next, @addkey
+  @duptab:
+    %ht = load i32, *%hastab
+    %has2 = eq i32 %ht, 1
+    br %has2, @next, @addtab
+  @addkey:
+    %d0 = load i32, *@input_N
+    %room0 = slt i32 %d0, @input_MAXDEV
+    br %room0, @do_key, @next
+  @do_key:
+    %ok0 = call @input_init_one(%base, 1, %d0)
+    %ok0b = eq i32 %ok0, 1
+    br %ok0b, @key_done, @next
+  @key_done:
+    store i32 1, *%haskbd
+    %nd0 = add i32 %d0, 1
+    store i32 %nd0, *@input_N
+    jmp @next
+  @addtab:
+    %d1 = load i32, *@input_N
+    %room1 = slt i32 %d1, @input_MAXDEV
+    br %room1, @do_tab, @next
+  @do_tab:
+    %ok1 = call @input_init_one(%base, 2, %d1)
+    %ok1b = eq i32 %ok1, 1
+    br %ok1b, @tab_done, @next
+  @tab_done:
+    store i32 1, *%hastab
+    %nd1 = add i32 %d1, 1
+    store i32 %nd1, *@input_N
+    jmp @next
+  @next:
+    %in = add i32 %iv, 1
+    store i32 %in, *%i
+    jmp @scan
+  @summary:
+    %hk2 = load i32, *%haskbd
+    %ht2 = load i32, *%hastab
+    %both = add i32 %hk2, %ht2
+    %isboth = eq i32 %both, 2
+    br %isboth, @pr_both, @chkone
+  @chkone:
+    %iskey2 = eq i32 %hk2, 1
+    br %iskey2, @pr_kbd, @chktab
+  @chktab:
+    %istab2 = eq i32 %ht2, 1
+    br %istab2, @pr_tab, @pr_none
+  @pr_both:
+    %m0 = gep i8, *@input_MSG_BOTH, 0
+    call @console_puts(%m0)
+    ret i32 1
+  @pr_kbd:
+    %m1 = gep i8, *@input_MSG_KBD, 0
+    call @console_puts(%m1)
+    ret i32 1
+  @pr_tab:
+    %m2 = gep i8, *@input_MSG_TAB, 0
+    call @console_puts(%m2)
+    ret i32 1
+  @pr_none:
+    %m3 = gep i8, *@input_MSG_NONE, 0
+    call @console_puts(%m3)
+    ret i32 0
+}
+
+fun @input_find_kind(kind: i32) -> i32 {
+  @entry:
+    %n = load i32, *@input_N
+    %i = let i32
+    store i32 0, *%i
+    jmp @cond
+  @cond:
+    %iv = load i32, *%i
+    %end = sge i32 %iv, %n
+    br %end, @none, @body
+  @body:
+    %kp = gep i32, *@input_KIND, %iv
+    %kv = load i32, *%kp
+    %is = eq i32 %kv, %kind
+    br %is, @found, @next
+  @next:
+    %in = add i32 %iv, 1
+    store i32 %in, *%i
+    jmp @cond
+  @found:
+    ret i32 %iv
+  @none:
+    ret i32 -1
+}
+
+fun @input_abs_min(dev: i32, axis: i32) -> i32 {
+  @entry:
+    %isx = eq i32 %axis, @input_ABS_X
+    br %isx, @x, @y
+  @x:
+    %p = gep i32, *@input_MINX, %dev
+    %v = load i32, *%p
+    ret i32 %v
+  @y:
+    %p2 = gep i32, *@input_MINY, %dev
+    %v2 = load i32, *%p2
+    ret i32 %v2
+}
+
+fun @input_abs_max(dev: i32, axis: i32) -> i32 {
+  @entry:
+    %isx = eq i32 %axis, @input_ABS_X
+    br %isx, @x, @y
+  @x:
+    %p = gep i32, *@input_MAXX, %dev
+    %v = load i32, *%p
+    ret i32 %v
+  @y:
+    %p2 = gep i32, *@input_MAXY, %dev
+    %v2 = load i32, *%p2
+    ret i32 %v2
+}
+
+fun @input_used_idx(q: i64) -> i32 {
+  @entry:
+    call @input_barrier()
+    %a = add i64 %q, 4098
+    %p = call @input_cast16(%a)
+    %v = load i16, *%p
+    %v32 = zext i16 %v to i32
+    ret i32 %v32
+}
+
+fun @input_notify(base: i64) -> void {
+  @entry:
+    call @input_w32(%base, @input_REG_QUEUENOTIFY, 0)
+    ret void
+}
+
+// Fetch one event; returns 0 when no event is available. ev = {source, type, code, value}.
+fun @input_poll(ev: *i32) -> i32 {
+  @entry:
+    %n = load i32, *@input_N
+    %d = let i32
+    store i32 0, *%d
+    jmp @loop
+  @loop:
+    %dv = load i32, *%d
+    %end = sge i32 %dv, %n
+    br %end, @none, @dev
+  @dev:
+    %qp = gep i64, *@input_Q, %dv
+    %q = load i64, *%qp
+    %used = call @input_used_idx(%q)
+    %donep = gep i32, *@input_DONE, %dv
+    %done = load i32, *%donep
+    %dl = and i32 %done, 0xFFFF
+    %pending = sub i32 %used, %dl
+    %pendm = and i32 %pending, 0xFFFF
+    %has = sgt i32 %pendm, 0
+    br %has, @take, @next
+  @take:
+    %slot = and i32 %done, 31
+    %eo = mul i32 %slot, 8
+    %eo64 = zext i32 %eo to i64
+    %ue = add i64 %q, 4100
+    %uep = add i64 %ue, %eo64
+    %eidp = call @input_cast32(%uep)
+    %eid = load i32, *%eidp
+    %id = and i32 %eid, 31
+    %di = mul i32 %dv, @input_QSIZE
+    %slotix = add i32 %di, %id
+    %boff = mul i32 %slotix, @input_EVSZ
+    %buf = gep i8, *@input_BUF, %boff
+    %ba = call @kmem_ptr_addr(%buf)
+    %tp = call @input_cast16(%ba)
+    %tv = load i16, *%tp
+    %type = zext i16 %tv to i32
+    %co = add i64 %ba, 2
+    %cp = call @input_cast16(%co)
+    %cv = load i16, *%cp
+    %code = zext i16 %cv to i32
+    %vo = add i64 %ba, 4
+    %vp = call @input_cast32(%vo)
+    %value = load i32, *%vp
+
+    // Recycle the descriptor.
+    %avp = gep i32, *@input_AVAIL, %dv
+    %av = load i32, *%avp
+    %aslot = and i32 %av, 31
+    %aro = mul i32 %aslot, 2
+    %aro64 = zext i32 %aro to i64
+    %arbase = add i64 %q, 516
+    %are = add i64 %arbase, %aro64
+    call @input_st16(%are, %id)
+    %avn = add i32 %av, 1
+    store i32 %avn, *%avp
+    %aidx = add i64 %q, 514
+    call @input_st16(%aidx, %avn)
+    %dnext = add i32 %done, 1
+    store i32 %dnext, *%donep
+    %bp = gep i64, *@input_BASE, %dv
+    %base = load i64, *%bp
+    call @input_barrier()
+    call @input_notify(%base)
+
+    %kp = gep i32, *@input_KIND, %dv
+    %kind = load i32, *%kp
+    store i32 %kind, *%ev
+    %e1 = gep i32, *%ev, 1
+    store i32 %type, *%e1
+    %e2 = gep i32, *%ev, 2
+    store i32 %code, *%e2
+    %e3 = gep i32, *%ev, 3
+    store i32 %value, *%e3
+    ret i32 1
+  @next:
+    %dn = add i32 %dv, 1
+    store i32 %dn, *%d
+    jmp @loop
+  @none:
+    ret i32 0
+}

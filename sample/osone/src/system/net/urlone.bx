@@ -1,0 +1,968 @@
+// urlone.bx - curl-like HTTP/HTTPS client for the osone shell.
+//
+// Supports GET/HEAD/POST and custom methods, extra request headers, response
+// headers, and writing the response body to a VFS file.  HTTPS tries TLS 1.3,
+// then a TLS 1.2 ECDHE client, then the toolchain's RSA-only TLS 1.2 client;
+// server certificates are checked for hostname and handshake signatures, but
+// no CA trust store is available.
+
+extern @net_ready() -> i32
+extern @net_parse_ip(s: *i8) -> i32
+extern @dns_resolve(name: *i8, timeout_ms: i32) -> i32
+extern @tcp_connect(ip: i32, port: i32, timeout_ms: i32) -> i32
+extern @tcp_send(id: i32, data: *i8, len: i32) -> i32
+extern @tcp_recv(id: i32, buf: *i8, max: i32, timeout_ms: i32) -> i32
+extern @tcp_close(id: i32) -> i32
+extern @tlsclient_connect(host: *i8, hostlen: i32, fd: i32) -> i32
+extern @tlsclient_connect12(host: *i8, hostlen: i32, fd: i32) -> i32
+extern @tlsclient_send(buf: *i8, len: i32) -> i32
+extern @tlsclient_recv(buf: *i8, cap: i32) -> i32
+extern @tlsclient_close() -> i32
+extern @tls12e_connect(host: *i8, hostlen: i32, fd: i32) -> i32
+extern @tls12e_send(buf: *i8, len: i32) -> i32
+extern @tls12e_recv(buf: *i8, cap: i32) -> i32
+extern @tls12e_close() -> i32
+extern @vfs_open(path: *i8, flags: i32) -> i32
+extern @vfs_write(fd: i32, buf: *i8, len: i64) -> i64
+extern @vfs_close(fd: i32) -> i32
+extern @console_putc(ch: i32) -> void
+extern @console_printf(fmt: *i8, a: i64, b: i64, c: i64, d: i64, s1: *i8, s2: *i8) -> void
+extern @url_parse(src: *i8, host: *i8, path: *i8, portp: *i32, schemep: *i32,
+                  hostcap: i32, pathcap: i32) -> i32
+
+const @urlone_USAGE: [i8, 488] = "usage: urlone [options] <url>\n  -i, --include   include response headers\n  -I, --head      send a HEAD request\n  -X <method>     use a custom request method\n  -d <data>       send a request body (POST by default)\n  -H <header>     add a request header (no spaces)\n  -o <file>       write the response body to a file\n  -h, --help      show this help\nhttp:// and https:// URLs are supported; https is encrypted but the server\ncertificate is not chain-validated (no CA store or wall clock)\n"
+const @urlone_ERR_SCHEME: [i8, 54] = "urlone: only http:// and https:// URLs are supported\n"
+const @urlone_ERR_TLS: [i8, 30] = "urlone: TLS handshake failed\n"
+const @urlone_ERR_URL: [i8, 21] = "urlone: invalid URL\n"
+const @urlone_ERR_NET: [i8, 30] = "urlone: network is not ready\n"
+const @urlone_ERR_DNS: [i8, 28] = "urlone: %s: cannot resolve\n"
+const @urlone_ERR_CONN: [i8, 28] = "urlone: %s: cannot connect\n"
+const @urlone_ERR_SEND: [i8, 29] = "urlone: request send failed\n"
+const @urlone_ERR_RECV: [i8, 33] = "urlone: response receive failed\n"
+const @urlone_ERR_HTTP: [i8, 33] = "urlone: malformed HTTP response\n"
+const @urlone_ERR_HDRBIG: [i8, 36] = "urlone: response headers too large\n"
+const @urlone_ERR_FILE: [i8, 37] = "urlone: %s: cannot open output file\n"
+const @urlone_ERR_WRITE: [i8, 29] = "urlone: output write failed\n"
+const @urlone_ERR_OPT: [i8, 27] = "urlone: unknown option %s\n"
+
+const @urlone_GET: [i8, 4] = "GET"
+const @urlone_HEAD: [i8, 5] = "HEAD"
+const @urlone_POST: [i8, 5] = "POST"
+
+const @urlone_HTTP10: [i8, 12] = " HTTP/1.0\r\n"
+const @urlone_HOST: [i8, 7] = "Host: "
+const @urlone_UA: [i8, 25] = "User-Agent: urlone/1.0\r\n"
+const @urlone_ACCEPT: [i8, 14] = "Accept: */*\r\n"
+const @urlone_CONN: [i8, 20] = "Connection: close\r\n"
+const @urlone_CTYPE: [i8, 50] = "Content-Type: application/x-www-form-urlencoded\r\n"
+const @urlone_CLEN: [i8, 17] = "Content-Length: "
+const @urlone_CRLF: [i8, 3] = "\r\n"
+
+const @urlone_TOK_H: [i8, 3] = "-h"
+const @urlone_TOK_HELP: [i8, 7] = "--help"
+const @urlone_TOK_I: [i8, 3] = "-i"
+const @urlone_TOK_INCLUDE: [i8, 10] = "--include"
+const @urlone_TOK_ICAP: [i8, 3] = "-I"
+const @urlone_TOK_HEAD: [i8, 7] = "--head"
+const @urlone_TOK_X: [i8, 3] = "-X"
+const @urlone_TOK_REQUEST: [i8, 10] = "--request"
+const @urlone_TOK_D: [i8, 3] = "-d"
+const @urlone_TOK_DATA: [i8, 7] = "--data"
+const @urlone_TOK_HDR: [i8, 3] = "-H"
+const @urlone_TOK_HEADER: [i8, 9] = "--header"
+const @urlone_TOK_O: [i8, 3] = "-o"
+const @urlone_TOK_OUTPUT: [i8, 9] = "--output"
+
+global @urlone_HDRBUF: [i8, 8192]
+global @urlone_CHUNK: [i8, 4096]
+
+fun @urlone_strlen(s: *i8) -> i32 {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @cond
+  @cond:
+    %iv = load i32, *%i
+    %cp = gep i8, *%s, %iv
+    %ch = load i8, *%cp
+    %z = eq i8 %ch, 0
+    br %z, @done, @body
+  @body:
+    %n = add i32 %iv, 1
+    store i32 %n, *%i
+    jmp @cond
+  @done:
+    ret i32 %iv
+}
+
+// Copy src to dst. Returns 0 on success, -1 when it does not fit.
+fun @urlone_copy_cap(dst: *i8, src: *i8, cap: i32) -> i32 {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @cond
+  @cond:
+    %iv = load i32, *%i
+    %sp = gep i8, *%src, %iv
+    %ch = load i8, *%sp
+    %z = eq i8 %ch, 0
+    br %z, @done, @chk
+  @chk:
+    %lim = sub i32 %cap, 1
+    %full = sge i32 %iv, %lim
+    br %full, @overflow, @body
+  @body:
+    %dp = gep i8, *%dst, %iv
+    store i8 %ch, *%dp
+    %n = add i32 %iv, 1
+    store i32 %n, *%i
+    jmp @cond
+  @done:
+    %dp2 = gep i8, *%dst, %iv
+    store i8 0, *%dp2
+    ret i32 0
+  @overflow:
+    ret i32 -1
+}
+
+fun @urlone_streq(a: *i8, b: *i8) -> i32 {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @cond
+  @cond:
+    %iv = load i32, *%i
+    %ap = gep i8, *%a, %iv
+    %ac = load i8, *%ap
+    %bp = gep i8, *%b, %iv
+    %bc = load i8, *%bp
+    %eqc = eq i8 %ac, %bc
+    br %eqc, @same, @diff
+  @same:
+    %z = eq i8 %ac, 0
+    br %z, @yes, @next
+  @next:
+    %n = add i32 %iv, 1
+    store i32 %n, *%i
+    jmp @cond
+  @diff:
+    ret i32 0
+  @yes:
+    ret i32 1
+}
+
+fun @urlone_is_opt(tok: *i8, shrt: *i8, lng: *i8) -> i32 {
+  @entry:
+    %a = call @urlone_streq(%tok, %shrt)
+    %b = call @urlone_streq(%tok, %lng)
+    %r = or i32 %a, %b
+    ret i32 %r
+}
+
+fun @urlone_append_ch(dst: *i8, lenp: *i32, ch: i8, cap: i32) -> void {
+  @entry:
+    %lv = load i32, *%lenp
+    %lim = sub i32 %cap, 1
+    %full = sge i32 %lv, %lim
+    br %full, @done, @body
+  @body:
+    %dp = gep i8, *%dst, %lv
+    store i8 %ch, *%dp
+    %nl = add i32 %lv, 1
+    store i32 %nl, *%lenp
+    jmp @done
+  @done:
+    %lv2 = load i32, *%lenp
+    %dp2 = gep i8, *%dst, %lv2
+    store i8 0, *%dp2
+    ret void
+}
+
+fun @urlone_append(dst: *i8, lenp: *i32, src: *i8, cap: i32) -> void {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @cond
+  @cond:
+    %iv = load i32, *%i
+    %sp = gep i8, *%src, %iv
+    %ch = load i8, *%sp
+    %z = eq i8 %ch, 0
+    br %z, @done, @body
+  @body:
+    call @urlone_append_ch(%dst, %lenp, %ch, %cap)
+    %n = add i32 %iv, 1
+    store i32 %n, *%i
+    jmp @cond
+  @done:
+    ret void
+}
+
+fun @urlone_append_uint(dst: *i8, lenp: *i32, val: i32, cap: i32) -> void {
+  @entry:
+    %tmp = let [i8, 16]
+    %n = let i32
+    %v = let i32
+    %oi = let i32
+    store i32 0, *%n
+    store i32 %val, *%v
+    store i32 0, *%oi
+    %zero = eq i32 %val, 0
+    br %zero, @zero_case, @digits
+  @zero_case:
+    %zp = gep i8, *%tmp, 0
+    store i8 48, *%zp
+    store i32 1, *%n
+    jmp @emit_setup
+  @digits:
+    jmp @dcond
+  @dcond:
+    %dv = load i32, *%v
+    %dz = eq i32 %dv, 0
+    br %dz, @emit_setup, @dbody
+  @dbody:
+    %rem = urem i32 %dv, 10
+    %rem8 = trunc i32 %rem to i8
+    %ch = add i8 %rem8, 48
+    %dn = load i32, *%n
+    %tp = gep i8, *%tmp, %dn
+    store i8 %ch, *%tp
+    %dn2 = add i32 %dn, 1
+    store i32 %dn2, *%n
+    %q = udiv i32 %dv, 10
+    store i32 %q, *%v
+    jmp @dcond
+  @emit_setup:
+    %cnt = load i32, *%n
+    %start = sub i32 %cnt, 1
+    store i32 %start, *%oi
+    jmp @econd
+  @econd:
+    %ov = load i32, *%oi
+    %odone = slt i32 %ov, 0
+    br %odone, @done, @ebody
+  @ebody:
+    %cp = gep i8, *%tmp, %ov
+    %cv = load i8, *%cp
+    call @urlone_append_ch(%dst, %lenp, %cv, %cap)
+    %ov2 = sub i32 %ov, 1
+    store i32 %ov2, *%oi
+    jmp @econd
+  @done:
+    ret void
+}
+
+// Copy the next whitespace-separated token, skipping leading spaces.
+fun @urlone_next_tok(args: *i8, pos: *i32, tok: *i8, cap: i32) -> i32 {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @skip
+  @skip:
+    %pv = load i32, *%pos
+    %cp = gep i8, *%args, %pv
+    %ch = load i8, *%cp
+    %z = eq i8 %ch, 0
+    br %z, @none, @chksp
+  @chksp:
+    %sp = eq i8 %ch, 32
+    br %sp, @adv, @copy
+  @adv:
+    %pn = add i32 %pv, 1
+    store i32 %pn, *%pos
+    jmp @skip
+  @copy:
+    %idx = load i32, *%i
+    %lim = sub i32 %cap, 1
+    %full = sge i32 %idx, %lim
+    br %full, @term, @cbody
+  @cbody:
+    %pv2 = load i32, *%pos
+    %sp2 = gep i8, *%args, %pv2
+    %c = load i8, *%sp2
+    %z2 = eq i8 %c, 0
+    br %z2, @term, @cchk
+  @cchk:
+    %spc = eq i8 %c, 32
+    br %spc, @term, @cstore
+  @cstore:
+    %dp = gep i8, *%tok, %idx
+    store i8 %c, *%dp
+    %ni = add i32 %idx, 1
+    store i32 %ni, *%i
+    %np = add i32 %pv2, 1
+    store i32 %np, *%pos
+    jmp @copy
+  @term:
+    %tv = load i32, *%i
+    %tp = gep i8, *%tok, %tv
+    store i8 0, *%tp
+    ret i32 1
+  @none:
+    %nv = load i32, *%i
+    %np2 = gep i8, *%tok, %nv
+    store i8 0, *%np2
+    ret i32 0
+}
+
+// Return the offset just past CRLFCRLF, or -1 when it is not present.
+fun @urlone_find_header_end(buf: *i8, len: i32) -> i32 {
+  @entry:
+    %i = let i32
+    store i32 3, *%i
+    jmp @cond
+  @cond:
+    %iv = load i32, *%i
+    %done = sge i32 %iv, %len
+    br %done, @none, @body
+  @body:
+    %i1 = sub i32 %iv, 1
+    %i2 = sub i32 %iv, 2
+    %i3 = sub i32 %iv, 3
+    %p0 = gep i8, *%buf, %iv
+    %c0 = load i8, *%p0
+    %p1 = gep i8, *%buf, %i1
+    %c1 = load i8, *%p1
+    %p2 = gep i8, *%buf, %i2
+    %c2 = load i8, *%p2
+    %p3 = gep i8, *%buf, %i3
+    %c3 = load i8, *%p3
+    %e0 = eq i8 %c0, 10
+    %e1 = eq i8 %c1, 13
+    %e2 = eq i8 %c2, 10
+    %e3 = eq i8 %c3, 13
+    %a = and i1 %e0, %e1
+    %b = and i1 %e2, %e3
+    %c = and i1 %a, %b
+    br %c, @found, @next
+  @next:
+    %n = add i32 %iv, 1
+    store i32 %n, *%i
+    jmp @cond
+  @found:
+    %r = add i32 %iv, 1
+    ret i32 %r
+  @none:
+    ret i32 -1
+}
+
+// Write bytes to a VFS file (fd >= 0) or to the console (fd < 0).
+fun @urlone_emit(fd: i32, buf: *i8, len: i32) -> i32 {
+  @entry:
+    %neg = slt i32 %fd, 0
+    br %neg, @console, @file
+  @console:
+    %i = let i32
+    store i32 0, *%i
+    jmp @ccond
+  @ccond:
+    %iv = load i32, *%i
+    %done = sge i32 %iv, %len
+    br %done, @ok, @cbody
+  @cbody:
+    %cp = gep i8, *%buf, %iv
+    %ch = load i8, *%cp
+    %ci = zext i8 %ch to i32
+    call @console_putc(%ci)
+    %n = add i32 %iv, 1
+    store i32 %n, *%i
+    jmp @ccond
+  @file:
+    %len64 = sext i32 %len to i64
+    %w = call @vfs_write(%fd, %buf, %len64)
+    %want = sext i32 %len to i64
+    %same = eq i64 %w, %want
+    br %same, @ok, @fail
+  @ok:
+    ret i32 0
+  @fail:
+    ret i32 -1
+}
+
+// Close a plain or TLS connection.  Mode 0 = plain, 1 = toolchain TLS,
+// 2 = tls12e ECDHE TLS.
+fun @urlone_close(sock: i32, mode: i32) -> void {
+  @entry:
+    %ise = eq i32 %mode, 2
+    br %ise, @doecdhe, @chk1
+  @doecdhe:
+    call @tls12e_close()
+    jmp @dotcp
+  @chk1:
+    %istls = eq i32 %mode, 1
+    br %istls, @dotls, @dotcp
+  @dotls:
+    call @tlsclient_close()
+    jmp @dotcp
+  @dotcp:
+    %has = sge i32 %sock, 0
+    br %has, @close, @done
+  @close:
+    call @tcp_close(%sock)
+    jmp @done
+  @done:
+    ret void
+}
+
+// Send a request over HTTP or TLS.  TLS send returns 0 on success.
+fun @urlone_send(sock: i32, mode: i32, buf: *i8, len: i32) -> i32 {
+  @entry:
+    %ise = eq i32 %mode, 2
+    br %ise, @doecdhe, @chk1
+  @doecdhe:
+    %re = call @tls12e_send(%buf, %len)
+    ret i32 %re
+  @chk1:
+    %istls = eq i32 %mode, 1
+    br %istls, @dotls, @dotcp
+  @dotls:
+    %r = call @tlsclient_send(%buf, %len)
+    ret i32 %r
+  @dotcp:
+    %r2 = call @tcp_send(%sock, %buf, %len)
+    ret i32 %r2
+}
+
+// Receive payload bytes.  TLS returns -1 when the peer closed the session.
+fun @urlone_recv(sock: i32, mode: i32, buf: *i8, max: i32, timeout: i32) -> i32 {
+  @entry:
+    %ise = eq i32 %mode, 2
+    br %ise, @doecdhe, @chk1
+  @doecdhe:
+    %re = call @tls12e_recv(%buf, %max)
+    ret i32 %re
+  @chk1:
+    %istls = eq i32 %mode, 1
+    br %istls, @dotls, @dotcp
+  @dotls:
+    %r = call @tlsclient_recv(%buf, %max)
+    ret i32 %r
+  @dotcp:
+    %r2 = call @tcp_recv(%sock, %buf, %max, %timeout)
+    ret i32 %r2
+}
+
+fun @urlone_abort(sock: i32, tls: i32, fd: i32, fmt: *i8, arg: *i8) -> i32 {
+  @entry:
+    %hasfd = sge i32 %fd, 0
+    br %hasfd, @closefd, @closeconn
+  @closefd:
+    call @vfs_close(%fd)
+    jmp @closeconn
+  @closeconn:
+    call @urlone_close(%sock, %tls)
+    call @console_printf(%fmt, 0, 0, 0, 0, %arg, null)
+    ret i32 1
+}
+
+fun @urlone_run(args: *i8) -> i32 {
+  @entry:
+    %url = let [i8, 256]
+    %host = let [i8, 256]
+    %path = let [i8, 1024]
+    %method = let [i8, 16]
+    %data = let [i8, 512]
+    %header = let [i8, 256]
+    %outfile = let [i8, 256]
+    %tok = let [i8, 256]
+    %req = let [i8, 2048]
+    %port = let i32
+    %scheme = let i32
+    %tls = let i32
+    %defport = let i32
+    %include = let i32
+    %method_set = let i32
+    %data_on = let i32
+    %header_on = let i32
+    %out_on = let i32
+    %url_on = let i32
+    %help = let i32
+    %pos = let i32
+    %rlen = let i32
+    %ofd = let i32
+    %total = let i32
+    %hdr_end = let i32
+    %ipc = let i32
+    %idc = let i32
+    %mode = let i32
+    %urlp = gep i8, *%url, 0
+    %hostp = gep i8, *%host, 0
+    %pathp = gep i8, *%path, 0
+    %methodp = gep i8, *%method, 0
+    %datap = gep i8, *%data, 0
+    %headerp = gep i8, *%header, 0
+    %outfilep = gep i8, *%outfile, 0
+    %tokp = gep i8, *%tok, 0
+    %reqp = gep i8, *%req, 0
+    %schemep = gep i32, *%scheme, 0
+    %tlsp = gep i32, *%tls, 0
+    %defportp = gep i32, *%defport, 0
+    %t_h = gep i8, *@urlone_TOK_H, 0
+    %t_help = gep i8, *@urlone_TOK_HELP, 0
+    %t_i = gep i8, *@urlone_TOK_I, 0
+    %t_include = gep i8, *@urlone_TOK_INCLUDE, 0
+    %t_icap = gep i8, *@urlone_TOK_ICAP, 0
+    %t_head = gep i8, *@urlone_TOK_HEAD, 0
+    %t_x = gep i8, *@urlone_TOK_X, 0
+    %t_request = gep i8, *@urlone_TOK_REQUEST, 0
+    %t_d = gep i8, *@urlone_TOK_D, 0
+    %t_data = gep i8, *@urlone_TOK_DATA, 0
+    %t_hdr = gep i8, *@urlone_TOK_HDR, 0
+    %t_header = gep i8, *@urlone_TOK_HEADER, 0
+    %t_o = gep i8, *@urlone_TOK_O, 0
+    %t_output = gep i8, *@urlone_TOK_OUTPUT, 0
+    store i32 0, *%include
+    store i32 0, *%method_set
+    store i32 0, *%data_on
+    store i32 0, *%header_on
+    store i32 0, *%out_on
+    store i32 0, *%url_on
+    store i32 0, *%help
+    store i32 0, *%pos
+    store i32 0, *%rlen
+    store i32 0, *%total
+    store i32 -1, *%hdr_end
+    store i32 0, *%ipc
+    store i32 -1, *%idc
+    store i32 -1, *%ofd
+    store i32 0, *%tls
+    store i32 0, *%mode
+    store i32 0, *%scheme
+    store i32 80, *%defport
+    %getp = gep i8, *@urlone_GET, 0
+    call @urlone_copy_cap(%methodp, %getp, 16)
+    jmp @arg_cond
+  @arg_cond:
+    %r0 = call @urlone_next_tok(%args, %pos, %tokp, 256)
+    %ok0 = eq i32 %r0, 1
+    br %ok0, @arg_body, @arg_done
+  @arg_body:
+    %ish = call @urlone_is_opt(%tokp, %t_h, %t_help)
+    %okh = eq i32 %ish, 1
+    br %okh, @set_help, @arg_i
+  @set_help:
+    store i32 1, *%help
+    jmp @arg_cond
+  @arg_i:
+    %isi = call @urlone_is_opt(%tokp, %t_i, %t_include)
+    %oki = eq i32 %isi, 1
+    br %oki, @set_include, @arg_icap
+  @set_include:
+    store i32 1, *%include
+    jmp @arg_cond
+  @arg_icap:
+    %isic = call @urlone_is_opt(%tokp, %t_icap, %t_head)
+    %okic = eq i32 %isic, 1
+    br %okic, @set_head, @arg_x
+  @set_head:
+    %hp = gep i8, *@urlone_HEAD, 0
+    call @urlone_copy_cap(%methodp, %hp, 16)
+    store i32 1, *%method_set
+    store i32 1, *%include
+    jmp @arg_cond
+  @arg_x:
+    %isx = call @urlone_is_opt(%tokp, %t_x, %t_request)
+    %okx = eq i32 %isx, 1
+    br %okx, @arg_x_get, @arg_d
+  @arg_x_get:
+    %r1 = call @urlone_next_tok(%args, %pos, %tokp, 256)
+    %ok1 = eq i32 %r1, 1
+    br %ok1, @arg_x_got, @usage
+  @arg_x_got:
+    %cx = call @urlone_copy_cap(%methodp, %tokp, 16)
+    %okx2 = eq i32 %cx, 0
+    br %okx2, @arg_x_ok, @usage
+  @arg_x_ok:
+    store i32 1, *%method_set
+    jmp @arg_cond
+  @arg_d:
+    %isd = call @urlone_is_opt(%tokp, %t_d, %t_data)
+    %okd = eq i32 %isd, 1
+    br %okd, @arg_d_get, @arg_hdr
+  @arg_d_get:
+    %r2 = call @urlone_next_tok(%args, %pos, %tokp, 256)
+    %ok2 = eq i32 %r2, 1
+    br %ok2, @arg_d_got, @usage
+  @arg_d_got:
+    %cd = call @urlone_copy_cap(%datap, %tokp, 512)
+    %okd2 = eq i32 %cd, 0
+    br %okd2, @arg_d_ok, @usage
+  @arg_d_ok:
+    store i32 1, *%data_on
+    %ms = load i32, *%method_set
+    %set = eq i32 %ms, 1
+    br %set, @arg_cond, @arg_d_post
+  @arg_d_post:
+    %postp = gep i8, *@urlone_POST, 0
+    call @urlone_copy_cap(%methodp, %postp, 16)
+    jmp @arg_cond
+  @arg_hdr:
+    %ishdr = call @urlone_is_opt(%tokp, %t_hdr, %t_header)
+    %okhdr = eq i32 %ishdr, 1
+    br %okhdr, @arg_hdr_get, @arg_o
+  @arg_hdr_get:
+    %r3 = call @urlone_next_tok(%args, %pos, %tokp, 256)
+    %ok3 = eq i32 %r3, 1
+    br %ok3, @arg_hdr_got, @usage
+  @arg_hdr_got:
+    %ch = call @urlone_copy_cap(%headerp, %tokp, 256)
+    %okh2 = eq i32 %ch, 0
+    br %okh2, @arg_hdr_ok, @usage
+  @arg_hdr_ok:
+    store i32 1, *%header_on
+    jmp @arg_cond
+  @arg_o:
+    %iso = call @urlone_is_opt(%tokp, %t_o, %t_output)
+    %oko = eq i32 %iso, 1
+    br %oko, @arg_o_get, @arg_other
+  @arg_o_get:
+    %r4 = call @urlone_next_tok(%args, %pos, %tokp, 256)
+    %ok4 = eq i32 %r4, 1
+    br %ok4, @arg_o_got, @usage
+  @arg_o_got:
+    %co = call @urlone_copy_cap(%outfilep, %tokp, 256)
+    %oko2 = eq i32 %co, 0
+    br %oko2, @arg_o_ok, @usage
+  @arg_o_ok:
+    store i32 1, *%out_on
+    jmp @arg_cond
+  @arg_other:
+    %c0p = gep i8, *%tokp, 0
+    %c0 = load i8, *%c0p
+    %dash = eq i8 %c0, 45
+    br %dash, @unknown_opt, @arg_url
+  @unknown_opt:
+    %ofmt = gep i8, *@urlone_ERR_OPT, 0
+    call @console_printf(%ofmt, 0, 0, 0, 0, %tokp, null)
+    ret i32 2
+  @arg_url:
+    %uo = load i32, *%url_on
+    %have = eq i32 %uo, 1
+    br %have, @usage, @arg_url_store
+  @arg_url_store:
+    %cu = call @urlone_copy_cap(%urlp, %tokp, 256)
+    %oku = eq i32 %cu, 0
+    br %oku, @arg_url_ok, @invalid_url
+  @arg_url_ok:
+    store i32 1, *%url_on
+    jmp @arg_cond
+  @arg_done:
+    %hv = load i32, *%help
+    %wants_help = eq i32 %hv, 1
+    br %wants_help, @show_help, @need_url
+  @need_url:
+    %uo2 = load i32, *%url_on
+    %none = eq i32 %uo2, 0
+    br %none, @usage, @proceed
+  @show_help:
+    %ufp = gep i8, *@urlone_USAGE, 0
+    call @console_printf(%ufp, 0, 0, 0, 0, null, null)
+    ret i32 0
+  @usage:
+    %ufp2 = gep i8, *@urlone_USAGE, 0
+    call @console_printf(%ufp2, 0, 0, 0, 0, null, null)
+    ret i32 2
+  @invalid_url:
+    %iuf = gep i8, *@urlone_ERR_URL, 0
+    call @console_printf(%iuf, 0, 0, 0, 0, null, null)
+    ret i32 2
+  @proceed:
+    %pr = call @url_parse(%urlp, %hostp, %pathp, %port, %schemep, 256, 1024)
+    %unsup = eq i32 %pr, -2
+    br %unsup, @err_scheme, @chk_url
+  @chk_url:
+    %badurl = eq i32 %pr, -1
+    br %badurl, @invalid_url, @scheme_ok
+  @scheme_ok:
+    %sv = load i32, *%scheme
+    %ishttps = eq i32 %sv, 1
+    br %ishttps, @scheme_https, @scheme_http
+  @scheme_https:
+    store i32 1, *%tls
+    store i32 1, *%mode
+    store i32 443, *%defport
+    jmp @req_build
+  @scheme_http:
+    store i32 0, *%tls
+    store i32 80, *%defport
+    jmp @req_build
+  @err_scheme:
+    %esf = gep i8, *@urlone_ERR_SCHEME, 0
+    call @console_printf(%esf, 0, 0, 0, 0, null, null)
+    ret i32 2
+  @req_build:
+    call @urlone_append(%reqp, %rlen, %methodp, 2048)
+    call @urlone_append_ch(%reqp, %rlen, 32, 2048)
+    call @urlone_append(%reqp, %rlen, %pathp, 2048)
+    %h10p = gep i8, *@urlone_HTTP10, 0
+    call @urlone_append(%reqp, %rlen, %h10p, 2048)
+    %hosthdr = gep i8, *@urlone_HOST, 0
+    call @urlone_append(%reqp, %rlen, %hosthdr, 2048)
+    call @urlone_append(%reqp, %rlen, %hostp, 2048)
+    %pv = load i32, *%port
+    %dpv = load i32, *%defport
+    %default_port = eq i32 %pv, %dpv
+    br %default_port, @req_host_done, @req_host_port
+  @req_host_port:
+    call @urlone_append_ch(%reqp, %rlen, 58, 2048)
+    call @urlone_append_uint(%reqp, %rlen, %pv, 2048)
+    jmp @req_host_done
+  @req_host_done:
+    %crlfp = gep i8, *@urlone_CRLF, 0
+    call @urlone_append(%reqp, %rlen, %crlfp, 2048)
+    %uap = gep i8, *@urlone_UA, 0
+    call @urlone_append(%reqp, %rlen, %uap, 2048)
+    %acceptp = gep i8, *@urlone_ACCEPT, 0
+    call @urlone_append(%reqp, %rlen, %acceptp, 2048)
+    %connp = gep i8, *@urlone_CONN, 0
+    call @urlone_append(%reqp, %rlen, %connp, 2048)
+    %hon = load i32, *%header_on
+    %hset = eq i32 %hon, 1
+    br %hset, @req_header, @req_data
+  @req_header:
+    call @urlone_append(%reqp, %rlen, %headerp, 2048)
+    call @urlone_append(%reqp, %rlen, %crlfp, 2048)
+    jmp @req_data
+  @req_data:
+    %don = load i32, *%data_on
+    %dset = eq i32 %don, 1
+    br %dset, @req_data_body, @req_end
+  @req_data_body:
+    %ctypep = gep i8, *@urlone_CTYPE, 0
+    call @urlone_append(%reqp, %rlen, %ctypep, 2048)
+    %clenp = gep i8, *@urlone_CLEN, 0
+    call @urlone_append(%reqp, %rlen, %clenp, 2048)
+    %dl = call @urlone_strlen(%datap)
+    call @urlone_append_uint(%reqp, %rlen, %dl, 2048)
+    call @urlone_append(%reqp, %rlen, %crlfp, 2048)
+    jmp @req_end
+  @req_end:
+    call @urlone_append(%reqp, %rlen, %crlfp, 2048)
+    %don2 = load i32, *%data_on
+    %dset2 = eq i32 %don2, 1
+    br %dset2, @req_body, @req_connect
+  @req_body:
+    call @urlone_append(%reqp, %rlen, %datap, 2048)
+    jmp @req_connect
+  @req_connect:
+    %ready = call @net_ready()
+    %up = eq i32 %ready, 1
+    br %up, @resolve_ip, @err_net
+  @resolve_ip:
+    %ipv = call @net_parse_ip(%hostp)
+    %isip = ne i32 %ipv, 0
+    br %isip, @store_ip, @dns_lookup
+  @store_ip:
+    store i32 %ipv, *%ipc
+    jmp @connect
+  @dns_lookup:
+    %dns = call @dns_resolve(%hostp, 3000)
+    %dnok = ne i32 %dns, 0
+    br %dnok, @store_dns, @err_dns
+  @store_dns:
+    store i32 %dns, *%ipc
+    jmp @connect
+  @connect:
+    %ipf = load i32, *%ipc
+    %pv2 = load i32, *%port
+    %id = call @tcp_connect(%ipf, %pv2, 5000)
+    %cok = sge i32 %id, 0
+    br %cok, @proto_start, @err_conn
+  @proto_start:
+    store i32 %id, *%idc
+    %tlsv0 = load i32, *%tls
+    %istls = eq i32 %tlsv0, 1
+    br %istls, @tls_handshake, @send_req
+  @tls_handshake:
+    %hl = call @urlone_strlen(%hostp)
+    %idh = load i32, *%idc
+    %hr = call @tlsclient_connect(%hostp, %hl, %idh)
+    %hok = eq i32 %hr, 0
+    br %hok, @send_req, @tls_retry
+  @tls_retry:
+    // TLS 1.3 was rejected (for example a TLS 1.2-only server): reconnect and try TLS 1.2.
+    %idr = load i32, *%idc
+    call @tcp_close(%idr)
+    %ipf2 = load i32, *%ipc
+    %pv3 = load i32, *%port
+    %id2 = call @tcp_connect(%ipf2, %pv3, 5000)
+    %cok2 = sge i32 %id2, 0
+    br %cok2, @tls12_start, @err_conn
+  @tls12_start:
+    // TLS 1.3 failed: try TLS 1.2 with ECDHE (RSA-signed ServerKeyExchange).
+    store i32 %id2, *%idc
+    %hr2 = call @tls12e_connect(%hostp, %hl, %id2)
+    %hok2 = eq i32 %hr2, 0
+    br %hok2, @tls12_ok, @tls_rsa_retry
+  @tls12_ok:
+    store i32 2, *%mode
+    jmp @send_req
+  @tls_rsa_retry:
+    // ECDHE failed too: fall back to the toolchain RSA-only TLS 1.2 client.
+    %idr3 = load i32, *%idc
+    call @tcp_close(%idr3)
+    %ipf3 = load i32, *%ipc
+    %pv4 = load i32, *%port
+    %id3 = call @tcp_connect(%ipf3, %pv4, 5000)
+    %cok3 = sge i32 %id3, 0
+    br %cok3, @tls_rsa_start, @err_conn
+  @tls_rsa_start:
+    store i32 %id3, *%idc
+    %hr3 = call @tlsclient_connect12(%hostp, %hl, %id3)
+    %hok3 = eq i32 %hr3, 0
+    br %hok3, @send_req, @err_tls
+  @send_req:
+    %rlv = load i32, *%rlen
+    %tlsv = load i32, *%mode
+    %ids = load i32, *%idc
+    %sr = call @urlone_send(%ids, %tlsv, %reqp, %rlv)
+    %sok = sge i32 %sr, 0
+    br %sok, @recv_start, @err_send
+  @recv_start:
+    store i32 0, *%total
+    jmp @hdr_loop
+  @hdr_loop:
+    %tv = load i32, *%total
+    %lim = sub i32 8192, %tv
+    %full = sle i32 %lim, 0
+    br %full, @err_hdrbig, @hdr_read
+  @hdr_read:
+    %hp2 = gep i8, *@urlone_HDRBUF, %tv
+    %tlsr = load i32, *%mode
+    %idhr = load i32, *%idc
+    %n = call @urlone_recv(%idhr, %tlsr, %hp2, %lim, 5000)
+    %posn = sgt i32 %n, 0
+    br %posn, @hdr_got, @hdr_nodata
+  @hdr_got:
+    %nt = add i32 %tv, %n
+    store i32 %nt, *%total
+    %hbufp = gep i8, *@urlone_HDRBUF, 0
+    %he = call @urlone_find_header_end(%hbufp, %nt)
+    %found = sge i32 %he, 0
+    br %found, @hdr_found, @hdr_loop
+  @hdr_nodata:
+    %nz = eq i32 %n, 0
+    br %nz, @err_http, @err_recv
+  @hdr_found:
+    store i32 %he, *%hdr_end
+    %oon = load i32, *%out_on
+    %oset = eq i32 %oon, 1
+    br %oset, @open_out, @emit_start
+  @open_out:
+    %fd = call @vfs_open(%outfilep, 1)
+    %fok = sge i32 %fd, 0
+    br %fok, @out_ok, @err_file
+  @out_ok:
+    store i32 %fd, *%ofd
+    jmp @emit_start
+  @emit_start:
+    %inc = load i32, *%include
+    %iset = eq i32 %inc, 1
+    br %iset, @emit_headers, @emit_body
+  @emit_headers:
+    %fdv = load i32, *%ofd
+    %hbp = gep i8, *@urlone_HDRBUF, 0
+    %hev = load i32, *%hdr_end
+    %w = call @urlone_emit(%fdv, %hbp, %hev)
+    %wok = eq i32 %w, 0
+    br %wok, @emit_body, @err_write
+  @emit_body:
+    %tv2 = load i32, *%total
+    %hev2 = load i32, *%hdr_end
+    %blen = sub i32 %tv2, %hev2
+    %bbp = gep i8, *@urlone_HDRBUF, %hev2
+    %fdv2 = load i32, *%ofd
+    %w2 = call @urlone_emit(%fdv2, %bbp, %blen)
+    %wok2 = eq i32 %w2, 0
+    br %wok2, @body_loop, @err_write
+  @body_loop:
+    %chp = gep i8, *@urlone_CHUNK, 0
+    %tlsb = load i32, *%mode
+    %idb = load i32, *%idc
+    %n2 = call @urlone_recv(%idb, %tlsb, %chp, 4096, 5000)
+    %posn2 = sgt i32 %n2, 0
+    br %posn2, @body_emit, @body_end
+  @body_emit:
+    %fdv3 = load i32, *%ofd
+    %chp2 = gep i8, *@urlone_CHUNK, 0
+    %w3 = call @urlone_emit(%fdv3, %chp2, %n2)
+    %wok3 = eq i32 %w3, 0
+    br %wok3, @body_loop, @err_write
+  @body_end:
+    %nz2 = eq i32 %n2, 0
+    br %nz2, @finish, @body_tlscheck
+  @body_tlscheck:
+    %tlsv2 = load i32, *%mode
+    %istls2 = ne i32 %tlsv2, 0
+    br %istls2, @finish, @err_recv
+  @finish:
+    %fdv4 = load i32, *%ofd
+    %hasfd = sge i32 %fdv4, 0
+    br %hasfd, @finish_close, @finish_tcp
+  @finish_close:
+    call @vfs_close(%fdv4)
+    jmp @finish_tcp
+  @finish_tcp:
+    %tlsv3 = load i32, *%mode
+    %idf = load i32, *%idc
+    call @urlone_close(%idf, %tlsv3)
+    ret i32 0
+  @err_net:
+    %enf = gep i8, *@urlone_ERR_NET, 0
+    call @console_printf(%enf, 0, 0, 0, 0, null, null)
+    ret i32 1
+  @err_dns:
+    %edf = gep i8, *@urlone_ERR_DNS, 0
+    %r5 = call @urlone_abort(-1, 0, -1, %edf, %hostp)
+    ret i32 %r5
+  @err_conn:
+    %ecf = gep i8, *@urlone_ERR_CONN, 0
+    %r6 = call @urlone_abort(-1, 0, -1, %ecf, %hostp)
+    ret i32 %r6
+  @err_tls:
+    %etf = gep i8, *@urlone_ERR_TLS, 0
+    %ide = load i32, *%idc
+    %modee = load i32, *%mode
+    %r13 = call @urlone_abort(%ide, %modee, -1, %etf, null)
+    ret i32 %r13
+  @err_send:
+    %esf2 = gep i8, *@urlone_ERR_SEND, 0
+    %tlsa = load i32, *%mode
+    %ids2 = load i32, *%idc
+    %r7 = call @urlone_abort(%ids2, %tlsa, -1, %esf2, null)
+    ret i32 %r7
+  @err_recv:
+    %erf = gep i8, *@urlone_ERR_RECV, 0
+    %fdv5 = load i32, *%ofd
+    %tlsb2 = load i32, *%mode
+    %idr2 = load i32, *%idc
+    %r8 = call @urlone_abort(%idr2, %tlsb2, %fdv5, %erf, null)
+    ret i32 %r8
+  @err_http:
+    %ehf = gep i8, *@urlone_ERR_HTTP, 0
+    %fdv6 = load i32, *%ofd
+    %tlsc = load i32, *%mode
+    %idh2 = load i32, *%idc
+    %r9 = call @urlone_abort(%idh2, %tlsc, %fdv6, %ehf, null)
+    ret i32 %r9
+  @err_hdrbig:
+    %ehbf = gep i8, *@urlone_ERR_HDRBIG, 0
+    %fdv7 = load i32, *%ofd
+    %tlsd = load i32, *%mode
+    %idb2 = load i32, *%idc
+    %r10 = call @urlone_abort(%idb2, %tlsd, %fdv7, %ehbf, null)
+    ret i32 %r10
+  @err_file:
+    %eff = gep i8, *@urlone_ERR_FILE, 0
+    %tlse = load i32, *%mode
+    %idf2 = load i32, *%idc
+    %r11 = call @urlone_abort(%idf2, %tlse, -1, %eff, %outfilep)
+    ret i32 %r11
+  @err_write:
+    %ewf = gep i8, *@urlone_ERR_WRITE, 0
+    %fdv8 = load i32, *%ofd
+    %tlsf = load i32, *%mode
+    %idw = load i32, *%idc
+    %r12 = call @urlone_abort(%idw, %tlsf, %fdv8, %ewf, null)
+    ret i32 %r12
+}

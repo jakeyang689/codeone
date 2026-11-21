@@ -1,0 +1,422 @@
+// draw.bx - framebuffer drawing primitives (B8G8R8X8, little-endian)
+//
+// Colors are encoded as (r<<16)|(g<<8)|b; a 32-bit little-endian store produces exactly the B,G,R,X byte order.
+// The *_alpha variants blend src over the pixel already in the framebuffer; alpha is 0..255.
+
+extern @gui_font_get(ch: i32) -> i64
+
+global @gui_FB: *i8
+global @gui_W: i32
+global @gui_H: i32
+
+fun @gui_draw_init(fb: *i8, w: i32, h: i32) -> void {
+  @entry:
+    store *i8 %fb, *@gui_FB
+    store i32 %w, *@gui_W
+    store i32 %h, *@gui_H
+    ret void
+}
+
+fun @gui_pixel(x: i32, y: i32, color: i32) -> void {
+  @entry:
+    %negx = slt i32 %x, 0
+    br %negx, @ret, @xhi
+  @xhi:
+    %w = load i32, *@gui_W
+    %xge = sge i32 %x, %w
+    br %xge, @ret, @y0
+  @y0:
+    %negy = slt i32 %y, 0
+    br %negy, @ret, @yhi
+  @yhi:
+    %h = load i32, *@gui_H
+    %yge = sge i32 %y, %h
+    br %yge, @ret, @store
+  @store:
+    %base = load *i8, *@gui_FB
+    %row = mul i32 %y, %w
+    %idx = add i32 %row, %x
+    %off = mul i32 %idx, 4
+    %p = gep i8, *%base, %off
+    %p32 = asm att *i32, "mov $0, ${1}", "=r,r", *i8 %p
+    store i32 %color, *%p32
+    ret void
+  @ret:
+    ret void
+}
+
+// src over dst for one color channel; alpha 0..255.
+fun @gui_mix_channel(src: i32, dst: i32, alpha: i32) -> i32 {
+  @entry:
+    %inv = sub i32 255, %alpha
+    %s1 = mul i32 %src, %alpha
+    %d1 = mul i32 %dst, %inv
+    %sum = add i32 %s1, %d1
+    %hi = lshr i32 %sum, 8
+    %r = add i32 %sum, %hi
+    %r2 = add i32 %r, 1
+    %out = lshr i32 %r2, 8
+    ret i32 %out
+}
+
+// Blends src over dst; alpha 0 keeps dst, 255 keeps src.
+fun @gui_mix(dst: i32, src: i32, alpha: i32) -> i32 {
+  @entry:
+    %a = and i32 %alpha, 0xFF
+    %opaque = sge i32 %a, 255
+    br %opaque, @src, @chk_clear
+  @chk_clear:
+    %clear = sle i32 %a, 0
+    br %clear, @dst, @blend
+  @src:
+    ret i32 %src
+  @dst:
+    ret i32 %dst
+  @blend:
+    %dr = lshr i32 %dst, 16
+    %dr2 = and i32 %dr, 0xFF
+    %dg = lshr i32 %dst, 8
+    %dg2 = and i32 %dg, 0xFF
+    %db = and i32 %dst, 0xFF
+    %sr = lshr i32 %src, 16
+    %sr2 = and i32 %sr, 0xFF
+    %sg = lshr i32 %src, 8
+    %sg2 = and i32 %sg, 0xFF
+    %sb = and i32 %src, 0xFF
+    %mr = call @gui_mix_channel(%sr2, %dr2, %a)
+    %mg = call @gui_mix_channel(%sg2, %dg2, %a)
+    %mb = call @gui_mix_channel(%sb, %db, %a)
+    %rs = shl i32 %mr, 16
+    %gs = shl i32 %mg, 8
+    %rg = or i32 %rs, %gs
+    %out = or i32 %rg, %mb
+    ret i32 %out
+}
+
+fun @gui_pixel_alpha(x: i32, y: i32, color: i32, alpha: i32) -> void {
+  @entry:
+    %negx = slt i32 %x, 0
+    br %negx, @ret, @xhi
+  @xhi:
+    %w = load i32, *@gui_W
+    %xge = sge i32 %x, %w
+    br %xge, @ret, @y0
+  @y0:
+    %negy = slt i32 %y, 0
+    br %negy, @ret, @yhi
+  @yhi:
+    %h = load i32, *@gui_H
+    %yge = sge i32 %y, %h
+    br %yge, @ret, @store
+  @store:
+    %base = load *i8, *@gui_FB
+    %row = mul i32 %y, %w
+    %idx = add i32 %row, %x
+    %off = mul i32 %idx, 4
+    %p = gep i8, *%base, %off
+    %p32 = asm att *i32, "mov $0, ${1}", "=r,r", *i8 %p
+    %old = load i32, *%p32
+    %mix = call @gui_mix(%old, %color, %alpha)
+    store i32 %mix, *%p32
+    ret void
+  @ret:
+    ret void
+}
+
+fun @gui_fill_rect(x: i32, y: i32, w: i32, h: i32, color: i32) -> void {
+  @entry:
+    %sw = load i32, *@gui_W
+    %sh = load i32, *@gui_H
+    %x0 = let i32
+    %y0 = let i32
+    %x1 = let i32
+    %y1 = let i32
+    store i32 %x, *%x0
+    store i32 %y, *%y0
+    %rx = add i32 %x, %w
+    %ry = add i32 %y, %h
+    store i32 %rx, *%x1
+    store i32 %ry, *%y1
+    %xneg = slt i32 %x, 0
+    br %xneg, @clamp_x0, @chk_x1
+  @clamp_x0:
+    store i32 0, *%x0
+    jmp @chk_x1
+  @chk_x1:
+    %xv1 = load i32, *%x1
+    %xover = sgt i32 %xv1, %sw
+    br %xover, @clamp_x1, @chk_y0
+  @clamp_x1:
+    store i32 %sw, *%x1
+    jmp @chk_y0
+  @chk_y0:
+    %yneg = slt i32 %y, 0
+    br %yneg, @clamp_y0, @chk_y1
+  @clamp_y0:
+    store i32 0, *%y0
+    jmp @chk_y1
+  @chk_y1:
+    %yv1 = load i32, *%y1
+    %yover = sgt i32 %yv1, %sh
+    br %yover, @clamp_y1, @chk_empty
+  @clamp_y1:
+    store i32 %sh, *%y1
+    jmp @chk_empty
+  @chk_empty:
+    %ax0 = load i32, *%x0
+    %ax1 = load i32, *%x1
+    %ay0 = load i32, *%y0
+    %ay1 = load i32, *%y1
+    %emptyx = sge i32 %ax0, %ax1
+    br %emptyx, @ret, @chk_empty_y
+  @chk_empty_y:
+    %emptyy = sge i32 %ay0, %ay1
+    br %emptyy, @ret, @rows
+  @rows:
+    %yy = let i32
+    store i32 %ay0, *%yy
+    jmp @row_cond
+  @row_cond:
+    %yv = load i32, *%yy
+    %yend = sge i32 %yv, %ay1
+    br %yend, @ret, @row_body
+  @row_body:
+    %xx = let i32
+    store i32 %ax0, *%xx
+    jmp @col_cond
+  @col_cond:
+    %xv = load i32, *%xx
+    %xend = sge i32 %xv, %ax1
+    br %xend, @row_next, @col_body
+  @col_body:
+    %base = load *i8, *@gui_FB
+    %rowix = mul i32 %yv, %sw
+    %pix = add i32 %rowix, %xv
+    %off = mul i32 %pix, 4
+    %p = gep i8, *%base, %off
+    %p32 = asm att *i32, "mov $0, ${1}", "=r,r", *i8 %p
+    store i32 %color, *%p32
+    %xn = add i32 %xv, 1
+    store i32 %xn, *%xx
+    jmp @col_cond
+  @row_next:
+    %yn = add i32 %yv, 1
+    store i32 %yn, *%yy
+    jmp @row_cond
+  @ret:
+    ret void
+}
+
+fun @gui_fill_rect_alpha(x: i32, y: i32, w: i32, h: i32, color: i32, alpha: i32) -> void {
+  @entry:
+    %a = and i32 %alpha, 0xFF
+    %opaque = sge i32 %a, 255
+    br %opaque, @solid, @chk_clear
+  @solid:
+    call @gui_fill_rect(%x, %y, %w, %h, %color)
+    ret void
+  @chk_clear:
+    %clear = sle i32 %a, 0
+    br %clear, @ret, @clip
+  @clip:
+    %sw = load i32, *@gui_W
+    %sh = load i32, *@gui_H
+    %x0 = let i32
+    %y0 = let i32
+    %x1 = let i32
+    %y1 = let i32
+    store i32 %x, *%x0
+    store i32 %y, *%y0
+    %rx = add i32 %x, %w
+    %ry = add i32 %y, %h
+    store i32 %rx, *%x1
+    store i32 %ry, *%y1
+    %xneg = slt i32 %x, 0
+    br %xneg, @clamp_x0, @chk_x1
+  @clamp_x0:
+    store i32 0, *%x0
+    jmp @chk_x1
+  @chk_x1:
+    %xv1 = load i32, *%x1
+    %xover = sgt i32 %xv1, %sw
+    br %xover, @clamp_x1, @chk_y0
+  @clamp_x1:
+    store i32 %sw, *%x1
+    jmp @chk_y0
+  @chk_y0:
+    %yneg = slt i32 %y, 0
+    br %yneg, @clamp_y0, @chk_y1
+  @clamp_y0:
+    store i32 0, *%y0
+    jmp @chk_y1
+  @chk_y1:
+    %yv1 = load i32, *%y1
+    %yover = sgt i32 %yv1, %sh
+    br %yover, @clamp_y1, @chk_empty
+  @clamp_y1:
+    store i32 %sh, *%y1
+    jmp @chk_empty
+  @chk_empty:
+    %ax0 = load i32, *%x0
+    %ax1 = load i32, *%x1
+    %ay0 = load i32, *%y0
+    %ay1 = load i32, *%y1
+    %emptyx = sge i32 %ax0, %ax1
+    br %emptyx, @ret, @chk_empty_y
+  @chk_empty_y:
+    %emptyy = sge i32 %ay0, %ay1
+    br %emptyy, @ret, @rows
+  @rows:
+    %yy = let i32
+    store i32 %ay0, *%yy
+    jmp @row_cond
+  @row_cond:
+    %yv = load i32, *%yy
+    %yend = sge i32 %yv, %ay1
+    br %yend, @ret, @row_body
+  @row_body:
+    %xx = let i32
+    store i32 %ax0, *%xx
+    jmp @col_cond
+  @col_cond:
+    %xv = load i32, *%xx
+    %xend = sge i32 %xv, %ax1
+    br %xend, @row_next, @col_body
+  @col_body:
+    call @gui_pixel_alpha(%xv, %yv, %color, %a)
+    %xn = add i32 %xv, 1
+    store i32 %xn, *%xx
+    jmp @col_cond
+  @row_next:
+    %yn = add i32 %yv, 1
+    store i32 %yn, *%yy
+    jmp @row_cond
+  @ret:
+    ret void
+}
+
+fun @gui_hline(x: i32, y: i32, w: i32, color: i32) -> void {
+  @entry:
+    call @gui_fill_rect(%x, %y, %w, 1, %color)
+    ret void
+}
+
+fun @gui_vline(x: i32, y: i32, h: i32, color: i32) -> void {
+  @entry:
+    call @gui_fill_rect(%x, %y, 1, %h, %color)
+    ret void
+}
+
+fun @gui_rect_outline(x: i32, y: i32, w: i32, h: i32, color: i32) -> void {
+  @entry:
+    call @gui_rect_outline_alpha(%x, %y, %w, %h, %color, 255)
+    ret void
+}
+
+fun @gui_rect_outline_alpha(x: i32, y: i32, w: i32, h: i32, color: i32, alpha: i32) -> void {
+  @entry:
+    call @gui_fill_rect_alpha(%x, %y, %w, 1, %color, %alpha)
+    %yb = sub i32 %y, 1
+    %yb2 = add i32 %yb, %h
+    call @gui_fill_rect_alpha(%x, %yb2, %w, 1, %color, %alpha)
+    call @gui_fill_rect_alpha(%x, %y, 1, %h, %color, %alpha)
+    %xr = sub i32 %x, 1
+    %xr2 = add i32 %xr, %w
+    call @gui_fill_rect_alpha(%xr2, %y, 1, %h, %color, %alpha)
+    ret void
+}
+
+fun @gui_text_scale_alpha(x: i32, y: i32, s: *i8, color: i32, scale: i32, alpha: i32) -> void {
+  @entry:
+    %ci = let i32
+    %ri = let i32
+    %co = let i32
+    store i32 0, *%ci
+    jmp @char_cond
+  @char_cond:
+    %iv = load i32, *%ci
+    %cp = gep i8, *%s, %iv
+    %ch = load i8, *%cp
+    %z = eq i8 %ch, 0
+    br %z, @done, @char_body
+  @char_body:
+    %chi = sext i8 %ch to i32
+    %glyph = call @gui_font_get(%chi)
+    store i32 0, *%ri
+    jmp @row_cond
+  @row_cond:
+    %rv = load i32, *%ri
+    %rend = sge i32 %rv, 8
+    br %rend, @next_char, @row_body
+  @row_body:
+    %rsh = mul i32 %rv, 8
+    %rsh64 = zext i32 %rsh to i64
+    %gsh = lshr i64 %glyph, %rsh64
+    %byte64 = and i64 %gsh, 0xFF
+    %byte = trunc i64 %byte64 to i32
+    store i32 0, *%co
+    jmp @col_cond
+  @col_cond:
+    %cv = load i32, *%co
+    %cend = sge i32 %cv, 8
+    br %cend, @row_next, @col_body
+  @col_body:
+    %bs = lshr i32 %byte, %cv
+    %bit = and i32 %bs, 1
+    %set = eq i32 %bit, 1
+    br %set, @paint, @col_next
+  @paint:
+    %cx = mul i32 %iv, 8
+    %cx2 = add i32 %cx, %cv
+    %px = mul i32 %cx2, %scale
+    %px2 = add i32 %x, %px
+    %py = mul i32 %rv, %scale
+    %py2 = add i32 %y, %py
+    call @gui_fill_rect_alpha(%px2, %py2, %scale, %scale, %color, %alpha)
+    jmp @col_next
+  @col_next:
+    %cn = add i32 %cv, 1
+    store i32 %cn, *%co
+    jmp @col_cond
+  @row_next:
+    %rn = add i32 %rv, 1
+    store i32 %rn, *%ri
+    jmp @row_cond
+  @next_char:
+    %cin = add i32 %iv, 1
+    store i32 %cin, *%ci
+    jmp @char_cond
+  @done:
+    ret void
+}
+
+fun @gui_text_scale(x: i32, y: i32, s: *i8, color: i32, scale: i32) -> void {
+  @entry:
+    call @gui_text_scale_alpha(%x, %y, %s, %color, %scale, 255)
+    ret void
+}
+
+fun @gui_text(x: i32, y: i32, s: *i8, color: i32) -> void {
+  @entry:
+    call @gui_text_scale(%x, %y, %s, %color, 1)
+    ret void
+}
+
+fun @gui_strlen(s: *i8) -> i32 {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @cond
+  @cond:
+    %iv = load i32, *%i
+    %p = gep i8, *%s, %iv
+    %c = load i8, *%p
+    %z = eq i8 %c, 0
+    br %z, @done, @body
+  @body:
+    %n = add i32 %iv, 1
+    store i32 %n, *%i
+    jmp @cond
+  @done:
+    ret i32 %iv
+}

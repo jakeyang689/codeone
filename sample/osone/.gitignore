@@ -1,0 +1,5 @@
+osone
+*.o
+*.elf
+build/
+qemu.log

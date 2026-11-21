@@ -1,0 +1,436 @@
+// virtio.bx - legacy virtio-mmio NIC driver
+//
+// QEMU virt provides 32 virtio-mmio slots starting at 0x0a000000 with a stride of 0x200.
+// The driver scans Magic/Version/DeviceID to find the NIC and uses the legacy interface:
+// a single 4KB-aligned split virtqueue (desc + avail + used) with a queue size of 32.
+//
+// Each TX/RX buffer is preceded by a 10-byte virtio_net_hdr (mrg_rxbuf is not negotiated,
+// nor is checksum offload).
+
+extern @kmem_alloc(size: i64) -> *i8
+extern @kmem_memset(p: *i8, v: i32, n: i64) -> void
+extern @kmem_memcpy(dst: *i8, src: *i8, n: i64) -> void
+extern @kmem_ptr_addr(p: *i8) -> i64
+extern @console_printf(fmt: *i8, a: i64, b: i64, c: i64, d: i64, s1: *i8, s2: *i8) -> void
+
+const @virtio_MMIO_BASE: i64 = 0x0A000000
+const @virtio_MMIO_STEP: i64 = 0x200
+
+const @virtio_REG_MAGIC: i64 = 0x000
+const @virtio_REG_VERSION: i64 = 0x004
+const @virtio_REG_DEVICEID: i64 = 0x008
+const @virtio_REG_HOSTFEAT: i64 = 0x010
+const @virtio_REG_HOSTFEATSEL: i64 = 0x014
+const @virtio_REG_GUESTFEAT: i64 = 0x020
+const @virtio_REG_GUESTFEATSEL: i64 = 0x024
+const @virtio_REG_QUEUESEL: i64 = 0x030
+const @virtio_REG_QUEUENUMMAX: i64 = 0x034
+const @virtio_REG_QUEUENUM: i64 = 0x038
+const @virtio_REG_QUEUEALIGN: i64 = 0x03C
+const @virtio_REG_QUEUEPFN: i64 = 0x040
+const @virtio_REG_QUEUENOTIFY: i64 = 0x050
+const @virtio_REG_STATUS: i64 = 0x070
+const @virtio_REG_CONFIG: i64 = 0x100
+
+const @virtio_MAGIC: i32 = 0x74726976
+const @virtio_QSIZE: i32 = 32
+const @virtio_BUFSZ: i32 = 1600
+const @virtio_HDRSZ: i32 = 10
+
+global @virtio_BASE: i64
+global @virtio_READY: i32
+global @virtio_MAC: [i8, 6]
+global @virtio_RXQ: i64
+global @virtio_TXQ: i64
+global @virtio_RX_AVAIL: i32
+global @virtio_RX_LAST: i32
+global @virtio_TX_AVAIL: i32
+global @virtio_RXBUF: [i8, 51200]
+global @virtio_TXBUF: [i8, 51200]
+
+fun @virtio_r32(off: i64) -> i32 {
+  @entry:
+    %base = load i64, *@virtio_BASE
+    %addr = add i64 %base, %off
+    %v = asm att i32, "ldr ${0:w}, [${addr}]", "=r,r,~{memory}", i64 %addr
+    ret i32 %v
+}
+
+fun @virtio_w32(off: i64, val: i32) -> void {
+  @entry:
+    %base = load i64, *@virtio_BASE
+    %addr = add i64 %base, %off
+    asm att void, "str ${val:w}, [${addr}]", "r,r,~{memory}", i64 %addr, i32 %val
+    ret void
+}
+
+fun @virtio_r8(off: i64) -> i32 {
+  @entry:
+    %base = load i64, *@virtio_BASE
+    %addr = add i64 %base, %off
+    %v = asm att i32, "ldrb ${0:w}, [${addr}]", "=r,r,~{memory}", i64 %addr
+    ret i32 %v
+}
+
+fun @virtio_ptr(addr: i64) -> *i8 {
+  @entry:
+    %p = asm att *i8, "mov $0, ${addr}", "=r,r", i64 %addr
+    ret *i8 %p
+}
+
+fun @virtio_barrier() -> void {
+  @entry:
+    asm att void, "dsb sy", "~{memory}"
+    ret void
+}
+
+// Initialize a queue using the legacy layout and return its address (4KB aligned).
+fun @virtio_setup_queue(qsel: i32) -> i64 {
+  @entry:
+    call @virtio_w32(@virtio_REG_QUEUESEL, %qsel)
+    %max = call @virtio_r32(@virtio_REG_QUEUENUMMAX)
+    %ok = sge i32 %max, @virtio_QSIZE
+    br %ok, @alloc, @fail
+  @alloc:
+    %raw = call @kmem_alloc(12288)
+    %isnull = eq *i8 %raw, null
+    br %isnull, @fail, @align
+  @align:
+    %ra = call @kmem_ptr_addr(%raw)
+    %up = add i64 %ra, 4095
+    %al = asm att i64, "and $0, ${up}, #0xfffffffffffff000", "=r,r", i64 %up
+    // This QEMU's legacy QueuePFN takes a byte address directly (the spec says address >> 12);
+    // writing a page number makes the device read the ring at a low address, which shows up as the queue never being consumed after notify.
+    %al32 = trunc i64 %al to i32
+    %ptr = call @virtio_ptr(%al)
+    call @kmem_memset(%ptr, 0, 8192)
+    call @virtio_w32(@virtio_REG_QUEUENUM, @virtio_QSIZE)
+    call @virtio_w32(@virtio_REG_QUEUEALIGN, 4096)
+    call @virtio_w32(@virtio_REG_QUEUEPFN, %al32)
+    ret i64 %al
+  @fail:
+    ret i64 0
+}
+
+fun @virtio_queue_notify(idx: i32) -> void {
+  @entry:
+    call @virtio_w32(@virtio_REG_QUEUENOTIFY, %idx)
+    ret void
+}
+
+// Pre-fill RX descriptors and publish them to the avail ring.
+fun @virtio_prime_rx() -> void {
+  @entry:
+    %q = load i64, *@virtio_RXQ
+    %i = let i32
+    store i32 0, *%i
+    jmp @cond
+  @cond:
+    %iv = load i32, *%i
+    %done = sge i32 %iv, @virtio_QSIZE
+    br %done, @ring, @body
+  @body:
+    %off = mul i32 %iv, @virtio_BUFSZ
+    %bp = gep i8, *@virtio_RXBUF, %off
+    %ba = call @kmem_ptr_addr(%bp)
+    %d32 = mul i32 %iv, 16
+    %d64 = zext i32 %d32 to i64
+    %dp = add i64 %q, %d64
+    %dpp = call @virtio_ptr(%dp)
+    %dpp64 = asm att *i64, "mov $0, ${1}", "=r,r", *i8 %dpp
+    store i64 %ba, *%dpp64
+    %lp = gep i8, *%dpp, 8
+    %lpp = asm att *i32, "mov $0, ${1}", "=r,r", *i8 %lp
+    store i32 @virtio_BUFSZ, *%lpp
+    %fp = gep i8, *%dpp, 12
+    %fpp = asm att *i16, "mov $0, ${1}", "=r,r", *i8 %fp
+    store i16 2, *%fpp
+    %np = gep i8, *%dpp, 14
+    %npp = asm att *i16, "mov $0, ${1}", "=r,r", *i8 %np
+    store i16 0, *%npp
+    %ap = add i64 %q, 512
+    %ap2 = add i64 %ap, 4
+    %aoff = mul i32 %iv, 2
+    %aoff64 = zext i32 %aoff to i64
+    %ae = add i64 %ap2, %aoff64
+    %aep = call @virtio_ptr(%ae)
+    %aep16 = asm att *i16, "mov $0, ${1}", "=r,r", *i8 %aep
+    %s16 = trunc i32 %iv to i16
+    store i16 %s16, *%aep16
+    %in = add i32 %iv, 1
+    store i32 %in, *%i
+    jmp @cond
+  @ring:
+    %q2 = load i64, *@virtio_RXQ
+    %idxp = add i64 %q2, 514
+    %ip = call @virtio_ptr(%idxp)
+    %ip16 = asm att *i16, "mov $0, ${1}", "=r,r", *i8 %ip
+    store i16 32, *%ip16
+    call @virtio_barrier()
+    call @virtio_queue_notify(0)
+    ret void
+}
+
+fun @virtio_net_init() -> i32 {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @scan
+  @scan:
+    %iv = load i32, *%i
+    %done = sge i32 %iv, 32
+    br %done, @none, @probe
+  @probe:
+    %off = mul i32 %iv, 0x200
+    %off64 = zext i32 %off to i64
+    %base = add i64 @virtio_MMIO_BASE, %off64
+    store i64 %base, *@virtio_BASE
+    %magic = call @virtio_r32(@virtio_REG_MAGIC)
+    %isv = eq i32 %magic, @virtio_MAGIC
+    br %isv, @chkver, @next
+  @chkver:
+    %ver = call @virtio_r32(@virtio_REG_VERSION)
+    %v1 = eq i32 %ver, 1
+    br %v1, @chkdev, @next
+  @chkdev:
+    %dev = call @virtio_r32(@virtio_REG_DEVICEID)
+    %netdev = eq i32 %dev, 1
+    br %netdev, @found, @next
+  @next:
+    %in = add i32 %iv, 1
+    store i32 %in, *%i
+    jmp @scan
+  @found:
+    // Reset and enter the driver state.
+    call @virtio_w32(@virtio_REG_STATUS, 0)
+    call @virtio_w32(@virtio_REG_STATUS, 1)
+    call @virtio_w32(@virtio_REG_STATUS, 3)
+    // Negotiate VIRTIO_NET_F_MAC (bit 5) and disable all other features.
+    call @virtio_w32(@virtio_REG_GUESTFEATSEL, 0)
+    call @virtio_w32(@virtio_REG_GUESTFEAT, 0x20)
+    call @virtio_w32(@virtio_REG_GUESTFEATSEL, 1)
+    call @virtio_w32(@virtio_REG_GUESTFEAT, 0)
+    // Read the MAC address.
+    %m0 = call @virtio_r8(@virtio_REG_CONFIG)
+    %m1 = call @virtio_r8(0x101)
+    %m2 = call @virtio_r8(0x102)
+    %m3 = call @virtio_r8(0x103)
+    %m4 = call @virtio_r8(0x104)
+    %m5 = call @virtio_r8(0x105)
+    %p0 = gep i8, *@virtio_MAC, 0
+    %c0 = trunc i32 %m0 to i8
+    store i8 %c0, *%p0
+    %p1 = gep i8, *@virtio_MAC, 1
+    %c1 = trunc i32 %m1 to i8
+    store i8 %c1, *%p1
+    %p2 = gep i8, *@virtio_MAC, 2
+    %c2 = trunc i32 %m2 to i8
+    store i8 %c2, *%p2
+    %p3 = gep i8, *@virtio_MAC, 3
+    %c3 = trunc i32 %m3 to i8
+    store i8 %c3, *%p3
+    %p4 = gep i8, *@virtio_MAC, 4
+    %c4 = trunc i32 %m4 to i8
+    store i8 %c4, *%p4
+    %p5 = gep i8, *@virtio_MAC, 5
+    %c5 = trunc i32 %m5 to i8
+    store i8 %c5, *%p5
+    // Queues.
+    %rx = call @virtio_setup_queue(0)
+    %rxz = eq i64 %rx, 0
+    br %rxz, @none, @setup_tx
+  @setup_tx:
+    %tx = call @virtio_setup_queue(1)
+    %txz = eq i64 %tx, 0
+    br %txz, @none, @ready
+  @ready:
+    store i64 %rx, *@virtio_RXQ
+    store i64 %tx, *@virtio_TXQ
+    // After pre-filling, avail idx is already QSIZE, so recycling must continue from that index;
+    // starting from 0 would make the device see avail idx wrap back to 1, and RX would stall after QSIZE frames.
+    store i32 @virtio_QSIZE, *@virtio_RX_AVAIL
+    store i32 0, *@virtio_RX_LAST
+    store i32 0, *@virtio_TX_AVAIL
+    // Notifications before DRIVER_OK are ignored by the device, so fill avail, set the status bit, and then notify.
+    call @virtio_prime_rx()
+    call @virtio_w32(@virtio_REG_STATUS, 7)
+    call @virtio_queue_notify(0)
+    store i32 1, *@virtio_READY
+    ret i32 1
+  @none:
+    store i32 0, *@virtio_READY
+    ret i32 0
+}
+
+fun @virtio_net_ready() -> i32 {
+  @entry:
+    %v = load i32, *@virtio_READY
+    ret i32 %v
+}
+
+fun @virtio_net_mac() -> *i8 {
+  @entry:
+    %p = gep i8, *@virtio_MAC, 0
+    ret *i8 %p
+}
+
+// Read the used ring idx (host memory; a memory barrier is required).
+fun @virtio_used_idx(q: i64) -> i32 {
+  @entry:
+    call @virtio_barrier()
+    %p = add i64 %q, 4098
+    %pp = call @virtio_ptr(%p)
+    %pp16 = asm att *i16, "mov $0, ${1}", "=r,r", *i8 %pp
+    %v = load i16, *%pp16
+    %v32 = zext i16 %v to i32
+    ret i32 %v32
+}
+
+fun @virtio_net_send(frame: *i8, len: i32) -> i32 {
+  @entry:
+    %ready = load i32, *@virtio_READY
+    %rok = eq i32 %ready, 1
+    br %rok, @chklen, @fail
+  @chklen:
+    %toobig = sgt i32 %len, 1514
+    br %toobig, @fail, @space
+  @space:
+    %q = load i64, *@virtio_TXQ
+    %av = load i32, *@virtio_TX_AVAIL
+    %used = call @virtio_used_idx(%q)
+    %inflight = sub i32 %av, %used
+    %full = sge i32 %inflight, 31
+    br %full, @wait, @send
+  @wait:
+    %used2 = call @virtio_used_idx(%q)
+    %av2 = load i32, *@virtio_TX_AVAIL
+    %inflight2 = sub i32 %av2, %used2
+    %full2 = sge i32 %inflight2, 31
+    br %full2, @wait, @send
+  @send:
+    %avy = load i32, *@virtio_TX_AVAIL
+    %slot = and i32 %avy, 31
+    %boff = mul i32 %slot, @virtio_BUFSZ
+    %buf = gep i8, *@virtio_TXBUF, %boff
+    call @kmem_memset(%buf, 0, 10)
+    %data = gep i8, *%buf, 10
+    %len64 = sext i32 %len to i64
+    call @kmem_memcpy(%data, %frame, %len64)
+    %ba = call @kmem_ptr_addr(%buf)
+    %d32 = mul i32 %slot, 16
+    %d64 = zext i32 %d32 to i64
+    %q3 = load i64, *@virtio_TXQ
+    %dp = add i64 %q3, %d64
+    %dpp = call @virtio_ptr(%dp)
+    %dpp64 = asm att *i64, "mov $0, ${1}", "=r,r", *i8 %dpp
+    store i64 %ba, *%dpp64
+    %lp = gep i8, *%dpp, 8
+    %lpp = asm att *i32, "mov $0, ${1}", "=r,r", *i8 %lp
+    %flen = add i32 %len, 10
+    store i32 %flen, *%lpp
+    %fp = gep i8, *%dpp, 12
+    %fpp = asm att *i16, "mov $0, ${1}", "=r,r", *i8 %fp
+    store i16 0, *%fpp
+    %np = gep i8, *%dpp, 14
+    %npp = asm att *i16, "mov $0, ${1}", "=r,r", *i8 %np
+    store i16 0, *%npp
+    %ringp = add i64 %q3, 516
+    %ro = mul i32 %slot, 2
+    %ro64 = zext i32 %ro to i64
+    %re = add i64 %ringp, %ro64
+    %rep = call @virtio_ptr(%re)
+    %rep16 = asm att *i16, "mov $0, ${1}", "=r,r", *i8 %rep
+    %slot16 = trunc i32 %slot to i16
+    store i16 %slot16, *%rep16
+    %idxp = add i64 %q3, 514
+    %ipp = call @virtio_ptr(%idxp)
+    %ipp16 = asm att *i16, "mov $0, ${1}", "=r,r", *i8 %ipp
+    %avy16 = trunc i32 %avy to i16
+    %avn = add i16 %avy16, 1
+    store i16 %avn, *%ipp16
+    %avn32 = add i32 %avy, 1
+    store i32 %avn32, *@virtio_TX_AVAIL
+    call @virtio_barrier()
+    call @virtio_queue_notify(1)
+    ret i32 %len
+  @fail:
+    ret i32 -1
+}
+
+// Take one frame (stripping the virtio header) and recycle the RX descriptor; returns -1 when no packet is available.
+fun @virtio_net_recv(buf: *i8, max: i32) -> i32 {
+  @entry:
+    %ready = load i32, *@virtio_READY
+    %rok = eq i32 %ready, 1
+    br %rok, @check, @empty
+  @check:
+    %q = load i64, *@virtio_RXQ
+    %used = call @virtio_used_idx(%q)
+    %last = load i32, *@virtio_RX_LAST
+    %has = slt i32 %last, %used
+    br %has, @take, @empty
+  @take:
+    %slotix = and i32 %last, 31
+    %eo = mul i32 %slotix, 8
+    %eo64 = zext i32 %eo to i64
+    %ebase = add i64 %q, 4100
+    %ep = add i64 %ebase, %eo64
+    %epp = call @virtio_ptr(%ep)
+    %idp = asm att *i32, "mov $0, ${1}", "=r,r", *i8 %epp
+    %id = load i32, *%idp
+    %lenp = gep i8, *%epp, 4
+    %lenpp = asm att *i32, "mov $0, ${1}", "=r,r", *i8 %lenp
+    %tlen = load i32, *%lenpp
+    %soff = mul i32 %id, @virtio_BUFSZ
+    %sbuf = gep i8, *@virtio_RXBUF, %soff
+    %data = gep i8, *%sbuf, @virtio_HDRSZ
+    %pay = sub i32 %tlen, @virtio_HDRSZ
+    %neg = slt i32 %pay, 0
+    br %neg, @recycle0, @copy
+  @copy:
+    %dt = sub i32 %pay, %max
+    %dts = ashr i32 %dt, 31
+    %dtm = and i32 %dt, %dts
+    %n = add i32 %max, %dtm
+    %n64 = sext i32 %n to i64
+    call @kmem_memcpy(%buf, %data, %n64)
+    jmp @recycle
+  @recycle0:
+    jmp @recycle
+  @recycle:
+    %id2 = load i32, *%idp
+    %av = load i32, *@virtio_RX_AVAIL
+    %avslot = and i32 %av, 31
+    %ringbase = add i64 %q, 516
+    %ro = mul i32 %avslot, 2
+    %ro64 = zext i32 %ro to i64
+    %re = add i64 %ringbase, %ro64
+    %rep = call @virtio_ptr(%re)
+    %rep16 = asm att *i16, "mov $0, ${1}", "=r,r", *i8 %rep
+    %id16 = trunc i32 %id2 to i16
+    store i16 %id16, *%rep16
+    %avn = add i32 %av, 1
+    store i32 %avn, *@virtio_RX_AVAIL
+    %idxp = add i64 %q, 514
+    %ipp = call @virtio_ptr(%idxp)
+    %ipp16 = asm att *i16, "mov $0, ${1}", "=r,r", *i8 %ipp
+    %avn16 = trunc i32 %avn to i16
+    store i16 %avn16, *%ipp16
+    %lastn = add i32 %last, 1
+    store i32 %lastn, *@virtio_RX_LAST
+    call @virtio_barrier()
+    call @virtio_queue_notify(0)
+    %pay2 = sub i32 %tlen, @virtio_HDRSZ
+    %neg2 = slt i32 %pay2, 0
+    br %neg2, @zero, @retn
+  @zero:
+    ret i32 0
+  @retn:
+    %dt2 = sub i32 %pay2, %max
+    %dts2 = ashr i32 %dt2, 31
+    %dtm2 = and i32 %dt2, %dts2
+    %n2 = add i32 %max, %dtm2
+    ret i32 %n2
+  @empty:
+    ret i32 -1
+}

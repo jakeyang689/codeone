@@ -1,0 +1,16 @@
+// psci.bx - PSCI SYSTEM_OFF / SYSTEM_RESET through the QEMU virt HVC conduit
+//
+// QEMU's virt machine exposes PSCI 0.2 at EL2; the kernel calls it with `hvc #0`.
+// Function IDs: SYSTEM_OFF 0x84000008, SYSTEM_RESET 0x84000009.
+
+fun @psci_system_off() -> void {
+  @entry:
+    asm att void, "mov x0, #8\nmovk x0, #0x8400, lsl #16\nhvc #0", "~{x0},~{x1},~{x2},~{x3},~{x4},~{x5},~{x6},~{x7},~{x8},~{x9},~{x10},~{x11},~{x12},~{x13},~{x14},~{x15},~{x16},~{x17},~{memory}"
+    ret void
+}
+
+fun @psci_system_reset() -> void {
+  @entry:
+    asm att void, "mov x0, #9\nmovk x0, #0x8400, lsl #16\nhvc #0", "~{x0},~{x1},~{x2},~{x3},~{x4},~{x5},~{x6},~{x7},~{x8},~{x9},~{x10},~{x11},~{x12},~{x13},~{x14},~{x15},~{x16},~{x17},~{memory}"
+    ret void
+}

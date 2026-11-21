@@ -1,0 +1,657 @@
+// ramfs.bx - in-memory file system backend
+//
+// Fixed 64 inodes and 64 4KB data blocks (256KB data area); a single file spans at most 8 blocks (32KB).
+// inode 0 is the root directory "/".
+
+extern @kmem_memcpy(d: *i8, s: *i8, n: i64) -> void
+extern @kmem_memset(p: *i8, v: i32, n: i64) -> void
+
+const @ramfs_MAX_INODES: i32 = 64
+const @ramfs_MAX_BLOCKS: i32 = 64
+const @ramfs_BLOCK_SIZE: i32 = 4096
+const @ramfs_DIR: i32 = 2
+const @ramfs_FILE: i32 = 1
+
+// Field indices: 0 used, 1 type, 2 parent, 3 first, 4 next, 5 blocks, 6 size, 7 name, 8 blk[]
+struct @ramfs_Inode {
+  @used: i32,
+  @type: i32,
+  @parent: i32,
+  @first: i32,
+  @next: i32,
+  @blkcount: i32,
+  @size: i64,
+  @name: [i8, 32],
+  @blk: [i32, 8]
+}
+
+// Field indices: 0 inodes, 1 arena, 2 bitmap, 3 inited
+struct @ramfs_State {
+  @inodes: [@ramfs_Inode, 64],
+  @arena: [i8, 262144],
+  @bitmap: [i32, 64],
+  @inited: i32
+}
+
+global @ramfs_state: @ramfs_State
+
+fun @ramfs_inode(i: i32) -> *@ramfs_Inode {
+  @entry:
+    %arr = field @ramfs_State, *@ramfs_state, 0
+    %p = gep @ramfs_Inode, *%arr, %i
+    ret *@ramfs_Inode %p
+}
+
+fun @ramfs_arena() -> *i8 {
+  @entry:
+    %arr = field @ramfs_State, *@ramfs_state, 1
+    %p = gep i8, *%arr, 0
+    ret *i8 %p
+}
+
+fun @ramfs_block_ptr(blk: i32) -> *i8 {
+  @entry:
+    %base = call @ramfs_arena()
+    %off = mul i32 %blk, 4096
+    %p = gep i8, *%base, %off
+    ret *i8 %p
+}
+
+fun @ramfs_bitmap(blk: i32) -> *i32 {
+  @entry:
+    %arr = field @ramfs_State, *@ramfs_state, 2
+    %p = gep i32, *%arr, %blk
+    ret *i32 %p
+}
+
+fun @ramfs_alloc_block() -> i32 {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @cond
+  @cond:
+    %iv = load i32, *%i
+    %done = sge i32 %iv, 64
+    br %done, @none, @body
+  @body:
+    %bp = call @ramfs_bitmap(%iv)
+    %bv = load i32, *%bp
+    %free = eq i32 %bv, 0
+    br %free, @take, @next
+  @take:
+    store i32 1, *%bp
+    ret i32 %iv
+  @next:
+    %n = add i32 %iv, 1
+    store i32 %n, *%i
+    jmp @cond
+  @none:
+    ret i32 -1
+}
+
+fun @ramfs_free_block(blk: i32) -> void {
+  @entry:
+    %bp = call @ramfs_bitmap(%blk)
+    store i32 0, *%bp
+    ret void
+}
+
+fun @ramfs_streq(a: *i8, b: *i8) -> i32 {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @cond
+  @cond:
+    %iv = load i32, *%i
+    %over = sge i32 %iv, 32
+    br %over, @no, @body
+  @body:
+    %ap = gep i8, *%a, %iv
+    %av = load i8, *%ap
+    %bp = gep i8, *%b, %iv
+    %bv = load i8, *%bp
+    %same = eq i8 %av, %bv
+    br %same, @chk_end, @no
+  @chk_end:
+    %az = eq i8 %av, 0
+    br %az, @yes, @next
+  @next:
+    %n = add i32 %iv, 1
+    store i32 %n, *%i
+    jmp @cond
+  @yes:
+    ret i32 1
+  @no:
+    ret i32 0
+}
+
+fun @ramfs_strcpy(dst: *i8, src: *i8, max: i32) -> void {
+  @entry:
+    %i = let i32
+    %lim = sub i32 %max, 1
+    store i32 0, *%i
+    jmp @cond
+  @cond:
+    %iv = load i32, *%i
+    %over = sge i32 %iv, %lim
+    br %over, @term, @body
+  @body:
+    %sp = gep i8, *%src, %iv
+    %ch = load i8, *%sp
+    %end = eq i8 %ch, 0
+    br %end, @term, @copy
+  @copy:
+    %dp = gep i8, *%dst, %iv
+    store i8 %ch, *%dp
+    %n = add i32 %iv, 1
+    store i32 %n, *%i
+    jmp @cond
+  @term:
+    %tv = load i32, *%i
+    %tp = gep i8, *%dst, %tv
+    store i8 0, *%tp
+    ret void
+}
+
+fun @ramfs_init() -> void {
+  @entry:
+    %p = call @ramfs_inode(0)
+    %f0 = field @ramfs_Inode, *%p, 0
+    store i32 1, *%f0
+    %f1 = field @ramfs_Inode, *%p, 1
+    store i32 2, *%f1
+    %f2 = field @ramfs_Inode, *%p, 2
+    store i32 -1, *%f2
+    %f3 = field @ramfs_Inode, *%p, 3
+    store i32 -1, *%f3
+    %f4 = field @ramfs_Inode, *%p, 4
+    store i32 -1, *%f4
+    %f5 = field @ramfs_Inode, *%p, 5
+    store i32 0, *%f5
+    %f6 = field @ramfs_Inode, *%p, 6
+    store i64 0, *%f6
+    %f7 = field @ramfs_Inode, *%p, 7
+    %np0 = gep i8, *%f7, 0
+    store i8 47, *%np0
+    %np1 = gep i8, *%f7, 1
+    store i8 0, *%np1
+    %f8 = field @ramfs_Inode, *%p, 8
+    %b0 = gep i32, *%f8, 0
+    store i32 -1, *%b0
+    %b1 = gep i32, *%f8, 1
+    store i32 -1, *%b1
+    %b2 = gep i32, *%f8, 2
+    store i32 -1, *%b2
+    %b3 = gep i32, *%f8, 3
+    store i32 -1, *%b3
+    %b4 = gep i32, *%f8, 4
+    store i32 -1, *%b4
+    %b5 = gep i32, *%f8, 5
+    store i32 -1, *%b5
+    %b6 = gep i32, *%f8, 6
+    store i32 -1, *%b6
+    %b7 = gep i32, *%f8, 7
+    store i32 -1, *%b7
+    ret void
+}
+
+fun @ramfs_root() -> i32 {
+  @entry:
+    ret i32 0
+}
+
+fun @ramfs_lookup(parent: i32, name: *i8) -> i32 {
+  @entry:
+    %pp = call @ramfs_inode(%parent)
+    %firstp = field @ramfs_Inode, *%pp, 3
+    %first = load i32, *%firstp
+    %cur = let i32
+    store i32 %first, *%cur
+    jmp @cond
+  @cond:
+    %cv = load i32, *%cur
+    %none = slt i32 %cv, 0
+    br %none, @notfound, @body
+  @body:
+    %ip = call @ramfs_inode(%cv)
+    %np = field @ramfs_Inode, *%ip, 7
+    %n0 = gep i8, *%np, 0
+    %eqn = call @ramfs_streq(%n0, %name)
+    %hit = eq i32 %eqn, 1
+    br %hit, @found, @next
+  @found:
+    %rv = load i32, *%cur
+    ret i32 %rv
+  @next:
+    %ip2 = call @ramfs_inode(%cv)
+    %nxp = field @ramfs_Inode, *%ip2, 4
+    %nx = load i32, *%nxp
+    store i32 %nx, *%cur
+    jmp @cond
+  @notfound:
+    ret i32 -1
+}
+
+fun @ramfs_create(parent: i32, name: *i8, type: i32) -> i32 {
+  @entry:
+    %i = let i32
+    store i32 1, *%i
+    jmp @find_cond
+  @find_cond:
+    %iv = load i32, *%i
+    %over = sge i32 %iv, 64
+    br %over, @full, @find_body
+  @find_body:
+    %ip = call @ramfs_inode(%iv)
+    %up = field @ramfs_Inode, *%ip, 0
+    %uv = load i32, *%up
+    %free = eq i32 %uv, 0
+    br %free, @init, @find_next
+  @find_next:
+    %n = add i32 %iv, 1
+    store i32 %n, *%i
+    jmp @find_cond
+  @init:
+    %ni = load i32, *%i
+    %np = call @ramfs_inode(%ni)
+    %fu = field @ramfs_Inode, *%np, 0
+    store i32 1, *%fu
+    %ft = field @ramfs_Inode, *%np, 1
+    store i32 %type, *%ft
+    %fp = field @ramfs_Inode, *%np, 2
+    store i32 %parent, *%fp
+    %ff = field @ramfs_Inode, *%np, 3
+    store i32 -1, *%ff
+    %fs = field @ramfs_Inode, *%np, 6
+    store i64 0, *%fs
+    %fc = field @ramfs_Inode, *%np, 5
+    store i32 0, *%fc
+    %fn = field @ramfs_Inode, *%np, 7
+    %nd = gep i8, *%fn, 0
+    call @ramfs_strcpy(%nd, %name, 32)
+    %fb = field @ramfs_Inode, *%np, 8
+    %e0 = gep i32, *%fb, 0
+    store i32 -1, *%e0
+    %e1 = gep i32, *%fb, 1
+    store i32 -1, *%e1
+    %e2 = gep i32, *%fb, 2
+    store i32 -1, *%e2
+    %e3 = gep i32, *%fb, 3
+    store i32 -1, *%e3
+    %e4 = gep i32, *%fb, 4
+    store i32 -1, *%e4
+    %e5 = gep i32, *%fb, 5
+    store i32 -1, *%e5
+    %e6 = gep i32, *%fb, 6
+    store i32 -1, *%e6
+    %e7 = gep i32, *%fb, 7
+    store i32 -1, *%e7
+    // Link at the head of the parent directory's child list.
+    %pp = call @ramfs_inode(%parent)
+    %pfirstp = field @ramfs_Inode, *%pp, 3
+    %pfirst = load i32, *%pfirstp
+    %np2 = call @ramfs_inode(%ni)
+    %nlp = field @ramfs_Inode, *%np2, 4
+    store i32 %pfirst, *%nlp
+    %pp2 = call @ramfs_inode(%parent)
+    %pfirstp2 = field @ramfs_Inode, *%pp2, 3
+    store i32 %ni, *%pfirstp2
+    ret i32 %ni
+  @full:
+    ret i32 -1
+}
+
+fun @ramfs_read(ino: i32, off: i64, buf: *i8, len: i64) -> i64 {
+  @entry:
+    %done = let i64
+    %chunkv = let i64
+    store i64 0, *%done
+    %bad = slt i32 %ino, 0
+    br %bad, @fin, @start
+  @start:
+    %ip = call @ramfs_inode(%ino)
+    %szp = field @ramfs_Inode, *%ip, 6
+    %sz = load i64, *%szp
+    jmp @cond
+  @cond:
+    %dv = load i64, *%done
+    %dend = sge i64 %dv, %len
+    br %dend, @fin, @body
+  @body:
+    %pos = add i64 %off, %dv
+    %lim = sub i64 %sz, %pos
+    %past = sle i64 %lim, 0
+    br %past, @fin, @have_lim
+  @have_lim:
+    %bq = udiv i64 %pos, 4096
+    %bi = trunc i64 %bq to i32
+    %inner = urem i64 %pos, 4096
+    %rem = sub i64 4096, %inner
+    %left = sub i64 %len, %dv
+    store i64 %lim, *%chunkv
+    %gt1 = sgt i64 %lim, %rem
+    br %gt1, @c_rem, @c1_done
+  @c_rem:
+    store i64 %rem, *%chunkv
+    jmp @c1_done
+  @c1_done:
+    %c1 = load i64, *%chunkv
+    %gt2 = sgt i64 %c1, %left
+    br %gt2, @c_left, @c2_done
+  @c_left:
+    store i64 %left, *%chunkv
+    jmp @c2_done
+  @c2_done:
+    %chunk = load i64, *%chunkv
+    %cz = sle i64 %chunk, 0
+    br %cz, @fin, @copy
+  @copy:
+    %bep = field @ramfs_Inode, *%ip, 8
+    %bp = gep i32, *%bep, %bi
+    %blk = load i32, *%bp
+    %inner32 = trunc i64 %inner to i32
+    %dv32 = trunc i64 %dv to i32
+    %dstb = gep i8, *%buf, %dv32
+    %unalloc = slt i32 %blk, 0
+    br %unalloc, @zero_fill, @do_copy
+  @zero_fill:
+    call @kmem_memset(%dstb, 0, %chunk)
+    jmp @advance
+  @do_copy:
+    %src = call @ramfs_block_ptr(%blk)
+    %srcp = gep i8, *%src, %inner32
+    call @kmem_memcpy(%dstb, %srcp, %chunk)
+    jmp @advance
+  @advance:
+    %dv2 = load i64, *%done
+    %dv3 = add i64 %dv2, %chunk
+    store i64 %dv3, *%done
+    jmp @cond
+  @fin:
+    %rv = load i64, *%done
+    ret i64 %rv
+}
+
+fun @ramfs_write(ino: i32, off: i64, buf: *i8, len: i64) -> i64 {
+  @entry:
+    %done = let i64
+    %chunkv = let i64
+    store i64 0, *%done
+    %bad = slt i32 %ino, 0
+    br %bad, @bad_ret, @start
+  @bad_ret:
+    ret i64 0
+  @start:
+    %ip = call @ramfs_inode(%ino)
+    jmp @cond
+  @cond:
+    %dv = load i64, *%done
+    %dend = sge i64 %dv, %len
+    br %dend, @fin, @body
+  @body:
+    %pos = add i64 %off, %dv
+    %bq = udiv i64 %pos, 4096
+    %bi = trunc i64 %bq to i32
+    %biok = sge i32 %bi, 8
+    br %biok, @fin, @b_ok
+  @b_ok:
+    %inner = urem i64 %pos, 4096
+    %rem = sub i64 4096, %inner
+    %left = sub i64 %len, %dv
+    store i64 %rem, *%chunkv
+    %gt = sgt i64 %rem, %left
+    br %gt, @c_left, @c_done
+  @c_left:
+    store i64 %left, *%chunkv
+    jmp @c_done
+  @c_done:
+    %chunk = load i64, *%chunkv
+    %cz = sle i64 %chunk, 0
+    br %cz, @fin, @ensure
+  @ensure:
+    %bep = field @ramfs_Inode, *%ip, 8
+    %bp = gep i32, *%bep, %bi
+    %blk = load i32, *%bp
+    %freeb = slt i32 %blk, 0
+    br %freeb, @allocb, @writeb
+  @allocb:
+    %nb = call @ramfs_alloc_block()
+    %nfail = slt i32 %nb, 0
+    br %nfail, @fin, @setb
+  @setb:
+    store i32 %nb, *%bp
+    %cntp = field @ramfs_Inode, *%ip, 5
+    %cnt = load i32, *%cntp
+    %cntn = add i32 %cnt, 1
+    store i32 %cntn, *%cntp
+    jmp @writeb
+  @writeb:
+    %blk2 = load i32, *%bp
+    %src = call @ramfs_block_ptr(%blk2)
+    %inner32 = trunc i64 %inner to i32
+    %dstp = gep i8, *%src, %inner32
+    %dv32 = trunc i64 %dv to i32
+    %srcb = gep i8, *%buf, %dv32
+    call @kmem_memcpy(%dstp, %srcb, %chunk)
+    %dv2 = load i64, *%done
+    %dv3 = add i64 %dv2, %chunk
+    store i64 %dv3, *%done
+    jmp @cond
+  @fin:
+    %rv = load i64, *%done
+    %newsz = add i64 %off, %rv
+    %szp = field @ramfs_Inode, *%ip, 6
+    %oldsz = load i64, *%szp
+    %big = sgt i64 %newsz, %oldsz
+    br %big, @setsz, @retv
+  @setsz:
+    store i64 %newsz, *%szp
+    jmp @retv
+  @retv:
+    ret i64 %rv
+}
+
+fun @ramfs_readdir(dir: i32, idx: i32) -> i32 {
+  @entry:
+    %cur = let i32
+    %i = let i32
+    %pp = call @ramfs_inode(%dir)
+    %fp = field @ramfs_Inode, *%pp, 3
+    %first = load i32, *%fp
+    store i32 %first, *%cur
+    store i32 0, *%i
+    jmp @cond
+  @cond:
+    %iv = load i32, *%i
+    %reached = sge i32 %iv, %idx
+    br %reached, @ret, @step
+  @step:
+    %cv = load i32, *%cur
+    %none = slt i32 %cv, 0
+    br %none, @ret, @adv
+  @adv:
+    %ip = call @ramfs_inode(%cv)
+    %nxp = field @ramfs_Inode, *%ip, 4
+    %nx = load i32, *%nxp
+    store i32 %nx, *%cur
+    %in = add i32 %iv, 1
+    store i32 %in, *%i
+    jmp @cond
+  @ret:
+    %rv = load i32, *%cur
+    ret i32 %rv
+}
+
+fun @ramfs_get_name(ino: i32) -> *i8 {
+  @entry:
+    %ip = call @ramfs_inode(%ino)
+    %np = field @ramfs_Inode, *%ip, 7
+    %p = gep i8, *%np, 0
+    ret *i8 %p
+}
+
+fun @ramfs_type(ino: i32) -> i32 {
+  @entry:
+    %ip = call @ramfs_inode(%ino)
+    %tp = field @ramfs_Inode, *%ip, 1
+    %v = load i32, *%tp
+    ret i32 %v
+}
+
+fun @ramfs_size(ino: i32) -> i64 {
+  @entry:
+    %ip = call @ramfs_inode(%ino)
+    %sp = field @ramfs_Inode, *%ip, 6
+    %v = load i64, *%sp
+    ret i64 %v
+}
+
+// Remove ino from its parent's child list.
+fun @ramfs_unlink(parent: i32, ino: i32) -> void {
+  @entry:
+    %pp = call @ramfs_inode(%parent)
+    %fp = field @ramfs_Inode, *%pp, 3
+    %first = load i32, *%fp
+    %ishead = eq i32 %first, %ino
+    br %ishead, @head, @walk
+  @head:
+    %cip = call @ramfs_inode(%ino)
+    %cnp = field @ramfs_Inode, *%cip, 4
+    %cnx = load i32, *%cnp
+    store i32 %cnx, *%fp
+    ret void
+  @walk:
+    %cur = let i32
+    store i32 %first, *%cur
+    jmp @cond
+  @cond:
+    %cv = load i32, *%cur
+    %none = slt i32 %cv, 0
+    br %none, @done, @body
+  @body:
+    %ip = call @ramfs_inode(%cv)
+    %nxp = field @ramfs_Inode, *%ip, 4
+    %nx = load i32, *%nxp
+    %found = eq i32 %nx, %ino
+    br %found, @cut, @next
+  @cut:
+    %cip2 = call @ramfs_inode(%ino)
+    %cnp2 = field @ramfs_Inode, *%cip2, 4
+    %cnx2 = load i32, *%cnp2
+    store i32 %cnx2, *%nxp
+    ret void
+  @next:
+    store i32 %nx, *%cur
+    jmp @cond
+  @done:
+    ret void
+}
+
+// Returns 0 on success, -1 not found, -2 directory not empty, -3 invalid.
+fun @ramfs_remove(ino: i32) -> i32 {
+  @entry:
+    %bad = slt i32 %ino, 1
+    br %bad, @invalid, @chkdir
+  @invalid:
+    ret i32 -3
+  @chkdir:
+    %ip = call @ramfs_inode(%ino)
+    %tp = field @ramfs_Inode, *%ip, 1
+    %ty = load i32, *%tp
+    %isdir = eq i32 %ty, 2
+    br %isdir, @dirchk, @link
+  @dirchk:
+    %fp = field @ramfs_Inode, *%ip, 3
+    %first = load i32, *%fp
+    %empty = slt i32 %first, 0
+    br %empty, @link, @notempty
+  @notempty:
+    ret i32 -2
+  @link:
+    %parp = field @ramfs_Inode, *%ip, 2
+    %par = load i32, *%parp
+    call @ramfs_unlink(%par, %ino)
+    %i = let i32
+    store i32 0, *%i
+    jmp @fcond
+  @fcond:
+    %iv = load i32, *%i
+    %fdone = sge i32 %iv, 8
+    br %fdone, @clear, @fbody
+  @fbody:
+    %bp = field @ramfs_Inode, *%ip, 8
+    %ep = gep i32, *%bp, %iv
+    %blk = load i32, *%ep
+    %noblk = slt i32 %blk, 0
+    br %noblk, @fnext, @free
+  @free:
+    call @ramfs_free_block(%blk)
+    store i32 -1, *%ep
+    jmp @fnext
+  @fnext:
+    %in = add i32 %iv, 1
+    store i32 %in, *%i
+    jmp @fcond
+  @clear:
+    store i32 0, *%tp
+    %fp2 = field @ramfs_Inode, *%ip, 3
+    store i32 -1, *%fp2
+    %nxp = field @ramfs_Inode, *%ip, 4
+    store i32 -1, *%nxp
+    %bcp = field @ramfs_Inode, *%ip, 5
+    store i32 0, *%bcp
+    %sp = field @ramfs_Inode, *%ip, 6
+    store i64 0, *%sp
+    %np = field @ramfs_Inode, *%ip, 7
+    %n0 = gep i8, *%np, 0
+    store i8 0, *%n0
+    %up = field @ramfs_Inode, *%ip, 0
+    store i32 0, *%up
+    ret i32 0
+}
+
+// Move ino under newparent and give it newname.
+// Returns 0 on success, -3 when ino is the root or newparent is its descendant.
+fun @ramfs_rename(ino: i32, newparent: i32, newname: *i8) -> i32 {
+  @entry:
+    %bad = slt i32 %ino, 1
+    br %bad, @invalid, @chkparent
+  @chkparent:
+    %pbad = slt i32 %newparent, 0
+    br %pbad, @invalid, @cycle
+  @cycle:
+    %cur = let i32
+    store i32 %newparent, *%cur
+    jmp @cond
+  @cond:
+    %cv = load i32, *%cur
+    %rooted = slt i32 %cv, 0
+    br %rooted, @move, @body
+  @body:
+    %hit = eq i32 %cv, %ino
+    br %hit, @invalid, @next
+  @next:
+    %cip = call @ramfs_inode(%cv)
+    %pp = field @ramfs_Inode, *%cip, 2
+    %par = load i32, *%pp
+    store i32 %par, *%cur
+    jmp @cond
+  @move:
+    %ip = call @ramfs_inode(%ino)
+    %oparp = field @ramfs_Inode, *%ip, 2
+    %opar = load i32, *%oparp
+    call @ramfs_unlink(%opar, %ino)
+    %np = field @ramfs_Inode, *%ip, 7
+    %n0 = gep i8, *%np, 0
+    call @ramfs_strcpy(%n0, %newname, 32)
+    store i32 %newparent, *%oparp
+    %npp = call @ramfs_inode(%newparent)
+    %nfp = field @ramfs_Inode, *%npp, 3
+    %nfirst = load i32, *%nfp
+    %nxp = field @ramfs_Inode, *%ip, 4
+    store i32 %nfirst, *%nxp
+    store i32 %ino, *%nfp
+    ret i32 0
+  @invalid:
+    ret i32 -3
+}

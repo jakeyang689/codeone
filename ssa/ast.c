@@ -287,6 +287,9 @@ static Operand parse_operand(Parser *parser) {
                 decl.name = decl_name;
                 decl.type = arr_type;
                 decl.is_const = true;
+                /* The counter restarts in every translation unit, so the name
+                   repeats across objects; internal linkage keeps them apart. */
+                decl.is_internal = true;
                 decl.has_init = true;
                 decl.array_init = items;
                 decl.array_count = count;

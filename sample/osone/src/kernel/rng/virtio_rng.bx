@@ -1,0 +1,432 @@
+// virtio_rng.bx - legacy virtio-mmio entropy source
+//
+// The device is found by scanning the virtio-mmio slot range used by the NIC,
+// GPU and input drivers.  Each request places one writable buffer in queue 0
+// and polls the used ring; interrupts are not enabled.
+
+extern @kmem_alloc(size: i64) -> *i8
+extern @kmem_memset(p: *i8, v: i32, n: i64) -> void
+extern @kmem_memcpy(d: *i8, s: *i8, n: i64) -> void
+extern @kmem_ptr_addr(p: *i8) -> i64
+extern @console_puts(s: *i8) -> void
+extern @timer_now() -> i64
+extern @timer_freq() -> i64
+
+const @rng_MMIO_BASE: i64 = 0x0A000000
+const @rng_MMIO_STEP: i64 = 0x200
+const @rng_SLOTS: i32 = 32
+
+const @rng_REG_MAGIC: i64 = 0x000
+const @rng_REG_VERSION: i64 = 0x004
+const @rng_REG_DEVICEID: i64 = 0x008
+const @rng_REG_GUESTFEAT: i64 = 0x020
+const @rng_REG_GUESTFEATSEL: i64 = 0x024
+const @rng_REG_QUEUESEL: i64 = 0x030
+const @rng_REG_QUEUENUMMAX: i64 = 0x034
+const @rng_REG_QUEUENUM: i64 = 0x038
+const @rng_REG_QUEUEALIGN: i64 = 0x03C
+const @rng_REG_QUEUEPFN: i64 = 0x040
+const @rng_REG_QUEUENOTIFY: i64 = 0x050
+const @rng_REG_STATUS: i64 = 0x070
+
+const @rng_MAGIC: i32 = 0x74726976
+const @rng_DEV_ENTROPY: i32 = 4
+const @rng_QSIZE: i32 = 8
+const @rng_BUF_SIZE: i32 = 256
+const @rng_TIMEOUT_MS: i64 = 500
+
+const @rng_MSG_OK: [i8, 17] = "rng: virtio-rng\n"
+const @rng_MSG_NONE: [i8, 11] = "rng: none\n"
+
+global @rng_BASE: i64
+global @rng_READY: i32
+global @rng_Q: i64
+global @rng_AVAIL: i32
+global @rng_DONE: i32
+global @rng_STATE: i64
+global @rng_SEEDED: i32
+global @rng_BUF: [i8, 256]
+
+fun @rng_r32(off: i64) -> i32 {
+  @entry:
+    %base = load i64, *@rng_BASE
+    %addr = add i64 %base, %off
+    %v = asm att i32, "ldr ${0:w}, [${addr}]", "=r,r,~{memory}", i64 %addr
+    ret i32 %v
+}
+
+fun @rng_w32(off: i64, val: i32) -> void {
+  @entry:
+    %base = load i64, *@rng_BASE
+    %addr = add i64 %base, %off
+    asm att void, "str ${val:w}, [${addr}]", "r,r,~{memory}", i64 %addr, i32 %val
+    ret void
+}
+
+fun @rng_ptr(addr: i64) -> *i8 {
+  @entry:
+    %p = asm att *i8, "mov $0, ${addr}", "=r,r", i64 %addr
+    ret *i8 %p
+}
+
+fun @rng_cast16(addr: i64) -> *i16 {
+  @entry:
+    %p = asm att *i16, "mov $0, ${addr}", "=r,r", i64 %addr
+    ret *i16 %p
+}
+
+fun @rng_cast32(addr: i64) -> *i32 {
+  @entry:
+    %p = asm att *i32, "mov $0, ${addr}", "=r,r", i64 %addr
+    ret *i32 %p
+}
+
+fun @rng_cast64(addr: i64) -> *i64 {
+  @entry:
+    %p = asm att *i64, "mov $0, ${addr}", "=r,r", i64 %addr
+    ret *i64 %p
+}
+
+fun @rng_barrier() -> void {
+  @entry:
+    asm att void, "dsb sy", "~{memory}"
+    ret void
+}
+
+fun @rng_st16(addr: i64, v: i32) -> void {
+  @entry:
+    %p = call @rng_cast16(%addr)
+    %v16 = trunc i32 %v to i16
+    store i16 %v16, *%p
+    ret void
+}
+
+fun @rng_st32(addr: i64, v: i32) -> void {
+  @entry:
+    %p = call @rng_cast32(%addr)
+    store i32 %v, *%p
+    ret void
+}
+
+fun @rng_st64(addr: i64, v: i64) -> void {
+  @entry:
+    %p = call @rng_cast64(%addr)
+    store i64 %v, *%p
+    ret void
+}
+
+fun @rng_now_ms() -> i64 {
+  @entry:
+    %f = call @timer_freq()
+    %z = eq i64 %f, 0
+    br %z, @none, @calc
+  @none:
+    ret i64 0
+  @calc:
+    %t = call @timer_now()
+    %k = mul i64 %t, 1000
+    %ms = udiv i64 %k, %f
+    ret i64 %ms
+}
+
+// Set up queue 0 and return its 4KB-aligned base address, or 0 on failure.
+fun @rng_setup_queue() -> i64 {
+  @entry:
+    call @rng_w32(@rng_REG_QUEUESEL, 0)
+    %max = call @rng_r32(@rng_REG_QUEUENUMMAX)
+    %ok = sge i32 %max, @rng_QSIZE
+    br %ok, @alloc, @fail
+  @alloc:
+    %raw = call @kmem_alloc(8192)
+    %isnull = eq *i8 %raw, null
+    br %isnull, @fail, @align
+  @align:
+    %ra = call @kmem_ptr_addr(%raw)
+    %up = add i64 %ra, 4095
+    %al = asm att i64, "and $0, ${up}, #0xfffffffffffff000", "=r,r", i64 %up
+    %al32 = trunc i64 %al to i32
+    %ptr = call @rng_ptr(%al)
+    call @kmem_memset(%ptr, 0, 8192)
+    call @rng_w32(@rng_REG_QUEUENUM, @rng_QSIZE)
+    call @rng_w32(@rng_REG_QUEUEALIGN, 4096)
+    // This QEMU's legacy QueuePFN takes a byte address rather than a page number.
+    call @rng_w32(@rng_REG_QUEUEPFN, %al32)
+    ret i64 %al
+  @fail:
+    ret i64 0
+}
+
+fun @rng_used_idx() -> i32 {
+  @entry:
+    call @rng_barrier()
+    %q = load i64, *@rng_Q
+    %a = add i64 %q, 4098
+    %p = call @rng_cast16(%a)
+    %v = load i16, *%p
+    %v32 = zext i16 %v to i32
+    ret i32 %v32
+}
+
+// Fill buf from the hardware device.  Returns 0 on success, -1 on timeout.
+fun @rng_fill_hw(buf: *i8, len: i32) -> i32 {
+  @entry:
+    %off = let i32
+    %chunk = let i32
+    store i32 0, *%off
+    jmp @loop
+  @loop:
+    %ov = load i32, *%off
+    %done = sge i32 %ov, %len
+    br %done, @ok, @body
+  @body:
+    %rem = sub i32 %len, %ov
+    %big = sgt i32 %rem, @rng_BUF_SIZE
+    br %big, @cap, @chunk_set
+  @cap:
+    store i32 @rng_BUF_SIZE, *%chunk
+    jmp @submit
+  @chunk_set:
+    store i32 %rem, *%chunk
+    jmp @submit
+  @submit:
+    %q = load i64, *@rng_Q
+    %bp = gep i8, *@rng_BUF, 0
+    %ba = call @kmem_ptr_addr(%bp)
+    %cload = load i32, *%chunk
+    // desc0: writable buffer
+    call @rng_st64(%q, %ba)
+    %q8 = add i64 %q, 8
+    call @rng_st32(%q8, %cload)
+    %q12 = add i64 %q, 12
+    call @rng_st16(%q12, 2)
+    %q14 = add i64 %q, 14
+    call @rng_st16(%q14, 0)
+    // avail ring entry
+    %av = load i32, *@rng_AVAIL
+    %slot = and i32 %av, 7
+    %so = mul i32 %slot, 2
+    %so64 = zext i32 %so to i64
+    %rp = add i64 %q, 132
+    %re = add i64 %rp, %so64
+    call @rng_st16(%re, 0)
+    %avn = add i32 %av, 1
+    store i32 %avn, *@rng_AVAIL
+    %ain = add i64 %q, 130
+    call @rng_st16(%ain, %avn)
+    call @rng_barrier()
+    call @rng_w32(@rng_REG_QUEUENOTIFY, 0)
+    %avlow = and i32 %avn, 0xFFFF
+    %start = call @rng_now_ms()
+    jmp @wait
+  @wait:
+    %used = call @rng_used_idx()
+    %uslow = and i32 %used, 0xFFFF
+    %diff = sub i32 %uslow, %avlow
+    %diffm = and i32 %diff, 0xFFFF
+    %arrived = eq i32 %diffm, 0
+    br %arrived, @done, @timeout
+  @timeout:
+    %now = call @rng_now_ms()
+    %el = sub i64 %now, %start
+    %to = sge i64 %el, @rng_TIMEOUT_MS
+    br %to, @fail, @wait
+  @done:
+    call @rng_barrier()
+    %donec = load i32, *@rng_DONE
+    %dslot = and i32 %donec, 7
+    %deo = mul i32 %dslot, 8
+    %deo64 = zext i32 %deo to i64
+    %ue = add i64 %q, 4100
+    %uep = add i64 %ue, %deo64
+    %lenp = add i64 %uep, 4
+    %lp = call @rng_cast32(%lenp)
+    %ulen = load i32, *%lp
+    %dnext = add i32 %donec, 1
+    store i32 %dnext, *@rng_DONE
+    %cload2 = load i32, *%chunk
+    %copy = let i32
+    %too_many = sgt i32 %ulen, %cload2
+    br %too_many, @use_chunk, @use_used
+  @use_chunk:
+    store i32 %cload2, *%copy
+    jmp @do_copy
+  @use_used:
+    store i32 %ulen, *%copy
+    jmp @do_copy
+  @do_copy:
+    %cv = load i32, *%copy
+    %zero = sle i32 %cv, 0
+    br %zero, @advance, @copy_bytes
+  @copy_bytes:
+    %ov2 = load i32, *%off
+    %dp = gep i8, *%buf, %ov2
+    %sp = gep i8, *@rng_BUF, 0
+    %cv64 = sext i32 %cv to i64
+    call @kmem_memcpy(%dp, %sp, %cv64)
+    jmp @advance
+  @advance:
+    %ov3 = load i32, *%off
+    %cv2 = load i32, *%copy
+    %no = add i32 %ov3, %cv2
+    store i32 %no, *%off
+    jmp @loop
+  @ok:
+    ret i32 0
+  @fail:
+    ret i32 -1
+}
+
+fun @rng_seed() -> void {
+  @entry:
+    %s = load i64, *@rng_STATE
+    %nz = ne i64 %s, 0
+    br %nz, @done, @seed
+  @seed:
+    %t = call @timer_now()
+    %c = asm att i64, "mrs $0, cntpct_el0", "=r,~{memory}"
+    %x = xor i64 %t, %c
+    %x2 = xor i64 %x, 0x9E3779B97F4A7C15
+    store i64 %x2, *@rng_STATE
+    store i32 1, *@rng_SEEDED
+    jmp @done
+  @done:
+    ret void
+}
+
+// Non-cryptographic fallback used only when no virtio-rng device is present.
+fun @rng_fallback(buf: *i8, len: i32) -> void {
+  @entry:
+    call @rng_seed()
+    %i = let i32
+    store i32 0, *%i
+    jmp @cond
+  @cond:
+    %iv = load i32, *%i
+    %done = sge i32 %iv, %len
+    br %done, @ok, @body
+  @body:
+    %s = load i64, *@rng_STATE
+    %s1 = shl i64 %s, 13
+    %s2 = xor i64 %s, %s1
+    %s3 = lshr i64 %s2, 7
+    %s4 = xor i64 %s2, %s3
+    %s5 = shl i64 %s4, 17
+    %s6 = xor i64 %s4, %s5
+    store i64 %s6, *@rng_STATE
+    %j = let i32
+    store i32 0, *%j
+    jmp @bcond
+  @bcond:
+    %jv = load i32, *%j
+    %jdone = sge i32 %jv, 8
+    br %jdone, @next, @bchk
+  @bchk:
+    %pos = add i32 %iv, %jv
+    %pdone = sge i32 %pos, %len
+    br %pdone, @next, @put
+  @put:
+    %shift = mul i32 %jv, 8
+    %shift64 = zext i32 %shift to i64
+    %byte = lshr i64 %s6, %shift64
+    %b8 = trunc i64 %byte to i8
+    %dp = gep i8, *%buf, %pos
+    store i8 %b8, *%dp
+    %jn = add i32 %jv, 1
+    store i32 %jn, *%j
+    jmp @bcond
+  @next:
+    %in = add i32 %iv, 8
+    store i32 %in, *%i
+    jmp @cond
+  @ok:
+    ret void
+}
+
+fun @rng_fill(buf: *i8, len: i32) -> i32 {
+  @entry:
+    %neg = slt i32 %len, 0
+    br %neg, @bad, @chk
+  @chk:
+    %zero = eq i32 %len, 0
+    br %zero, @ok, @ready
+  @ready:
+    %r = load i32, *@rng_READY
+    %on = eq i32 %r, 1
+    br %on, @hw, @fallback
+  @hw:
+    %h = call @rng_fill_hw(%buf, %len)
+    %hok = eq i32 %h, 0
+    br %hok, @ok, @fallback
+  @fallback:
+    call @rng_fallback(%buf, %len)
+    ret i32 %len
+  @ok:
+    ret i32 %len
+  @bad:
+    ret i32 -1
+}
+
+fun @rng_ready() -> i32 {
+  @entry:
+    %v = load i32, *@rng_READY
+    ret i32 %v
+}
+
+fun @rng_init() -> i32 {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @scan
+  @scan:
+    %iv = load i32, *%i
+    %done = sge i32 %iv, @rng_SLOTS
+    br %done, @none, @probe
+  @probe:
+    %iv64 = sext i32 %iv to i64
+    %step = mul i64 %iv64, @rng_MMIO_STEP
+    %base = add i64 @rng_MMIO_BASE, %step
+    store i64 %base, *@rng_BASE
+    %magic = call @rng_r32(@rng_REG_MAGIC)
+    %mgok = eq i32 %magic, @rng_MAGIC
+    br %mgok, @ver, @next
+  @ver:
+    %ver = call @rng_r32(@rng_REG_VERSION)
+    %vok = eq i32 %ver, 1
+    br %vok, @dev, @next
+  @dev:
+    %dev = call @rng_r32(@rng_REG_DEVICEID)
+    %dok = eq i32 %dev, @rng_DEV_ENTROPY
+    br %dok, @setup, @next
+  @setup:
+    call @rng_w32(@rng_REG_STATUS, 0)
+    call @rng_w32(@rng_REG_STATUS, 1)
+    call @rng_w32(@rng_REG_STATUS, 3)
+    call @rng_w32(@rng_REG_GUESTFEATSEL, 0)
+    call @rng_w32(@rng_REG_GUESTFEAT, 0)
+    call @rng_w32(@rng_REG_GUESTFEATSEL, 1)
+    call @rng_w32(@rng_REG_GUESTFEAT, 0)
+    %q = call @rng_setup_queue()
+    %qok = ne i64 %q, 0
+    br %qok, @enable, @reset
+  @reset:
+    call @rng_w32(@rng_REG_STATUS, 0)
+    jmp @next
+  @enable:
+    store i64 %q, *@rng_Q
+    store i32 0, *@rng_AVAIL
+    store i32 0, *@rng_DONE
+    call @rng_w32(@rng_REG_STATUS, 7)
+    store i32 1, *@rng_READY
+    %msg = gep i8, *@rng_MSG_OK, 0
+    call @console_puts(%msg)
+    ret i32 1
+  @next:
+    %n = add i32 %iv, 1
+    store i32 %n, *%i
+    jmp @scan
+  @none:
+    store i32 0, *@rng_READY
+    %msg2 = gep i8, *@rng_MSG_NONE, 0
+    call @console_puts(%msg2)
+    ret i32 0
+}

@@ -1,0 +1,1061 @@
+// llm.bx - LLM client and tool loop for the osone agent
+//
+// No third-party code. The request builder, JSON escaping and the response
+// scanner are plain SSA. TLS uses the in-tree stack: TLS 1.3 first, then ECDHE
+// TLS 1.2, then the RSA-only TLS 1.2 client.
+//
+// The model talks a line protocol so small models can follow it:
+//   ACTION: tool
+//   TOOL: fs.list
+//   ARG: path=/
+// or
+//   ACTION: final
+//   TEXT: <answer>
+
+extern @console_puts(s: *i8) -> void
+extern @console_putc(ch: i32) -> void
+extern @agent_strlen(s: *i8) -> i32
+extern @agent_puts(out: *i8, lenp: *i32, cap: i32, s: *i8) -> void
+extern @agent_putc(out: *i8, lenp: *i32, cap: i32, ch: i32) -> void
+extern @agent_putdec(out: *i8, lenp: *i32, cap: i32, v: i64) -> void
+extern @agent_copy_n(dst: *i8, src: *i8, n: i32, cap: i32) -> void
+extern @agent_zero(buf: *i8, n: i32) -> void
+extern @agent_cfg_load() -> void
+extern @agent_cfg_host() -> *i8
+extern @agent_cfg_path() -> *i8
+extern @agent_cfg_model() -> *i8
+extern @agent_cfg_key() -> *i8
+extern @agent_cfg_scheme() -> i32
+extern @agent_cfg_port() -> i32
+extern @agent_cfg_maxstep() -> i32
+extern @agent_audit(kind: *i8, detail: *i8) -> void
+extern @agtools_call(name: *i8, args: *i8, out: *i8, cap: i32) -> i32
+extern @net_ready() -> i32
+extern @net_parse_ip(s: *i8) -> i32
+extern @dns_resolve(name: *i8, timeout_ms: i32) -> i32
+extern @tcp_connect(ip: i32, port: i32, timeout_ms: i32) -> i32
+extern @tcp_send(id: i32, data: *i8, len: i32) -> i32
+extern @tcp_recv(id: i32, buf: *i8, max: i32, timeout_ms: i32) -> i32
+extern @tcp_close(id: i32) -> i32
+extern @tlsclient_connect(host: *i8, hostlen: i32, fd: i32) -> i32
+extern @tlsclient_connect12(host: *i8, hostlen: i32, fd: i32) -> i32
+extern @tlsclient_send(buf: *i8, len: i32) -> i32
+extern @tlsclient_recv(buf: *i8, cap: i32) -> i32
+extern @tlsclient_close() -> i32
+extern @tls12e_connect(host: *i8, hostlen: i32, fd: i32) -> i32
+extern @tls12e_send(buf: *i8, len: i32) -> i32
+extern @tls12e_recv(buf: *i8, cap: i32) -> i32
+extern @tls12e_close() -> i32
+
+const @agentl_CRLF2: [i8, 5] = "\r\n\r\n"
+const @agentl_LF2: [i8, 3] = "\n\n"
+const @agentl_SP: [i8, 2] = " "
+const @agentl_CHUNKED: [i8, 8] = "chunked"
+const @agentl_EMPTY: [i8, 1] = ""
+const @agentl_CONTENT_KEY: [i8, 10] = "\"content\""
+
+global @agentl_BODY: [i8, 8192]
+global @agentl_REQ: [i8, 8704]
+global @agentl_RAW: [i8, 16384]
+global @agentl_RESP: [i8, 2048]
+global @agentl_CHUNK: [i8, 2048]
+global @agentl_TRANS: [i8, 3072]
+global @agentl_SOCK: i32 = -1
+global @agentl_MODE: i32 = 0
+
+fun @agentl_find_from(hay: *i8, needle: *i8, start: i32) -> i32 {
+  @entry:
+    %i = let i32
+    %j = let i32
+    store i32 %start, *%i
+    jmp @outer
+  @outer:
+    %iv = load i32, *%i
+    %hp = gep i8, *%hay, %iv
+    %hc = load i8, *%hp
+    %hend = eq i8 %hc, 0
+    br %hend, @miss, @try
+  @try:
+    store i32 0, *%j
+    jmp @cmp
+  @cmp:
+    %jv = load i32, *%j
+    %np = gep i8, *%needle, %jv
+    %nc = load i8, *%np
+    %nend = eq i8 %nc, 0
+    br %nend, @hit, @ch
+  @ch:
+    %iv2 = load i32, *%i
+    %jv2 = load i32, *%j
+    %k = add i32 %iv2, %jv2
+    %kp = gep i8, *%hay, %k
+    %kc = load i8, *%kp
+    %same = eq i8 %kc, %nc
+    br %same, @cont, @next
+  @cont:
+    %jn = add i32 %jv2, 1
+    store i32 %jn, *%j
+    jmp @cmp
+  @next:
+    %in = add i32 %iv2, 1
+    store i32 %in, *%i
+    jmp @outer
+  @hit:
+    %rv = load i32, *%i
+    ret i32 %rv
+  @miss:
+    ret i32 -1
+}
+
+fun @agentl_escape(out: *i8, lenp: *i32, cap: i32, src: *i8) -> void {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @cond
+  @cond:
+    %iv = load i32, *%i
+    %sp = gep i8, *%src, %iv
+    %c = load i8, *%sp
+    %end = eq i8 %c, 0
+    br %end, @fin, @chkq
+  @chkq:
+    %isq = eq i8 %c, 34
+    br %isq, @q, @chkbs
+  @q:
+    call @agent_putc(%out, %lenp, %cap, 92)
+    call @agent_putc(%out, %lenp, %cap, 34)
+    jmp @adv
+  @chkbs:
+    %isb = eq i8 %c, 92
+    br %isb, @bs, @chknl
+  @bs:
+    call @agent_putc(%out, %lenp, %cap, 92)
+    call @agent_putc(%out, %lenp, %cap, 92)
+    jmp @adv
+  @chknl:
+    %isnl = eq i8 %c, 10
+    br %isnl, @nl, @chkcr
+  @nl:
+    call @agent_puts(%out, %lenp, %cap, "\\n")
+    jmp @adv
+  @chkcr:
+    %iscr = eq i8 %c, 13
+    br %iscr, @cr, @chkt
+  @cr:
+    call @agent_puts(%out, %lenp, %cap, "\\r")
+    jmp @adv
+  @chkt:
+    %ist = eq i8 %c, 9
+    br %ist, @tb, @plain
+  @tb:
+    call @agent_puts(%out, %lenp, %cap, "\\t")
+    jmp @adv
+  @plain:
+    %cu = zext i8 %c to i32
+    %lo = slt i32 %cu, 32
+    br %lo, @skipc, @putc
+  @skipc:
+    call @agent_putc(%out, %lenp, %cap, 32)
+    jmp @adv
+  @putc:
+    call @agent_putc(%out, %lenp, %cap, %cu)
+    jmp @adv
+  @adv:
+    %iv2 = load i32, *%i
+    %in = add i32 %iv2, 1
+    store i32 %in, *%i
+    jmp @cond
+  @fin:
+    ret void
+}
+
+// Copy a JSON string body until the closing quote. \uXXXX becomes '?' because
+// the console is ASCII and the tool protocol never relies on wide characters.
+fun @agentl_unescape(dst: *i8, src: *i8, cap: i32) -> i32 {
+  @entry:
+    %i = let i32
+    %len = let i32
+    %done = let i32
+    store i32 0, *%i
+    store i32 0, *%len
+    store i32 0, *%done
+    jmp @cond
+  @cond:
+    %dv = load i32, *%done
+    %isd = eq i32 %dv, 1
+    br %isd, @fin, @read
+  @read:
+    %iv = load i32, *%i
+    %sp = gep i8, *%src, %iv
+    %c = load i8, *%sp
+    %end = eq i8 %c, 0
+    br %end, @fin, @chkq
+  @chkq:
+    %isq = eq i8 %c, 34
+    br %isq, @markdone, @chkbs
+  @markdone:
+    store i32 1, *%done
+    jmp @fin
+  @chkbs:
+    %isb = eq i8 %c, 92
+    br %isb, @esc, @plain
+  @esc:
+    %iv2 = load i32, *%i
+    %n1 = add i32 %iv2, 1
+    %ep = gep i8, *%src, %n1
+    %ec = load i8, *%ep
+    %enul = eq i8 %ec, 0
+    br %enul, @markdone, @esc_n
+  @esc_n:
+    %isl = eq i8 %ec, 110
+    br %isl, @do_lf, @esc_r
+  @do_lf:
+    call @agent_putc(%dst, %len, %cap, 10)
+    jmp @esc_adv
+  @esc_r:
+    %isr = eq i8 %ec, 114
+    br %isr, @do_cr, @esc_t
+  @do_cr:
+    call @agent_putc(%dst, %len, %cap, 13)
+    jmp @esc_adv
+  @esc_t:
+    %ist = eq i8 %ec, 116
+    br %ist, @do_tab, @esc_u
+  @do_tab:
+    call @agent_putc(%dst, %len, %cap, 9)
+    jmp @esc_adv
+  @esc_u:
+    %isu = eq i8 %ec, 117
+    br %isu, @do_uni, @esc_other
+  @do_uni:
+    call @agent_putc(%dst, %len, %cap, 63)
+    %iv3 = load i32, *%i
+    %sk = add i32 %iv3, 6
+    store i32 %sk, *%i
+    jmp @cond
+  @esc_other:
+    %eu = zext i8 %ec to i32
+    call @agent_putc(%dst, %len, %cap, %eu)
+    jmp @esc_adv
+  @esc_adv:
+    %iv4 = load i32, *%i
+    %sk2 = add i32 %iv4, 2
+    store i32 %sk2, *%i
+    jmp @cond
+  @plain:
+    %cu = zext i8 %c to i32
+    call @agent_putc(%dst, %len, %cap, %cu)
+    %iv5 = load i32, *%i
+    %in2 = add i32 %iv5, 1
+    store i32 %in2, *%i
+    jmp @cond
+  @fin:
+    %r = load i32, *%len
+    ret i32 %r
+}
+
+// Copy the rest of the line that follows key, trimmed at both ends.
+fun @agentl_line(text: *i8, key: *i8, out: *i8, cap: i32) -> i32 {
+  @entry:
+    %i = let i32
+    %n = let i32
+    %idx = call @agentl_find_from(%text, %key, 0)
+    %none = slt i32 %idx, 0
+    store i32 0, *%n
+    br %none, @miss, @start
+  @start:
+    %kl = call @agent_strlen(%key)
+    %vs = add i32 %idx, %kl
+    store i32 %vs, *%i
+    jmp @skip
+  @skip:
+    %iv = load i32, *%i
+    %sp = gep i8, *%text, %iv
+    %c = load i8, *%sp
+    %issp = eq i8 %c, 32
+    %istab = eq i8 %c, 9
+    %ws = or i1 %issp, %istab
+    br %ws, @skip_one, @copy_cond
+  @skip_one:
+    %in = add i32 %iv, 1
+    store i32 %in, *%i
+    jmp @skip
+  @copy_cond:
+    %iv2 = load i32, *%i
+    %sp2 = gep i8, *%text, %iv2
+    %c2 = load i8, *%sp2
+    %nul = eq i8 %c2, 0
+    br %nul, @trim, @chklf
+  @chklf:
+    %lf = eq i8 %c2, 10
+    br %lf, @trim, @chkcr
+  @chkcr:
+    %cr = eq i8 %c2, 13
+    br %cr, @trim, @chkroom
+  @chkroom:
+    %nv = load i32, *%n
+    %lim = sub i32 %cap, 1
+    %full = sge i32 %nv, %lim
+    br %full, @trim, @put
+  @put:
+    %op = gep i8, *%out, %nv
+    store i8 %c2, *%op
+    %nv2 = add i32 %nv, 1
+    store i32 %nv2, *%n
+    %iv3 = load i32, *%i
+    %in3 = add i32 %iv3, 1
+    store i32 %in3, *%i
+    jmp @copy_cond
+  @trim:
+    %tv = load i32, *%n
+    %zero = eq i32 %tv, 0
+    br %zero, @term, @trim_chk
+  @trim_chk:
+    %last = sub i32 %tv, 1
+    %lp = gep i8, *%out, %last
+    %lc = load i8, *%lp
+    %lsp = eq i8 %lc, 32
+    %ltab = eq i8 %lc, 9
+    %lws = or i1 %lsp, %ltab
+    br %lws, @trim_del, @term
+  @trim_del:
+    store i32 %last, *%n
+    jmp @trim
+  @term:
+    %fv = load i32, *%n
+    %fp = gep i8, *%out, %fv
+    store i8 0, *%fp
+    ret i32 %fv
+  @miss:
+    %zp = gep i8, *%out, 0
+    store i8 0, *%zp
+    ret i32 -1
+}
+
+// Copy everything after key (multi-line), trimmed at both ends.
+fun @agentl_after(text: *i8, key: *i8, out: *i8, cap: i32) -> i32 {
+  @entry:
+    %i = let i32
+    %n = let i32
+    %idx = call @agentl_find_from(%text, %key, 0)
+    %none = slt i32 %idx, 0
+    store i32 0, *%n
+    br %none, @miss, @start
+  @start:
+    %kl = call @agent_strlen(%key)
+    %vs = add i32 %idx, %kl
+    store i32 %vs, *%i
+    jmp @skip
+  @skip:
+    %iv = load i32, *%i
+    %sp = gep i8, *%text, %iv
+    %c = load i8, *%sp
+    %issp = eq i8 %c, 32
+    %istab = eq i8 %c, 9
+    %ws = or i1 %issp, %istab
+    br %ws, @skip_one, @copy_cond
+  @skip_one:
+    %in = add i32 %iv, 1
+    store i32 %in, *%i
+    jmp @skip
+  @copy_cond:
+    %iv2 = load i32, *%i
+    %sp2 = gep i8, *%text, %iv2
+    %c2 = load i8, *%sp2
+    %nul = eq i8 %c2, 0
+    br %nul, @trim, @chkroom
+  @chkroom:
+    %nv = load i32, *%n
+    %lim = sub i32 %cap, 1
+    %full = sge i32 %nv, %lim
+    br %full, @trim, @put
+  @put:
+    %op = gep i8, *%out, %nv
+    store i8 %c2, *%op
+    %nv2 = add i32 %nv, 1
+    store i32 %nv2, *%n
+    %iv3 = load i32, *%i
+    %in3 = add i32 %iv3, 1
+    store i32 %in3, *%i
+    jmp @copy_cond
+  @trim:
+    %tv = load i32, *%n
+    %zero = eq i32 %tv, 0
+    br %zero, @term, @trim_chk
+  @trim_chk:
+    %last = sub i32 %tv, 1
+    %lp = gep i8, *%out, %last
+    %lc = load i8, *%lp
+    %lsp = eq i8 %lc, 32
+    %ltab = eq i8 %lc, 9
+    %lf = eq i8 %lc, 10
+    %cr = eq i8 %lc, 13
+    %w1 = or i1 %lsp, %ltab
+    %w2 = or i1 %lf, %cr
+    %lws = or i1 %w1, %w2
+    br %lws, @trim_del, @term
+  @trim_del:
+    store i32 %last, *%n
+    jmp @trim
+  @term:
+    %fv = load i32, *%n
+    %fp = gep i8, *%out, %fv
+    store i8 0, *%fp
+    ret i32 %fv
+  @miss:
+    %zp = gep i8, *%out, 0
+    store i8 0, *%zp
+    ret i32 -1
+}
+
+// Decode a chunked HTTP body. Returns the decoded length.
+fun @agentl_dechunk(src: *i8, dst: *i8, cap: i32) -> i32 {
+  @entry:
+    %i = let i32
+    %len = let i32
+    %size = let i32
+    %k = let i32
+    store i32 0, *%i
+    store i32 0, *%len
+    store i32 0, *%size
+    store i32 0, *%k
+    jmp @line
+  @line:
+    store i32 0, *%size
+    jmp @hex
+  @hex:
+    %iv = load i32, *%i
+    %p = gep i8, *%src, %iv
+    %c = load i8, *%p
+    %cu = zext i8 %c to i32
+    %ge0 = sge i32 %cu, 48
+    %le9 = sle i32 %cu, 57
+    %isd = and i1 %ge0, %le9
+    br %isd, @dig, @alpha
+  @dig:
+    %dv = load i32, *%size
+    %sh = shl i32 %dv, 4
+    %d2 = sub i32 %cu, 48
+    %d3 = add i32 %sh, %d2
+    store i32 %d3, *%size
+    %in1 = add i32 %iv, 1
+    store i32 %in1, *%i
+    jmp @hex
+  @alpha:
+    %gea = sge i32 %cu, 97
+    %lea = sle i32 %cu, 102
+    %isa = and i1 %gea, %lea
+    br %isa, @low, @upper
+  @low:
+    %dv2 = load i32, *%size
+    %sh2 = shl i32 %dv2, 4
+    %d4 = sub i32 %cu, 87
+    %d5 = add i32 %sh2, %d4
+    store i32 %d5, *%size
+    %in2 = add i32 %iv, 1
+    store i32 %in2, *%i
+    jmp @hex
+  @upper:
+    %geA = sge i32 %cu, 65
+    %leF = sle i32 %cu, 70
+    %isA = and i1 %geA, %leF
+    br %isA, @up, @size_end
+  @up:
+    %dv3 = load i32, *%size
+    %sh3 = shl i32 %dv3, 4
+    %d6 = sub i32 %cu, 55
+    %d7 = add i32 %sh3, %d6
+    store i32 %d7, *%size
+    %in3 = add i32 %iv, 1
+    store i32 %in3, *%i
+    jmp @hex
+  @size_end:
+    %sv = load i32, *%size
+    %zero = eq i32 %sv, 0
+    br %zero, @fin, @eol
+  @eol:
+    %iv2 = load i32, *%i
+    %p2 = gep i8, *%src, %iv2
+    %c2 = load i8, *%p2
+    %nul2 = eq i8 %c2, 0
+    br %nul2, @fin, @eol_chk
+  @eol_chk:
+    %lf2 = eq i8 %c2, 10
+    br %lf2, @eol_adv, @eol_skip
+  @eol_adv:
+    %in4 = add i32 %iv2, 1
+    store i32 %in4, *%i
+    jmp @chunk
+  @eol_skip:
+    %in5 = add i32 %iv2, 1
+    store i32 %in5, *%i
+    jmp @eol
+  @chunk:
+    store i32 0, *%k
+    jmp @copy_cond
+  @copy_cond:
+    %kv = load i32, *%k
+    %sz2 = load i32, *%size
+    %done = sge i32 %kv, %sz2
+    br %done, @next_line, @copy_chk
+  @copy_chk:
+    %lv = load i32, *%len
+    %clim = sub i32 %cap, 1
+    %full = sge i32 %lv, %clim
+    br %full, @copy_adv, @copy_put
+  @copy_put:
+    %iv3 = load i32, *%i
+    %sp = gep i8, *%src, %iv3
+    %ch = load i8, *%sp
+    %dp = gep i8, *%dst, %lv
+    store i8 %ch, *%dp
+    %lv2 = add i32 %lv, 1
+    store i32 %lv2, *%len
+    jmp @copy_adv
+  @copy_adv:
+    %iv4 = load i32, *%i
+    %in6 = add i32 %iv4, 1
+    store i32 %in6, *%i
+    %kv2 = load i32, *%k
+    %kn = add i32 %kv2, 1
+    store i32 %kn, *%k
+    jmp @copy_cond
+  @next_line:
+    %iv5 = load i32, *%i
+    %p3 = gep i8, *%src, %iv5
+    %c3 = load i8, *%p3
+    %nul3 = eq i8 %c3, 0
+    br %nul3, @fin, @nl_chk
+  @nl_chk:
+    %lf3 = eq i8 %c3, 10
+    br %lf3, @nl_adv, @nl_skip
+  @nl_adv:
+    %in7 = add i32 %iv5, 1
+    store i32 %in7, *%i
+    jmp @line
+  @nl_skip:
+    %in8 = add i32 %iv5, 1
+    store i32 %in8, *%i
+    jmp @next_line
+  @fin:
+    %rv = load i32, *%len
+    %fp = gep i8, *%dst, %rv
+    store i8 0, *%fp
+    ret i32 %rv
+}
+
+// Pull the "content" string out of an OpenAI-style JSON body.
+fun @agentl_extract_content(raw: *i8, out: *i8, cap: i32) -> i32 {
+  @entry:
+    %i = let i32
+    %idx = call @agentl_find_from(%raw, @agentl_CONTENT_KEY, 0)
+    %none = slt i32 %idx, 0
+    br %none, @miss, @walk
+  @walk:
+    %kl = call @agent_strlen(@agentl_CONTENT_KEY)
+    %s = add i32 %idx, %kl
+    store i32 %s, *%i
+    jmp @ws
+  @ws:
+    %iv = load i32, *%i
+    %p = gep i8, *%raw, %iv
+    %c = load i8, *%p
+    %nul = eq i8 %c, 0
+    br %nul, @miss, @ws_col
+  @ws_col:
+    %iscol = eq i8 %c, 58
+    br %iscol, @after_col, @ws_ws
+  @ws_ws:
+    %issp = eq i8 %c, 32
+    %istab = eq i8 %c, 9
+    %iscr = eq i8 %c, 13
+    %islf = eq i8 %c, 10
+    %w1 = or i1 %issp, %istab
+    %w2 = or i1 %iscr, %islf
+    %ws = or i1 %w1, %w2
+    br %ws, @ws_adv, @miss
+  @ws_adv:
+    %in = add i32 %iv, 1
+    store i32 %in, *%i
+    jmp @ws
+  @after_col:
+    %in2 = add i32 %iv, 1
+    store i32 %in2, *%i
+    jmp @pre
+  @pre:
+    %iv2 = load i32, *%i
+    %p2 = gep i8, *%raw, %iv2
+    %c2 = load i8, *%p2
+    %nul2 = eq i8 %c2, 0
+    br %nul2, @miss, @pre_q
+  @pre_q:
+    %isq = eq i8 %c2, 34
+    br %isq, @value, @pre_ws
+  @pre_ws:
+    %issp2 = eq i8 %c2, 32
+    %istab2 = eq i8 %c2, 9
+    %iscr2 = eq i8 %c2, 13
+    %islf2 = eq i8 %c2, 10
+    %w3 = or i1 %issp2, %istab2
+    %w4 = or i1 %iscr2, %islf2
+    %ws2 = or i1 %w3, %w4
+    br %ws2, @pre_adv, @miss
+  @pre_adv:
+    %in3 = add i32 %iv2, 1
+    store i32 %in3, *%i
+    jmp @pre
+  @value:
+    %in4 = add i32 %iv2, 1
+    %vp = gep i8, *%raw, %in4
+    %n = call @agentl_unescape(%out, %vp, %cap)
+    ret i32 %n
+  @miss:
+    ret i32 -1
+}
+
+fun @agentl_connect() -> i32 {
+  @entry:
+    %ip = let i32
+    %host = call @agent_cfg_host()
+    %hl = call @agent_strlen(%host)
+    %nohost = eq i32 %hl, 0
+    br %nohost, @fail_cfg, @netchk
+  @netchk:
+    %r = call @net_ready()
+    %nr = eq i32 %r, 0
+    br %nr, @fail_net, @resolve
+  @resolve:
+    %lit = call @net_parse_ip(%host)
+    %islit = ne i32 %lit, 0
+    br %islit, @use_lit, @dns
+  @use_lit:
+    store i32 %lit, *%ip
+    jmp @conn
+  @dns:
+    %d = call @dns_resolve(%host, 3000)
+    %dok = ne i32 %d, 0
+    br %dok, @use_dns, @fail_dns
+  @use_dns:
+    store i32 %d, *%ip
+    jmp @conn
+  @conn:
+    %ipv = load i32, *%ip
+    %port = call @agent_cfg_port()
+    %id = call @tcp_connect(%ipv, %port, 5000)
+    %ok = sge i32 %id, 0
+    br %ok, @conn_ok, @fail_conn
+  @conn_ok:
+    store i32 %id, *@agentl_SOCK
+    %sc = call @agent_cfg_scheme()
+    %sec = eq i32 %sc, 1
+    br %sec, @tls, @plain
+  @plain:
+    store i32 0, *@agentl_MODE
+    ret i32 %id
+  @tls:
+    %h13 = call @tlsclient_connect(%host, %hl, %id)
+    %ok13 = eq i32 %h13, 0
+    br %ok13, @tls13_ok, @retry12
+  @tls13_ok:
+    store i32 1, *@agentl_MODE
+    ret i32 %id
+  @retry12:
+    call @tcp_close(%id)
+    %ip2 = load i32, *%ip
+    %port2 = call @agent_cfg_port()
+    %id2 = call @tcp_connect(%ip2, %port2, 5000)
+    %ok2 = sge i32 %id2, 0
+    store i32 %id2, *@agentl_SOCK
+    br %ok2, @tls12_try, @fail_conn
+  @tls12_try:
+    %h12 = call @tls12e_connect(%host, %hl, %id2)
+    %ok12 = eq i32 %h12, 0
+    br %ok12, @tls12_ok, @retryrsa
+  @tls12_ok:
+    store i32 2, *@agentl_MODE
+    ret i32 %id2
+  @retryrsa:
+    call @tcp_close(%id2)
+    %ip3 = load i32, *%ip
+    %port3 = call @agent_cfg_port()
+    %id3 = call @tcp_connect(%ip3, %port3, 5000)
+    %ok3 = sge i32 %id3, 0
+    store i32 %id3, *@agentl_SOCK
+    br %ok3, @rsa_try, @fail_conn
+  @rsa_try:
+    %hr = call @tlsclient_connect12(%host, %hl, %id3)
+    %okr = eq i32 %hr, 0
+    br %okr, @rsa_ok, @fail_tls
+  @rsa_ok:
+    store i32 1, *@agentl_MODE
+    ret i32 %id3
+  @fail_cfg:
+    call @console_puts("agent: no endpoint configured\n")
+    ret i32 -1
+  @fail_net:
+    call @console_puts("agent: network is not up (try dhcp)\n")
+    ret i32 -1
+  @fail_dns:
+    call @console_puts("agent: dns lookup failed\n")
+    ret i32 -1
+  @fail_conn:
+    call @console_puts("agent: tcp connect failed\n")
+    ret i32 -1
+  @fail_tls:
+    call @console_puts("agent: tls handshake failed\n")
+    ret i32 -1
+}
+
+fun @agentl_send(buf: *i8, len: i32) -> i32 {
+  @entry:
+    %m = load i32, *@agentl_MODE
+    %is0 = eq i32 %m, 0
+    br %is0, @plain, @chk1
+  @plain:
+    %s = load i32, *@agentl_SOCK
+    %r = call @tcp_send(%s, %buf, %len)
+    ret i32 %r
+  @chk1:
+    %is1 = eq i32 %m, 1
+    br %is1, @tls, @ecdhe
+  @tls:
+    %r1 = call @tlsclient_send(%buf, %len)
+    ret i32 %r1
+  @ecdhe:
+    %r2 = call @tls12e_send(%buf, %len)
+    ret i32 %r2
+}
+
+fun @agentl_recv(buf: *i8, cap: i32) -> i32 {
+  @entry:
+    %m = load i32, *@agentl_MODE
+    %is0 = eq i32 %m, 0
+    br %is0, @plain, @chk1
+  @plain:
+    %s = load i32, *@agentl_SOCK
+    %r = call @tcp_recv(%s, %buf, %cap, 15000)
+    ret i32 %r
+  @chk1:
+    %is1 = eq i32 %m, 1
+    br %is1, @tls, @ecdhe
+  @tls:
+    %r1 = call @tlsclient_recv(%buf, %cap)
+    ret i32 %r1
+  @ecdhe:
+    %r2 = call @tls12e_recv(%buf, %cap)
+    ret i32 %r2
+}
+
+fun @agentl_close() -> void {
+  @entry:
+    %m = load i32, *@agentl_MODE
+    %is2 = eq i32 %m, 2
+    br %is2, @do12, @chk1
+  @do12:
+    call @tls12e_close()
+    jmp @tcp
+  @chk1:
+    %is1 = eq i32 %m, 1
+    br %is1, @dotls, @tcp
+  @dotls:
+    call @tlsclient_close()
+    jmp @tcp
+  @tcp:
+    %s = load i32, *@agentl_SOCK
+    %has = sge i32 %s, 0
+    br %has, @closefd, @done
+  @closefd:
+    call @tcp_close(%s)
+    jmp @done
+  @done:
+    store i32 -1, *@agentl_SOCK
+    store i32 0, *@agentl_MODE
+    ret void
+}
+
+fun @agentl_build_body(out: *i8, cap: i32, transcript: *i8) -> i32 {
+  @entry:
+    %len = let i32
+    store i32 0, *%len
+    call @agent_puts(%out, %len, %cap, "{\"model\":\"")
+    %model = call @agent_cfg_model()
+    call @agentl_escape(%out, %len, %cap, %model)
+    call @agent_puts(%out, %len, %cap, "\",\"temperature\":0,\"messages\":[")
+    call @agent_puts(%out, %len, %cap, "{\"role\":\"system\",\"content\":\"")
+    call @agent_puts(%out, %len, %cap, "You are the osone system agent running inside the kernel.\n")
+    call @agent_puts(%out, %len, %cap, "Answer with exactly one action.\n")
+    call @agent_puts(%out, %len, %cap, "To run a tool reply:\n")
+    call @agent_puts(%out, %len, %cap, "ACTION: tool\nTOOL: <name>\nARG: key=value;key=value\n")
+    call @agent_puts(%out, %len, %cap, "When finished reply:\n")
+    call @agent_puts(%out, %len, %cap, "ACTION: final\nTEXT: <short answer>\n")
+    call @agent_puts(%out, %len, %cap, "Tools: fs.list(path=/) fs.read(path=..) fs.stat(path=..)\n")
+    call @agent_puts(%out, %len, %cap, "fs.write(path=..;data=..) fs.mkdir(path=..) fs.remove(path=..)\n")
+    call @agent_puts(%out, %len, %cap, "net.status net.dhcp net.dns(name=..) net.ping(host=..)\n")
+    call @agent_puts(%out, %len, %cap, "sys.info sys.reboot sys.poweroff\n")
+    call @agent_puts(%out, %len, %cap, "Do not invent tool names. Do not explain the action.\n")
+    call @agent_puts(%out, %len, %cap, "\"},{\"role\":\"user\",\"content\":\"")
+    call @agentl_escape(%out, %len, %cap, %transcript)
+    call @agent_puts(%out, %len, %cap, "\"}]}")
+    %r = load i32, *%len
+    ret i32 %r
+}
+
+fun @agentl_build_req(body: *i8, bodylen: i32) -> i32 {
+  @entry:
+    %len = let i32
+    %rp = gep i8, *@agentl_REQ, 0
+    store i32 0, *%len
+    call @agent_puts(%rp, %len, 8704, "POST ")
+    %path = call @agent_cfg_path()
+    call @agent_puts(%rp, %len, 8704, %path)
+    call @agent_puts(%rp, %len, 8704, " HTTP/1.1\r\nHost: ")
+    %host = call @agent_cfg_host()
+    call @agent_puts(%rp, %len, 8704, %host)
+    call @agent_puts(%rp, %len, 8704, "\r\nUser-Agent: osone-agent\r\n")
+    call @agent_puts(%rp, %len, 8704, "Content-Type: application/json\r\n")
+    call @agent_puts(%rp, %len, 8704, "Content-Length: ")
+    %bl = sext i32 %bodylen to i64
+    call @agent_putdec(%rp, %len, 8704, %bl)
+    call @agent_puts(%rp, %len, 8704, "\r\n")
+    %key = call @agent_cfg_key()
+    %k0p = gep i8, *%key, 0
+    %k0 = load i8, *%k0p
+    %has = ne i8 %k0, 0
+    br %has, @auth, @tail
+  @auth:
+    call @agent_puts(%rp, %len, 8704, "Authorization: Bearer ")
+    call @agent_puts(%rp, %len, 8704, %key)
+    call @agent_puts(%rp, %len, 8704, "\r\n")
+    jmp @tail
+  @tail:
+    call @agent_puts(%rp, %len, 8704, "Connection: close\r\n\r\n")
+    %lv = load i32, *%len
+    %rem = sub i32 8704, %lv
+    %dp = gep i8, *@agentl_REQ, %lv
+    call @agent_copy_n(%dp, %body, %bodylen, %rem)
+    %lv2 = load i32, *%len
+    %tot = add i32 %lv2, %bodylen
+    ret i32 %tot
+}
+
+// Send the request and decode the reply into @agentl_RESP. Returns the content
+// length, or -1 after printing the reason.
+fun @agentl_post(body: *i8, bodylen: i32) -> i32 {
+  @entry:
+    %total = let i32
+    %he = let i32
+    %bst = let i32
+    %reqlen = call @agentl_build_req(%body, %bodylen)
+    call @console_puts("agent: contacting model...\n")
+    %fd = call @agentl_connect()
+    %fail = slt i32 %fd, 0
+    br %fail, @err, @send
+  @send:
+    %reqp = gep i8, *@agentl_REQ, 0
+    %sr = call @agentl_send(%reqp, %reqlen)
+    %sok = sge i32 %sr, 0
+    br %sok, @recv_start, @err_close
+  @recv_start:
+    store i32 0, *%total
+    jmp @recv
+  @recv:
+    %tv = load i32, *%total
+    %lim = sub i32 16383, %tv
+    %full = sle i32 %lim, 0
+    br %full, @recv_done, @recv_read
+  @recv_read:
+    %bp = gep i8, *@agentl_RAW, %tv
+    %n = call @agentl_recv(%bp, %lim)
+    %pos = sgt i32 %n, 0
+    br %pos, @recv_add, @recv_done
+  @recv_add:
+    %tn = add i32 %tv, %n
+    store i32 %tn, *%total
+    jmp @recv
+  @recv_done:
+    %tv2 = load i32, *%total
+    %zp = gep i8, *@agentl_RAW, %tv2
+    store i8 0, *%zp
+    call @agentl_close()
+    %nz = sgt i32 %tv2, 0
+    br %nz, @parse, @err
+  @parse:
+    %rawp = gep i8, *@agentl_RAW, 0
+    %spidx = call @agentl_find_from(%rawp, @agentl_SP, 0)
+    %nosp = slt i32 %spidx, 0
+    br %nosp, @bad_status, @status
+  @status:
+    %p1 = add i32 %spidx, 1
+    %p1p = gep i8, *@agentl_RAW, %p1
+    %c1 = load i8, *%p1p
+    %ok = eq i8 %c1, 50
+    br %ok, @headers, @bad_status
+  @bad_status:
+    %linep = gep i8, *@agentl_RESP, 0
+    %emptyp = gep i8, *@agentl_EMPTY, 0
+    %lv = call @agentl_line(%rawp, %emptyp, %linep, 200)
+    call @console_puts("agent: http ")
+    call @console_puts(%linep)
+    call @console_putc(10)
+    ret i32 -1
+  @headers:
+    %h4 = call @agentl_find_from(%rawp, @agentl_CRLF2, 0)
+    %no4 = slt i32 %h4, 0
+    br %no4, @headers_lf, @body4
+  @body4:
+    %e4 = add i32 %h4, 4
+    store i32 %e4, *%he
+    store i32 %e4, *%bst
+    jmp @body
+  @headers_lf:
+    %h2 = call @agentl_find_from(%rawp, @agentl_LF2, 0)
+    %no2 = slt i32 %h2, 0
+    br %no2, @bad_resp, @body2
+  @body2:
+    %e2 = add i32 %h2, 2
+    store i32 %e2, *%he
+    store i32 %e2, *%bst
+    jmp @body
+  @bad_resp:
+    call @console_puts("agent: malformed http response\n")
+    ret i32 -1
+  @body:
+    %bv = load i32, *%bst
+    %bp2 = gep i8, *@agentl_RAW, %bv
+    %chk = call @agentl_find_from(%rawp, @agentl_CHUNKED, 0)
+    %chknz = sge i32 %chk, 0
+    %hev = load i32, *%he
+    %inhdr = slt i32 %chk, %hev
+    %chunked = and i1 %chknz, %inhdr
+    br %chunked, @chunk_body, @plain_body
+  @chunk_body:
+    %cb = gep i8, *@agentl_CHUNK, 0
+    %rp = gep i8, *@agentl_RESP, 0
+    %cl = call @agentl_dechunk(%bp2, %cb, 2048)
+    %cok = slt i32 %cl, 0
+    br %cok, @bad_content, @chunk_extract
+  @chunk_extract:
+    %cl2 = call @agentl_extract_content(%cb, %rp, 2048)
+    %cok2 = slt i32 %cl2, 0
+    br %cok2, @bad_content, @chunk_ok
+  @chunk_ok:
+    ret i32 %cl2
+  @plain_body:
+    %rp2 = gep i8, *@agentl_RESP, 0
+    %el = call @agentl_extract_content(%bp2, %rp2, 2048)
+    %eok = sge i32 %el, 0
+    br %eok, @plain_ok, @bad_content
+  @plain_ok:
+    ret i32 %el
+  @bad_content:
+    call @console_puts("agent: no string content in response\n")
+    ret i32 -1
+  @err_close:
+    call @agentl_close()
+    jmp @err
+  @err:
+    ret i32 -1
+}
+
+fun @agent_session_reset() -> void {
+  @entry:
+    %tp = gep i8, *@agentl_TRANS, 0
+    %rp = gep i8, *@agentl_RESP, 0
+    call @agent_zero(%tp, 3072)
+    call @agent_zero(%rp, 2048)
+    ret void
+}
+
+fun @agent_ask(text: *i8) -> void {
+  @entry:
+    %step = let i32
+    %tlen = let i32
+    %name = let [i8, 64]
+    %argb = let [i8, 768]
+    %outb = let [i8, 2048]
+    call @agent_cfg_load()
+    %host = call @agent_cfg_host()
+    %h0 = load i8, *%host
+    %nohost = eq i8 %h0, 0
+    br %nohost, @no_cfg, @model_chk
+  @no_cfg:
+    call @console_puts("agent: no endpoint configured\n")
+    call @console_puts("  agent config url=https://host/v1\n")
+    call @console_puts("  or export AGENT_URL / OPENAI_BASE_URL before make run\n")
+    ret void
+  @model_chk:
+    %model = call @agent_cfg_model()
+    %m0 = load i8, *%model
+    %nomodel = eq i8 %m0, 0
+    br %nomodel, @no_model, @start
+  @no_model:
+    call @console_puts("agent: no model configured (agent config model=...)\n")
+    ret void
+  @start:
+    call @agent_session_reset()
+    %tp = gep i8, *@agentl_TRANS, 0
+    store i32 0, *%tlen
+    call @agent_puts(%tp, %tlen, 3072, "USER: ")
+    call @agent_puts(%tp, %tlen, 3072, %text)
+    call @agent_putc(%tp, %tlen, 3072, 10)
+    store i32 0, *%step
+    jmp @loop
+  @loop:
+    %bp = gep i8, *@agentl_BODY, 0
+    %bl = call @agentl_build_body(%bp, 8192, %tp)
+    %cl = call @agentl_post(%bp, %bl)
+    %bad = slt i32 %cl, 0
+    br %bad, @failed, @append
+  @append:
+    %rp = gep i8, *@agentl_RESP, 0
+    call @agent_puts(%tp, %tlen, 3072, "ASSISTANT: ")
+    call @agent_puts(%tp, %tlen, 3072, %rp)
+    call @agent_putc(%tp, %tlen, 3072, 10)
+    %np = gep i8, *%name, 0
+    %nv = call @agentl_line(%rp, "TOOL:", %np, 64)
+    %has_tool = sgt i32 %nv, 0
+    br %has_tool, @run_tool, @final
+  @run_tool:
+    %sv = load i32, *%step
+    %mx = call @agent_cfg_maxstep()
+    %over = sge i32 %sv, %mx
+    br %over, @limit, @run_tool2
+  @run_tool2:
+    %argp = gep i8, *%argb, 0
+    %av = call @agentl_line(%rp, "ARG:", %argp, 768)
+    call @console_puts("agent> tool ")
+    call @console_puts(%np)
+    call @console_putc(32)
+    call @console_puts(%argp)
+    call @console_putc(10)
+    %op = gep i8, *%outb, 0
+    %orc = call @agtools_call(%np, %argp, %op, 2048)
+    call @console_puts(%op)
+    call @agent_audit("tool", %np)
+    call @agent_puts(%tp, %tlen, 3072, "RESULT: ")
+    call @agent_puts(%tp, %tlen, 3072, %op)
+    call @agent_putc(%tp, %tlen, 3072, 10)
+    %sv2 = load i32, *%step
+    %sn = add i32 %sv2, 1
+    store i32 %sn, *%step
+    jmp @loop
+  @limit:
+    call @console_puts("agent: step limit reached\n")
+    ret void
+  @final:
+    %fp = gep i8, *%outb, 0
+    %tv = call @agentl_after(%rp, "TEXT:", %fp, 2048)
+    %has_text = sgt i32 %tv, 0
+    br %has_text, @print_text, @print_all
+  @print_text:
+    call @console_puts(%fp)
+    call @console_putc(10)
+    ret void
+  @print_all:
+    call @console_puts(%rp)
+    call @console_putc(10)
+    ret void
+  @failed:
+    call @console_puts("agent: request failed\n")
+    ret void
+}

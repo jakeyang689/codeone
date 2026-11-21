@@ -1,0 +1,330 @@
+// dhcp.bx - minimal DHCP client (DISCOVER / OFFER / REQUEST / ACK)
+//
+// The vmnet-shared backend provides its own DHCP/NAT; at boot the guest broadcasts a discover
+// message to port 67 and, once the address, mask, gateway, and DNS are obtained, writes them into the net module's runtime configuration.
+// All packets are sent as BOOTP minimum-length 300-byte frames, broadcast from 0.0.0.0.
+
+extern @udp_send_bcast(src: i32, sport: i32, dport: i32, data: *i8, len: i32) -> i32
+extern @udp_recv(port: i32, buf: *i8, max: i32, timeout_ms: i32) -> i32
+extern @net_my_mac() -> *i8
+extern @net_configure(ip: i32, mask: i32, gw: i32, dns: i32) -> void
+extern @net_print_ip(ip: i32) -> void
+extern @net_ld8(p: *i8, off: i32) -> i32
+extern @net_be32(p: *i8, off: i32) -> i32
+extern @net_st8(p: *i8, off: i32, v: i32) -> void
+extern @net_stbe16(p: *i8, off: i32, v: i32) -> void
+extern @net_stbe32(p: *i8, off: i32, v: i32) -> void
+extern @kmem_memcpy(dst: *i8, src: *i8, n: i64) -> void
+extern @kmem_memset(p: *i8, v: i32, n: i64) -> void
+extern @console_puts(s: *i8) -> void
+
+const @dhcp_OP_REQ: i32 = 1
+const @dhcp_OP_REP: i32 = 2
+const @dhcp_PORT_CLIENT: i32 = 68
+const @dhcp_PORT_SERVER: i32 = 67
+const @dhcp_XID: i32 = 0x4F534F4E
+const @dhcp_PKT_LEN: i32 = 300
+const @dhcp_COOKIE: i32 = 240
+const @dhcp_MSG_DISCOVER: i32 = 1
+const @dhcp_MSG_OFFER: i32 = 2
+const @dhcp_MSG_REQUEST: i32 = 3
+const @dhcp_MSG_ACK: i32 = 5
+const @dhcp_DEF_MASK: i32 = 0xFFFFFF00
+const @dhcp_WAIT_OFFER: i32 = 700
+const @dhcp_WAIT_ACK: i32 = 900
+
+const @dhcp_MSG_OK: [i8, 11] = "net: dhcp "
+const @dhcp_GW_WORD: [i8, 5] = " gw "
+const @dhcp_NL: [i8, 2] = "\n"
+const @dhcp_MSG_FAIL: [i8, 18] = "net: dhcp failed\n"
+
+global @dhcp_TX: [i8, 320]
+global @dhcp_RX: [i8, 1024]
+global @dhcp_YI: i32
+global @dhcp_MASK: i32
+global @dhcp_GW: i32
+global @dhcp_DNS: i32
+global @dhcp_SID: i32
+global @dhcp_TYPE: i32
+
+// Fixed option layout: 53/61/55, optional 50/54, terminated by 255, zero-padded.
+fun @dhcp_build(mtype: i32, reqip: i32, sid: i32) -> i32 {
+  @entry:
+    %tx = gep i8, *@dhcp_TX, 0
+    %z = zext i32 @dhcp_PKT_LEN to i64
+    call @kmem_memset(%tx, 0, %z)
+    call @net_st8(%tx, 0, @dhcp_OP_REQ)
+    call @net_st8(%tx, 1, 1)
+    call @net_st8(%tx, 2, 6)
+    call @net_st8(%tx, 3, 0)
+    call @net_stbe32(%tx, 4, @dhcp_XID)
+    call @net_stbe16(%tx, 8, 0)
+    call @net_stbe16(%tx, 10, 0x8000)
+    %mac = call @net_my_mac()
+    %cha = gep i8, *%tx, 28
+    %six = zext i32 6 to i64
+    call @kmem_memcpy(%cha, %mac, %six)
+    call @net_st8(%tx, 236, 99)
+    call @net_st8(%tx, 237, 130)
+    call @net_st8(%tx, 238, 83)
+    call @net_st8(%tx, 239, 99)
+    call @net_st8(%tx, @dhcp_COOKIE, 53)
+    call @net_st8(%tx, 241, 1)
+    call @net_st8(%tx, 242, %mtype)
+    call @net_st8(%tx, 243, 61)
+    call @net_st8(%tx, 244, 7)
+    call @net_st8(%tx, 245, 1)
+    %cid = gep i8, *%tx, 246
+    call @kmem_memcpy(%cid, %mac, %six)
+    call @net_st8(%tx, 252, 55)
+    call @net_st8(%tx, 253, 3)
+    call @net_st8(%tx, 254, 1)
+    call @net_st8(%tx, 255, 3)
+    call @net_st8(%tx, 256, 6)
+    %hasreq = ne i32 %reqip, 0
+    br %hasreq, @withreq, @chksid
+  @chksid:
+    %hassid0 = ne i32 %sid, 0
+    br %hassid0, @sidonly, @endopt
+  @sidonly:
+    call @net_st8(%tx, 257, 54)
+    call @net_st8(%tx, 258, 4)
+    call @net_stbe32(%tx, 259, %sid)
+    jmp @endopt
+  @withreq:
+    call @net_st8(%tx, 257, 50)
+    call @net_st8(%tx, 258, 4)
+    call @net_stbe32(%tx, 259, %reqip)
+    %hassid = ne i32 %sid, 0
+    br %hassid, @withsid, @endopt
+  @withsid:
+    call @net_st8(%tx, 263, 54)
+    call @net_st8(%tx, 264, 4)
+    call @net_stbe32(%tx, 265, %sid)
+    jmp @endopt
+  @endopt:
+    call @net_st8(%tx, 271, 255)
+    ret i32 @dhcp_PKT_LEN
+}
+
+// Parse the reply into the @dhcp_* globals; returns 0 when the format is invalid.
+fun @dhcp_parse(len: i32) -> i32 {
+  @entry:
+    %rx = gep i8, *@dhcp_RX, 0
+    %op = call @net_ld8(%rx, 0)
+    %isrep = eq i32 %op, @dhcp_OP_REP
+    br %isrep, @xid, @bad
+  @xid:
+    %x = call @net_be32(%rx, 4)
+    %xok = eq i32 %x, @dhcp_XID
+    br %xok, @cookie, @bad
+  @cookie:
+    %c0 = call @net_ld8(%rx, 236)
+    %c1 = call @net_ld8(%rx, 237)
+    %c2 = call @net_ld8(%rx, 238)
+    %c3 = call @net_ld8(%rx, 239)
+    %ok0 = eq i32 %c0, 99
+    %ok1 = eq i32 %c1, 130
+    %ok2 = eq i32 %c2, 83
+    %ok3 = eq i32 %c3, 99
+    %a = and i1 %ok0, %ok1
+    %b = and i1 %ok2, %ok3
+    %cok = and i1 %a, %b
+    br %cok, @yi, @bad
+  @yi:
+    %yi = call @net_be32(%rx, 16)
+    %yiz = eq i32 %yi, 0
+    br %yiz, @bad, @init
+  @init:
+    store i32 %yi, *@dhcp_YI
+    store i32 0, *@dhcp_MASK
+    store i32 0, *@dhcp_GW
+    store i32 0, *@dhcp_DNS
+    store i32 0, *@dhcp_SID
+    store i32 0, *@dhcp_TYPE
+    %i = let i32
+    store i32 @dhcp_COOKIE, *%i
+    jmp @loop
+  @loop:
+    %iv = load i32, *%i
+    %lim = sge i32 %iv, %len
+    br %lim, @doneopts, @code
+  @code:
+    %code = call @net_ld8(%rx, %iv)
+    %end = eq i32 %code, 255
+    br %end, @doneopts, @pad
+  @pad:
+    %isz = eq i32 %code, 0
+    br %isz, @skip1, @olen
+  @skip1:
+    %iv1 = add i32 %iv, 1
+    store i32 %iv1, *%i
+    jmp @loop
+  @olen:
+    %io = add i32 %iv, 1
+    %iolim = sge i32 %io, %len
+    br %iolim, @doneopts, @olen2
+  @olen2:
+    %olen = call @net_ld8(%rx, %io)
+    %ds = add i32 %iv, 2
+    %de = add i32 %ds, %olen
+    %over = sgt i32 %de, %len
+    br %over, @doneopts, @dispatch
+  @dispatch:
+    %is53 = eq i32 %code, 53
+    br %is53, @o53, @c1
+  @c1:
+    %is1 = eq i32 %code, 1
+    br %is1, @o1, @c3
+  @c3:
+    %is3 = eq i32 %code, 3
+    br %is3, @o3, @c6
+  @c6:
+    %is6 = eq i32 %code, 6
+    br %is6, @o6, @c54
+  @c54:
+    %is54 = eq i32 %code, 54
+    br %is54, @o54, @next
+  @o53:
+    %v53 = call @net_ld8(%rx, %ds)
+    store i32 %v53, *@dhcp_TYPE
+    jmp @next
+  @o1:
+    %okm = sge i32 %olen, 4
+    br %okm, @o1s, @next
+  @o1s:
+    %vm = call @net_be32(%rx, %ds)
+    store i32 %vm, *@dhcp_MASK
+    jmp @next
+  @o3:
+    %okg = sge i32 %olen, 4
+    br %okg, @o3s, @next
+  @o3s:
+    %vg = call @net_be32(%rx, %ds)
+    store i32 %vg, *@dhcp_GW
+    jmp @next
+  @o6:
+    %okd = sge i32 %olen, 4
+    br %okd, @o6s, @next
+  @o6s:
+    %vd = call @net_be32(%rx, %ds)
+    store i32 %vd, *@dhcp_DNS
+    jmp @next
+  @o54:
+    %oks = sge i32 %olen, 4
+    br %oks, @o54s, @next
+  @o54s:
+    %vs = call @net_be32(%rx, %ds)
+    store i32 %vs, *@dhcp_SID
+    jmp @next
+  @next:
+    store i32 %de, *%i
+    jmp @loop
+  @doneopts:
+    ret i32 1
+  @bad:
+    ret i32 0
+}
+
+fun @dhcp_fail() -> i32 {
+  @entry:
+    %m = gep i8, *@dhcp_MSG_FAIL, 0
+    call @console_puts(%m)
+    ret i32 0
+}
+
+fun @dhcp_acquire() -> i32 {
+  @entry:
+    %attempt = let i32
+    %rround = let i32
+    store i32 0, *%attempt
+    jmp @disc
+  @disc:
+    %av = load i32, *%attempt
+    %out = sge i32 %av, 2
+    br %out, @fail, @send
+  @send:
+    %n = call @dhcp_build(@dhcp_MSG_DISCOVER, 0, 0)
+    %tx = gep i8, *@dhcp_TX, 0
+    call @udp_send_bcast(0, @dhcp_PORT_CLIENT, @dhcp_PORT_SERVER, %tx, %n)
+    %rx = gep i8, *@dhcp_RX, 0
+    %got = call @udp_recv(@dhcp_PORT_CLIENT, %rx, 1024, @dhcp_WAIT_OFFER)
+    %has = sgt i32 %got, 0
+    br %has, @parse, @retry
+  @parse:
+    %ok = call @dhcp_parse(%got)
+    %isok = eq i32 %ok, 1
+    br %isok, @chkoffer, @retry
+  @chkoffer:
+    %t = load i32, *@dhcp_TYPE
+    %isoff = eq i32 %t, @dhcp_MSG_OFFER
+    br %isoff, @request, @retry
+  @retry:
+    %av2 = load i32, *%attempt
+    %an = add i32 %av2, 1
+    store i32 %an, *%attempt
+    jmp @disc
+  @request:
+    store i32 0, *%rround
+    jmp @reqsend
+  @reqsend:
+    %yi = load i32, *@dhcp_YI
+    %sid = load i32, *@dhcp_SID
+    %rn = call @dhcp_build(@dhcp_MSG_REQUEST, %yi, %sid)
+    %tx2 = gep i8, *@dhcp_TX, 0
+    call @udp_send_bcast(0, @dhcp_PORT_CLIENT, @dhcp_PORT_SERVER, %tx2, %rn)
+    %rx2 = gep i8, *@dhcp_RX, 0
+    %got2 = call @udp_recv(@dhcp_PORT_CLIENT, %rx2, 1024, @dhcp_WAIT_ACK)
+    %has2 = sgt i32 %got2, 0
+    br %has2, @parseack, @reqnext
+  @parseack:
+    %ok2 = call @dhcp_parse(%got2)
+    %isok2 = eq i32 %ok2, 1
+    br %isok2, @chkack, @reqnext
+  @chkack:
+    %t2 = load i32, *@dhcp_TYPE
+    %isack = eq i32 %t2, @dhcp_MSG_ACK
+    br %isack, @mask, @reqnext
+  @reqnext:
+    %rv = load i32, *%rround
+    %rn2 = add i32 %rv, 1
+    store i32 %rn2, *%rround
+    %rout = sge i32 %rn2, 2
+    br %rout, @fail, @reqsend
+  @mask:
+    %m = load i32, *@dhcp_MASK
+    %mz = eq i32 %m, 0
+    br %mz, @defmask, @gw
+  @defmask:
+    store i32 @dhcp_DEF_MASK, *@dhcp_MASK
+    jmp @gw
+  @gw:
+    %g = load i32, *@dhcp_GW
+    %gz = eq i32 %g, 0
+    br %gz, @fail, @dns
+  @dns:
+    %d = load i32, *@dhcp_DNS
+    %dz = eq i32 %d, 0
+    br %dz, @usedgw, @apply
+  @usedgw:
+    store i32 %g, *@dhcp_DNS
+    jmp @apply
+  @apply:
+    %fip = load i32, *@dhcp_YI
+    %fmask = load i32, *@dhcp_MASK
+    %fgw = load i32, *@dhcp_GW
+    %fdns = load i32, *@dhcp_DNS
+    call @net_configure(%fip, %fmask, %fgw, %fdns)
+    %okmsg = gep i8, *@dhcp_MSG_OK, 0
+    call @console_puts(%okmsg)
+    call @net_print_ip(%fip)
+    %gwm = gep i8, *@dhcp_GW_WORD, 0
+    call @console_puts(%gwm)
+    call @net_print_ip(%fgw)
+    %nl = gep i8, *@dhcp_NL, 0
+    call @console_puts(%nl)
+    ret i32 1
+  @fail:
+    %r = call @dhcp_fail()
+    ret i32 0
+}

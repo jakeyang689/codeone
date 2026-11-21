@@ -1,0 +1,1500 @@
+// cli.bx - `agent` shell command, configuration and audit log
+//
+// Configuration is never compiled in. The order is:
+//   1. QEMU bootargs (make forwards AGENT_* / OPENAI_* from the host env)
+//   2. /etc/agent.conf, one key=value per line
+//   3. `agent config key=value`, which lives in RAM only
+//
+// The API key is kept in a kernel buffer and never printed; `agent reset`
+// zeroes it. Nothing here depends on libc or third-party code.
+
+extern @console_puts(s: *i8) -> void
+extern @console_printf(fmt: *i8, a: i64, b: i64, c: i64, d: i64, s1: *i8, s2: *i8) -> void
+extern @vfs_open(path: *i8, flags: i32) -> i32
+extern @vfs_read(fd: i32, buf: *i8, len: i64) -> i64
+extern @vfs_close(fd: i32) -> i32
+extern @timer_now() -> i64
+extern @timer_freq() -> i64
+extern @agentcfg_env_get(name: *i8, out: *i8, cap: i32) -> i32
+extern @agtools_call(name: *i8, args: *i8, out: *i8, cap: i32) -> i32
+extern @agtools_get_policy() -> i32
+extern @agtools_set_policy(p: i32) -> void
+extern @agent_ask(text: *i8) -> void
+extern @agent_session_reset() -> void
+extern @shell_getline(complete: i32) -> i32
+extern @shell_line_ptr() -> *i8
+extern @shell_set_prompt(p: *i8) -> void
+
+const @agent_CONF_PATH: [i8, 16] = "/etc/agent.conf"
+const @agent_DEF_PATH: [i8, 21] = "/v1/chat/completions"
+const @agent_PROMPT: [i8, 8] = "agent> "
+
+global @agent_HOST: [i8, 128]
+global @agent_PATH: [i8, 160]
+global @agent_MODEL: [i8, 96]
+global @agent_KEY: [i8, 256]
+global @agent_SCHEME: i32 = 1
+global @agent_PORT: i32 = 0
+global @agent_MAXSTEP: i32 = 4
+global @agent_CFG_LOADED: i32 = 0
+global @agent_CFGFILE: [i8, 1024]
+
+global @agent_LOG: [i8, 1536]
+global @agent_LOG_IDX: i32
+global @agent_LOG_CNT: i32
+
+fun @agent_strlen(s: *i8) -> i32 {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @cond
+  @cond:
+    %iv = load i32, *%i
+    %p = gep i8, *%s, %iv
+    %c = load i8, *%p
+    %end = eq i8 %c, 0
+    br %end, @done, @body
+  @body:
+    %n = add i32 %iv, 1
+    store i32 %n, *%i
+    jmp @cond
+  @done:
+    %r = load i32, *%i
+    ret i32 %r
+}
+
+fun @agent_streq(a: *i8, b: *i8) -> i32 {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @cond
+  @cond:
+    %iv = load i32, *%i
+    %ap = gep i8, *%a, %iv
+    %ac = load i8, *%ap
+    %bp = gep i8, *%b, %iv
+    %bc = load i8, *%bp
+    %diff = ne i8 %ac, %bc
+    br %diff, @no, @same
+  @same:
+    %end = eq i8 %ac, 0
+    br %end, @yes, @next
+  @next:
+    %n = add i32 %iv, 1
+    store i32 %n, *%i
+    jmp @cond
+  @yes:
+    ret i32 1
+  @no:
+    ret i32 0
+}
+
+fun @agent_prefix(s: *i8, pre: *i8) -> i32 {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @cond
+  @cond:
+    %iv = load i32, *%i
+    %pp = gep i8, *%pre, %iv
+    %pc = load i8, *%pp
+    %pend = eq i8 %pc, 0
+    br %pend, @yes, @cmp
+  @cmp:
+    %sp = gep i8, *%s, %iv
+    %sc = load i8, *%sp
+    %same = eq i8 %sc, %pc
+    br %same, @next, @no
+  @next:
+    %n = add i32 %iv, 1
+    store i32 %n, *%i
+    jmp @cond
+  @yes:
+    ret i32 1
+  @no:
+    ret i32 0
+}
+
+fun @agent_suffix(s: *i8, suf: *i8) -> i32 {
+  @entry:
+    %sl = call @agent_strlen(%s)
+    %fl = call @agent_strlen(%suf)
+    %gt = sgt i32 %sl, %fl
+    %ge = sge i32 %sl, %fl
+    br %ge, @start, @no
+  @start:
+    %st = sub i32 %sl, %fl
+    %i = let i32
+    store i32 0, *%i
+    jmp @cond
+  @cond:
+    %iv = load i32, *%i
+    %done = sge i32 %iv, %fl
+    br %done, @yes, @cmp
+  @cmp:
+    %ix = add i32 %st, %iv
+    %sp = gep i8, *%s, %ix
+    %sc = load i8, *%sp
+    %qp = gep i8, *%suf, %iv
+    %qc = load i8, *%qp
+    %same = eq i8 %sc, %qc
+    br %same, @next, @no
+  @next:
+    %n = add i32 %iv, 1
+    store i32 %n, *%i
+    jmp @cond
+  @yes:
+    ret i32 1
+  @no:
+    ret i32 0
+}
+
+fun @agent_copy(dst: *i8, src: *i8, cap: i32) -> void {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @cond
+  @cond:
+    %iv = load i32, *%i
+    %lim = sub i32 %cap, 1
+    %full = sge i32 %iv, %lim
+    br %full, @term, @body
+  @body:
+    %sp = gep i8, *%src, %iv
+    %c = load i8, *%sp
+    %end = eq i8 %c, 0
+    br %end, @term, @put
+  @put:
+    %dp = gep i8, *%dst, %iv
+    store i8 %c, *%dp
+    %n = add i32 %iv, 1
+    store i32 %n, *%i
+    jmp @cond
+  @term:
+    %tv = load i32, *%i
+    %tp = gep i8, *%dst, %tv
+    store i8 0, *%tp
+    ret void
+}
+
+fun @agent_copy_n(dst: *i8, src: *i8, n: i32, cap: i32) -> void {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @cond
+  @cond:
+    %iv = load i32, *%i
+    %nlim = sge i32 %iv, %n
+    %clim = sub i32 %cap, 1
+    %full = sge i32 %iv, %clim
+    %stop = or i1 %nlim, %full
+    br %stop, @term, @body
+  @body:
+    %sp = gep i8, *%src, %iv
+    %c = load i8, *%sp
+    %dp = gep i8, *%dst, %iv
+    store i8 %c, *%dp
+    %nx = add i32 %iv, 1
+    store i32 %nx, *%i
+    jmp @cond
+  @term:
+    %tv = load i32, *%i
+    %tp = gep i8, *%dst, %tv
+    store i8 0, *%tp
+    ret void
+}
+
+fun @agent_putdec(out: *i8, lenp: *i32, cap: i32, v: i64) -> void {
+  @entry:
+    %buf = let [i8, 24]
+    %digits = let i32
+    %val = let i64
+    store i32 0, *%digits
+    store i64 %v, *%val
+    %zero = eq i64 %v, 0
+    br %zero, @zero_out, @gen
+  @gen:
+    %cv = load i64, *%val
+    %q = udiv i64 %cv, 10
+    %r = urem i64 %cv, 10
+    %ri = trunc i64 %r to i32
+    %di = add i32 %ri, 48
+    %dv = load i32, *%digits
+    %bp = gep i8, *%buf, %dv
+    %ci = trunc i32 %di to i8
+    store i8 %ci, *%bp
+    %dn = add i32 %dv, 1
+    store i32 %dn, *%digits
+    store i64 %q, *%val
+    %qzero = eq i64 %q, 0
+    br %qzero, @emit, @gen
+  @emit:
+    %k = let i32
+    store i32 0, *%k
+    jmp @emit_cond
+  @emit_cond:
+    %kv = load i32, *%k
+    %dv2 = load i32, *%digits
+    %done = sge i32 %kv, %dv2
+    br %done, @fin, @emit_body
+  @emit_body:
+    %ix = sub i32 %dv2, %kv
+    %ix2 = sub i32 %ix, 1
+    %cp = gep i8, *%buf, %ix2
+    %ch = load i8, *%cp
+    %chi = zext i8 %ch to i32
+    call @agent_putc(%out, %lenp, %cap, %chi)
+    %kn = add i32 %kv, 1
+    store i32 %kn, *%k
+    jmp @emit_cond
+  @zero_out:
+    call @agent_putc(%out, %lenp, %cap, 48)
+    jmp @fin
+  @fin:
+    ret void
+}
+
+fun @agent_putc(out: *i8, lenp: *i32, cap: i32, ch: i32) -> void {
+  @entry:
+    %lv = load i32, *%lenp
+    %lim = sub i32 %cap, 1
+    %full = sge i32 %lv, %lim
+    br %full, @done, @put
+  @put:
+    %op = gep i8, *%out, %lv
+    %t = trunc i32 %ch to i8
+    store i8 %t, *%op
+    %ln = add i32 %lv, 1
+    store i32 %ln, *%lenp
+    %np = gep i8, *%out, %ln
+    store i8 0, *%np
+    ret void
+  @done:
+    %np2 = gep i8, *%out, %lv
+    store i8 0, *%np2
+    ret void
+}
+
+fun @agent_puts(out: *i8, lenp: *i32, cap: i32, s: *i8) -> void {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @cond
+  @cond:
+    %iv = load i32, *%i
+    %sp = gep i8, *%s, %iv
+    %c = load i8, *%sp
+    %end = eq i8 %c, 0
+    br %end, @fin, @chkroom
+  @chkroom:
+    %lv = load i32, *%lenp
+    %lim = sub i32 %cap, 1
+    %full = sge i32 %lv, %lim
+    br %full, @fin, @put
+  @put:
+    %ci = zext i8 %c to i32
+    call @agent_putc(%out, %lenp, %cap, %ci)
+    %n = add i32 %iv, 1
+    store i32 %n, *%i
+    jmp @cond
+  @fin:
+    ret void
+}
+
+fun @agent_zero(buf: *i8, n: i32) -> void {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @cond
+  @cond:
+    %iv = load i32, *%i
+    %done = sge i32 %iv, %n
+    br %done, @fin, @body
+  @body:
+    %p = gep i8, *%buf, %iv
+    store i8 0, *%p
+    %nx = add i32 %iv, 1
+    store i32 %nx, *%i
+    jmp @cond
+  @fin:
+    ret void
+}
+
+fun @agent_parse_uint(s: *i8) -> i32 {
+  @entry:
+    %i = let i32
+    %acc = let i32
+    store i32 0, *%i
+    store i32 0, *%acc
+    %c0p = gep i8, *%s, 0
+    %c0 = load i8, *%c0p
+    %empty = eq i8 %c0, 0
+    br %empty, @bad, @loop
+  @loop:
+    %iv = load i32, *%i
+    %p = gep i8, *%s, %iv
+    %c = load i8, *%p
+    %end = eq i8 %c, 0
+    br %end, @done, @digit
+  @digit:
+    %lo = sge i8 %c, 48
+    %hi = sle i8 %c, 57
+    %isd = and i1 %lo, %hi
+    br %isd, @add, @bad
+  @add:
+    %ci = zext i8 %c to i32
+    %d = sub i32 %ci, 48
+    %av = load i32, *%acc
+    %m = mul i32 %av, 10
+    %nv = add i32 %m, %d
+    store i32 %nv, *%acc
+    %nx = add i32 %iv, 1
+    store i32 %nx, *%i
+    jmp @loop
+  @done:
+    %r = load i32, *%acc
+    ret i32 %r
+  @bad:
+    ret i32 -1
+}
+
+fun @agent_cfg_clear() -> void {
+  @entry:
+    %hp = gep i8, *@agent_HOST, 0
+    %pp = gep i8, *@agent_PATH, 0
+    %mp = gep i8, *@agent_MODEL, 0
+    %kp = gep i8, *@agent_KEY, 0
+    call @agent_zero(%hp, 128)
+    call @agent_zero(%pp, 160)
+    call @agent_zero(%mp, 96)
+    call @agent_zero(%kp, 256)
+    store i32 1, *@agent_SCHEME
+    store i32 0, *@agent_PORT
+    store i32 4, *@agent_MAXSTEP
+    ret void
+}
+
+fun @agent_cfg_host() -> *i8 {
+  @entry:
+    %p = gep i8, *@agent_HOST, 0
+    ret *i8 %p
+}
+
+fun @agent_cfg_path() -> *i8 {
+  @entry:
+    %p = gep i8, *@agent_PATH, 0
+    ret *i8 %p
+}
+
+fun @agent_cfg_model() -> *i8 {
+  @entry:
+    %p = gep i8, *@agent_MODEL, 0
+    ret *i8 %p
+}
+
+fun @agent_cfg_key() -> *i8 {
+  @entry:
+    %p = gep i8, *@agent_KEY, 0
+    ret *i8 %p
+}
+
+fun @agent_cfg_scheme() -> i32 {
+  @entry:
+    %v = load i32, *@agent_SCHEME
+    ret i32 %v
+}
+
+fun @agent_cfg_port() -> i32 {
+  @entry:
+    %v = load i32, *@agent_PORT
+    %z = eq i32 %v, 0
+    br %z, @infer, @have
+  @infer:
+    %s = load i32, *@agent_SCHEME
+    %tls = eq i32 %s, 1
+    br %tls, @https, @http
+  @https:
+    ret i32 443
+  @http:
+    ret i32 80
+  @have:
+    ret i32 %v
+}
+
+fun @agent_cfg_maxstep() -> i32 {
+  @entry:
+    %v = load i32, *@agent_MAXSTEP
+    ret i32 %v
+}
+
+fun @agent_url_apply(url: *i8) -> void {
+  @entry:
+    %hp = gep i8, *@agent_HOST, 0
+    %pp = gep i8, *@agent_PATH, 0
+    %is_https = call @agent_prefix(%url, "https://")
+    %ih = eq i32 %is_https, 1
+    br %ih, @https, @try_http
+  @https:
+    store i32 1, *@agent_SCHEME
+    %hs = add i32 0, 8
+    jmp @host_scan
+  @try_http:
+    %is_http = call @agent_prefix(%url, "http://")
+    %ih2 = eq i32 %is_http, 1
+    br %ih2, @http, @bare
+  @http:
+    store i32 0, *@agent_SCHEME
+    %hs2 = add i32 0, 7
+    jmp @host_scan
+  @bare:
+    %hs3 = add i32 0, 0
+    jmp @host_scan
+  @host_scan:
+    %start = phi i32 [%hs, @https], [%hs2, @http], [%hs3, @bare]
+    %i = let i32
+    %hlen = let i32
+    store i32 %start, *%i
+    store i32 0, *%hlen
+    jmp @host_cond
+  @host_cond:
+    %iv = load i32, *%i
+    %p = gep i8, *%url, %iv
+    %c = load i8, *%p
+    %end = eq i8 %c, 0
+    %colon = eq i8 %c, 58
+    %slash = eq i8 %c, 47
+    %stopc = or i1 %colon, %slash
+    %stop = or i1 %stopc, %end
+    br %stop, @host_done, @host_body
+  @host_body:
+    %hl = load i32, *%hlen
+    %dp = gep i8, *%hp, %hl
+    store i8 %c, *%dp
+    %hln = add i32 %hl, 1
+    store i32 %hln, *%hlen
+    %nx = add i32 %iv, 1
+    store i32 %nx, *%i
+    jmp @host_cond
+  @host_done:
+    %hl2 = load i32, *%hlen
+    %ht = gep i8, *%hp, %hl2
+    store i8 0, *%ht
+    %iv2 = load i32, *%i
+    %p2 = gep i8, *%url, %iv2
+    %c2 = load i8, *%p2
+    %iscolon = eq i8 %c2, 58
+    br %iscolon, @port, @path_scan
+  @port:
+    %i2 = let i32
+    %acc = let i32
+    %in_port = add i32 %iv2, 1
+    store i32 %in_port, *%i2
+    store i32 0, *%acc
+    jmp @port_cond
+  @port_cond:
+    %pv = load i32, *%i2
+    %pp2 = gep i8, *%url, %pv
+    %pc = load i8, *%pp2
+    %pend = eq i8 %pc, 0
+    %pslash = eq i8 %pc, 47
+    %pstop = or i1 %pend, %pslash
+    br %pstop, @port_done, @port_body
+  @port_body:
+    %pci = zext i8 %pc to i32
+    %pd = sub i32 %pci, 48
+    %av = load i32, *%acc
+    %am = mul i32 %av, 10
+    %an = add i32 %am, %pd
+    store i32 %an, *%acc
+    %pnx = add i32 %pv, 1
+    store i32 %pnx, *%i2
+    jmp @port_cond
+  @port_done:
+    %portv = load i32, *%acc
+    store i32 %portv, *@agent_PORT
+    %pv2 = load i32, *%i2
+    store i32 %pv2, *%i
+    jmp @path_scan
+  @path_scan:
+    %iv3 = load i32, *%i
+    %p3 = gep i8, *%url, %iv3
+    %c3 = load i8, *%p3
+    %pempty = eq i8 %c3, 0
+    br %pempty, @path_default, @path_copy
+  @path_copy:
+    call @agent_copy(%pp, %p3, 160)
+    %plen = call @agent_strlen(%pp)
+    %isroot = eq i32 %plen, 1
+    %r0 = gep i8, *%pp, 0
+    %rootc = load i8, *%r0
+    %ris = eq i8 %rootc, 47
+    %isone = and i1 %isroot, %ris
+    br %isone, @path_default, @path_norm
+  @path_norm:
+    %v1 = call @agent_suffix(%pp, "/v1")
+    %v2 = call @agent_suffix(%pp, "/v1/")
+    %b1 = eq i32 %v1, 1
+    %b2 = eq i32 %v2, 1
+    %anyv = or i1 %b1, %b2
+    br %anyv, @path_append, @path_done
+  @path_append:
+    %l = call @agent_strlen(%pp)
+    %dp2 = gep i8, *%pp, %l
+    %add = gep i8, *@agent_TAIL, 0
+    %blen = let i32
+    store i32 %l, *%blen
+    call @agent_puts(%pp, %blen, 160, %add)
+    jmp @path_done
+  @path_default:
+    %def = gep i8, *@agent_DEF_PATH, 0
+    call @agent_copy(%pp, %def, 160)
+    jmp @path_done
+  @path_done:
+    ret void
+}
+
+const @agent_TAIL: [i8, 18] = "/chat/completions"
+
+fun @agent_cfg_apply_kv(key: *i8, val: *i8) -> i32 {
+  @entry:
+    %isurl = call @agent_streq(%key, "url")
+    %b1 = eq i32 %isurl, 1
+    br %b1, @do_url, @c2
+  @do_url:
+    call @agent_url_apply(%val)
+    ret i32 1
+  @c2:
+    %ishost = call @agent_streq(%key, "host")
+    %b2 = eq i32 %ishost, 1
+    br %b2, @do_host, @c3
+  @do_host:
+    %hp = gep i8, *@agent_HOST, 0
+    call @agent_copy(%hp, %val, 128)
+    ret i32 1
+  @c3:
+    %ispath = call @agent_streq(%key, "path")
+    %b3 = eq i32 %ispath, 1
+    br %b3, @do_path, @c4
+  @do_path:
+    %pp = gep i8, *@agent_PATH, 0
+    call @agent_copy(%pp, %val, 160)
+    ret i32 1
+  @c4:
+    %isport = call @agent_streq(%key, "port")
+    %b4 = eq i32 %isport, 1
+    br %b4, @do_port, @c5
+  @do_port:
+    %pv = call @agent_parse_uint(%val)
+    %pok = sge i32 %pv, 0
+    br %pok, @port_put, @badkey
+  @port_put:
+    store i32 %pv, *@agent_PORT
+    ret i32 1
+  @c5:
+    %isscheme = call @agent_streq(%key, "scheme")
+    %b5 = eq i32 %isscheme, 1
+    br %b5, @do_scheme, @c6
+  @do_scheme:
+    %ishttp = call @agent_streq(%val, "http")
+    %bh = eq i32 %ishttp, 1
+    br %bh, @scheme_http, @scheme_https
+  @scheme_http:
+    store i32 0, *@agent_SCHEME
+    ret i32 1
+  @scheme_https:
+    store i32 1, *@agent_SCHEME
+    ret i32 1
+  @c6:
+    %ismodel = call @agent_streq(%key, "model")
+    %b6 = eq i32 %ismodel, 1
+    br %b6, @do_model, @c7
+  @do_model:
+    %mp = gep i8, *@agent_MODEL, 0
+    call @agent_copy(%mp, %val, 96)
+    ret i32 1
+  @c7:
+    %iskey = call @agent_streq(%key, "key")
+    %b7 = eq i32 %iskey, 1
+    br %b7, @do_key, @c8
+  @c8:
+    %iskey2 = call @agent_streq(%key, "api_key")
+    %b8 = eq i32 %iskey2, 1
+    br %b8, @do_key, @c9
+  @do_key:
+    %kp = gep i8, *@agent_KEY, 0
+    call @agent_copy(%kp, %val, 256)
+    ret i32 1
+  @c9:
+    %isms = call @agent_streq(%key, "max_steps")
+    %b9 = eq i32 %isms, 1
+    br %b9, @do_ms, @badkey
+  @do_ms:
+    %mv = call @agent_parse_uint(%val)
+    %mok = sgt i32 %mv, 0
+    br %mok, @ms_put, @badkey
+  @ms_put:
+    store i32 %mv, *@agent_MAXSTEP
+    ret i32 1
+  @badkey:
+    ret i32 0
+}
+
+// Apply whitespace-separated key=value pairs. Returns the number applied.
+fun @agent_cfg_apply_text(s: *i8) -> i32 {
+  @entry:
+    %i = let i32
+    %klen = let i32
+    %vlen = let i32
+    %count = let i32
+    %key = let [i8, 64]
+    %val = let [i8, 160]
+    %kp = gep i8, *%key, 0
+    %vp = gep i8, *%val, 0
+    store i32 0, *%i
+    store i32 0, *%count
+    jmp @start
+  @start:
+    %iv = load i32, *%i
+    %sp = gep i8, *%s, %iv
+    %c = load i8, *%sp
+    %end = eq i8 %c, 0
+    br %end, @done, @chkws
+  @chkws:
+    %is_sp = eq i8 %c, 32
+    %is_tab = eq i8 %c, 9
+    %is_nl = eq i8 %c, 10
+    %is_cr = eq i8 %c, 13
+    %w1 = or i1 %is_sp, %is_tab
+    %w2 = or i1 %is_nl, %is_cr
+    %ws = or i1 %w1, %w2
+    br %ws, @skip_ws, @chkcomment
+  @skip_ws:
+    %iv2 = load i32, *%i
+    %nx2 = add i32 %iv2, 1
+    store i32 %nx2, *%i
+    jmp @start
+  @chkcomment:
+    %is_hash = eq i8 %c, 35
+    br %is_hash, @skip_line, @key_start
+  @skip_line:
+    %iv3 = load i32, *%i
+    %sp3 = gep i8, *%s, %iv3
+    %c3 = load i8, *%sp3
+    %e3 = eq i8 %c3, 0
+    %n3 = eq i8 %c3, 10
+    br %e3, @done, @line_step
+  @line_step:
+    %is_nl3 = eq i8 %c3, 10
+    br %is_nl3, @line_after, @line_inc
+  @line_inc:
+    %iv4 = load i32, *%i
+    %nx4 = add i32 %iv4, 1
+    store i32 %nx4, *%i
+    jmp @skip_line
+  @line_after:
+    %iv5 = load i32, *%i
+    %nx5 = add i32 %iv5, 1
+    store i32 %nx5, *%i
+    jmp @start
+  @key_start:
+    store i32 0, *%klen
+    jmp @key_loop
+  @key_loop:
+    %iv6 = load i32, *%i
+    %sp6 = gep i8, *%s, %iv6
+    %c6 = load i8, *%sp6
+    %e6 = eq i8 %c6, 0
+    br %e6, @done, @key_chk
+  @key_chk:
+    %eq6 = eq i8 %c6, 61
+    br %eq6, @val_start, @key_ws
+  @key_ws:
+    %wsp6 = eq i8 %c6, 32
+    %wtab6 = eq i8 %c6, 9
+    %wnl6 = eq i8 %c6, 10
+    %wcr6 = eq i8 %c6, 13
+    %wa = or i1 %wsp6, %wtab6
+    %wb = or i1 %wnl6, %wcr6
+    %w6 = or i1 %wa, %wb
+    br %w6, @skip_token, @key_put
+  @key_put:
+    %kl = load i32, *%klen
+    %limk = sub i32 64, 1
+    %kfull = sge i32 %kl, %limk
+    br %kfull, @skip_token, @key_put2
+  @key_put2:
+    %dp = gep i8, *%kp, %kl
+    store i8 %c6, *%dp
+    %kln = add i32 %kl, 1
+    store i32 %kln, *%klen
+    %iv7 = load i32, *%i
+    %nx7 = add i32 %iv7, 1
+    store i32 %nx7, *%i
+    jmp @key_loop
+  @val_start:
+    %iv8 = load i32, *%i
+    %nx8 = add i32 %iv8, 1
+    store i32 %nx8, *%i
+    store i32 0, *%vlen
+    jmp @val_loop
+  @val_loop:
+    %iv9 = load i32, *%i
+    %sp9 = gep i8, *%s, %iv9
+    %c9 = load i8, *%sp9
+    %e9 = eq i8 %c9, 0
+    br %e9, @apply, @val_chk
+  @val_chk:
+    %wsp9 = eq i8 %c9, 32
+    %wtab9 = eq i8 %c9, 9
+    %wnl9 = eq i8 %c9, 10
+    %wcr9 = eq i8 %c9, 13
+    %va = or i1 %wsp9, %wtab9
+    %vb = or i1 %wnl9, %wcr9
+    %w9 = or i1 %va, %vb
+    br %w9, @apply, @val_put
+  @val_put:
+    %vl = load i32, *%vlen
+    %limv = sub i32 160, 1
+    %vfull = sge i32 %vl, %limv
+    br %vfull, @apply, @val_put2
+  @val_put2:
+    %dp9 = gep i8, *%vp, %vl
+    store i8 %c9, *%dp9
+    %vln = add i32 %vl, 1
+    store i32 %vln, *%vlen
+    %iv10 = load i32, *%i
+    %nx10 = add i32 %iv10, 1
+    store i32 %nx10, *%i
+    jmp @val_loop
+  @apply:
+    %kl2 = load i32, *%klen
+    %kt = gep i8, *%kp, %kl2
+    store i8 0, *%kt
+    %vl2 = load i32, *%vlen
+    %vt = gep i8, *%vp, %vl2
+    store i8 0, *%vt
+    %applied = call @agent_cfg_apply_kv(%kp, %vp)
+    %isapp = eq i32 %applied, 1
+    br %isapp, @count, @start
+  @count:
+    %cv = load i32, *%count
+    %cvn = add i32 %cv, 1
+    store i32 %cvn, *%count
+    jmp @start
+  @skip_token:
+    %iv11 = load i32, *%i
+    %sp11 = gep i8, *%s, %iv11
+    %c11 = load i8, *%sp11
+    %e11 = eq i8 %c11, 0
+    br %e11, @done, @skip_chk
+  @skip_chk:
+    %swsp = eq i8 %c11, 32
+    %swtab = eq i8 %c11, 9
+    %swnl = eq i8 %c11, 10
+    %swcr = eq i8 %c11, 13
+    %swa = or i1 %swsp, %swtab
+    %swb = or i1 %swnl, %swcr
+    %sw = or i1 %swa, %swb
+    br %sw, @start, @skip_inc
+  @skip_inc:
+    %iv12 = load i32, *%i
+    %nx12 = add i32 %iv12, 1
+    store i32 %nx12, *%i
+    jmp @skip_token
+  @done:
+    %r = load i32, *%count
+    ret i32 %r
+}
+
+fun @agent_cfg_file() -> void {
+  @entry:
+    %fp = gep i8, *@agent_CFGFILE, 0
+    %path = gep i8, *@agent_CONF_PATH, 0
+    %fd = call @vfs_open(%path, 0)
+    %ok = sge i32 %fd, 0
+    br %ok, @read, @ret
+  @read:
+    %n = call @vfs_read(%fd, %fp, 1023)
+    call @vfs_close(%fd)
+    %neg = slt i64 %n, 0
+    br %neg, @ret, @term
+  @term:
+    %ni = trunc i64 %n to i32
+    %tp = gep i8, *%fp, %ni
+    store i8 0, *%tp
+    %applied = call @agent_cfg_apply_text(%fp)
+    jmp @ret
+  @ret:
+    ret void
+}
+
+fun @agent_cfg_load() -> void {
+  @entry:
+    %buf = let [i8, 256]
+    %bp = gep i8, *%buf, 0
+    %loaded = load i32, *@agent_CFG_LOADED
+    %isloaded = eq i32 %loaded, 1
+    br %isloaded, @ret, @env_url
+  @env_url:
+    %r = call @agentcfg_env_get("agent_url", %bp, 256)
+    %ok = sge i32 %r, 0
+    br %ok, @do_url, @env_host
+  @do_url:
+    call @agent_url_apply(%bp)
+    jmp @env_host
+  @env_host:
+    %r2 = call @agentcfg_env_get("agent_host", %bp, 256)
+    %ok2 = sge i32 %r2, 0
+    br %ok2, @do_host, @env_port
+  @do_host:
+    %hp = gep i8, *@agent_HOST, 0
+    call @agent_copy(%hp, %bp, 128)
+    jmp @env_port
+  @env_port:
+    %r3 = call @agentcfg_env_get("agent_port", %bp, 256)
+    %ok3 = sge i32 %r3, 0
+    br %ok3, @do_port, @env_path
+  @do_port:
+    %pv = call @agent_parse_uint(%bp)
+    %pok = sge i32 %pv, 0
+    br %pok, @port_put, @env_path
+  @port_put:
+    store i32 %pv, *@agent_PORT
+    jmp @env_path
+  @env_path:
+    %r4 = call @agentcfg_env_get("agent_path", %bp, 256)
+    %ok4 = sge i32 %r4, 0
+    br %ok4, @do_path, @env_scheme
+  @do_path:
+    %pp = gep i8, *@agent_PATH, 0
+    call @agent_copy(%pp, %bp, 160)
+    jmp @env_scheme
+  @env_scheme:
+    %r5 = call @agentcfg_env_get("agent_scheme", %bp, 256)
+    %ok5 = sge i32 %r5, 0
+    br %ok5, @do_scheme, @env_model
+  @do_scheme:
+    %ishttp = call @agent_streq(%bp, "http")
+    %bh = eq i32 %ishttp, 1
+    br %bh, @scheme_http, @scheme_https
+  @scheme_http:
+    store i32 0, *@agent_SCHEME
+    jmp @env_model
+  @scheme_https:
+    store i32 1, *@agent_SCHEME
+    jmp @env_model
+  @env_model:
+    %r6 = call @agentcfg_env_get("agent_model", %bp, 256)
+    %ok6 = sge i32 %r6, 0
+    br %ok6, @do_model, @env_key
+  @do_model:
+    %mp = gep i8, *@agent_MODEL, 0
+    call @agent_copy(%mp, %bp, 96)
+    jmp @env_key
+  @env_key:
+    %r7 = call @agentcfg_env_get("agent_api_key", %bp, 256)
+    %ok7 = sge i32 %r7, 0
+    br %ok7, @do_key, @env_steps
+  @do_key:
+    %kp = gep i8, *@agent_KEY, 0
+    call @agent_copy(%kp, %bp, 256)
+    jmp @env_steps
+  @env_steps:
+    %r8 = call @agentcfg_env_get("agent_max_steps", %bp, 256)
+    %ok8 = sge i32 %r8, 0
+    br %ok8, @do_steps, @file
+  @do_steps:
+    %mv = call @agent_parse_uint(%bp)
+    %mok = sgt i32 %mv, 0
+    br %mok, @steps_put, @file
+  @steps_put:
+    store i32 %mv, *@agent_MAXSTEP
+    jmp @file
+  @file:
+    call @agent_cfg_file()
+    store i32 1, *@agent_CFG_LOADED
+    jmp @ret
+  @ret:
+    ret void
+}
+
+fun @agent_cfg_show() -> void {
+  @entry:
+    %scheme = call @agent_cfg_scheme()
+    %tls = eq i32 %scheme, 1
+    br %tls, @show_https, @show_http
+  @show_https:
+    call @console_puts("endpoint=https://")
+    jmp @show_host
+  @show_http:
+    call @console_puts("endpoint=http://")
+    jmp @show_host
+  @show_host:
+    %hp = call @agent_cfg_host()
+    %hlen = call @agent_strlen(%hp)
+    %hempty = eq i32 %hlen, 0
+    br %hempty, @no_host, @have_host
+  @no_host:
+    call @console_puts("(not set)\n")
+    jmp @show_rest
+  @have_host:
+    call @console_puts(%hp)
+    call @console_puts(":")
+    %port = call @agent_cfg_port()
+    %port64 = sext i32 %port to i64
+    call @console_printf("%d", %port64, 0, 0, 0, null, null)
+    %pp = call @agent_cfg_path()
+    call @console_puts(%pp)
+    call @console_puts("\n")
+    jmp @show_rest
+  @show_rest:
+    call @console_puts("model=")
+    %mp = call @agent_cfg_model()
+    %mlen = call @agent_strlen(%mp)
+    %mempty = eq i32 %mlen, 0
+    br %mempty, @model_unset, @model_set
+  @model_unset:
+    call @console_puts("(not set)\n")
+    jmp @show_key
+  @model_set:
+    call @console_puts(%mp)
+    call @console_puts("\n")
+    jmp @show_key
+  @show_key:
+    call @console_puts("api_key=")
+    %kp = call @agent_cfg_key()
+    %klen = call @agent_strlen(%kp)
+    %kempty = eq i32 %klen, 0
+    br %kempty, @key_unset, @key_set
+  @key_unset:
+    call @console_puts("(not set)\n")
+    jmp @show_steps
+  @key_set:
+    call @console_puts("set\n")
+    jmp @show_steps
+  @show_steps:
+    %ms = call @agent_cfg_maxstep()
+    %ms64 = sext i32 %ms to i64
+    call @console_printf("max_steps=%d\n", %ms64, 0, 0, 0, null, null)
+    %pol = call @agtools_get_policy()
+    %pol64 = sext i32 %pol to i64
+    call @console_printf("policy=%d\n", %pol64, 0, 0, 0, null, null)
+    call @console_puts("source=bootargs, /etc/agent.conf, runtime\n")
+    ret void
+}
+
+fun @agent_audit(kind: *i8, detail: *i8) -> void {
+  @entry:
+    %buf = let [i8, 96]
+    %len = let i32
+    %bp = gep i8, *%buf, 0
+    store i32 0, *%len
+    call @agent_puts(%bp, %len, 96, "t=")
+    %now = call @timer_now()
+    %freq = call @timer_freq()
+    %fz = eq i64 %freq, 0
+    br %fz, @no_time, @with_time
+  @with_time:
+    %secs = udiv i64 %now, %freq
+    call @agent_putdec(%bp, %len, 96, %secs)
+    jmp @after_time
+  @no_time:
+    call @agent_putc(%bp, %len, 96, 48)
+    jmp @after_time
+  @after_time:
+    call @agent_puts(%bp, %len, 96, " ")
+    call @agent_puts(%bp, %len, 96, %kind)
+    call @agent_puts(%bp, %len, 96, " ")
+    call @agent_puts(%bp, %len, 96, %detail)
+    call @agent_puts(%bp, %len, 96, "\n")
+    %idx = load i32, *@agent_LOG_IDX
+    %off = mul i32 %idx, 96
+    %lp = gep i8, *@agent_LOG, 0
+    %dp = gep i8, *%lp, %off
+    call @agent_copy(%dp, %bp, 96)
+    %nidx = add i32 %idx, 1
+    %wrap = and i32 %nidx, 15
+    store i32 %wrap, *@agent_LOG_IDX
+    %cnt = load i32, *@agent_LOG_CNT
+    %full = sge i32 %cnt, 16
+    br %full, @ret, @inc
+  @inc:
+    %cn = add i32 %cnt, 1
+    store i32 %cn, *@agent_LOG_CNT
+    jmp @ret
+  @ret:
+    ret void
+}
+
+fun @agent_log_show() -> void {
+  @entry:
+    %i = let i32
+    %cnt = load i32, *@agent_LOG_CNT
+    store i32 0, *%i
+    jmp @cond
+  @cond:
+    %iv = load i32, *%i
+    %cnt2 = load i32, *@agent_LOG_CNT
+    %done = sge i32 %iv, %cnt2
+    br %done, @ret, @body
+  @body:
+    %off = mul i32 %iv, 96
+    %lp = gep i8, *@agent_LOG, 0
+    %ep = gep i8, *%lp, %off
+    call @console_puts(%ep)
+    %nx = add i32 %iv, 1
+    store i32 %nx, *%i
+    jmp @cond
+  @ret:
+    ret void
+}
+
+fun @agent_log_clear() -> void {
+  @entry:
+    store i32 0, *@agent_LOG_IDX
+    store i32 0, *@agent_LOG_CNT
+    call @console_puts("agent: log cleared\n")
+    ret void
+}
+
+fun @agent_tools_show() -> void {
+  @entry:
+    call @console_puts("fs.list      level 0  list a directory\n")
+    call @console_puts("fs.read      level 0  read a file\n")
+    call @console_puts("fs.stat      level 0  file metadata\n")
+    call @console_puts("fs.write     level 1  write path= text=\n")
+    call @console_puts("fs.mkdir     level 1  create a directory\n")
+    call @console_puts("fs.remove    level 2  remove a file or empty dir\n")
+    call @console_puts("net.status   level 0  ip/mask/gw/dns/mac\n")
+    call @console_puts("net.dhcp     level 1  renew DHCP lease\n")
+    call @console_puts("net.dns      level 0  resolve name=\n")
+    call @console_puts("net.ping     level 0  ping host=\n")
+    call @console_puts("sys.info     level 0  uptime and memory\n")
+    call @console_puts("sys.reboot   level 2  reboot the machine\n")
+    call @console_puts("sys.poweroff level 2  power off\n")
+    call @console_puts("args use path=/abs;text=... (semicolon separated)\n")
+    ret void
+}
+
+fun @agent_policy_cmd(rest: *i8) -> void {
+  @entry:
+    %tok = let [i8, 32]
+    %tp = gep i8, *%tok, 0
+    %pos = let i32
+    store i32 0, *%pos
+    %got = call @agent_tok(%rest, %pos, %tp, 32)
+    %none = eq i32 %got, 0
+    br %none, @show, @match
+  @match:
+    %is_safe = call @agent_streq(%tp, "safe")
+    %bsafe = eq i32 %is_safe, 1
+    br %bsafe, @set_safe, @try_write
+  @set_safe:
+    call @agtools_set_policy(0)
+    jmp @show
+  @try_write:
+    %is_write = call @agent_streq(%tp, "write")
+    %bwrite = eq i32 %is_write, 1
+    br %bwrite, @set_write, @try_unsafe
+  @set_write:
+    call @agtools_set_policy(1)
+    jmp @show
+  @try_unsafe:
+    %is_unsafe = call @agent_streq(%tp, "unsafe")
+    %bunsafe = eq i32 %is_unsafe, 1
+    br %bunsafe, @set_unsafe, @bad
+  @set_unsafe:
+    call @agtools_set_policy(2)
+    jmp @show
+  @bad:
+    call @console_puts("usage: agent policy safe|write|unsafe\n")
+    ret void
+  @show:
+    %pol = call @agtools_get_policy()
+    %pol64 = sext i32 %pol to i64
+    call @console_printf("policy=%d (0 read-only, 1 write, 2 unsafe)\n", %pol64, 0, 0, 0, null, null)
+    ret void
+}
+
+fun @agent_tok(args: *i8, posp: *i32, out: *i8, cap: i32) -> i32 {
+  @entry:
+    %i = let i32
+    %n = let i32
+    %iv = load i32, *%posp
+    store i32 %iv, *%i
+    store i32 0, *%n
+    jmp @skip
+  @skip:
+    %sv = load i32, *%i
+    %sp = gep i8, *%args, %sv
+    %c = load i8, *%sp
+    %end = eq i8 %c, 0
+    br %end, @done, @chk
+  @chk:
+    %is_sp = eq i8 %c, 32
+    %is_tab = eq i8 %c, 9
+    %ws = or i1 %is_sp, %is_tab
+    br %ws, @skip_one, @copy
+  @skip_one:
+    %sv2 = load i32, *%i
+    %sn = add i32 %sv2, 1
+    store i32 %sn, *%i
+    jmp @skip
+  @copy:
+    %cv = load i32, *%i
+    %cp = gep i8, *%args, %cv
+    %cc = load i8, *%cp
+    %cend = eq i8 %cc, 0
+    br %cend, @term, @copy_chk
+  @copy_chk:
+    %c_sp = eq i8 %cc, 32
+    %c_tab = eq i8 %cc, 9
+    %cws = or i1 %c_sp, %c_tab
+    br %cws, @term, @put
+  @put:
+    %nv = load i32, *%n
+    %lim = sub i32 %cap, 1
+    %full = sge i32 %nv, %lim
+    br %full, @term, @put2
+  @put2:
+    %op = gep i8, *%out, %nv
+    store i8 %cc, *%op
+    %nn = add i32 %nv, 1
+    store i32 %nn, *%n
+    %cv2 = load i32, *%i
+    %cn2 = add i32 %cv2, 1
+    store i32 %cn2, *%i
+    jmp @copy
+  @term:
+    %nv2 = load i32, *%n
+    %tp = gep i8, *%out, %nv2
+    store i8 0, *%tp
+    %fv = load i32, *%i
+    store i32 %fv, *%posp
+    %nz = ne i32 %nv2, 0
+    br %nz, @yes, @no
+  @yes:
+    ret i32 1
+  @no:
+    ret i32 0
+  @done:
+    %dv = load i32, *%i
+    store i32 %dv, *%posp
+    ret i32 0
+}
+
+fun @agent_rest(args: *i8, posp: *i32) -> *i8 {
+  @entry:
+    %i = let i32
+    %iv = load i32, *%posp
+    store i32 %iv, *%i
+    jmp @skip
+  @skip:
+    %sv = load i32, *%i
+    %sp = gep i8, *%args, %sv
+    %c = load i8, *%sp
+    %end = eq i8 %c, 0
+    br %end, @ret, @chk
+  @chk:
+    %is_sp = eq i8 %c, 32
+    %is_tab = eq i8 %c, 9
+    %ws = or i1 %is_sp, %is_tab
+    br %ws, @one, @ret
+  @one:
+    %sn = add i32 %sv, 1
+    store i32 %sn, *%i
+    jmp @skip
+  @ret:
+    %fv = load i32, *%i
+    %fp = gep i8, *%args, %fv
+    ret *i8 %fp
+}
+
+fun @agent_help() -> void {
+  @entry:
+    call @console_puts("agent - osone system agent\n")
+    call @console_puts("  agent                     interactive session\n")
+    call @console_puts("  agent ask <text>          ask the model (tools on)\n")
+    call @console_puts("  agent tool <name> [k=v;..] run a tool directly\n")
+    call @console_puts("  agent tools               list tools and levels\n")
+    call @console_puts("  agent config [k=v ...]    show or set endpoint/model/key\n")
+    call @console_puts("  agent policy [safe|write|unsafe]\n")
+    call @console_puts("  agent log [clear]         audit log\n")
+    call @console_puts("  agent reset               clear session and config\n")
+    call @console_puts("Endpoints come from bootargs (make forwards AGENT_* /\n")
+    call @console_puts("OPENAI_* from the host env) or /etc/agent.conf.\n")
+    ret void
+}
+
+fun @agent_repl_help() -> void {
+  @entry:
+    call @console_puts("agent> :help             this list\n")
+    call @console_puts("agent> :tools            list tools and levels\n")
+    call @console_puts("agent> :config [k=v ...]  show or set endpoint/model/key\n")
+    call @console_puts("agent> :policy safe|write|unsafe\n")
+    call @console_puts("agent> :log [clear]      audit log\n")
+    call @console_puts("agent> :reset            clear session and config\n")
+    call @console_puts("agent> :exit             leave the agent\n")
+    call @console_puts("any other line is sent to the model\n")
+    ret void
+}
+
+// Interactive loop. Lines starting with ':' are commands; everything else is
+// a prompt for the model. The line editor is reused with completion off, so
+// Tab and the shell's history stay out of the way.
+fun @agent_repl() -> void {
+  @entry:
+    %ltok = let [i8, 32]
+    %lpos = let i32
+    %ap = gep i8, *@agent_PROMPT, 0
+    call @shell_set_prompt(%ap)
+    call @console_puts("agent: interactive mode (:help to list commands)\n")
+    call @agent_cfg_load()
+    %h = call @agent_cfg_host()
+    %h0 = load i8, *%h
+    %nohost = eq i8 %h0, 0
+    br %nohost, @warn, @loop
+  @warn:
+    call @console_puts("agent: no endpoint set (agent config url=...)\n")
+    jmp @loop
+  @loop:
+    %prompt = gep i8, *@agent_PROMPT, 0
+    call @console_puts(%prompt)
+    call @shell_getline(0)
+    %lp = call @shell_line_ptr()
+    %l0 = load i8, *%lp
+    %empty = eq i8 %l0, 0
+    br %empty, @loop, @cmd
+  @cmd:
+    %tp = gep i8, *%ltok, 0
+    store i32 0, *%lpos
+    %got = call @agent_tok(%lp, %lpos, %tp, 32)
+    %none = eq i32 %got, 0
+    br %none, @loop, @tokchk
+  @tokchk:
+    %tc = load i8, *%tp
+    %colon = eq i8 %tc, 58
+    br %colon, @c_exit, @do_ask
+  @c_exit:
+    %is_exit = call @agent_streq(%tp, ":exit")
+    %be = eq i32 %is_exit, 1
+    br %be, @bye, @c_quit
+  @c_quit:
+    %is_quit = call @agent_streq(%tp, ":quit")
+    %bq = eq i32 %is_quit, 1
+    br %bq, @bye, @c_help
+  @c_help:
+    %is_help = call @agent_streq(%tp, ":help")
+    %bh = eq i32 %is_help, 1
+    br %bh, @do_help, @c_tools
+  @c_tools:
+    %is_tools = call @agent_streq(%tp, ":tools")
+    %bt = eq i32 %is_tools, 1
+    br %bt, @do_tools, @c_config
+  @c_config:
+    %is_cfg = call @agent_streq(%tp, ":config")
+    %bcfg = eq i32 %is_cfg, 1
+    br %bcfg, @do_config, @c_policy
+  @c_policy:
+    %is_pol = call @agent_streq(%tp, ":policy")
+    %bpol = eq i32 %is_pol, 1
+    br %bpol, @do_policy, @c_log
+  @c_log:
+    %is_log = call @agent_streq(%tp, ":log")
+    %blog = eq i32 %is_log, 1
+    br %blog, @do_log, @c_reset
+  @c_reset:
+    %is_reset = call @agent_streq(%tp, ":reset")
+    %br2 = eq i32 %is_reset, 1
+    br %br2, @do_reset, @unknown
+  @do_help:
+    call @agent_repl_help()
+    jmp @loop
+  @do_tools:
+    call @agent_tools_show()
+    jmp @loop
+  @do_config:
+    %crest = call @agent_rest(%lp, %lpos)
+    %c0 = load i8, *%crest
+    %cnone = eq i8 %c0, 0
+    br %cnone, @config_show, @config_set
+  @config_set:
+    call @agent_cfg_load()
+    %applied = call @agent_cfg_apply_text(%crest)
+    %any = sgt i32 %applied, 0
+    br %any, @config_ok, @config_none
+  @config_ok:
+    call @console_puts("agent: config updated\n")
+    jmp @config_show
+  @config_none:
+    call @console_puts("agent: no known keys in that string\n")
+    jmp @config_show
+  @config_show:
+    call @agent_cfg_load()
+    call @agent_cfg_show()
+    jmp @loop
+  @do_policy:
+    %prest = call @agent_rest(%lp, %lpos)
+    call @agent_policy_cmd(%prest)
+    jmp @loop
+  @do_log:
+    %lrest = call @agent_rest(%lp, %lpos)
+    %is_clear = call @agent_streq(%lrest, "clear")
+    %bcl = eq i32 %is_clear, 1
+    br %bcl, @log_clear, @log_show
+  @log_clear:
+    call @agent_log_clear()
+    jmp @loop
+  @log_show:
+    call @agent_log_show()
+    jmp @loop
+  @do_reset:
+    call @agent_reset()
+    jmp @loop
+  @unknown:
+    call @console_puts("agent: unknown command (:help)\n")
+    jmp @loop
+  @do_ask:
+    call @agent_audit("ask", "user request")
+    call @agent_ask(%lp)
+    jmp @loop
+  @bye:
+    call @shell_set_prompt(null)
+    call @console_puts("agent: leaving\n")
+    ret void
+}
+
+fun @agent_run(args: *i8) -> i32 {
+  @entry:
+    %cmd = let [i8, 32]
+    %cp = gep i8, *%cmd, 0
+    %pos = let i32
+    store i32 0, *%pos
+    %got = call @agent_tok(%args, %pos, %cp, 32)
+    %none = eq i32 %got, 0
+    br %none, @repl, @dispatch
+  @dispatch:
+    %is_help = call @agent_streq(%cp, "help")
+    %bh = eq i32 %is_help, 1
+    br %bh, @help, @c_tools
+  @c_tools:
+    %is_tools = call @agent_streq(%cp, "tools")
+    %bt = eq i32 %is_tools, 1
+    br %bt, @tools, @c_tool
+  @c_tool:
+    %is_tool = call @agent_streq(%cp, "tool")
+    %b1 = eq i32 %is_tool, 1
+    br %b1, @tool, @c_ask
+  @c_ask:
+    %is_ask = call @agent_streq(%cp, "ask")
+    %b2 = eq i32 %is_ask, 1
+    br %b2, @ask, @c_config
+  @c_config:
+    %is_cfg = call @agent_streq(%cp, "config")
+    %b3 = eq i32 %is_cfg, 1
+    br %b3, @config, @c_policy
+  @c_policy:
+    %is_pol = call @agent_streq(%cp, "policy")
+    %b4 = eq i32 %is_pol, 1
+    br %b4, @policy, @c_log
+  @c_log:
+    %is_log = call @agent_streq(%cp, "log")
+    %b5 = eq i32 %is_log, 1
+    br %b5, @log, @c_reset
+  @c_reset:
+    %is_reset = call @agent_streq(%cp, "reset")
+    %b6 = eq i32 %is_reset, 1
+    br %b6, @reset, @help
+  @repl:
+    call @agent_repl()
+    ret i32 0
+  @help:
+    call @agent_help()
+    ret i32 0
+  @tools:
+    call @agent_tools_show()
+    ret i32 0
+  @tool:
+    %name = let [i8, 32]
+    %np = gep i8, *%name, 0
+    %got2 = call @agent_tok(%args, %pos, %np, 32)
+    %none2 = eq i32 %got2, 0
+    br %none2, @tool_usage, @tool_run
+  @tool_usage:
+    call @console_puts("usage: agent tool <name> [k=v;...]\n")
+    ret i32 0
+  @tool_run:
+    %rest = call @agent_rest(%args, %pos)
+    %out = let [i8, 2048]
+    %op = gep i8, *%out, 0
+    %r = call @agtools_call(%np, %rest, %op, 2048)
+    call @console_puts(%op)
+    call @agent_audit("tool", %np)
+    ret i32 0
+  @ask:
+    %text = call @agent_rest(%args, %pos)
+    %t0 = gep i8, *%text, 0
+    %tc = load i8, *%t0
+    %empty = eq i8 %tc, 0
+    br %empty, @ask_usage, @ask_run
+  @ask_usage:
+    call @console_puts("usage: agent ask <text>\n")
+    ret i32 0
+  @ask_run:
+    call @agent_audit("ask", "user request")
+    call @agent_ask(%text)
+    ret i32 0
+  @config:
+    %rest2 = call @agent_rest(%args, %pos)
+    %c0p = gep i8, *%rest2, 0
+    %c0 = load i8, *%c0p
+    %cempty = eq i8 %c0, 0
+    br %cempty, @config_show, @config_set
+  @config_set:
+    call @agent_cfg_load()
+    %applied = call @agent_cfg_apply_text(%rest2)
+    %any = sgt i32 %applied, 0
+    br %any, @config_ok, @config_none
+  @config_ok:
+    call @console_puts("agent: config updated\n")
+    jmp @config_show
+  @config_none:
+    call @console_puts("agent: no known keys in that string\n")
+    jmp @config_show
+  @config_show:
+    call @agent_cfg_load()
+    call @agent_cfg_show()
+    ret i32 0
+  @policy:
+    %rest3 = call @agent_rest(%args, %pos)
+    call @agent_policy_cmd(%rest3)
+    ret i32 0
+  @log:
+    %lt = let [i8, 32]
+    %ltp = gep i8, *%lt, 0
+    %got3 = call @agent_tok(%args, %pos, %ltp, 32)
+    %nlt = eq i32 %got3, 0
+    br %nlt, @log_show, @log_chk
+  @log_chk:
+    %is_clear = call @agent_streq(%ltp, "clear")
+    %bcl = eq i32 %is_clear, 1
+    br %bcl, @log_do_clear, @log_show
+  @log_do_clear:
+    call @agent_log_clear()
+    ret i32 0
+  @log_show:
+    call @agent_log_show()
+    ret i32 0
+  @reset:
+    call @agent_reset()
+    ret i32 0
+}
+
+fun @agent_reset() -> void {
+  @entry:
+    call @agent_cfg_clear()
+    store i32 0, *@agent_CFG_LOADED
+    call @agent_session_reset()
+    call @console_puts("agent: session and config cleared\n")
+    ret void
+}

@@ -1,0 +1,148 @@
+// udp.bx - UDP send/receive (no port binding; udp_recv takes the latest received datagram)
+
+extern @ip_send(dst: i32, proto: i32, payload: *i8, len: i32) -> i32
+extern @ip_send_bcast(src: i32, proto: i32, payload: *i8, len: i32) -> i32
+extern @net_my_ip() -> i32
+extern @net_be16(p: *i8, off: i32) -> i32
+extern @net_stbe16(p: *i8, off: i32, v: i32) -> void
+extern @net_l4_cksum(src: i32, dst: i32, proto: i32, seg: *i8, len: i32) -> i32
+extern @net_now_ms() -> i64
+extern @net_poll() -> void
+extern @kmem_memcpy(dst: *i8, src: *i8, n: i64) -> void
+
+const @udp_PROTO: i32 = 17
+const @udp_HDR_LEN: i32 = 8
+const @udp_MAX_PAYLOAD: i32 = 1472
+
+global @udp_TXBUF: [i8, 1480]
+global @udp_RXBUF: [i8, 2048]
+global @udp_RXLEN: i32
+global @udp_RXFLAG: i32
+global @udp_RXSPORT: i32
+global @udp_RXDPORT: i32
+global @udp_RXIP: i32
+
+fun @udp_send(dst: i32, dport: i32, sport: i32, data: *i8, len: i32) -> i32 {
+  @entry:
+    %toobig = sgt i32 %len, @udp_MAX_PAYLOAD
+    br %toobig, @fail, @build
+  @build:
+    %tx = gep i8, *@udp_TXBUF, 0
+    call @net_stbe16(%tx, 0, %sport)
+    call @net_stbe16(%tx, 2, %dport)
+    %ulen = add i32 %len, @udp_HDR_LEN
+    call @net_stbe16(%tx, 4, %ulen)
+    call @net_stbe16(%tx, 6, 0)
+    %dp = gep i8, *%tx, @udp_HDR_LEN
+    %len64 = sext i32 %len to i64
+    call @kmem_memcpy(%dp, %data, %len64)
+    %myip = call @net_my_ip()
+    %ck = call @net_l4_cksum(%myip, %dst, @udp_PROTO, %tx, %ulen)
+    call @net_stbe16(%tx, 6, %ck)
+    %r = call @ip_send(%dst, @udp_PROTO, %tx, %ulen)
+    ret i32 %r
+  @fail:
+    ret i32 -1
+}
+
+// Link-layer broadcast; src may be 0.0.0.0 for DHCP before an address is configured.
+fun @udp_send_bcast(src: i32, sport: i32, dport: i32, data: *i8, len: i32) -> i32 {
+  @entry:
+    %toobig = sgt i32 %len, @udp_MAX_PAYLOAD
+    br %toobig, @fail, @build
+  @build:
+    %tx = gep i8, *@udp_TXBUF, 0
+    call @net_stbe16(%tx, 0, %sport)
+    call @net_stbe16(%tx, 2, %dport)
+    %ulen = add i32 %len, @udp_HDR_LEN
+    call @net_stbe16(%tx, 4, %ulen)
+    call @net_stbe16(%tx, 6, 0)
+    %dp = gep i8, *%tx, @udp_HDR_LEN
+    %len64 = sext i32 %len to i64
+    call @kmem_memcpy(%dp, %data, %len64)
+    %ck = call @net_l4_cksum(%src, -1, @udp_PROTO, %tx, %ulen)
+    call @net_stbe16(%tx, 6, %ck)
+    %r = call @ip_send_bcast(%src, @udp_PROTO, %tx, %ulen)
+    ret i32 %r
+  @fail:
+    ret i32 -1
+}
+
+fun @udp_input(src: i32, dst: i32, msg: *i8, len: i32) -> void {
+  @entry:
+    %short = slt i32 %len, @udp_HDR_LEN
+    br %short, @done, @parse
+  @parse:
+    %ulen = call @net_be16(%msg, 4)
+    %ulok = sge i32 %ulen, @udp_HDR_LEN
+    %ulmax = sle i32 %ulen, %len
+    %ulboth = and i1 %ulok, %ulmax
+    br %ulboth, @ck, @done
+  @ck:
+    %stored = call @net_be16(%msg, 6)
+    %zero = eq i32 %stored, 0
+    br %zero, @store, @verify
+  @verify:
+    call @net_stbe16(%msg, 6, 0)
+    %calc = call @net_l4_cksum(%src, %dst, @udp_PROTO, %msg, %ulen)
+    call @net_stbe16(%msg, 6, %stored)
+    %good = eq i32 %calc, %stored
+    br %good, @store, @done
+  @store:
+    %plen = sub i32 %ulen, @udp_HDR_LEN
+    %toobig = sgt i32 %plen, 2048
+    br %toobig, @done, @copy
+  @copy:
+    %rx = gep i8, *@udp_RXBUF, 0
+    %dp = gep i8, *%msg, @udp_HDR_LEN
+    %plen64 = sext i32 %plen to i64
+    call @kmem_memcpy(%rx, %dp, %plen64)
+    store i32 %plen, *@udp_RXLEN
+    %sp = call @net_be16(%msg, 0)
+    %dp2 = call @net_be16(%msg, 2)
+    store i32 %sp, *@udp_RXSPORT
+    store i32 %dp2, *@udp_RXDPORT
+    store i32 %src, *@udp_RXIP
+    store i32 1, *@udp_RXFLAG
+    jmp @done
+  @done:
+    ret void
+}
+
+// Wait for a datagram on the target port; returns the byte count, or -1 on timeout.
+fun @udp_recv(port: i32, buf: *i8, max: i32, timeout_ms: i32) -> i32 {
+  @entry:
+    %start = call @net_now_ms()
+    %t64 = sext i32 %timeout_ms to i64
+    %end = add i64 %start, %t64
+    jmp @cond
+  @cond:
+    %flag = load i32, *@udp_RXFLAG
+    %has = eq i32 %flag, 1
+    br %has, @chkport, @poll
+  @chkport:
+    %dp = load i32, *@udp_RXDPORT
+    %mine = eq i32 %dp, %port
+    br %mine, @take, @poll
+  @take:
+    %rlen = load i32, *@udp_RXLEN
+    %dt = sub i32 %rlen, %max
+    %dts = ashr i32 %dt, 31
+    %dtm = and i32 %dt, %dts
+    %n = add i32 %max, %dtm
+    %rx = gep i8, *@udp_RXBUF, 0
+    %n64 = sext i32 %n to i64
+    call @kmem_memcpy(%buf, %rx, %n64)
+    store i32 0, *@udp_RXFLAG
+    ret i32 %n
+  @poll:
+    call @net_poll()
+    %now = call @net_now_ms()
+    %late = sge i64 %now, %end
+    br %late, @fail, @sleep
+  @sleep:
+    asm att void, "wfe", "~{memory}"
+    jmp @cond
+  @fail:
+    ret i32 -1
+}

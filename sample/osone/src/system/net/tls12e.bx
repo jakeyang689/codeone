@@ -1,0 +1,1030 @@
+// tls12e.bx - TLS 1.2 ECDHE-RSA client (ECDHE_RSA_WITH_AES_128_GCM_SHA256)
+//
+// The toolchain TLS 1.2 client only offers RSA key exchange, which many
+// production servers disable.  This module implements the ECDHE variant on
+// top of the shared p256/rsa/aes/sha/tls_prf boxes so urlone can reach such
+// servers (for example www.baidu.com).  Certificates are checked for
+// hostname and the ServerKeyExchange signature, but there is no CA store.
+
+extern @tcp_send(id: i32, data: *i8, len: i32) -> i32
+extern @tcp_recv(id: i32, buf: *i8, max: i32, timeout_ms: i32) -> i32
+extern @kmem_memcpy(dst: *i8, src: *i8, n: i64) -> void
+extern @net_parse_ip(s: *i8) -> i32
+extern @c1_random_buf(buf: *i8, len: i64) -> void
+extern @std_crypto_sha256_compute(data: *i8, len: i32, digest: *i8) -> void
+extern @std_crypto_tls12_prf_sha256(secret: *i8, secret_len: i32, seed: *i8, seed_len: i32,
+                                    out_len: i32, out: *i8) -> void
+extern @std_crypto_tls12_finished_sha256(master_secret: *i8, handshake_hash: *i8,
+                                         is_client: i1, verify_data: *i8) -> void
+extern @std_crypto_p256_generate_keypair(priv: *i32, pub_x: *i32, pub_y: *i32) -> void
+extern @std_crypto_p256_ecdh(priv: *i32, peer_x: *i32, peer_y: *i32, secret_x: *i32) -> void
+extern @std_crypto_rsa_bn_from_bytes(r: *i32, bytes: *i8, byte_len: i32, limbs: i32) -> void
+extern @std_crypto_rsa_bn_to_bytes(bytes: *i8, a: *i32, byte_len: i32, limbs: i32) -> void
+extern @std_crypto_rsa_verify_pkcs1_v15(hash: *i8, signature: *i8, e: *i32, n: *i32,
+                                        limbs: i32) -> i1
+extern @std_crypto_aes_gcm_encrypt(plaintext: *i8, pt_len: i32, aad: *i8, aad_len: i32,
+                                   key: *i8, iv: *i8, ciphertext: *i8, tag: *i8) -> i32
+extern @std_crypto_aes_gcm_decrypt(ciphertext: *i8, ct_len: i32, aad: *i8, aad_len: i32,
+                                   key: *i8, iv: *i8, tag: *i8, plaintext: *i8) -> i32
+extern @x509_parse_rsa_pubkey(cert_der: *i8, cert_len: i32, n_out: *i32, e_out: *i32,
+                              limbs: i32) -> i1
+extern @x509_check_hostname(cert_der: *i8, cert_len: i32, host: *i8, host_len: i32) -> i1
+
+const @tls12e_CT_CCS: i32 = 20
+const @tls12e_CT_ALERT: i32 = 21
+const @tls12e_CT_HANDSHAKE: i32 = 22
+const @tls12e_CT_APP: i32 = 23
+
+const @tls12e_HS_CLIENT_HELLO: i32 = 1
+const @tls12e_HS_SERVER_HELLO: i32 = 2
+const @tls12e_HS_CERTIFICATE: i32 = 11
+const @tls12e_HS_SERVER_KEY_EXCHANGE: i32 = 12
+const @tls12e_HS_CERTIFICATE_REQUEST: i32 = 13
+const @tls12e_HS_SERVER_HELLO_DONE: i32 = 14
+const @tls12e_HS_CLIENT_KEY_EXCHANGE: i32 = 16
+const @tls12e_HS_FINISHED: i32 = 20
+const @tls12e_HS_CERTIFICATE_STATUS: i32 = 22
+
+const @tls12e_MS_LABEL: [i8, 14] = "master secret"
+const @tls12e_KE_LABEL: [i8, 14] = "key expansion"
+
+const @tls12e_SUITE: i32 = 0xC02F
+const @tls12e_LIMBS: i32 = 64
+const @tls12e_HS_CAP: i32 = 32768
+const @tls12e_REC_CAP: i32 = 18432
+const @tls12e_CERT_CAP: i32 = 4096
+const @tls12e_TR_CAP: i32 = 32768
+
+global @tls12e_FD: i32
+global @tls12e_CSEQ: i64
+global @tls12e_SSEQ: i64
+global @tls12e_CKEY: [i8, 16]
+global @tls12e_SKEY: [i8, 16]
+global @tls12e_CIV: [i8, 4]
+global @tls12e_SIV: [i8, 4]
+global @tls12e_CAND: [i8, 32]
+global @tls12e_SAND: [i8, 32]
+global @tls12e_MSEC: [i8, 48]
+global @tls12e_TXLEN: i32
+global @tls12e_LASTTYPE: i32
+global @tls12e_HSLEN: i32
+global @tls12e_HSOFF: i32
+global @tls12e_HSTYPE: i32
+global @tls12e_HSBODY: i32
+global @tls12e_HSBLEN: i32
+global @tls12e_PENDOFF: i32
+global @tls12e_PENDLEN: i32
+global @tls12e_HOST: [i8, 256]
+global @tls12e_HOSTLEN: i32
+global @tls12e_CERT: [i8, 4096]
+global @tls12e_CERTLEN: i32
+global @tls12e_PX: [i32, 8]
+global @tls12e_PY: [i32, 8]
+global @tls12e_N: [i32, 64]
+global @tls12e_E: [i32, 64]
+global @tls12e_TX: [i8, 2048]
+global @tls12e_HS: [i8, 32768]
+global @tls12e_TR: [i8, 32768]
+global @tls12e_REC: [i8, 18432]
+global @tls12e_PEND: [i8, 18432]
+global @tls12e_HDR: [i8, 5]
+global @tls12e_AAD: [i8, 13]
+global @tls12e_NONCE: [i8, 12]
+global @tls12e_SIGH: [i8, 256]
+
+fun @tls12e_put8(p: *i8, off: i32, v: i32) -> void {
+  @entry:
+    %cp = gep i8, *%p, %off
+    %b = trunc i32 %v to i8
+    store i8 %b, *%cp
+    ret void
+}
+
+fun @tls12e_put16(p: *i8, off: i32, v: i32) -> void {
+  @entry:
+    %hi = lshr i32 %v, 8
+    %hi8 = trunc i32 %hi to i8
+    %cp = gep i8, *%p, %off
+    store i8 %hi8, *%cp
+    %lo = and i32 %v, 255
+    %lo8 = trunc i32 %lo to i8
+    %o1 = add i32 %off, 1
+    %cp2 = gep i8, *%p, %o1
+    store i8 %lo8, *%cp2
+    ret void
+}
+
+fun @tls12e_put24(p: *i8, off: i32, v: i32) -> void {
+  @entry:
+    %s16 = lshr i32 %v, 16
+    %b0 = trunc i32 %s16 to i8
+    %cp = gep i8, *%p, %off
+    store i8 %b0, *%cp
+    %s8 = lshr i32 %v, 8
+    %b1 = trunc i32 %s8 to i8
+    %o1 = add i32 %off, 1
+    %cp2 = gep i8, *%p, %o1
+    store i8 %b1, *%cp2
+    %b2 = trunc i32 %v to i8
+    %o2 = add i32 %off, 2
+    %cp3 = gep i8, *%p, %o2
+    store i8 %b2, *%cp3
+    ret void
+}
+
+fun @tls12e_get8(p: *i8, off: i32) -> i32 {
+  @entry:
+    %cp = gep i8, *%p, %off
+    %b = load i8, *%cp
+    %v = zext i8 %b to i32
+    ret i32 %v
+}
+
+fun @tls12e_get16(p: *i8, off: i32) -> i32 {
+  @entry:
+    %b0 = call @tls12e_get8(%p, %off)
+    %o1 = add i32 %off, 1
+    %b1 = call @tls12e_get8(%p, %o1)
+    %s = shl i32 %b0, 8
+    %v = or i32 %s, %b1
+    ret i32 %v
+}
+
+fun @tls12e_get24(p: *i8, off: i32) -> i32 {
+  @entry:
+    %b0 = call @tls12e_get8(%p, %off)
+    %o1 = add i32 %off, 1
+    %b1 = call @tls12e_get8(%p, %o1)
+    %o2 = add i32 %off, 2
+    %b2 = call @tls12e_get8(%p, %o2)
+    %s0 = shl i32 %b0, 16
+    %s1 = shl i32 %b1, 8
+    %t = or i32 %s0, %s1
+    %v = or i32 %t, %b2
+    ret i32 %v
+}
+
+fun @tls12e_copy(dst: *i8, src: *i8, n: i32) -> void {
+  @entry:
+    %n64 = sext i32 %n to i64
+    call @kmem_memcpy(%dst, %src, %n64)
+    ret void
+}
+
+// Append one handshake message (4-byte header included) to the transcript.
+fun @tls12e_commit(msg: *i8, total: i32) -> i32 {
+  @entry:
+    %used = load i32, *@tls12e_TXLEN
+    %room = sub i32 @tls12e_TR_CAP, %used
+    %fit = sle i32 %total, %room
+    br %fit, @append, @fail
+  @append:
+    %dst = gep i8, *@tls12e_TR, %used
+    call @tls12e_copy(%dst, %msg, %total)
+    %nu = add i32 %used, %total
+    store i32 %nu, *@tls12e_TXLEN
+    ret i32 0
+  @fail:
+    ret i32 -1
+}
+
+// Send a cleartext TLS record.
+fun @tls12e_write_plain(typ: i32, body: *i8, len: i32) -> i32 {
+  @entry:
+    %hp = gep i8, *@tls12e_HDR, 0
+    call @tls12e_put8(%hp, 0, %typ)
+    call @tls12e_put8(%hp, 1, 3)
+    call @tls12e_put8(%hp, 2, 3)
+    call @tls12e_put16(%hp, 3, %len)
+    %fd = load i32, *@tls12e_FD
+    %r1 = call @tcp_send(%fd, %hp, 5)
+    %ok1 = sge i32 %r1, 0
+    br %ok1, @send_body, @fail
+  @send_body:
+    %r2 = call @tcp_send(%fd, %body, %len)
+    %ok2 = sge i32 %r2, 0
+    br %ok2, @ok, @fail
+  @ok:
+    ret i32 0
+  @fail:
+    ret i32 -1
+}
+
+// Read exactly need bytes from the TCP stream.
+fun @tls12e_read_exact(buf: *i8, need: i32) -> i32 {
+  @entry:
+    %off = let i32
+    store i32 0, *%off
+    jmp @cond
+  @cond:
+    %ov = load i32, *%off
+    %done = sge i32 %ov, %need
+    br %done, @ok, @body
+  @body:
+    %rem = sub i32 %need, %ov
+    %p = gep i8, *%buf, %ov
+    %fd = load i32, *@tls12e_FD
+    %r = call @tcp_recv(%fd, %p, %rem, 10000)
+    %got = sgt i32 %r, 0
+    br %got, @advance, @fail
+  @advance:
+    %ov2 = load i32, *%off
+    %n = add i32 %ov2, %r
+    store i32 %n, *%off
+    jmp @cond
+  @ok:
+    ret i32 0
+  @fail:
+    ret i32 -1
+}
+
+// Read one record payload into @tls12e_REC and store its type.
+fun @tls12e_record_read() -> i32 {
+  @entry:
+    %hp = gep i8, *@tls12e_HDR, 0
+    %r = call @tls12e_read_exact(%hp, 5)
+    %ok = eq i32 %r, 0
+    br %ok, @parse, @fail
+  @parse:
+    %t = call @tls12e_get8(%hp, 0)
+    store i32 %t, *@tls12e_LASTTYPE
+    %len = call @tls12e_get16(%hp, 3)
+    %fits = sle i32 %len, @tls12e_REC_CAP
+    br %fits, @body, @fail
+  @body:
+    %bp = gep i8, *@tls12e_REC, 0
+    %r2 = call @tls12e_read_exact(%bp, %len)
+    %ok2 = eq i32 %r2, 0
+    br %ok2, @done, @fail
+  @done:
+    ret i32 %len
+  @fail:
+    ret i32 -1
+}
+
+// Append one handshake record payload to @tls12e_HS.
+fun @tls12e_hs_fill() -> i32 {
+  @entry:
+    %n = call @tls12e_record_read()
+    %bad = slt i32 %n, 0
+    br %bad, @fail, @kind
+  @kind:
+    %t = load i32, *@tls12e_LASTTYPE
+    %ishs = eq i32 %t, @tls12e_CT_HANDSHAKE
+    br %ishs, @append, @fail
+  @append:
+    %hl = load i32, *@tls12e_HSLEN
+    %room = sub i32 @tls12e_HS_CAP, %hl
+    %fit = sle i32 %n, %room
+    br %fit, @copy, @fail
+  @copy:
+    %dst = gep i8, *@tls12e_HS, %hl
+    %src = gep i8, *@tls12e_REC, 0
+    call @tls12e_copy(%dst, %src, %n)
+    %nh = add i32 %hl, %n
+    store i32 %nh, *@tls12e_HSLEN
+    ret i32 0
+  @fail:
+    ret i32 -1
+}
+
+// Pop the next complete handshake message from the buffered stream.
+fun @tls12e_hs_next() -> i32 {
+  @entry:
+    jmp @check
+  @check:
+    %off = load i32, *@tls12e_HSOFF
+    %len = load i32, *@tls12e_HSLEN
+    %avail = sub i32 %len, %off
+    %hdr = sge i32 %avail, 4
+    br %hdr, @header, @refill
+  @refill:
+    %r = call @tls12e_hs_fill()
+    %bad = slt i32 %r, 0
+    br %bad, @fail, @check
+  @header:
+    %bp = gep i8, *@tls12e_HS, %off
+    %t = call @tls12e_get8(%bp, 0)
+    %blen = call @tls12e_get24(%bp, 1)
+    %need = add i32 %blen, 4
+    %have = sge i32 %avail, %need
+    br %have, @deliver, @refill2
+  @refill2:
+    %r2 = call @tls12e_hs_fill()
+    %bad2 = slt i32 %r2, 0
+    br %bad2, @fail, @check
+  @deliver:
+    store i32 %t, *@tls12e_HSTYPE
+    %boff = add i32 %off, 4
+    store i32 %boff, *@tls12e_HSBODY
+    store i32 %blen, *@tls12e_HSBLEN
+    %cr = call @tls12e_commit(%bp, %need)
+    %cok = eq i32 %cr, 0
+    br %cok, @advance, @fail
+  @advance:
+    %off2 = load i32, *@tls12e_HSOFF
+    %len2 = load i32, *@tls12e_HSLEN
+    %blen2 = load i32, *@tls12e_HSBLEN
+    %total = add i32 %blen2, 4
+    %no = add i32 %off2, %total
+    store i32 %no, *@tls12e_HSOFF
+    %atend = eq i32 %no, %len2
+    br %atend, @reset, @ok
+  @reset:
+    store i32 0, *@tls12e_HSOFF
+    store i32 0, *@tls12e_HSLEN
+    jmp @ok
+  @ok:
+    ret i32 0
+  @fail:
+    ret i32 -1
+}
+
+// AEAD-encrypt a record payload.  Writes explicit nonce || ciphertext || tag.
+fun @tls12e_encrypt(typ: i32, pt: *i8, ptlen: i32, out: *i8) -> i32 {
+  @entry:
+    %seq = load i64, *@tls12e_CSEQ
+    %ep = gep i8, *%out, 0
+    %i = let i32
+    store i32 0, *%i
+    jmp @nonce_cond
+  @nonce_cond:
+    %iv = load i32, *%i
+    %more = slt i32 %iv, 8
+    br %more, @nonce_body, @nonce_done
+  @nonce_body:
+    %sh = sub i32 7, %iv
+    %shb = shl i32 %sh, 3
+    %sh64 = zext i32 %shb to i64
+    %sv = lshr i64 %seq, %sh64
+    %svb = trunc i64 %sv to i8
+    %np = gep i8, *%ep, %iv
+    store i8 %svb, *%np
+    %ivn = add i32 %iv, 1
+    store i32 %ivn, *%i
+    jmp @nonce_cond
+  @nonce_done:
+    %np2 = gep i8, *@tls12e_NONCE, 0
+    %civ = gep i8, *@tls12e_CIV, 0
+    call @tls12e_copy(%np2, %civ, 4)
+    %np3 = gep i8, *@tls12e_NONCE, 4
+    call @tls12e_copy(%np3, %ep, 8)
+    %ap = gep i8, *@tls12e_AAD, 0
+    call @tls12e_copy(%ap, %ep, 8)
+    %ap2 = gep i8, *@tls12e_AAD, 8
+    call @tls12e_put8(%ap2, 0, %typ)
+    call @tls12e_put8(%ap2, 1, 3)
+    call @tls12e_put8(%ap2, 2, 3)
+    call @tls12e_put16(%ap2, 3, %ptlen)
+    %ctp = gep i8, *%out, 8
+    %plen = add i32 %ptlen, 8
+    %tagp = gep i8, *%out, %plen
+    %key = gep i8, *@tls12e_CKEY, 0
+    %r = call @std_crypto_aes_gcm_encrypt(%pt, %ptlen, %ap, 13, %key, %np2, %ctp, %tagp)
+    %ok = eq i32 %r, 0
+    br %ok, @advance, @fail
+  @advance:
+    %seq2 = load i64, *@tls12e_CSEQ
+    %seqn = add i64 %seq2, 1
+    store i64 %seqn, *@tls12e_CSEQ
+    %total = add i32 %ptlen, 24
+    ret i32 %total
+  @fail:
+    ret i32 -1
+}
+
+// AEAD-decrypt a record payload into out; returns plaintext length.
+fun @tls12e_decrypt(typ: i32, rec: *i8, reclen: i32, out: *i8) -> i32 {
+  @entry:
+    %ctlen = sub i32 %reclen, 24
+    %oklen = sge i32 %ctlen, 0
+    br %oklen, @build, @fail
+  @build:
+    %seq = load i64, *@tls12e_SSEQ
+    %np = gep i8, *@tls12e_NONCE, 0
+    %siv = gep i8, *@tls12e_SIV, 0
+    call @tls12e_copy(%np, %siv, 4)
+    %np2 = gep i8, *@tls12e_NONCE, 4
+    call @tls12e_copy(%np2, %rec, 8)
+    %ap = gep i8, *@tls12e_AAD, 0
+    %i = let i32
+    store i32 0, *%i
+    jmp @seq_cond
+  @seq_cond:
+    %iv = load i32, *%i
+    %more = slt i32 %iv, 8
+    br %more, @seq_body, @seq_done
+  @seq_body:
+    %sh = sub i32 7, %iv
+    %shb = shl i32 %sh, 3
+    %sh64 = zext i32 %shb to i64
+    %sv = lshr i64 %seq, %sh64
+    %svb = trunc i64 %sv to i8
+    %sp = gep i8, *%ap, %iv
+    store i8 %svb, *%sp
+    %ivn = add i32 %iv, 1
+    store i32 %ivn, *%i
+    jmp @seq_cond
+  @seq_done:
+    call @tls12e_put8(%ap, 8, %typ)
+    call @tls12e_put8(%ap, 9, 3)
+    call @tls12e_put8(%ap, 10, 3)
+    call @tls12e_put16(%ap, 11, %ctlen)
+    %ctp = gep i8, *%rec, 8
+    %tl = add i32 %ctlen, 8
+    %tagp = gep i8, *%rec, %tl
+    %key = gep i8, *@tls12e_SKEY, 0
+    %r = call @std_crypto_aes_gcm_decrypt(%ctp, %ctlen, %ap, 13, %key, %np, %tagp, %out)
+    %good = eq i32 %r, 0
+    br %good, @advance, @fail
+  @advance:
+    %seq2 = load i64, *@tls12e_SSEQ
+    %seqn = add i64 %seq2, 1
+    store i64 %seqn, *@tls12e_SSEQ
+    ret i32 %ctlen
+  @fail:
+    ret i32 -1
+}
+
+// Send one encrypted record.
+fun @tls12e_write_crypt(typ: i32, pt: *i8, len: i32) -> i32 {
+  @entry:
+    %rp = gep i8, *@tls12e_REC, 0
+    %rl = call @tls12e_encrypt(%typ, %pt, %len, %rp)
+    %ok = sge i32 %rl, 0
+    br %ok, @send, @fail
+  @send:
+    %r = call @tls12e_write_plain(%typ, %rp, %rl)
+    ret i32 %r
+  @fail:
+    ret i32 -1
+}
+
+// Send a ClientHello for ECDHE_RSA_WITH_AES_128_GCM_SHA256.
+fun @tls12e_send_hello() -> i32 {
+  @entry:
+    %ext = let [i8, 512]
+    %o = let i32
+    store i32 0, *%o
+    %hp = gep i8, *@tls12e_HOST, 0
+    %hlen = load i32, *@tls12e_HOSTLEN
+    %has_host = sgt i32 %hlen, 0
+    br %has_host, @sni, @after_sni
+  @sni:
+    %e0 = gep i8, *%ext, 0
+    %ov = load i32, *%o
+    call @tls12e_put16(%e0, %ov, 0)
+    %ov2 = add i32 %ov, 2
+    %edl = add i32 %hlen, 5
+    call @tls12e_put16(%e0, %ov2, %edl)
+    %ov3 = add i32 %ov, 4
+    %sll = add i32 %hlen, 3
+    call @tls12e_put16(%e0, %ov3, %sll)
+    %ov4 = add i32 %ov, 6
+    call @tls12e_put8(%e0, %ov4, 0)
+    %ov5 = add i32 %ov, 7
+    call @tls12e_put16(%e0, %ov5, %hlen)
+    %ov6 = add i32 %ov, 9
+    %dp = gep i8, *%ext, %ov6
+    call @tls12e_copy(%dp, %hp, %hlen)
+    %on = add i32 %ov6, %hlen
+    store i32 %on, *%o
+    jmp @after_sni
+  @after_sni:
+    %e1 = gep i8, *%ext, 0
+    %ov7 = load i32, *%o
+    call @tls12e_put16(%e1, %ov7, 13)
+    %ov8 = add i32 %ov7, 2
+    call @tls12e_put16(%e1, %ov8, 6)
+    %ov9 = add i32 %ov7, 4
+    call @tls12e_put16(%e1, %ov9, 4)
+    %ov10 = add i32 %ov7, 6
+    call @tls12e_put16(%e1, %ov10, 0x0401)
+    %ov11 = add i32 %ov7, 8
+    call @tls12e_put16(%e1, %ov11, 0x0403)
+    %ov12 = add i32 %ov7, 10
+    store i32 %ov12, *%o
+    %ov13 = load i32, *%o
+    call @tls12e_put16(%e1, %ov13, 10)
+    %ov14 = add i32 %ov13, 2
+    call @tls12e_put16(%e1, %ov14, 4)
+    %ov15 = add i32 %ov13, 4
+    call @tls12e_put16(%e1, %ov15, 2)
+    %ov16 = add i32 %ov13, 6
+    call @tls12e_put16(%e1, %ov16, 23)
+    %ov17 = add i32 %ov13, 8
+    store i32 %ov17, *%o
+    %ov18 = load i32, *%o
+    call @tls12e_put16(%e1, %ov18, 11)
+    %ov19 = add i32 %ov18, 2
+    call @tls12e_put16(%e1, %ov19, 2)
+    %ov20 = add i32 %ov18, 4
+    call @tls12e_put8(%e1, %ov20, 1)
+    %ov21 = add i32 %ov18, 5
+    call @tls12e_put8(%e1, %ov21, 0)
+    %ov22 = add i32 %ov18, 6
+    store i32 %ov22, *%o
+    // Assemble the ClientHello body.
+    %tx = gep i8, *@tls12e_TX, 0
+    call @tls12e_put8(%tx, 0, 3)
+    call @tls12e_put8(%tx, 1, 3)
+    %randp = gep i8, *@tls12e_CAND, 0
+    call @c1_random_buf(%randp, 32)
+    %txr = gep i8, *@tls12e_TX, 2
+    call @tls12e_copy(%txr, %randp, 32)
+    call @tls12e_put8(%tx, 34, 0)
+    call @tls12e_put16(%tx, 35, 2)
+    call @tls12e_put16(%tx, 37, @tls12e_SUITE)
+    call @tls12e_put8(%tx, 39, 1)
+    call @tls12e_put8(%tx, 40, 0)
+    %ev = load i32, *%o
+    call @tls12e_put16(%tx, 41, %ev)
+    %txe = gep i8, *@tls12e_TX, 43
+    %ep = gep i8, *%ext, 0
+    call @tls12e_copy(%txe, %ep, %ev)
+    %bodylen = add i32 43, %ev
+    // Handshake header for the transcript and the record.
+    %hsm = let [i8, 2048]
+    %hmp = gep i8, *%hsm, 0
+    call @tls12e_put8(%hmp, 0, @tls12e_HS_CLIENT_HELLO)
+    call @tls12e_put24(%hmp, 1, %bodylen)
+    %hbm = gep i8, *%hsm, 4
+    call @tls12e_copy(%hbm, %tx, %bodylen)
+    %mtotal = add i32 %bodylen, 4
+    %cr = call @tls12e_commit(%hmp, %mtotal)
+    %cok = eq i32 %cr, 0
+    br %cok, @send, @fail
+  @send:
+    %r = call @tls12e_write_plain(@tls12e_CT_HANDSHAKE, %hmp, %mtotal)
+    ret i32 %r
+  @fail:
+    ret i32 -1
+}
+
+// Parse ServerHello; stores the server random and checks the cipher suite.
+fun @tls12e_parse_sh(bp: *i8, blen: i32) -> i32 {
+  @entry:
+    %v = call @tls12e_get16(%bp, 0)
+    %vok = eq i32 %v, 0x0303
+    br %vok, @rand, @fail
+  @rand:
+    %sr = gep i8, *@tls12e_SAND, 0
+    %sp = gep i8, *%bp, 2
+    call @tls12e_copy(%sr, %sp, 32)
+    %sidlen = call @tls12e_get8(%bp, 34)
+    %csoff = add i32 %sidlen, 35
+    %cs = call @tls12e_get16(%bp, %csoff)
+    %csok = eq i32 %cs, @tls12e_SUITE
+    br %csok, @ok, @fail
+  @ok:
+    ret i32 0
+  @fail:
+    ret i32 -1
+}
+
+// Parse the first certificate and check its hostname.
+fun @tls12e_parse_cert(bp: *i8, blen: i32) -> i32 {
+  @entry:
+    %total = call @tls12e_get24(%bp, 0)
+    %clen = call @tls12e_get24(%bp, 3)
+    %fits = sle i32 %clen, @tls12e_CERT_CAP
+    %inb = add i32 %clen, 6
+    %fits2 = sle i32 %inb, %blen
+    %ok = and i1 %fits, %fits2
+    br %ok, @copy, @fail
+  @copy:
+    %cp = gep i8, *@tls12e_CERT, 0
+    %sp = gep i8, *%bp, 6
+    call @tls12e_copy(%cp, %sp, %clen)
+    store i32 %clen, *@tls12e_CERTLEN
+    %hp = gep i8, *@tls12e_HOST, 0
+    %ip = call @net_parse_ip(%hp)
+    %ishost = eq i32 %ip, 0
+    br %ishost, @hostchk, @ok
+  @hostchk:
+    %hlen = load i32, *@tls12e_HOSTLEN
+    %hok = call @x509_check_hostname(%cp, %clen, %hp, %hlen)
+    br %hok, @ok, @fail
+  @ok:
+    ret i32 0
+  @fail:
+    ret i32 -1
+}
+
+// Verify and parse ServerKeyExchange, storing the peer ECDH point.
+fun @tls12e_parse_ske(bp: *i8, blen: i32) -> i32 {
+  @entry:
+    %has_cert = load i32, *@tls12e_CERTLEN
+    %have = sgt i32 %has_cert, 0
+    br %have, @shape, @fail
+  @shape:
+    %ct = call @tls12e_get8(%bp, 0)
+    %cok = eq i32 %ct, 3
+    %curve = call @tls12e_get16(%bp, 1)
+    %gok = eq i32 %curve, 23
+    %plen = call @tls12e_get8(%bp, 3)
+    %pok = eq i32 %plen, 65
+    %a = and i1 %cok, %gok
+    %b = and i1 %a, %pok
+    br %b, @point, @fail
+  @point:
+    %first = call @tls12e_get8(%bp, 4)
+    %uok = eq i32 %first, 4
+    br %uok, @sig, @fail
+  @sig:
+    %pa = add i32 %plen, 4
+    %sigalg = call @tls12e_get16(%bp, %pa)
+    %saok = eq i32 %sigalg, 0x0401
+    br %saok, @siglen, @fail
+  @siglen:
+    %slo = add i32 %pa, 2
+    %sl = call @tls12e_get16(%bp, %slo)
+    %sle = add i32 %pa, 4
+    %slend = add i32 %sle, %sl
+    %fit = sle i32 %slend, %blen
+    br %fit, @verify, @fail
+  @verify:
+    // The signature is verified with the server certificate's public key,
+    // so the key must be extracted before the check.
+    %certp = gep i8, *@tls12e_CERT, 0
+    %clen = load i32, *@tls12e_CERTLEN
+    %np = gep i32, *@tls12e_N, 0
+    %ep = gep i32, *@tls12e_E, 0
+    %pubok = call @x509_parse_rsa_pubkey(%certp, %clen, %np, %ep, @tls12e_LIMBS)
+    br %pubok, @hash, @fail
+  @hash:
+    // hash = SHA256(client_random || server_random || params)
+    %shp = gep i8, *@tls12e_SIGH, 0
+    %cr = gep i8, *@tls12e_CAND, 0
+    %sr = gep i8, *@tls12e_SAND, 0
+    call @tls12e_copy(%shp, %cr, 32)
+    %shp2 = gep i8, *@tls12e_SIGH, 32
+    call @tls12e_copy(%shp2, %sr, 32)
+    %shp3 = gep i8, *@tls12e_SIGH, 64
+    call @tls12e_copy(%shp3, %bp, %pa)
+    %hash = let [i8, 32]
+    %hp = gep i8, *%hash, 0
+    %hinput = add i32 %pa, 64
+    call @std_crypto_sha256_compute(%shp, %hinput, %hp)
+    %sigp = gep i8, *%bp, %sle
+    %vok = call @std_crypto_rsa_verify_pkcs1_v15(%hp, %sigp, %ep, %np, @tls12e_LIMBS)
+    br %vok, @pointbn, @fail
+  @pointbn:
+    %px = gep i32, *@tls12e_PX, 0
+    %py = gep i32, *@tls12e_PY, 0
+    %xbytes = gep i8, *%bp, 5
+    %ybytes = gep i8, *%bp, 37
+    call @std_crypto_rsa_bn_from_bytes(%px, %xbytes, 32, 8)
+    call @std_crypto_rsa_bn_from_bytes(%py, %ybytes, 32, 8)
+    ret i32 0
+  @fail:
+    ret i32 -1
+}
+
+// Send ClientKeyExchange, derive keys, and send ChangeCipherSpec + Finished.
+fun @tls12e_send_cke() -> i32 {
+  @entry:
+    %priv = let [i32, 8]
+    %pubx = let [i32, 8]
+    %puby = let [i32, 8]
+    %secx = let [i32, 8]
+    %privp = gep i32, *%priv, 0
+    %pubxp = gep i32, *%pubx, 0
+    %pubyp = gep i32, *%puby, 0
+    %secxp = gep i32, *%secx, 0
+    call @std_crypto_p256_generate_keypair(%privp, %pubxp, %pubyp)
+    %pxp = gep i32, *@tls12e_PX, 0
+    %pyp = gep i32, *@tls12e_PY, 0
+    call @std_crypto_p256_ecdh(%privp, %pxp, %pyp, %secxp)
+    // ClientKeyExchange message body: point length, uncompressed marker, X, Y.
+    %hsm = let [i8, 128]
+    %hmp = gep i8, *%hsm, 0
+    call @tls12e_put8(%hmp, 0, @tls12e_HS_CLIENT_KEY_EXCHANGE)
+    call @tls12e_put24(%hmp, 1, 66)
+    call @tls12e_put8(%hmp, 4, 65)
+    call @tls12e_put8(%hmp, 5, 4)
+    %xb = gep i8, *%hsm, 6
+    call @std_crypto_rsa_bn_to_bytes(%xb, %pubxp, 32, 8)
+    %yb = gep i8, *%hsm, 38
+    call @std_crypto_rsa_bn_to_bytes(%yb, %pubyp, 32, 8)
+    %cr = call @tls12e_commit(%hmp, 70)
+    %cok = eq i32 %cr, 0
+    br %cok, @send, @fail
+  @send:
+    %sr = call @tls12e_write_plain(@tls12e_CT_HANDSHAKE, %hmp, 70)
+    %sok = eq i32 %sr, 0
+    br %sok, @derive, @fail
+  @derive:
+    %pre = let [i8, 32]
+    %prep = gep i8, *%pre, 0
+    call @std_crypto_rsa_bn_to_bytes(%prep, %secxp, 32, 8)
+    %crand = gep i8, *@tls12e_CAND, 0
+    %srand = gep i8, *@tls12e_SAND, 0
+    %msec = gep i8, *@tls12e_MSEC, 0
+    // master_secret = PRF(pre_master, "master secret", cr || sr)
+    %msseed = let [i8, 77]
+    %msp = gep i8, *%msseed, 0
+    %mslbl = gep i8, *@tls12e_MS_LABEL, 0
+    call @tls12e_copy(%msp, %mslbl, 13)
+    %msp1 = gep i8, *%msseed, 13
+    call @tls12e_copy(%msp1, %crand, 32)
+    %msp2 = gep i8, *%msseed, 45
+    call @tls12e_copy(%msp2, %srand, 32)
+    call @std_crypto_tls12_prf_sha256(%prep, 32, %msp, 77, 48, %msec)
+    // key_block = PRF(master_secret, "key expansion", sr || cr)
+    %kb = let [i8, 40]
+    %kbp = gep i8, *%kb, 0
+    %kbseed = let [i8, 77]
+    %ksp = gep i8, *%kbseed, 0
+    %klbl = gep i8, *@tls12e_KE_LABEL, 0
+    call @tls12e_copy(%ksp, %klbl, 13)
+    %ksp1 = gep i8, *%kbseed, 13
+    call @tls12e_copy(%ksp1, %srand, 32)
+    %ksp2 = gep i8, *%kbseed, 45
+    call @tls12e_copy(%ksp2, %crand, 32)
+    call @std_crypto_tls12_prf_sha256(%msec, 48, %ksp, 77, 40, %kbp)
+    %ck = gep i8, *@tls12e_CKEY, 0
+    call @tls12e_copy(%ck, %kbp, 16)
+    %sk = gep i8, *@tls12e_SKEY, 0
+    %kbp2 = gep i8, *%kb, 16
+    call @tls12e_copy(%sk, %kbp2, 16)
+    %ci = gep i8, *@tls12e_CIV, 0
+    %kbp3 = gep i8, *%kb, 32
+    call @tls12e_copy(%ci, %kbp3, 4)
+    %si = gep i8, *@tls12e_SIV, 0
+    %kbp4 = gep i8, *%kb, 36
+    call @tls12e_copy(%si, %kbp4, 4)
+    jmp @ccs
+  @ccs:
+    %ccs = let [i8, 1]
+    %ccsp = gep i8, *%ccs, 0
+    store i8 1, *%ccsp
+    %r1 = call @tls12e_write_plain(@tls12e_CT_CCS, %ccsp, 1)
+    %ok1 = eq i32 %r1, 0
+    br %ok1, @finished, @fail
+  @finished:
+    %hash = let [i8, 32]
+    %hashp = gep i8, *%hash, 0
+    %trp = gep i8, *@tls12e_TR, 0
+    %trlen = load i32, *@tls12e_TXLEN
+    call @std_crypto_sha256_compute(%trp, %trlen, %hashp)
+    %fin = let [i8, 16]
+    %finp = gep i8, *%fin, 0
+    call @std_crypto_tls12_finished_sha256(%msec, %hashp, 1, %finp)
+    %msg = let [i8, 16]
+    %msgp = gep i8, *%msg, 0
+    call @tls12e_put8(%msgp, 0, @tls12e_HS_FINISHED)
+    call @tls12e_put24(%msgp, 1, 12)
+    %mb = gep i8, *%msg, 4
+    call @tls12e_copy(%mb, %finp, 12)
+    %cr2 = call @tls12e_commit(%msgp, 16)
+    %cok2 = eq i32 %cr2, 0
+    br %cok2, @send_fin, @fail
+  @send_fin:
+    %r2 = call @tls12e_write_crypt(@tls12e_CT_HANDSHAKE, %msgp, 16)
+    ret i32 %r2
+  @fail:
+    ret i32 -1
+}
+
+// Read the server ChangeCipherSpec and verify its Finished message.
+fun @tls12e_read_server_fin() -> i32 {
+  @entry:
+    %rl = call @tls12e_record_read()
+    %bad = slt i32 %rl, 0
+    br %bad, @fail, @kind
+  @kind:
+    %t = load i32, *@tls12e_LASTTYPE
+    %isc = eq i32 %t, @tls12e_CT_CCS
+    br %isc, @ccs, @fail
+  @ccs:
+    %one = eq i32 %rl, 1
+    br %one, @ccsval, @fail
+  @ccsval:
+    %rp = gep i8, *@tls12e_REC, 0
+    %v = call @tls12e_get8(%rp, 0)
+    %vok = eq i32 %v, 1
+    br %vok, @read_fin, @fail
+  @read_fin:
+    %rl2 = call @tls12e_record_read()
+    %bad2 = slt i32 %rl2, 0
+    br %bad2, @fail, @finkind
+  @finkind:
+    %t2 = load i32, *@tls12e_LASTTYPE
+    %ishs = eq i32 %t2, @tls12e_CT_HANDSHAKE
+    br %ishs, @decrypt, @fail
+  @decrypt:
+    %plain = let [i8, 128]
+    %plainp = gep i8, *%plain, 0
+    %rp2 = gep i8, *@tls12e_REC, 0
+    %pn = call @tls12e_decrypt(@tls12e_CT_HANDSHAKE, %rp2, %rl2, %plainp)
+    %pok = sge i32 %pn, 0
+    br %pok, @shape, @fail
+  @shape:
+    %mt = call @tls12e_get8(%plainp, 0)
+    %mtok = eq i32 %mt, @tls12e_HS_FINISHED
+    %ml = call @tls12e_get24(%plainp, 1)
+    %mlok = eq i32 %ml, 12
+    %both = and i1 %mtok, %mlok
+    br %both, @verify, @fail
+  @verify:
+    %hash = let [i8, 32]
+    %hashp = gep i8, *%hash, 0
+    %trp = gep i8, *@tls12e_TR, 0
+    %trlen = load i32, *@tls12e_TXLEN
+    call @std_crypto_sha256_compute(%trp, %trlen, %hashp)
+    %msec = gep i8, *@tls12e_MSEC, 0
+    %expect = let [i8, 16]
+    %expp = gep i8, *%expect, 0
+    call @std_crypto_tls12_finished_sha256(%msec, %hashp, 0, %expp)
+    %got = gep i8, *%plain, 4
+    %i = let i32
+    store i32 0, *%i
+    jmp @cmp_cond
+  @cmp_cond:
+    %iv = load i32, *%i
+    %more = slt i32 %iv, 12
+    br %more, @cmp_body, @ok
+  @cmp_body:
+    %g = call @tls12e_get8(%got, %iv)
+    %e = call @tls12e_get8(%expp, %iv)
+    %same = eq i32 %g, %e
+    br %same, @next, @fail
+  @next:
+    %iv2 = load i32, *%i
+    %n = add i32 %iv2, 1
+    store i32 %n, *%i
+    jmp @cmp_cond
+  @ok:
+    ret i32 0
+  @fail:
+    ret i32 -1
+}
+
+fun @tls12e_connect(host: *i8, hostlen: i32, fd: i32) -> i32 {
+  @entry:
+    %hp = gep i8, *@tls12e_HOST, 0
+    %cap = sub i32 %hostlen, 255
+    %fits = sle i32 %cap, 0
+    br %fits, @setup, @fail
+  @setup:
+    call @tls12e_copy(%hp, %host, %hostlen)
+    %np = gep i8, *@tls12e_HOST, %hostlen
+    store i8 0, *%np
+    store i32 %hostlen, *@tls12e_HOSTLEN
+    store i32 %fd, *@tls12e_FD
+    store i64 0, *@tls12e_CSEQ
+    store i64 0, *@tls12e_SSEQ
+    store i32 0, *@tls12e_TXLEN
+    store i32 0, *@tls12e_HSLEN
+    store i32 0, *@tls12e_HSOFF
+    store i32 0, *@tls12e_PENDOFF
+    store i32 0, *@tls12e_PENDLEN
+    store i32 0, *@tls12e_CERTLEN
+    %r = call @tls12e_send_hello()
+    %ok = eq i32 %r, 0
+    br %ok, @hs_loop, @fail
+  @hs_loop:
+    %hr = call @tls12e_hs_next()
+    %hbad = slt i32 %hr, 0
+    br %hbad, @fail, @dispatch
+  @dispatch:
+    %t = load i32, *@tls12e_HSTYPE
+    %ish = eq i32 %t, @tls12e_HS_SERVER_HELLO
+    br %ish, @do_sh, @chk_cert
+  @chk_cert:
+    %isc = eq i32 %t, @tls12e_HS_CERTIFICATE
+    br %isc, @do_cert, @chk_ske
+  @chk_ske:
+    %iss = eq i32 %t, @tls12e_HS_SERVER_KEY_EXCHANGE
+    br %iss, @do_ske, @chk_shd
+  @chk_shd:
+    %isd = eq i32 %t, @tls12e_HS_SERVER_HELLO_DONE
+    br %isd, @done_hs, @chk_other
+  @chk_other:
+    %isreq = eq i32 %t, @tls12e_HS_CERTIFICATE_REQUEST
+    br %isreq, @fail, @chk_status
+  @chk_status:
+    %isst = eq i32 %t, @tls12e_HS_CERTIFICATE_STATUS
+    br %isst, @hs_loop, @fail
+  @do_sh:
+    %boff = load i32, *@tls12e_HSBODY
+    %blen = load i32, *@tls12e_HSBLEN
+    %bp = gep i8, *@tls12e_HS, %boff
+    %r2 = call @tls12e_parse_sh(%bp, %blen)
+    %ok2 = eq i32 %r2, 0
+    br %ok2, @hs_loop, @fail
+  @do_cert:
+    %boff2 = load i32, *@tls12e_HSBODY
+    %blen2 = load i32, *@tls12e_HSBLEN
+    %bp2 = gep i8, *@tls12e_HS, %boff2
+    %r3 = call @tls12e_parse_cert(%bp2, %blen2)
+    %ok3 = eq i32 %r3, 0
+    br %ok3, @hs_loop, @fail
+  @do_ske:
+    %boff3 = load i32, *@tls12e_HSBODY
+    %blen3 = load i32, *@tls12e_HSBLEN
+    %bp3 = gep i8, *@tls12e_HS, %boff3
+    %r4 = call @tls12e_parse_ske(%bp3, %blen3)
+    %ok4 = eq i32 %r4, 0
+    br %ok4, @hs_loop, @fail
+  @done_hs:
+    %r5 = call @tls12e_send_cke()
+    %ok5 = eq i32 %r5, 0
+    br %ok5, @server_fin, @fail
+  @server_fin:
+    %r6 = call @tls12e_read_server_fin()
+    %ok6 = eq i32 %r6, 0
+    br %ok6, @ok, @fail
+  @ok:
+    ret i32 0
+  @fail:
+    ret i32 -1
+}
+
+fun @tls12e_send(buf: *i8, len: i32) -> i32 {
+  @entry:
+    %r = call @tls12e_write_crypt(@tls12e_CT_APP, %buf, %len)
+    ret i32 %r
+}
+
+fun @tls12e_recv(buf: *i8, cap: i32) -> i32 {
+  @entry:
+    jmp @have
+  @have:
+    %po = load i32, *@tls12e_PENDOFF
+    %pl = load i32, *@tls12e_PENDLEN
+    %avail = sub i32 %pl, %po
+    %has = sgt i32 %avail, 0
+    br %has, @drain, @readrec
+  @drain:
+    %po2 = load i32, *@tls12e_PENDOFF
+    %pl2 = load i32, *@tls12e_PENDLEN
+    %av2 = sub i32 %pl2, %po2
+    %diff = sub i32 %av2, %cap
+    %sign = ashr i32 %diff, 31
+    %neg = and i32 %diff, %sign
+    %n = add i32 %cap, %neg
+    %src = gep i8, *@tls12e_PEND, %po2
+    call @tls12e_copy(%buf, %src, %n)
+    %no = add i32 %po2, %n
+    store i32 %no, *@tls12e_PENDOFF
+    %pl3 = load i32, *@tls12e_PENDLEN
+    %end = eq i32 %no, %pl3
+    br %end, @clearpend, @ret_n
+  @clearpend:
+    store i32 0, *@tls12e_PENDOFF
+    store i32 0, *@tls12e_PENDLEN
+    jmp @ret_n
+  @ret_n:
+    ret i32 %n
+  @readrec:
+    %rl = call @tls12e_record_read()
+    %bad = slt i32 %rl, 0
+    br %bad, @fail, @kind
+  @kind:
+    %t = load i32, *@tls12e_LASTTYPE
+    %isapp = eq i32 %t, @tls12e_CT_APP
+    br %isapp, @decrypt, @chk_alert
+  @chk_alert:
+    %isa = eq i32 %t, @tls12e_CT_ALERT
+    br %isa, @alert, @chk_hs
+  @chk_hs:
+    %ishs = eq i32 %t, @tls12e_CT_HANDSHAKE
+    br %ishs, @skip_hs, @fail
+  @skip_hs:
+    %plainp0 = gep i8, *@tls12e_PEND, 0
+    %rp0 = gep i8, *@tls12e_REC, 0
+    %pn0 = call @tls12e_decrypt(@tls12e_CT_HANDSHAKE, %rp0, %rl, %plainp0)
+    %ok0 = sge i32 %pn0, 0
+    br %ok0, @readrec, @fail
+  @decrypt:
+    %pendp = gep i8, *@tls12e_PEND, 0
+    %rp = gep i8, *@tls12e_REC, 0
+    %pn = call @tls12e_decrypt(@tls12e_CT_APP, %rp, %rl, %pendp)
+    %ok = sge i32 %pn, 0
+    br %ok, @setpend, @fail
+  @setpend:
+    store i32 0, *@tls12e_PENDOFF
+    store i32 %pn, *@tls12e_PENDLEN
+    jmp @have
+  @alert:
+    %pendp2 = gep i8, *@tls12e_PEND, 0
+    %rp2 = gep i8, *@tls12e_REC, 0
+    %an = call @tls12e_decrypt(@tls12e_CT_ALERT, %rp2, %rl, %pendp2)
+    %aok = sge i32 %an, 0
+    br %aok, @alertkind, @fail
+  @alertkind:
+    %d = call @tls12e_get8(%pendp2, 1)
+    %cn = eq i32 %d, 0
+    br %cn, @eof, @fail
+  @eof:
+    ret i32 0
+  @fail:
+    ret i32 -1
+}
+
+fun @tls12e_close() -> i32 {
+  @entry:
+    ret i32 0
+}

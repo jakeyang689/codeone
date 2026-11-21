@@ -1,0 +1,623 @@
+// tcp.bx - TCP client implementation
+//
+// Active open only (no listen), one connection at a time with serial send/receive, no retransmission or window scaling.
+// The protocol semantics are sufficient for the three-way handshake, data transfer, and FIN close used by the kernel network self-test.
+
+extern @ip_send(dst: i32, proto: i32, payload: *i8, len: i32) -> i32
+extern @net_my_ip() -> i32
+extern @net_ld8(p: *i8, off: i32) -> i32
+extern @net_be16(p: *i8, off: i32) -> i32
+extern @net_be32(p: *i8, off: i32) -> i32
+extern @net_st8(p: *i8, off: i32, v: i32) -> void
+extern @net_stbe16(p: *i8, off: i32, v: i32) -> void
+extern @net_stbe32(p: *i8, off: i32, v: i32) -> void
+extern @net_l4_cksum(src: i32, dst: i32, proto: i32, seg: *i8, len: i32) -> i32
+extern @net_now_ms() -> i64
+extern @net_poll() -> void
+extern @kmem_memcpy(dst: *i8, src: *i8, n: i64) -> void
+
+const @tcp_PROTO: i32 = 6
+const @tcp_MAX_SOCK: i32 = 4
+const @tcp_RXBUF_SIZE: i32 = 4096
+const @tcp_MSS: i32 = 1024
+const @tcp_WINDOW: i32 = 4096
+const @tcp_HDR_LEN: i32 = 20
+const @tcp_FLAG_FIN: i32 = 1
+const @tcp_FLAG_SYN: i32 = 2
+const @tcp_FLAG_RST: i32 = 4
+const @tcp_FLAG_PSH: i32 = 8
+const @tcp_FLAG_ACK: i32 = 16
+
+const @tcp_FREE: i32 = 0
+const @tcp_SYN_SENT: i32 = 1
+const @tcp_ESTABLISHED: i32 = 2
+const @tcp_FIN_WAIT_1: i32 = 3
+const @tcp_FIN_WAIT_2: i32 = 4
+const @tcp_CLOSE_WAIT: i32 = 5
+const @tcp_LAST_ACK: i32 = 6
+const @tcp_CLOSED: i32 = 7
+const @tcp_TIME_WAIT: i32 = 8
+
+// Field indices: 0 used, 1 state, 2 lport, 3 rip, 4 rport, 5 snd_una,
+// 6 snd_nxt, 7 snd_wnd, 8 rcv_nxt, 9 rxlen, 10 rxoff, 11 fin_rcvd
+struct @tcp_Sock {
+  @used: i32,
+  @state: i32,
+  @lport: i32,
+  @rip: i32,
+  @rport: i32,
+  @snd_una: i32,
+  @snd_nxt: i32,
+  @snd_wnd: i32,
+  @rcv_nxt: i32,
+  @rxlen: i32,
+  @rxoff: i32,
+  @fin_rcvd: i32
+}
+
+global @tcp_SOCKS: [@tcp_Sock, 4]
+global @tcp_RXBUF: [i8, 16384]
+global @tcp_TXBUF: [i8, 1044]
+global @tcp_EPHEM: i32
+
+fun @tcp_sock(i: i32) -> *@tcp_Sock {
+  @entry:
+    %p = gep @tcp_Sock, *@tcp_SOCKS, %i
+    ret *@tcp_Sock %p
+}
+
+fun @tcp_find(src: i32, sport: i32, dport: i32) -> i32 {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @cond
+  @cond:
+    %iv = load i32, *%i
+    %done = sge i32 %iv, @tcp_MAX_SOCK
+    br %done, @miss, @body
+  @body:
+    %sp = call @tcp_sock(%iv)
+    %up = field @tcp_Sock, *%sp, 0
+    %used = load i32, *%up
+    %isused = eq i32 %used, 1
+    br %isused, @chk, @next
+  @chk:
+    %lp = field @tcp_Sock, *%sp, 2
+    %lv = load i32, *%lp
+    %portok = eq i32 %lv, %dport
+    br %portok, @chkrp, @next
+  @chkrp:
+    %rp = field @tcp_Sock, *%sp, 4
+    %rv = load i32, *%rp
+    %rportok = eq i32 %rv, %sport
+    br %rportok, @chkip, @next
+  @chkip:
+    %ip = field @tcp_Sock, *%sp, 3
+    %iv2 = load i32, *%ip
+    %ipok = eq i32 %iv2, %src
+    br %ipok, @hit, @next
+  @next:
+    %in = add i32 %iv, 1
+    store i32 %in, *%i
+    jmp @cond
+  @hit:
+    ret i32 %iv
+  @miss:
+    ret i32 -1
+}
+
+// Build and send one TCP segment; returns the send result.
+fun @tcp_send_seg(slot: i32, flags: i32, seq: i32, ack: i32, payload: *i8, plen: i32) -> i32 {
+  @entry:
+    %toobig = sgt i32 %plen, @tcp_MSS
+    br %toobig, @fail, @build
+  @build:
+    %sp = call @tcp_sock(%slot)
+    %lpp = field @tcp_Sock, *%sp, 2
+    %lport = load i32, *%lpp
+    %rpp = field @tcp_Sock, *%sp, 4
+    %rport = load i32, *%rpp
+    %ripp = field @tcp_Sock, *%sp, 3
+    %rip = load i32, *%ripp
+    %tx = gep i8, *@tcp_TXBUF, 0
+    call @net_stbe16(%tx, 0, %lport)
+    call @net_stbe16(%tx, 2, %rport)
+    call @net_stbe32(%tx, 4, %seq)
+    call @net_stbe32(%tx, 8, %ack)
+    call @net_st8(%tx, 12, 0x50)
+    call @net_st8(%tx, 13, %flags)
+    call @net_stbe16(%tx, 14, @tcp_WINDOW)
+    call @net_stbe16(%tx, 16, 0)
+    call @net_stbe16(%tx, 18, 0)
+    %dp = gep i8, *%tx, @tcp_HDR_LEN
+    %plen64 = sext i32 %plen to i64
+    call @kmem_memcpy(%dp, %payload, %plen64)
+    %seg = add i32 @tcp_HDR_LEN, %plen
+    %myip = call @net_my_ip()
+    %ck = call @net_l4_cksum(%myip, %rip, @tcp_PROTO, %tx, %seg)
+    call @net_stbe16(%tx, 16, %ck)
+    %r = call @ip_send(%rip, @tcp_PROTO, %tx, %seg)
+    ret i32 %r
+  @fail:
+    ret i32 -1
+}
+
+// Append received data to the receive buffer.
+fun @tcp_append(slot: i32, msg: *i8, doff: i32, plen: i32) -> void {
+  @entry:
+    %sp = call @tcp_sock(%slot)
+    %rlp = field @tcp_Sock, *%sp, 9
+    %rxlen = load i32, *%rlp
+    %space = sub i32 @tcp_RXBUF_SIZE, %rxlen
+    %room = sgt i32 %space, 0
+    br %room, @cap, @done
+  @cap:
+    %dt = sub i32 %plen, %space
+    %dts = ashr i32 %dt, 31
+    %dtm = and i32 %dt, %dts
+    %n = add i32 %space, %dtm
+    %soff = mul i32 %slot, @tcp_RXBUF_SIZE
+    %rxbase = gep i8, *@tcp_RXBUF, %soff
+    %dst = gep i8, *%rxbase, %rxlen
+    %src = gep i8, *%msg, %doff
+    %n64 = sext i32 %n to i64
+    call @kmem_memcpy(%dst, %src, %n64)
+    %nl = add i32 %rxlen, %n
+    store i32 %nl, *%rlp
+    jmp @done
+  @done:
+    ret void
+}
+
+fun @tcp_input(src: i32, dst: i32, msg: *i8, len: i32) -> void {
+  @entry:
+    %short = slt i32 %len, @tcp_HDR_LEN
+    br %short, @done, @lookup
+  @lookup:
+    %sport = call @net_be16(%msg, 0)
+    %dport = call @net_be16(%msg, 2)
+    %slot = call @tcp_find(%src, %sport, %dport)
+    %found = sge i32 %slot, 0
+    br %found, @verify, @done
+  @verify:
+    %stored = call @net_be16(%msg, 16)
+    call @net_stbe16(%msg, 16, 0)
+    %calc = call @net_l4_cksum(%src, %dst, @tcp_PROTO, %msg, %len)
+    call @net_stbe16(%msg, 16, %stored)
+    %good = eq i32 %calc, %stored
+    br %good, @parse, @done
+  @parse:
+    %doffb = call @net_ld8(%msg, 12)
+    %doff4 = lshr i32 %doffb, 4
+    %doff = mul i32 %doff4, 4
+    %doffok = sge i32 %doff, @tcp_HDR_LEN
+    br %doffok, @flags, @done
+  @flags:
+    %fl = call @net_ld8(%msg, 13)
+    %isrst = and i32 %fl, @tcp_FLAG_RST
+    %rst = ne i32 %isrst, 0
+    br %rst, @reset, @seq
+  @reset:
+    %sp = call @tcp_sock(%slot)
+    %up = field @tcp_Sock, *%sp, 0
+    store i32 0, *%up
+    %stp = field @tcp_Sock, *%sp, 1
+    store i32 @tcp_CLOSED, *%stp
+    jmp @done
+  @seq:
+    %sp2 = call @tcp_sock(%slot)
+    %seqi = call @net_be32(%msg, 4)
+    %acki = call @net_be32(%msg, 8)
+    %plen = sub i32 %len, %doff
+    %stp2 = field @tcp_Sock, *%sp2, 1
+    %st = load i32, *%stp2
+    %issynsent = eq i32 %st, @tcp_SYN_SENT
+    br %issynsent, @synsent, @data
+  @synsent:
+    %issyn = and i32 %fl, @tcp_FLAG_SYN
+    %isack = and i32 %fl, @tcp_FLAG_ACK
+    %synz = ne i32 %issyn, 0
+    %ackz = ne i32 %isack, 0
+    %both = and i1 %synz, %ackz
+    br %both, @synack, @done
+  @synack:
+    %snp = field @tcp_Sock, *%sp2, 6
+    %sndn = load i32, *%snp
+    %ackok = eq i32 %acki, %sndn
+    br %ackok, @establish, @done
+  @establish:
+    %unap = field @tcp_Sock, *%sp2, 5
+    store i32 %acki, *%unap
+    %wnd = call @net_be16(%msg, 14)
+    %wndp = field @tcp_Sock, *%sp2, 7
+    store i32 %wnd, *%wndp
+    %rn = add i32 %seqi, 1
+    %rcvp = field @tcp_Sock, *%sp2, 8
+    store i32 %rn, *%rcvp
+    store i32 @tcp_ESTABLISHED, *%stp2
+    %snd2 = load i32, *%snp
+    call @tcp_send_seg(%slot, @tcp_FLAG_ACK, %snd2, %rn, null, 0)
+    jmp @done
+  @data:
+    // Advance the send window based on the ACK first.
+    %isack2 = and i32 %fl, @tcp_FLAG_ACK
+    %ackz2 = ne i32 %isack2, 0
+    br %ackz2, @upd_ack, @after_ack
+  @upd_ack:
+    %unap2 = field @tcp_Sock, *%sp2, 5
+    %una = load i32, *%unap2
+    %newer = sgt i32 %acki, %una
+    br %newer, @set_una, @after_ack
+  @set_una:
+    store i32 %acki, *%unap2
+    %wnd2 = call @net_be16(%msg, 14)
+    %wndp2 = field @tcp_Sock, *%sp2, 7
+    store i32 %wnd2, *%wndp2
+    jmp @after_ack
+  @after_ack:
+    %plenpos = sgt i32 %plen, 0
+    br %plenpos, @with_data, @fin_chk
+  @with_data:
+    %rcvp2 = field @tcp_Sock, *%sp2, 8
+    %rcv = load i32, *%rcvp2
+    %inorder = eq i32 %seqi, %rcv
+    br %inorder, @accept_data, @dup_ack
+  @accept_data:
+    call @tcp_append(%slot, %msg, %doff, %plen)
+    %rcv2 = load i32, *%rcvp2
+    %rcvn = add i32 %rcv2, %plen
+    store i32 %rcvn, *%rcvp2
+    jmp @fin_chk
+  @dup_ack:
+    %sndp = field @tcp_Sock, *%sp2, 6
+    %snd3 = load i32, *%sndp
+    %rcv3 = load i32, *%rcvp2
+    call @tcp_send_seg(%slot, @tcp_FLAG_ACK, %snd3, %rcv3, null, 0)
+    jmp @done
+  @fin_chk:
+    %isfin = and i32 %fl, @tcp_FLAG_FIN
+    %finz = ne i32 %isfin, 0
+    br %finz, @fin_seq, @ack_data
+  @fin_seq:
+    %rcvp3 = field @tcp_Sock, *%sp2, 8
+    %rcv4 = load i32, *%rcvp3
+    %finpos = add i32 %seqi, %plen
+    %finok = eq i32 %finpos, %rcv4
+    br %finok, @take_fin, @ack_data
+  @take_fin:
+    %rcvn2 = add i32 %rcv4, 1
+    store i32 %rcvn2, *%rcvp3
+    %fp = field @tcp_Sock, *%sp2, 11
+    store i32 1, *%fp
+    %stp3 = field @tcp_Sock, *%sp2, 1
+    %st2 = load i32, *%stp3
+    %isest = eq i32 %st2, @tcp_ESTABLISHED
+    br %isest, @to_close_wait, @chk_fw1
+  @to_close_wait:
+    store i32 @tcp_CLOSE_WAIT, *%stp3
+    jmp @ack_data
+  @chk_fw1:
+    %isfw1 = eq i32 %st2, @tcp_FIN_WAIT_1
+    br %isfw1, @to_time_wait, @chk_fw2
+  @chk_fw2:
+    %isfw2 = eq i32 %st2, @tcp_FIN_WAIT_2
+    br %isfw2, @to_time_wait, @chk_la
+  @chk_la:
+    %isla = eq i32 %st2, @tcp_LAST_ACK
+    br %isla, @to_time_wait, @ack_data
+  @to_time_wait:
+    store i32 @tcp_TIME_WAIT, *%stp3
+    jmp @ack_data
+  @ack_data:
+    // ACK data or FIN; also handle the state transition when our FIN is acknowledged.
+    %stp4 = field @tcp_Sock, *%sp2, 1
+    %st3 = load i32, *%stp4
+    %sndp2 = field @tcp_Sock, *%sp2, 6
+    %snd4 = load i32, *%sndp2
+    %unap3 = field @tcp_Sock, *%sp2, 5
+    %una2 = load i32, *%unap3
+    %allack = eq i32 %una2, %snd4
+    %isfw1b = eq i32 %st3, @tcp_FIN_WAIT_1
+    %fwcase = and i1 %allack, %isfw1b
+    br %fwcase, @fw_done, @chk_lastack
+  @fw_done:
+    %fp2 = field @tcp_Sock, *%sp2, 11
+    %finv = load i32, *%fp2
+    %peerfin = eq i32 %finv, 1
+    br %peerfin, @fw_timewait, @fw_fw2
+  @fw_timewait:
+    store i32 @tcp_TIME_WAIT, *%stp4
+    jmp @chk_lastack
+  @fw_fw2:
+    store i32 @tcp_FIN_WAIT_2, *%stp4
+    jmp @chk_lastack
+  @chk_lastack:
+    %st4 = load i32, *%stp4
+    %isla2 = eq i32 %st4, @tcp_LAST_ACK
+    %allack2 = eq i32 %una2, %snd4
+    %lacase = and i1 %isla2, %allack2
+    br %lacase, @la_done, @send_ack
+  @la_done:
+    store i32 @tcp_TIME_WAIT, *%stp4
+    jmp @send_ack
+  @send_ack:
+    %needack = ne i32 %plen, 0
+    %isfin2 = and i32 %fl, @tcp_FLAG_FIN
+    %finz2 = ne i32 %isfin2, 0
+    %any = or i1 %needack, %finz2
+    br %any, @do_ack, @done
+  @do_ack:
+    %rcvp4 = field @tcp_Sock, *%sp2, 8
+    %rcv5 = load i32, *%rcvp4
+    %sndp3 = field @tcp_Sock, *%sp2, 6
+    %snd5 = load i32, *%sndp3
+    call @tcp_send_seg(%slot, @tcp_FLAG_ACK, %snd5, %rcv5, null, 0)
+    jmp @done
+  @done:
+    ret void
+}
+
+// Active connect; returns a socket slot on success, -1 on failure.
+fun @tcp_connect(ip: i32, port: i32, timeout_ms: i32) -> i32 {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @find
+  @find:
+    %iv = load i32, *%i
+    %done = sge i32 %iv, @tcp_MAX_SOCK
+    br %done, @nofree, @findbody
+  @findbody:
+    %sp = call @tcp_sock(%iv)
+    %up = field @tcp_Sock, *%sp, 0
+    %used = load i32, *%up
+    %free = eq i32 %used, 0
+    br %free, @init, @fnext
+  @fnext:
+    %in = add i32 %iv, 1
+    store i32 %in, *%i
+    jmp @find
+  @init:
+    %slot = load i32, *%i
+    %sp2 = call @tcp_sock(%slot)
+    %up2 = field @tcp_Sock, *%sp2, 0
+    store i32 1, *%up2
+    %stp = field @tcp_Sock, *%sp2, 1
+    store i32 @tcp_SYN_SENT, *%stp
+    %ep = load i32, *@tcp_EPHEM
+    %epn = add i32 %ep, 1
+    store i32 %epn, *@tcp_EPHEM
+    %epm = urem i32 %ep, 20000
+    %lport = add i32 %epm, 40000
+    %lpp = field @tcp_Sock, *%sp2, 2
+    store i32 %lport, *%lpp
+    %ripp = field @tcp_Sock, *%sp2, 3
+    store i32 %ip, *%ripp
+    %rpp = field @tcp_Sock, *%sp2, 4
+    store i32 %port, *%rpp
+    %ls = shl i32 %lport, 4
+    %seq0 = add i32 %ls, 0x12340000
+    %snp = field @tcp_Sock, *%sp2, 6
+    store i32 %seq0, *%snp
+    %unap = field @tcp_Sock, *%sp2, 5
+    store i32 %seq0, *%unap
+    %wndp = field @tcp_Sock, *%sp2, 7
+    store i32 0, *%wndp
+    %rcvp = field @tcp_Sock, *%sp2, 8
+    store i32 0, *%rcvp
+    %rlp = field @tcp_Sock, *%sp2, 9
+    store i32 0, *%rlp
+    %rop = field @tcp_Sock, *%sp2, 10
+    store i32 0, *%rop
+    %fp = field @tcp_Sock, *%sp2, 11
+    store i32 0, *%fp
+    %r = call @tcp_send_seg(%slot, @tcp_FLAG_SYN, %seq0, 0, null, 0)
+    %sent = sge i32 %r, 0
+    br %sent, @armed, @abort
+  @armed:
+    %ns = add i32 %seq0, 1
+    store i32 %ns, *%snp
+    %start = call @net_now_ms()
+    %t64 = sext i32 %timeout_ms to i64
+    %end = add i64 %start, %t64
+    jmp @wait
+  @wait:
+    call @net_poll()
+    %sp3 = call @tcp_sock(%slot)
+    %stp2 = field @tcp_Sock, *%sp3, 1
+    %stv = load i32, *%stp2
+    %up3 = field @tcp_Sock, *%sp3, 0
+    %used3 = load i32, *%up3
+    %est = eq i32 %stv, @tcp_ESTABLISHED
+    br %est, @success, @chkfail
+  @chkfail:
+    %freed = eq i32 %used3, 0
+    %closed = eq i32 %stv, @tcp_CLOSED
+    %bad = or i1 %freed, %closed
+    br %bad, @abort, @chkto
+  @chkto:
+    %now = call @net_now_ms()
+    %late = sge i64 %now, %end
+    br %late, @abort, @sleep
+  @sleep:
+    asm att void, "wfe", "~{memory}"
+    jmp @wait
+  @success:
+    ret i32 %slot
+  @abort:
+    %sp4 = call @tcp_sock(%slot)
+    %up4 = field @tcp_Sock, *%sp4, 0
+    store i32 0, *%up4
+    ret i32 -1
+  @nofree:
+    ret i32 -1
+}
+
+fun @tcp_send(id: i32, data: *i8, len: i32) -> i32 {
+  @entry:
+    %off = let i32
+    store i32 0, *%off
+    jmp @cond
+  @cond:
+    %ov = load i32, *%off
+    %done = sge i32 %ov, %len
+    br %done, @success, @body
+  @body:
+    %sp = call @tcp_sock(%id)
+    %remain = sub i32 %len, %ov
+    %dt = sub i32 %remain, @tcp_MSS
+    %dts = ashr i32 %dt, 31
+    %dtm = and i32 %dt, %dts
+    %chunk = add i32 @tcp_MSS, %dtm
+    %snp = field @tcp_Sock, *%sp, 6
+    %seq = load i32, *%snp
+    %rcvp = field @tcp_Sock, *%sp, 8
+    %rcv = load i32, *%rcvp
+    %dp = gep i8, *%data, %ov
+    %flags = or i32 @tcp_FLAG_ACK, @tcp_FLAG_PSH
+    %r = call @tcp_send_seg(%id, %flags, %seq, %rcv, %dp, %chunk)
+    %ok = sge i32 %r, 0
+    br %ok, @advance, @fail
+  @advance:
+    %sp2 = call @tcp_sock(%id)
+    %snp2 = field @tcp_Sock, *%sp2, 6
+    %ns = add i32 %seq, %chunk
+    store i32 %ns, *%snp2
+    %start = call @net_now_ms()
+    %end = add i64 %start, 1000
+    %target = add i32 %ov, %chunk
+    jmp @wait
+  @wait:
+    call @net_poll()
+    %sp3 = call @tcp_sock(%id)
+    %unap = field @tcp_Sock, *%sp3, 5
+    %una = load i32, *%unap
+    %acked = sge i32 %una, %target
+    br %acked, @next, @chkto
+  @chkto:
+    %now = call @net_now_ms()
+    %late = sge i64 %now, %end
+    br %late, @fail, @sleep
+  @sleep:
+    asm att void, "wfe", "~{memory}"
+    jmp @wait
+  @next:
+    %ov2 = load i32, *%off
+    %on = add i32 %ov2, %chunk
+    store i32 %on, *%off
+    jmp @cond
+  @success:
+    ret i32 %len
+  @fail:
+    ret i32 -1
+}
+
+// Read data that has arrived; returns 0 when the peer closed and no data remains, -1 on timeout.
+fun @tcp_recv(id: i32, buf: *i8, max: i32, timeout_ms: i32) -> i32 {
+  @entry:
+    %start = call @net_now_ms()
+    %t64 = sext i32 %timeout_ms to i64
+    %end = add i64 %start, %t64
+    jmp @cond
+  @cond:
+    %sp = call @tcp_sock(%id)
+    %rlp = field @tcp_Sock, *%sp, 9
+    %rxlen = load i32, *%rlp
+    %rop = field @tcp_Sock, *%sp, 10
+    %rxoff = load i32, *%rop
+    %avail = sub i32 %rxlen, %rxoff
+    %has = sgt i32 %avail, 0
+    br %has, @take, @chkfin
+  @chkfin:
+    %fp = field @tcp_Sock, *%sp, 11
+    %fin = load i32, *%fp
+    %finz = eq i32 %fin, 1
+    br %finz, @eof, @poll
+  @take:
+    %dt = sub i32 %avail, %max
+    %dts = ashr i32 %dt, 31
+    %dtm = and i32 %dt, %dts
+    %n = add i32 %max, %dtm
+    %soff = mul i32 %id, @tcp_RXBUF_SIZE
+    %base = gep i8, *@tcp_RXBUF, %soff
+    %src = gep i8, *%base, %rxoff
+    %n64 = sext i32 %n to i64
+    call @kmem_memcpy(%buf, %src, %n64)
+    %newoff = add i32 %rxoff, %n
+    %ate = eq i32 %newoff, %rxlen
+    br %ate, @reset_buf, @keep
+  @reset_buf:
+    store i32 0, *%rlp
+    store i32 0, *%rop
+    ret i32 %n
+  @keep:
+    store i32 %newoff, *%rop
+    ret i32 %n
+  @eof:
+    ret i32 0
+  @poll:
+    call @net_poll()
+    %now = call @net_now_ms()
+    %late = sge i64 %now, %end
+    br %late, @fail, @sleep
+  @sleep:
+    asm att void, "wfe", "~{memory}"
+    jmp @cond
+  @fail:
+    ret i32 -1
+}
+
+fun @tcp_close(id: i32) -> i32 {
+  @entry:
+    %sp = call @tcp_sock(%id)
+    %up = field @tcp_Sock, *%sp, 0
+    %used = load i32, *%up
+    %isused = eq i32 %used, 1
+    br %isused, @send, @done
+  @send:
+    %snp = field @tcp_Sock, *%sp, 6
+    %seq = load i32, *%snp
+    %rcvp = field @tcp_Sock, *%sp, 8
+    %rcv = load i32, *%rcvp
+    %stp = field @tcp_Sock, *%sp, 1
+    store i32 @tcp_FIN_WAIT_1, *%stp
+    %flags = or i32 @tcp_FLAG_ACK, @tcp_FLAG_FIN
+    %r = call @tcp_send_seg(%id, %flags, %seq, %rcv, null, 0)
+    %ok = sge i32 %r, 0
+    br %ok, @armed, @free
+  @armed:
+    %ns = add i32 %seq, 1
+    store i32 %ns, *%snp
+    %start = call @net_now_ms()
+    %end = add i64 %start, 1000
+    jmp @wait
+  @wait:
+    call @net_poll()
+    %sp2 = call @tcp_sock(%id)
+    %unap = field @tcp_Sock, *%sp2, 5
+    %una = load i32, *%unap
+    %snp2 = field @tcp_Sock, *%sp2, 6
+    %ns2 = load i32, *%snp2
+    %acked = eq i32 %una, %ns2
+    br %acked, @free, @chkto
+  @chkto:
+    %now = call @net_now_ms()
+    %late = sge i64 %now, %end
+    br %late, @free, @sleep
+  @sleep:
+    asm att void, "wfe", "~{memory}"
+    jmp @wait
+  @free:
+    %sp3 = call @tcp_sock(%id)
+    %up3 = field @tcp_Sock, *%sp3, 0
+    store i32 0, *%up3
+    %rlp = field @tcp_Sock, *%sp3, 9
+    store i32 0, *%rlp
+    %rop = field @tcp_Sock, *%sp3, 10
+    store i32 0, *%rop
+    %fp = field @tcp_Sock, *%sp3, 11
+    store i32 0, *%fp
+    ret i32 0
+  @done:
+    ret i32 -1
+}

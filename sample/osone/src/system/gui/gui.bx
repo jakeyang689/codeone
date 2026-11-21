@@ -1,0 +1,715 @@
+// gui.bx - desktop scene and keyboard/tablet event loop
+//
+// Layout lives here; the controls themselves are records in widget.bx and are
+// painted by render.bx. The scene is redrawn and flushed only when state
+// changes, including a change of hover target.
+
+extern @console_puts(s: *i8) -> void
+extern @console_getc() -> i32
+extern @gpu_ready() -> i32
+extern @gpu_present() -> i32
+extern @gpu_fb() -> *i8
+extern @gpu_width() -> i32
+extern @gpu_height() -> i32
+extern @gpu_flush() -> i32
+extern @input_poll(ev: *i32) -> i32
+extern @input_find_kind(kind: i32) -> i32
+extern @input_abs_min(dev: i32, axis: i32) -> i32
+extern @input_abs_max(dev: i32, axis: i32) -> i32
+extern @timer_now() -> i64
+extern @timer_freq() -> i64
+extern @gui_draw_init(fb: *i8, w: i32, h: i32) -> void
+extern @gui_fill_rect(x: i32, y: i32, w: i32, h: i32, color: i32) -> void
+
+extern @render_text(x: i32, y: i32, s: *i8, color: i32, scale: i32, alpha: i32) -> void
+extern @render_text_centered(x: i32, y: i32, w: i32, s: *i8, color: i32, scale: i32, alpha: i32) -> void
+
+extern @widget_reset() -> void
+extern @widget_add_window(id: i32, x: i32, y: i32, w: i32, h: i32, accent: i32, title: *i8) -> i32
+extern @widget_add_text(id: i32, x: i32, y: i32, color: i32, scale: i32, s: *i8) -> i32
+extern @widget_add_button(id: i32, x: i32, y: i32, w: i32, h: i32, color: i32, label: *i8) -> i32
+extern @widget_set_color(id: i32, color: i32) -> void
+extern @widget_set_alpha(id: i32, alpha: i32) -> void
+extern @widget_select(id: i32) -> void
+extern @widget_pointer_move(px: i32, py: i32) -> i32
+extern @widget_pointer_down(px: i32, py: i32) -> i32
+extern @widget_pointer_up(px: i32, py: i32) -> i32
+extern @widget_draw() -> void
+
+const @gui_EV_KEY: i32 = 1
+const @gui_EV_ABS: i32 = 3
+const @gui_BTN_LEFT: i32 = 0x110
+const @gui_KIND_TABLET: i32 = 2
+
+const @gui_ID_WINDOW: i32 = 1
+const @gui_ID_CLOSE: i32 = 2
+const @gui_ID_RED: i32 = 3
+const @gui_ID_GREEN: i32 = 4
+const @gui_ID_BLUE: i32 = 5
+const @gui_ID_HEADING: i32 = 10
+const @gui_ID_SUB: i32 = 11
+const @gui_ID_KEYLABEL: i32 = 12
+const @gui_ID_KEYVAL: i32 = 13
+const @gui_ID_HINT: i32 = 14
+
+const @gui_C_DESKTOP: i32 = 0x1E2430
+const @gui_C_PANEL: i32 = 0x2B3446
+const @gui_C_TEXT: i32 = 0x1A1F29
+const @gui_C_MUTED: i32 = 0x5A6578
+const @gui_C_LIGHT: i32 = 0xF2F5FA
+const @gui_C_SOFT: i32 = 0x9AA6BA
+const @gui_C_RED: i32 = 0xC0392B
+const @gui_C_GREEN: i32 = 0x27AE60
+const @gui_C_BLUE: i32 = 0x2D6CDF
+const @gui_C_CLOSE: i32 = 0xE74C3C
+
+const @gui_A_WINDOW: i32 = 216
+const @gui_A_HINT: i32 = 176
+
+const @gui_S_TITLE: [i8, 14] = "osone desktop"
+const @gui_S_WINTITLE: [i8, 10] = "osone gui"
+const @gui_S_SUB: [i8, 31] = "a tiny GUI drawn by the kernel"
+const @gui_S_RED: [i8, 4] = "RED"
+const @gui_S_GREEN: [i8, 6] = "GREEN"
+const @gui_S_BLUE: [i8, 5] = "BLUE"
+const @gui_S_KEY: [i8, 5] = "key:"
+const @gui_S_HINT: [i8, 21] = "click a color button"
+const @gui_S_EXIT: [i8, 17] = "ESC or q to exit"
+const @gui_S_X: [i8, 2] = "x"
+const @gui_S_SPACE: [i8, 6] = "SPACE"
+const @gui_S_ENTER: [i8, 6] = "ENTER"
+const @gui_S_BACKSPACE: [i8, 10] = "BACKSPACE"
+const @gui_S_ESC: [i8, 4] = "ESC"
+const @gui_S_SHIFT: [i8, 6] = "SHIFT"
+const @gui_LETTERS: [i8, 27] = "QWERTYUIOPASDFGHJKLZXCVBNM"
+const @gui_HEX: [i8, 17] = "0123456789ABCDEF"
+
+const @gui_MSG_ENTER: [i8, 26] = "gui: enter (ESC to exit)\n"
+const @gui_MSG_EXIT: [i8, 11] = "gui: exit\n"
+const @gui_MSG_NODEV: [i8, 59] = "gui: no virtio-gpu device; start QEMU with 'make run-gui'\n"
+const @gui_MSG_NOINIT: [i8, 55] = "gui: virtio-gpu init failed; see the boot 'gpu:' line\n"
+
+global @gui_THEME: i32
+global @gui_SHIFT: i32
+global @gui_DIRTY: i32
+global @gui_PX: i32
+global @gui_PY: i32
+global @gui_PDEV: i32
+global @gui_KBUF: [i8, 24]
+global @gui_SW: i32
+global @gui_SH: i32
+
+fun @gui_now_ms() -> i64 {
+  @entry:
+    %f = call @timer_freq()
+    %z = eq i64 %f, 0
+    br %z, @none, @calc
+  @none:
+    ret i64 0
+  @calc:
+    %t = call @timer_now()
+    %k = mul i64 %t, 1000
+    %ms = udiv i64 %k, %f
+    ret i64 %ms
+}
+
+fun @gui_wait_ms(ms: i32) -> void {
+  @entry:
+    %f = call @timer_freq()
+    %z = eq i64 %f, 0
+    br %z, @ret, @calc
+  @calc:
+    %start = call @gui_now_ms()
+    %ms64 = sext i32 %ms to i64
+    %end = add i64 %start, %ms64
+    jmp @cond
+  @cond:
+    %now = call @gui_now_ms()
+    %done = sge i64 %now, %end
+    br %done, @ret, @wait
+  @wait:
+    asm att void, "wfe", "~{memory}"
+    jmp @cond
+  @ret:
+    ret void
+}
+
+fun @gui_accent() -> i32 {
+  @entry:
+    %t = load i32, *@gui_THEME
+    %isred = eq i32 %t, 1
+    br %isred, @red, @chk_green
+  @chk_green:
+    %isgreen = eq i32 %t, 2
+    br %isgreen, @green, @blue
+  @red:
+    ret i32 @gui_C_RED
+  @green:
+    ret i32 @gui_C_GREEN
+  @blue:
+    ret i32 @gui_C_BLUE
+}
+
+fun @gui_apply_theme(t: i32) -> void {
+  @entry:
+    store i32 %t, *@gui_THEME
+    %ac = call @gui_accent()
+    call @widget_set_color(@gui_ID_WINDOW, %ac)
+    call @widget_set_color(@gui_ID_KEYVAL, %ac)
+    %isred = eq i32 %t, 1
+    br %isred, @red, @chk_green
+  @chk_green:
+    %isgreen = eq i32 %t, 2
+    br %isgreen, @green, @blue
+  @red:
+    call @widget_select(@gui_ID_RED)
+    jmp @done
+  @green:
+    call @widget_select(@gui_ID_GREEN)
+    jmp @done
+  @blue:
+    call @widget_select(@gui_ID_BLUE)
+    jmp @done
+  @done:
+    store i32 1, *@gui_DIRTY
+    ret void
+}
+
+fun @gui_map_axis(v: i32, vmin: i32, vmax: i32, size: i32) -> i32 {
+  @entry:
+    %span = sub i32 %vmax, %vmin
+    %zero = eq i32 %span, 0
+    br %zero, @ret0, @clamp_start
+  @clamp_start:
+    %c = let i32
+    store i32 %v, *%c
+    %lt = slt i32 %v, %vmin
+    br %lt, @setmin, @chkmax
+  @setmin:
+    store i32 %vmin, *%c
+    jmp @chkmax
+  @chkmax:
+    %cv = load i32, *%c
+    %gt = sgt i32 %cv, %vmax
+    br %gt, @setmax, @calc
+  @setmax:
+    store i32 %vmax, *%c
+    jmp @calc
+  @calc:
+    %cv2 = load i32, *%c
+    %d = sub i32 %cv2, %vmin
+    %last = sub i32 %size, 1
+    %num = mul i32 %d, %last
+    %res = udiv i32 %num, %span
+    ret i32 %res
+  @ret0:
+    ret i32 0
+}
+
+fun @gui_map_x(v: i32) -> i32 {
+  @entry:
+    %dev = load i32, *@gui_PDEV
+    %mn = call @input_abs_min(%dev, 0)
+    %mx = call @input_abs_max(%dev, 0)
+    %w = load i32, *@gui_SW
+    %r = call @gui_map_axis(%v, %mn, %mx, %w)
+    ret i32 %r
+}
+
+fun @gui_map_y(v: i32) -> i32 {
+  @entry:
+    %dev = load i32, *@gui_PDEV
+    %mn = call @input_abs_min(%dev, 1)
+    %mx = call @input_abs_max(%dev, 1)
+    %h = load i32, *@gui_SH
+    %r = call @gui_map_axis(%v, %mn, %mx, %h)
+    ret i32 %r
+}
+
+fun @gui_set_char(c: i32) -> void {
+  @entry:
+    %p = gep i8, *@gui_KBUF, 0
+    %c8 = trunc i32 %c to i8
+    store i8 %c8, *%p
+    %p1 = gep i8, *@gui_KBUF, 1
+    store i8 0, *%p1
+    ret void
+}
+
+fun @gui_set_name(src: *i8) -> void {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @cond
+  @cond:
+    %iv = load i32, *%i
+    %sp = gep i8, *%src, %iv
+    %c = load i8, *%sp
+    %dp = gep i8, *@gui_KBUF, %iv
+    store i8 %c, *%dp
+    %z = eq i8 %c, 0
+    br %z, @done, @body
+  @body:
+    %n = add i32 %iv, 1
+    store i32 %n, *%i
+    jmp @cond
+  @done:
+    ret void
+}
+
+fun @gui_set_hex(code: i32) -> void {
+  @entry:
+    %b0 = gep i8, *@gui_KBUF, 0
+    store i8 75, *%b0
+    %b1 = gep i8, *@gui_KBUF, 1
+    store i8 69, *%b1
+    %b2 = gep i8, *@gui_KBUF, 2
+    store i8 89, *%b2
+    %b3 = gep i8, *@gui_KBUF, 3
+    store i8 32, *%b3
+    %b4 = gep i8, *@gui_KBUF, 4
+    store i8 48, *%b4
+    %b5 = gep i8, *@gui_KBUF, 5
+    store i8 120, *%b5
+    %hi = and i32 %code, 0xF0
+    %his = lshr i32 %hi, 4
+    %hp = gep i8, *@gui_HEX, %his
+    %hc = load i8, *%hp
+    %b6 = gep i8, *@gui_KBUF, 6
+    store i8 %hc, *%b6
+    %lo = and i32 %code, 0x0F
+    %lp = gep i8, *@gui_HEX, %lo
+    %lc = load i8, *%lp
+    %b7 = gep i8, *@gui_KBUF, 7
+    store i8 %lc, *%b7
+    %b8 = gep i8, *@gui_KBUF, 8
+    store i8 0, *%b8
+    ret void
+}
+
+fun @gui_set_letter(idx: i32, shift: i32) -> void {
+  @entry:
+    %p = gep i8, *@gui_LETTERS, %idx
+    %c = load i8, *%p
+    %ci = zext i8 %c to i32
+    %up = ne i32 %shift, 0
+    br %up, @upper, @lower
+  @upper:
+    call @gui_set_char(%ci)
+    ret void
+  @lower:
+    %lc = add i32 %ci, 32
+    call @gui_set_char(%lc)
+    ret void
+}
+
+fun @gui_key_name(code: i32, shift: i32) -> void {
+  @entry:
+    %q0 = sge i32 %code, 16
+    br %q0, @qhi, @row_a
+  @qhi:
+    %q1 = slt i32 %code, 26
+    br %q1, @qset, @row_a
+  @qset:
+    %qi = sub i32 %code, 16
+    call @gui_set_letter(%qi, %shift)
+    ret void
+  @row_a:
+    %a0 = sge i32 %code, 30
+    br %a0, @ahi, @row_z
+  @ahi:
+    %a1 = slt i32 %code, 39
+    br %a1, @aset, @row_z
+  @aset:
+    %ai = sub i32 %code, 30
+    %ai2 = add i32 %ai, 10
+    call @gui_set_letter(%ai2, %shift)
+    ret void
+  @row_z:
+    %z0 = sge i32 %code, 44
+    br %z0, @zhi, @digits
+  @zhi:
+    %z1 = slt i32 %code, 51
+    br %z1, @zset, @digits
+  @zset:
+    %zi = sub i32 %code, 44
+    %zi2 = add i32 %zi, 19
+    call @gui_set_letter(%zi2, %shift)
+    ret void
+  @digits:
+    %d0 = sge i32 %code, 2
+    br %d0, @dhi, @special
+  @dhi:
+    %d1 = slt i32 %code, 12
+    br %d1, @dset, @special
+  @dset:
+    %is0 = eq i32 %code, 11
+    br %is0, @zero, @dchar
+  @zero:
+    call @gui_set_char(48)
+    ret void
+  @dchar:
+    %dv = sub i32 %code, 1
+    %dc = add i32 48, %dv
+    call @gui_set_char(%dc)
+    ret void
+  @special:
+    %isspace = eq i32 %code, 57
+    br %isspace, @space, @enter
+  @space:
+    %sp = gep i8, *@gui_S_SPACE, 0
+    call @gui_set_name(%sp)
+    ret void
+  @enter:
+    %isent = eq i32 %code, 28
+    br %isent, @enter2, @back
+  @enter2:
+    %ep = gep i8, *@gui_S_ENTER, 0
+    call @gui_set_name(%ep)
+    ret void
+  @back:
+    %isbs = eq i32 %code, 14
+    br %isbs, @back2, @esc
+  @back2:
+    %bp = gep i8, *@gui_S_BACKSPACE, 0
+    call @gui_set_name(%bp)
+    ret void
+  @esc:
+    %isesc = eq i32 %code, 1
+    br %isesc, @esc2, @shiftkey
+  @esc2:
+    %ecp = gep i8, *@gui_S_ESC, 0
+    call @gui_set_name(%ecp)
+    ret void
+  @shiftkey:
+    %is1 = eq i32 %code, 42
+    %is2 = eq i32 %code, 54
+    br %is1, @shiftname, @chk54
+  @chk54:
+    br %is2, @shiftname, @otherkey
+  @shiftname:
+    %shp = gep i8, *@gui_S_SHIFT, 0
+    call @gui_set_name(%shp)
+    ret void
+  @otherkey:
+    call @gui_set_hex(%code)
+    ret void
+}
+
+fun @gui_handle_key(code: i32, val: i32) -> i32 {
+  @entry:
+    %is1 = eq i32 %code, 42
+    br %is1, @shift, @chk54
+  @chk54:
+    %is2 = eq i32 %code, 54
+    br %is2, @shift, @normal
+  @shift:
+    %rel = eq i32 %val, 0
+    br %rel, @shift_up, @shift_down
+  @shift_up:
+    store i32 0, *@gui_SHIFT
+    ret i32 0
+  @shift_down:
+    store i32 1, *@gui_SHIFT
+    ret i32 0
+  @normal:
+    %released = eq i32 %val, 0
+    br %released, @none, @press
+  @press:
+    %isesc = eq i32 %code, 1
+    br %isesc, @quit, @update
+  @update:
+    %sh = load i32, *@gui_SHIFT
+    call @gui_key_name(%code, %sh)
+    store i32 1, *@gui_DIRTY
+    ret i32 0
+  @quit:
+    ret i32 1
+  @none:
+    ret i32 0
+}
+
+fun @gui_handle_ptr(typ: i32, code: i32, val: i32) -> i32 {
+  @entry:
+    %isabs = eq i32 %typ, @gui_EV_ABS
+    br %isabs, @abs, @other
+  @abs:
+    %isx = eq i32 %code, 0
+    br %isx, @mx, @absy
+  @absy:
+    %isy = eq i32 %code, 1
+    br %isy, @my, @none
+  @mx:
+    %nx = call @gui_map_x(%val)
+    store i32 %nx, *@gui_PX
+    %py = load i32, *@gui_PY
+    %ch = call @widget_pointer_move(%nx, %py)
+    %chg = eq i32 %ch, 1
+    br %chg, @dirty, @none
+  @my:
+    %ny = call @gui_map_y(%val)
+    store i32 %ny, *@gui_PY
+    %px = load i32, *@gui_PX
+    %ch2 = call @widget_pointer_move(%px, %ny)
+    %chg2 = eq i32 %ch2, 1
+    br %chg2, @dirty, @none
+  @dirty:
+    store i32 1, *@gui_DIRTY
+    ret i32 0
+  @other:
+    %iskey = eq i32 %typ, @gui_EV_KEY
+    br %iskey, @keyev, @none
+  @keyev:
+    %isleft = eq i32 %code, @gui_BTN_LEFT
+    br %isleft, @left, @none
+  @left:
+    %down = ne i32 %val, 0
+    br %down, @press, @release
+  @press:
+    %px2 = load i32, *@gui_PX
+    %py2 = load i32, *@gui_PY
+    %idp = call @widget_pointer_down(%px2, %py2)
+    %missp = eq i32 %idp, -1
+    br %missp, @none, @dirty
+  @release:
+    %px3 = load i32, *@gui_PX
+    %py3 = load i32, *@gui_PY
+    %id = call @widget_pointer_up(%px3, %py3)
+    store i32 1, *@gui_DIRTY
+    %isclose = eq i32 %id, @gui_ID_CLOSE
+    br %isclose, @quit, @chk_red
+  @chk_red:
+    %isred = eq i32 %id, @gui_ID_RED
+    br %isred, @red, @chk_green
+  @chk_green:
+    %isgreen = eq i32 %id, @gui_ID_GREEN
+    br %isgreen, @green, @chk_blue
+  @chk_blue:
+    %isblue = eq i32 %id, @gui_ID_BLUE
+    br %isblue, @blue, @none
+  @red:
+    call @gui_apply_theme(1)
+    ret i32 0
+  @green:
+    call @gui_apply_theme(2)
+    ret i32 0
+  @blue:
+    call @gui_apply_theme(0)
+    ret i32 0
+  @quit:
+    ret i32 1
+  @none:
+    ret i32 0
+}
+
+fun @gui_layout() -> void {
+  @entry:
+    %sw = load i32, *@gui_SW
+    %sh = load i32, *@gui_SH
+    %ww = let i32
+    %wh = let i32
+    store i32 720, *%ww
+    store i32 420, *%wh
+    %maxw = sub i32 %sw, 80
+    %toow = sgt i32 720, %maxw
+    br %toow, @clamp_w, @chk_h
+  @clamp_w:
+    store i32 %maxw, *%ww
+    jmp @chk_h
+  @chk_h:
+    %maxh = sub i32 %sh, 120
+    %tooh = sgt i32 420, %maxh
+    br %tooh, @clamp_h, @place
+  @clamp_h:
+    store i32 %maxh, *%wh
+    jmp @place
+  @place:
+    %wv = load i32, *%ww
+    %hv = load i32, *%wh
+    %dx = sub i32 %sw, %wv
+    %wx = udiv i32 %dx, 2
+    %dy = sub i32 %sh, %hv
+    %wy = udiv i32 %dy, 2
+    call @widget_reset()
+
+    %ac = call @gui_accent()
+    %wt = gep i8, *@gui_S_WINTITLE, 0
+    call @widget_add_window(@gui_ID_WINDOW, %wx, %wy, %wv, %hv, %ac, %wt)
+
+    %cx = sub i32 %wv, 40
+    %cx2 = add i32 %wx, %cx
+    %cy = add i32 %wy, 8
+    %xl = gep i8, *@gui_S_X, 0
+    call @widget_add_button(@gui_ID_CLOSE, %cx2, %cy, 24, 24, @gui_C_CLOSE, %xl)
+
+    %hx = add i32 %wx, 36
+    %hy = add i32 %wy, 70
+    %head = gep i8, *@gui_S_TITLE, 0
+    call @widget_add_text(@gui_ID_HEADING, %hx, %hy, @gui_C_TEXT, 2, %head)
+    %suby = add i32 %wy, 100
+    %sub = gep i8, *@gui_S_SUB, 0
+    call @widget_add_text(@gui_ID_SUB, %hx, %suby, @gui_C_MUTED, 1, %sub)
+
+    %bx0 = add i32 %wx, 60
+    %bx1 = add i32 %bx0, 164
+    %bx2 = add i32 %bx1, 164
+    %by = add i32 %wy, 180
+    %redl = gep i8, *@gui_S_RED, 0
+    call @widget_add_button(@gui_ID_RED, %bx0, %by, 140, 52, @gui_C_RED, %redl)
+    %greenl = gep i8, *@gui_S_GREEN, 0
+    call @widget_add_button(@gui_ID_GREEN, %bx1, %by, 140, 52, @gui_C_GREEN, %greenl)
+    %bluel = gep i8, *@gui_S_BLUE, 0
+    call @widget_add_button(@gui_ID_BLUE, %bx2, %by, 140, 52, @gui_C_BLUE, %bluel)
+
+    %kyl = add i32 %wy, 278
+    %kpl = gep i8, *@gui_S_KEY, 0
+    call @widget_add_text(@gui_ID_KEYLABEL, %bx0, %kyl, @gui_C_TEXT, 2, %kpl)
+    %kbx = add i32 %bx0, 80
+    %kb = gep i8, *@gui_KBUF, 0
+    call @widget_add_text(@gui_ID_KEYVAL, %kbx, %kyl, %ac, 2, %kb)
+
+    %hinty = add i32 %wy, 336
+    %hint = gep i8, *@gui_S_HINT, 0
+    call @widget_add_text(@gui_ID_HINT, %bx0, %hinty, @gui_C_MUTED, 1, %hint)
+
+    call @widget_set_alpha(@gui_ID_WINDOW, @gui_A_WINDOW)
+    call @widget_set_alpha(@gui_ID_HINT, @gui_A_HINT)
+
+    %t = load i32, *@gui_THEME
+    call @gui_apply_theme(%t)
+    ret void
+}
+
+fun @gui_draw_scene() -> void {
+  @entry:
+    %w = load i32, *@gui_SW
+    %h = load i32, *@gui_SH
+    call @gui_fill_rect(0, 0, %w, %h, @gui_C_DESKTOP)
+    call @gui_fill_rect(0, 0, %w, 36, @gui_C_PANEL)
+    %title = gep i8, *@gui_S_TITLE, 0
+    call @render_text(16, 14, %title, @gui_C_LIGHT, 1, 255)
+
+    call @widget_draw()
+
+    %exit = gep i8, *@gui_S_EXIT, 0
+    %ey = sub i32 %h, 28
+    call @render_text_centered(0, %ey, %w, %exit, @gui_C_SOFT, 1, 200)
+    ret void
+}
+
+fun @gui_drain(ev: *i32) -> void {
+  @entry:
+    jmp @cond
+  @cond:
+    %got = call @input_poll(%ev)
+    %has = eq i32 %got, 1
+    br %has, @cond, @done
+  @done:
+    ret void
+}
+
+fun @gui_run() -> i32 {
+  @entry:
+    %ready = call @gpu_ready()
+    %rok = eq i32 %ready, 1
+    br %rok, @go, @nodev
+  @nodev:
+    %pres = call @gpu_present()
+    %devhas = eq i32 %pres, 1
+    br %devhas, @noinit, @absent
+  @noinit:
+    %im = gep i8, *@gui_MSG_NOINIT, 0
+    call @console_puts(%im)
+    ret i32 -1
+  @absent:
+    %nm = gep i8, *@gui_MSG_NODEV, 0
+    call @console_puts(%nm)
+    ret i32 -1
+  @go:
+    %fb = call @gpu_fb()
+    %w = call @gpu_width()
+    %h = call @gpu_height()
+    call @gui_draw_init(%fb, %w, %h)
+    store i32 %w, *@gui_SW
+    store i32 %h, *@gui_SH
+    store i32 0, *@gui_THEME
+    store i32 0, *@gui_SHIFT
+    store i32 0, *@gui_DIRTY
+    store i32 0, *@gui_PX
+    store i32 0, *@gui_PY
+    call @gui_layout()
+    %pdev = call @input_find_kind(@gui_KIND_TABLET)
+    store i32 %pdev, *@gui_PDEV
+    call @gui_set_char(45)
+    %em = gep i8, *@gui_MSG_ENTER, 0
+    call @console_puts(%em)
+    %ev = let [i32, 4]
+    %evp = gep i32, *%ev, 0
+    call @gui_drain(%evp)
+    call @gui_draw_scene()
+    %fr = call @gpu_flush()
+    %quit = let i32
+    store i32 0, *%quit
+    jmp @loop
+  @loop:
+    %c = call @console_getc()
+    %hasch = sge i32 %c, 0
+    br %hasch, @ser, @poll_init
+  @ser:
+    %isq = eq i32 %c, 113
+    br %isq, @quit_loop, @ser_esc
+  @ser_esc:
+    %isesc = eq i32 %c, 27
+    br %isesc, @quit_loop, @poll_init
+  @poll_init:
+    %cnt = let i32
+    store i32 0, *%cnt
+    jmp @poll_cond
+  @poll_cond:
+    %cv = load i32, *%cnt
+    %cend = sge i32 %cv, 64
+    br %cend, @after_poll, @poll_one
+  @poll_one:
+    %got = call @input_poll(%evp)
+    %has = eq i32 %got, 1
+    br %has, @handle, @after_poll
+  @handle:
+    %src = load i32, *%evp
+    %typp = gep i32, *%evp, 1
+    %typ = load i32, *%typp
+    %codp = gep i32, *%evp, 2
+    %cod = load i32, *%codp
+    %valp = gep i32, *%evp, 3
+    %val = load i32, *%valp
+    %iskbd = eq i32 %src, 1
+    br %iskbd, @hkey, @hptr
+  @hkey:
+    %qk = call @gui_handle_key(%cod, %val)
+    %qkb = eq i32 %qk, 1
+    br %qkb, @quit_loop, @ev_done
+  @hptr:
+    %qp = call @gui_handle_ptr(%typ, %cod, %val)
+    %qpb = eq i32 %qp, 1
+    br %qpb, @quit_loop, @ev_done
+  @ev_done:
+    %cv2 = load i32, *%cnt
+    %cn = add i32 %cv2, 1
+    store i32 %cn, *%cnt
+    jmp @poll_cond
+  @after_poll:
+    %dv = load i32, *@gui_DIRTY
+    %dd = eq i32 %dv, 1
+    br %dd, @repaint, @wait
+  @repaint:
+    call @gui_draw_scene()
+    %fr2 = call @gpu_flush()
+    store i32 0, *@gui_DIRTY
+    jmp @wait
+  @wait:
+    call @gui_wait_ms(8)
+    jmp @loop
+  @quit_loop:
+    %xm = gep i8, *@gui_MSG_EXIT, 0
+    call @console_puts(%xm)
+    ret i32 0
+}

@@ -1,0 +1,200 @@
+// url.bx - parse http:// and https:// host[:port][/path] URLs.
+
+const @url_HTTP: [i8, 8] = "http://"
+const @url_HTTPS: [i8, 9] = "https://"
+
+// Returns 1 when s starts with p.
+fun @url_prefix(s: *i8, p: *i8) -> i32 {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @cond
+  @cond:
+    %iv = load i32, *%i
+    %pp = gep i8, *%p, %iv
+    %pc = load i8, *%pp
+    %z = eq i8 %pc, 0
+    br %z, @yes, @body
+  @body:
+    %sp = gep i8, *%s, %iv
+    %sc = load i8, *%sp
+    %same = eq i8 %sc, %pc
+    br %same, @next, @no
+  @next:
+    %n = add i32 %iv, 1
+    store i32 %n, *%i
+    jmp @cond
+  @yes:
+    ret i32 1
+  @no:
+    ret i32 0
+}
+
+// Parse a URL into host, path and port.  Returns 0 on success, -1 on a
+// malformed URL and -2 when the scheme is neither http nor https.  schemep is
+// set to 0 for http and 1 for https.
+fun @url_parse(src: *i8, host: *i8, path: *i8, portp: *i32, schemep: *i32,
+               hostcap: i32, pathcap: i32) -> i32 {
+  @entry:
+    %i = let i32
+    %hl = let i32
+    %port = let i32
+    %http = gep i8, *@url_HTTP, 0
+    %ishttp = call @url_prefix(%src, %http)
+    %okhttp = eq i32 %ishttp, 1
+    br %okhttp, @scheme_http, @scheme
+  @scheme_http:
+    store i32 0, *%schemep
+    store i32 7, *%i
+    store i32 80, *%port
+    jmp @after_scheme
+  @scheme:
+    %https = gep i8, *@url_HTTPS, 0
+    %ishttps = call @url_prefix(%src, %https)
+    %okhttps = eq i32 %ishttps, 1
+    br %okhttps, @scheme_https, @unsupported
+  @scheme_https:
+    store i32 1, *%schemep
+    store i32 8, *%i
+    store i32 443, *%port
+    jmp @after_scheme
+  @after_scheme:
+    store i32 0, *%hl
+    jmp @host_cond
+  @host_cond:
+    %iv = load i32, *%i
+    %cp = gep i8, *%src, %iv
+    %ch = load i8, *%cp
+    %z = eq i8 %ch, 0
+    br %z, @host_done, @host_chk
+  @host_chk:
+    %colon = eq i8 %ch, 58
+    %slash = eq i8 %ch, 47
+    %stop = or i1 %colon, %slash
+    br %stop, @host_done, @host_store
+  @host_store:
+    %hlv = load i32, *%hl
+    %hlim = sub i32 %hostcap, 1
+    %hfull = sge i32 %hlv, %hlim
+    br %hfull, @invalid, @host_put
+  @host_put:
+    %dp = gep i8, *%host, %hlv
+    store i8 %ch, *%dp
+    %nhl = add i32 %hlv, 1
+    store i32 %nhl, *%hl
+    %ni = add i32 %iv, 1
+    store i32 %ni, *%i
+    jmp @host_cond
+  @host_done:
+    %hlf = load i32, *%hl
+    %empty = eq i32 %hlf, 0
+    br %empty, @invalid, @host_term
+  @host_term:
+    %tp = gep i8, *%host, %hlf
+    store i8 0, *%tp
+    %iv2 = load i32, *%i
+    %cp2 = gep i8, *%src, %iv2
+    %ch2 = load i8, *%cp2
+    %colon2 = eq i8 %ch2, 58
+    br %colon2, @port_begin, @path_begin
+  @port_begin:
+    %pi = add i32 %iv2, 1
+    store i32 %pi, *%i
+    store i32 0, *%port
+    %pgot = let i32
+    store i32 0, *%pgot
+    jmp @port_cond
+  @port_cond:
+    %pvi = load i32, *%i
+    %pcp = gep i8, *%src, %pvi
+    %pch = load i8, *%pcp
+    %pz = eq i8 %pch, 0
+    br %pz, @port_done, @port_chk
+  @port_chk:
+    %pslash = eq i8 %pch, 47
+    br %pslash, @port_done, @port_digit
+  @port_digit:
+    %low = sge i8 %pch, 48
+    %high = sle i8 %pch, 57
+    %isd = and i1 %low, %high
+    br %isd, @port_acc, @invalid
+  @port_acc:
+    %pv = load i32, *%port
+    %mul = mul i32 %pv, 10
+    %cv = zext i8 %pch to i32
+    %d = sub i32 %cv, 48
+    %nv = add i32 %mul, %d
+    store i32 %nv, *%port
+    store i32 1, *%pgot
+    %pi2 = add i32 %pvi, 1
+    store i32 %pi2, *%i
+    jmp @port_cond
+  @port_done:
+    %gv = load i32, *%pgot
+    %nogot = eq i32 %gv, 0
+    br %nogot, @invalid, @port_check
+  @port_check:
+    %pv2 = load i32, *%port
+    %lo = sle i32 %pv2, 0
+    br %lo, @invalid, @port_hi
+  @port_hi:
+    %hi = sgt i32 %pv2, 65535
+    br %hi, @invalid, @path_begin
+  @path_begin:
+    %pl = let i32
+    store i32 0, *%pl
+    %iv3 = load i32, *%i
+    %cp3 = gep i8, *%src, %iv3
+    %ch3 = load i8, *%cp3
+    %pz2 = eq i8 %ch3, 0
+    br %pz2, @default_path, @path_chk
+  @path_chk:
+    %pslash2 = eq i8 %ch3, 47
+    br %pslash2, @path_copy, @path_query
+  @path_query:
+    %isq = eq i8 %ch3, 63
+    br %isq, @path_query_ok, @invalid
+  @path_query_ok:
+    %qdp = gep i8, *%path, 0
+    store i8 47, *%qdp
+    store i32 1, *%pl
+    jmp @path_copy
+  @default_path:
+    %dp0 = gep i8, *%path, 0
+    store i8 47, *%dp0
+    %dp1 = gep i8, *%path, 1
+    store i8 0, *%dp1
+    %pv3 = load i32, *%port
+    store i32 %pv3, *%portp
+    ret i32 0
+  @path_copy:
+    %ivp = load i32, *%i
+    %scp = gep i8, *%src, %ivp
+    %sch = load i8, *%scp
+    %sz = eq i8 %sch, 0
+    br %sz, @path_done, @path_cap
+  @path_cap:
+    %plv = load i32, *%pl
+    %plim = sub i32 %pathcap, 1
+    %pfull = sge i32 %plv, %plim
+    br %pfull, @invalid, @path_put
+  @path_put:
+    %pdp = gep i8, *%path, %plv
+    store i8 %sch, *%pdp
+    %npl = add i32 %plv, 1
+    store i32 %npl, *%pl
+    %ni2 = add i32 %ivp, 1
+    store i32 %ni2, *%i
+    jmp @path_copy
+  @path_done:
+    %plv2 = load i32, *%pl
+    %pdp2 = gep i8, *%path, %plv2
+    store i8 0, *%pdp2
+    %pv4 = load i32, *%port
+    store i32 %pv4, *%portp
+    ret i32 0
+  @unsupported:
+    ret i32 -2
+  @invalid:
+    ret i32 -1
+}

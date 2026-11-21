@@ -1,0 +1,190 @@
+// nettest.bx - network stack self-test: ARP / ICMP / UDP / TCP
+//
+// Depends on the host-side L2 peer (tests/net_peer.bx, started by `make run-peer`):
+// it answers ARP, echoes ICMP, echoes on UDP port 7, and echoes on TCP port 7000
+// before sending FIN.
+
+extern @net_ready() -> i32
+extern @net_gateway() -> i32
+extern @arp_resolve(ip: i32) -> *i8
+extern @icmp_ping(dst: i32, seq: i32, timeout_ms: i32) -> i32
+extern @udp_send(dst: i32, dport: i32, sport: i32, data: *i8, len: i32) -> i32
+extern @udp_recv(port: i32, buf: *i8, max: i32, timeout_ms: i32) -> i32
+extern @tcp_connect(ip: i32, port: i32, timeout_ms: i32) -> i32
+extern @tcp_send(id: i32, data: *i8, len: i32) -> i32
+extern @tcp_recv(id: i32, buf: *i8, max: i32, timeout_ms: i32) -> i32
+extern @tcp_close(id: i32) -> i32
+extern @net_memcmp(a: *i8, b: *i8, n: i32) -> i32
+extern @console_puts(s: *i8) -> void
+extern @console_putc(ch: i32) -> void
+extern @console_printf(fmt: *i8, a: i64, b: i64, c: i64, d: i64, s1: *i8, s2: *i8) -> void
+
+const @nettest_NODEV: [i8, 23] = "net: device not ready\n"
+const @nettest_HDR: [i8, 15] = "net: selftest\n"
+const @nettest_ARP_OK: [i8, 23] = "arp: gateway resolved\n"
+const @nettest_ARP_FAIL: [i8, 32] = "arp: FAILED (no gateway reply)\n"
+const @nettest_ICMP_OK: [i8, 20] = "icmp: seq=%d reply\n"
+const @nettest_ICMP_BAD: [i8, 22] = "icmp: seq=%d timeout\n"
+const @nettest_UDP_OK: [i8, 14] = "udp: echo ok\n"
+const @nettest_UDP_BAD: [i8, 13] = "udp: FAILED\n"
+const @nettest_TCP_CONN: [i8, 16] = "tcp: connected\n"
+const @nettest_TCP_RX: [i8, 23] = "tcp: recv %d bytes: %s"
+const @nettest_TCP_EOF: [i8, 16] = "tcp: eof (FIN)\n"
+const @nettest_TCP_BAD: [i8, 13] = "tcp: FAILED\n"
+const @nettest_PASS: [i8, 23] = "net: all tests passed\n"
+const @nettest_FAIL: [i8, 22] = "net: selftest FAILED\n"
+const @nettest_NL: [i8, 2] = "\n"
+const @nettest_UDP_MSG: [i8, 10] = "hello-udp"
+const @nettest_TCP_MSG: [i8, 11] = "hello-tcp\n"
+
+global @nettest_RXBUF: [i8, 256]
+global @nettest_FAILED: i32
+
+fun @nettest_fail() -> void {
+  @entry:
+    store i32 1, *@nettest_FAILED
+    ret void
+}
+
+fun @nettest_run() -> i32 {
+  @entry:
+    %ready = call @net_ready()
+    %up = eq i32 %ready, 1
+    br %up, @start, @nodev
+  @nodev:
+    %m = gep i8, *@nettest_NODEV, 0
+    call @console_puts(%m)
+    ret i32 0
+  @start:
+    store i32 0, *@nettest_FAILED
+    %hdr = gep i8, *@nettest_HDR, 0
+    call @console_puts(%hdr)
+    %gw = call @net_gateway()
+    %mac = call @arp_resolve(%gw)
+    %nomac = eq *i8 %mac, null
+    br %nomac, @arp_bad, @arp_ok
+  @arp_bad:
+    %ab = gep i8, *@nettest_ARP_FAIL, 0
+    call @console_puts(%ab)
+    call @nettest_fail()
+    jmp @summary
+  @arp_ok:
+    %ao = gep i8, *@nettest_ARP_OK, 0
+    call @console_puts(%ao)
+    %seq = let i32
+    store i32 1, *%seq
+    jmp @ping_cond
+  @ping_cond:
+    %sv = load i32, *%seq
+    %pdone = sgt i32 %sv, 4
+    br %pdone, @udp_start, @ping_body
+  @ping_body:
+    %sv2 = load i32, *%seq
+    %ok = call @icmp_ping(%gw, %sv2, 1000)
+    %got = eq i32 %ok, 1
+    %sv64 = sext i32 %sv2 to i64
+    br %got, @ping_ok, @ping_bad
+  @ping_ok:
+    %pf = gep i8, *@nettest_ICMP_OK, 0
+    call @console_printf(%pf, %sv64, 0, 0, 0, null, null)
+    jmp @ping_next
+  @ping_bad:
+    %pbf = gep i8, *@nettest_ICMP_BAD, 0
+    call @console_printf(%pbf, %sv64, 0, 0, 0, null, null)
+    call @nettest_fail()
+    jmp @ping_next
+  @ping_next:
+    %sn = add i32 %sv2, 1
+    store i32 %sn, *%seq
+    jmp @ping_cond
+  @udp_start:
+    %umsg = gep i8, *@nettest_UDP_MSG, 0
+    %sr = call @udp_send(%gw, 7, 5555, %umsg, 9)
+    %sok = sge i32 %sr, 0
+    br %sok, @udp_wait, @udp_bad
+  @udp_wait:
+    %rx = gep i8, *@nettest_RXBUF, 0
+    %n = call @udp_recv(5555, %rx, 64, 1500)
+    %nok = sgt i32 %n, 0
+    br %nok, @udp_cmp, @udp_bad
+  @udp_cmp:
+    %rx2 = gep i8, *@nettest_RXBUF, 0
+    %umsg2 = gep i8, *@nettest_UDP_MSG, 0
+    %cmp = call @net_memcmp(%rx2, %umsg2, 9)
+    %same = eq i32 %cmp, 0
+    %enough = sge i32 %n, 9
+    %match = and i1 %same, %enough
+    br %match, @udp_ok, @udp_bad
+  @udp_ok:
+    %uo = gep i8, *@nettest_UDP_OK, 0
+    call @console_puts(%uo)
+    jmp @tcp_start
+  @udp_bad:
+    %ub = gep i8, *@nettest_UDP_BAD, 0
+    call @console_puts(%ub)
+    call @nettest_fail()
+    jmp @tcp_start
+  @tcp_start:
+    %id = call @tcp_connect(%gw, 7000, 2000)
+    %conn = sge i32 %id, 0
+    br %conn, @tcp_conn, @tcp_bad
+  @tcp_conn:
+    %tc = gep i8, *@nettest_TCP_CONN, 0
+    call @console_puts(%tc)
+    %tmsg = gep i8, *@nettest_TCP_MSG, 0
+    %sr2 = call @tcp_send(%id, %tmsg, 10)
+    %sok2 = sge i32 %sr2, 0
+    br %sok2, @tcp_rx, @tcp_close_bad
+  @tcp_rx:
+    %rx3 = gep i8, *@nettest_RXBUF, 0
+    %n2 = call @tcp_recv(%id, %rx3, 200, 3000)
+    %n2ok = sgt i32 %n2, 0
+    br %n2ok, @tcp_print, @tcp_close_bad
+  @tcp_print:
+    %rx4 = gep i8, *@nettest_RXBUF, 0
+    %tp = gep i8, *@nettest_RXBUF, %n2
+    store i8 0, *%tp
+    %fmt = gep i8, *@nettest_TCP_RX, 0
+    %n264 = sext i32 %n2 to i64
+    call @console_printf(%fmt, %n264, 0, 0, 0, %rx4, null)
+    %nl = gep i8, *@nettest_NL, 0
+    call @console_puts(%nl)
+    jmp @tcp_eof
+  @tcp_eof:
+    %rx5 = gep i8, *@nettest_RXBUF, 0
+    %n3 = call @tcp_recv(%id, %rx5, 200, 1000)
+    %iseof = eq i32 %n3, 0
+    br %iseof, @tcp_eof_ok, @tcp_eof_skip
+  @tcp_eof_ok:
+    %ef = gep i8, *@nettest_TCP_EOF, 0
+    call @console_puts(%ef)
+    jmp @tcp_finish
+  @tcp_eof_skip:
+    call @nettest_fail()
+    jmp @tcp_finish
+  @tcp_close_bad:
+    %tb = gep i8, *@nettest_TCP_BAD, 0
+    call @console_puts(%tb)
+    call @nettest_fail()
+    jmp @tcp_finish
+  @tcp_finish:
+    call @tcp_close(%id)
+    jmp @summary
+  @tcp_bad:
+    %tb2 = gep i8, *@nettest_TCP_BAD, 0
+    call @console_puts(%tb2)
+    call @nettest_fail()
+    jmp @summary
+  @summary:
+    %f = load i32, *@nettest_FAILED
+    %failed = eq i32 %f, 1
+    br %failed, @bad, @good
+  @good:
+    %p = gep i8, *@nettest_PASS, 0
+    call @console_puts(%p)
+    ret i32 1
+  @bad:
+    %b = gep i8, *@nettest_FAIL, 0
+    call @console_puts(%b)
+    ret i32 0
+}

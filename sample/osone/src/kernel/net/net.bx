@@ -1,0 +1,540 @@
+// net.bx - network core: NIC initialization, RX polling, byte-order/checksum helpers
+//
+// Address convention: IP addresses are host-order i32 values throughout the code (for example, 192.168.1.222 =
+// 0xC0A801DE) and are written into packets in network (big-endian) order. Link-layer addresses are
+// 6-byte arrays. Addresses match the host LAN, and the gateway also serves as DNS.
+
+extern @virtio_net_init() -> i32
+extern @virtio_net_ready() -> i32
+extern @virtio_net_mac() -> *i8
+extern @virtio_net_send(frame: *i8, len: i32) -> i32
+extern @virtio_net_recv(buf: *i8, max: i32) -> i32
+extern @eth_input(frame: *i8, len: i32) -> void
+extern @timer_now() -> i64
+extern @timer_freq() -> i64
+extern @console_puts(s: *i8) -> void
+extern @console_putc(ch: i32) -> void
+extern @console_printf(fmt: *i8, a: i64, b: i64, c: i64, d: i64, s1: *i8, s2: *i8) -> void
+extern @kmem_memcpy(dst: *i8, src: *i8, n: i64) -> void
+
+// These values are overridden by @net_configure after DHCP succeeds; static fallbacks are used during boot.
+global @net_MY_IP: i32 = 0xC0A801DE
+global @net_NETMASK: i32 = 0xFFFFFF00
+global @net_GATEWAY: i32 = 0xC0A80101
+global @net_DNS: i32 = 0xC0A80101
+const @net_MTU: i32 = 1500
+const @net_EPHEMERAL_BASE: i32 = 40000
+
+const @net_OK_FMT: [i8, 33] = "net: eth0 ip=%d.%d.%d.%d mac=%s\n"
+const @net_NONE: [i8, 27] = "net: no virtio-net device\n"
+const @net_IFCONFIG_HDR: [i8, 7] = "eth0: "
+const @net_IFCONFIG_IP: [i8, 6] = "inet "
+const @net_IFCONFIG_MASK: [i8, 10] = " netmask "
+const @net_IFCONFIG_GW: [i8, 5] = " gw "
+const @net_IFCONFIG_MAC: [i8, 6] = " mac "
+const @net_IP_FMT: [i8, 12] = "%d.%d.%d.%d"
+const @net_HEX: [i8, 17] = "0123456789abcdef"
+
+global @net_READY: i32
+global @net_RXBUF: [i8, 1600]
+global @net_MACSTR: [i8, 18]
+
+fun @net_init() -> i32 {
+  @entry:
+    %ok = call @virtio_net_init()
+    %yes = eq i32 %ok, 1
+    br %yes, @up, @down
+  @down:
+    %m = gep i8, *@net_NONE, 0
+    call @console_puts(%m)
+    store i32 0, *@net_READY
+    ret i32 0
+  @up:
+    store i32 1, *@net_READY
+    %mac = call @virtio_net_mac()
+    %out = gep i8, *@net_MACSTR, 0
+    call @net_format_mac(%mac, %out)
+    %fmt = gep i8, *@net_OK_FMT, 0
+    %ip = load i32, *@net_MY_IP
+    %b0 = lshr i32 %ip, 24
+    %b1 = and i32 %ip, 0x00FF0000
+    %b1s = lshr i32 %b1, 16
+    %b2 = and i32 %ip, 0x0000FF00
+    %b2s = lshr i32 %b2, 8
+    %b3 = and i32 %ip, 0xFF
+    %b064 = sext i32 %b0 to i64
+    %b164 = sext i32 %b1s to i64
+    %b264 = sext i32 %b2s to i64
+    %b364 = sext i32 %b3 to i64
+    %mstr = gep i8, *@net_MACSTR, 0
+    call @console_printf(%fmt, %b064, %b164, %b264, %b364, %mstr, null)
+    ret i32 1
+}
+
+fun @net_poll() -> void {
+  @entry:
+    %ready = load i32, *@net_READY
+    %rok = eq i32 %ready, 1
+    br %rok, @loop, @done
+  @loop:
+    %buf = gep i8, *@net_RXBUF, 0
+    %n = call @virtio_net_recv(%buf, 1600)
+    %none = slt i32 %n, 0
+    br %none, @done, @feed
+  @feed:
+    %buf2 = gep i8, *@net_RXBUF, 0
+    call @eth_input(%buf2, %n)
+    jmp @loop
+  @done:
+    ret void
+}
+
+fun @net_ready() -> i32 {
+  @entry:
+    %v = load i32, *@net_READY
+    ret i32 %v
+}
+
+fun @net_my_ip() -> i32 {
+  @entry:
+    %v = load i32, *@net_MY_IP
+    ret i32 %v
+}
+
+fun @net_netmask() -> i32 {
+  @entry:
+    %v = load i32, *@net_NETMASK
+    ret i32 %v
+}
+
+fun @net_gateway() -> i32 {
+  @entry:
+    %v = load i32, *@net_GATEWAY
+    ret i32 %v
+}
+
+fun @net_dns() -> i32 {
+  @entry:
+    %v = load i32, *@net_DNS
+    ret i32 %v
+}
+
+fun @net_configure(ip: i32, mask: i32, gw: i32, dns: i32) -> void {
+  @entry:
+    store i32 %ip, *@net_MY_IP
+    store i32 %mask, *@net_NETMASK
+    store i32 %gw, *@net_GATEWAY
+    store i32 %dns, *@net_DNS
+    ret void
+}
+
+fun @net_my_mac() -> *i8 {
+  @entry:
+    %p = call @virtio_net_mac()
+    ret *i8 %p
+}
+
+fun @net_now_ms() -> i64 {
+  @entry:
+    %f = call @timer_freq()
+    %z = eq i64 %f, 0
+    br %z, @no_timer, @calc
+  @no_timer:
+    ret i64 0
+  @calc:
+    %t = call @timer_now()
+    %k = mul i64 %t, 1000
+    %ms = udiv i64 %k, %f
+    ret i64 %ms
+}
+
+// Polling wait; depends on the timer frequency and polls only once when it is not initialized.
+fun @net_wait_ms(ms: i32) -> void {
+  @entry:
+    %f = call @timer_freq()
+    %z = eq i64 %f, 0
+    br %z, @once, @timed
+  @once:
+    call @net_poll()
+    ret void
+  @timed:
+    %start = call @net_now_ms()
+    %ms64 = sext i32 %ms to i64
+    %end = add i64 %start, %ms64
+    jmp @cond
+  @cond:
+    call @net_poll()
+    %now = call @net_now_ms()
+    %done = sge i64 %now, %end
+    br %done, @out, @wait
+  @wait:
+    asm att void, "wfe", "~{memory}"
+    jmp @cond
+  @out:
+    ret void
+}
+
+fun @net_ld8(p: *i8, off: i32) -> i32 {
+  @entry:
+    %pp = gep i8, *%p, %off
+    %v = asm att i32, "ldrb ${0:w}, [${pp}]", "=r,r,~{memory}", *i8 %pp
+    ret i32 %v
+}
+
+fun @net_ld16(p: *i8, off: i32) -> i32 {
+  @entry:
+    %pp = gep i8, *%p, %off
+    %v = asm att i32, "ldrh ${0:w}, [${pp}]", "=r,r,~{memory}", *i8 %pp
+    ret i32 %v
+}
+
+fun @net_ld32(p: *i8, off: i32) -> i32 {
+  @entry:
+    %pp = gep i8, *%p, %off
+    %v = asm att i32, "ldr ${0:w}, [${pp}]", "=r,r,~{memory}", *i8 %pp
+    ret i32 %v
+}
+
+fun @net_st8(p: *i8, off: i32, v: i32) -> void {
+  @entry:
+    %pp = gep i8, *%p, %off
+    asm att void, "strb ${v:w}, [${pp}]", "r,r,~{memory}", *i8 %pp, i32 %v
+    ret void
+}
+
+fun @net_st16(p: *i8, off: i32, v: i32) -> void {
+  @entry:
+    %pp = gep i8, *%p, %off
+    asm att void, "strh ${v:w}, [${pp}]", "r,r,~{memory}", *i8 %pp, i32 %v
+    ret void
+}
+
+fun @net_st32(p: *i8, off: i32, v: i32) -> void {
+  @entry:
+    %pp = gep i8, *%p, %off
+    asm att void, "str ${v:w}, [${pp}]", "r,r,~{memory}", *i8 %pp, i32 %v
+    ret void
+}
+
+// 16-bit big-endian read
+fun @net_be16(p: *i8, off: i32) -> i32 {
+  @entry:
+    %hi = call @net_ld8(%p, %off)
+    %lo1 = add i32 %off, 1
+    %lo = call @net_ld8(%p, %lo1)
+    %his = shl i32 %hi, 8
+    %v = or i32 %his, %lo
+    ret i32 %v
+}
+
+fun @net_be32(p: *i8, off: i32) -> i32 {
+  @entry:
+    %b0 = call @net_ld8(%p, %off)
+    %o1 = add i32 %off, 1
+    %b1 = call @net_ld8(%p, %o1)
+    %o2 = add i32 %off, 2
+    %b2 = call @net_ld8(%p, %o2)
+    %o3 = add i32 %off, 3
+    %b3 = call @net_ld8(%p, %o3)
+    %s0 = shl i32 %b0, 24
+    %s1 = shl i32 %b1, 16
+    %s2 = shl i32 %b2, 8
+    %v01 = or i32 %s0, %s1
+    %v23 = or i32 %s2, %b3
+    %v = or i32 %v01, %v23
+    ret i32 %v
+}
+
+fun @net_stbe16(p: *i8, off: i32, v: i32) -> void {
+  @entry:
+    %hi = lshr i32 %v, 8
+    %lo = and i32 %v, 255
+    call @net_st8(%p, %off, %hi)
+    %o1 = add i32 %off, 1
+    call @net_st8(%p, %o1, %lo)
+    ret void
+}
+
+fun @net_stbe32(p: *i8, off: i32, v: i32) -> void {
+  @entry:
+    %b0 = lshr i32 %v, 24
+    %t1 = and i32 %v, 0x00FF0000
+    %b1 = lshr i32 %t1, 16
+    %t2 = and i32 %v, 0x0000FF00
+    %b2 = lshr i32 %t2, 8
+    %b3 = and i32 %v, 255
+    call @net_st8(%p, %off, %b0)
+    %o1 = add i32 %off, 1
+    call @net_st8(%p, %o1, %b1)
+    %o2 = add i32 %off, 2
+    call @net_st8(%p, %o2, %b2)
+    %o3 = add i32 %off, 3
+    call @net_st8(%p, %o3, %b3)
+    ret void
+}
+
+// 16-bit ones-complement sum (already folded into 0xFFFF)
+fun @net_sum16(p: *i8, len: i32) -> i32 {
+  @entry:
+    %sum = let i32
+    %i = let i32
+    store i32 0, *%sum
+    store i32 0, *%i
+    jmp @cond
+  @cond:
+    %iv = load i32, *%i
+    %i1 = add i32 %iv, 1
+    %pair = slt i32 %i1, %len
+    br %pair, @body, @tail
+  @body:
+    %sv = load i32, *%sum
+    %w = call @net_be16(%p, %iv)
+    %ns = add i32 %sv, %w
+    store i32 %ns, *%sum
+    %in = add i32 %iv, 2
+    store i32 %in, *%i
+    jmp @cond
+  @tail:
+    %iv2 = load i32, *%i
+    %more = slt i32 %iv2, %len
+    br %more, @odd, @fold
+  @odd:
+    %sv2 = load i32, *%sum
+    %b = call @net_ld8(%p, %iv2)
+    %bs = shl i32 %b, 8
+    %ns2 = add i32 %sv2, %bs
+    store i32 %ns2, *%sum
+    jmp @fold
+  @fold:
+    %fv = load i32, *%sum
+    %hi = lshr i32 %fv, 16
+    %nz = ne i32 %hi, 0
+    br %nz, @fold_body, @done
+  @fold_body:
+    %lo = and i32 %fv, 0xFFFF
+    %add = add i32 %lo, %hi
+    store i32 %add, *%sum
+    jmp @fold
+  @done:
+    %r = load i32, *%sum
+    %r16 = and i32 %r, 0xFFFF
+    ret i32 %r16
+}
+
+fun @net_cksum(p: *i8, len: i32) -> i32 {
+  @entry:
+    %s = call @net_sum16(%p, %len)
+    %c = sub i32 0xFFFF, %s
+    ret i32 %c
+}
+
+// Transport-layer checksum: pseudo-header plus segment contents. The segment checksum field must be zero before the call.
+fun @net_l4_cksum(src: i32, dst: i32, proto: i32, seg: *i8, len: i32) -> i32 {
+  @entry:
+    %sh = lshr i32 %src, 16
+    %sl = and i32 %src, 0xFFFF
+    %dh = lshr i32 %dst, 16
+    %dl = and i32 %dst, 0xFFFF
+    %s1 = add i32 %sh, %sl
+    %s2 = add i32 %dh, %dl
+    %s3 = add i32 %s1, %s2
+    %s4 = add i32 %s3, %proto
+    %s5 = add i32 %s4, %len
+    %payload = call @net_sum16(%seg, %len)
+    %tot = add i32 %s5, %payload
+    %t1 = and i32 %tot, 0xFFFF
+    %t2 = lshr i32 %tot, 16
+    %t3 = add i32 %t1, %t2
+    %t4 = lshr i32 %t3, 16
+    %t5 = and i32 %t3, 0xFFFF
+    %t6 = add i32 %t5, %t4
+    %c = sub i32 0xFFFF, %t6
+    %z = eq i32 %c, 0
+    br %z, @fix, @ret
+  @fix:
+    ret i32 0xFFFF
+  @ret:
+    ret i32 %c
+}
+
+fun @net_memcmp(a: *i8, b: *i8, n: i32) -> i32 {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @cond
+  @cond:
+    %iv = load i32, *%i
+    %done = sge i32 %iv, %n
+    br %done, @same, @body
+  @body:
+    %pa = gep i8, *%a, %iv
+    %pb = gep i8, *%b, %iv
+    %ca = load i8, *%pa
+    %cb = load i8, *%pb
+    %neq = ne i8 %ca, %cb
+    br %neq, @diff, @next
+  @diff:
+    ret i32 1
+  @next:
+    %in = add i32 %iv, 1
+    store i32 %in, *%i
+    jmp @cond
+  @same:
+    ret i32 0
+}
+
+// Parse "a.b.c.d"; returns 0 on failure (0.0.0.0 is not a valid destination).
+fun @net_parse_ip(s: *i8) -> i32 {
+  @entry:
+    %ip = let i32
+    %val = let i32
+    %dots = let i32
+    %i = let i32
+    %bad = let i32
+    store i32 0, *%ip
+    store i32 0, *%val
+    store i32 0, *%dots
+    store i32 0, *%i
+    store i32 0, *%bad
+    jmp @cond
+  @cond:
+    %iv = load i32, *%i
+    %cp = gep i8, *%s, %iv
+    %ch = load i8, *%cp
+    %end = eq i8 %ch, 0
+    br %end, @finish, @chk
+  @chk:
+    %dot = eq i8 %ch, 46
+    br %dot, @sep, @digit
+  @digit:
+    %low = sge i8 %ch, 48
+    %high = sle i8 %ch, 57
+    %isd = and i1 %low, %high
+    br %isd, @accum, @invalid
+  @accum:
+    %vv = load i32, *%val
+    %cv = zext i8 %ch to i32
+    %d = sub i32 %cv, 48
+    %m = mul i32 %vv, 10
+    %nv = add i32 %m, %d
+    store i32 %nv, *%val
+    %inext = add i32 %iv, 1
+    store i32 %inext, *%i
+    jmp @cond
+  @sep:
+    %dotn = load i32, *%dots
+    %full = sge i32 %dotn, 3
+    br %full, @invalid, @append
+  @append:
+    %ipv = load i32, *%ip
+    %vv2 = load i32, *%val
+    %sh = shl i32 %ipv, 8
+    %nip = or i32 %sh, %vv2
+    store i32 %nip, *%ip
+    store i32 0, *%val
+    %dn = add i32 %dotn, 1
+    store i32 %dn, *%dots
+    %i2 = add i32 %iv, 1
+    store i32 %i2, *%i
+    jmp @cond
+  @finish:
+    %dotf = load i32, *%dots
+    %ok = eq i32 %dotf, 3
+    %badf = load i32, *%bad
+    %good = eq i32 %badf, 0
+    %both = and i1 %ok, %good
+    br %both, @good, @invalid
+  @good:
+    %ipf = load i32, *%ip
+    %vf = load i32, *%val
+    %shf = shl i32 %ipf, 8
+    %res = or i32 %shf, %vf
+    ret i32 %res
+  @invalid:
+    store i32 1, *%bad
+    ret i32 0
+}
+
+fun @net_print_ip(ip: i32) -> void {
+  @entry:
+    %b0 = lshr i32 %ip, 24
+    %t1 = and i32 %ip, 0x00FF0000
+    %b1 = lshr i32 %t1, 16
+    %t2 = and i32 %ip, 0x0000FF00
+    %b2 = lshr i32 %t2, 8
+    %b3 = and i32 %ip, 255
+    %b064 = sext i32 %b0 to i64
+    %b164 = sext i32 %b1 to i64
+    %b264 = sext i32 %b2 to i64
+    %b364 = sext i32 %b3 to i64
+    %fmt = gep i8, *@net_IP_FMT, 0
+    call @console_printf(%fmt, %b064, %b164, %b264, %b364, null, null)
+    ret void
+}
+
+fun @net_format_mac(mac: *i8, out: *i8) -> void {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @cond
+  @cond:
+    %iv = load i32, *%i
+    %done = sge i32 %iv, 6
+    br %done, @done, @body
+  @body:
+    %mp = gep i8, *%mac, %iv
+    %b = load i8, *%mp
+    %bi = zext i8 %b to i32
+    %hi = lshr i32 %bi, 4
+    %lo = and i32 %bi, 15
+    %hp = gep i8, *@net_HEX, %hi
+    %h = load i8, *%hp
+    %lp = gep i8, *@net_HEX, %lo
+    %l = load i8, *%lp
+    %o = mul i32 %iv, 3
+    %op = gep i8, *%out, %o
+    store i8 %h, *%op
+    %o1 = add i32 %o, 1
+    %op1 = gep i8, *%out, %o1
+    store i8 %l, *%op1
+    %o2 = add i32 %o, 2
+    %op2 = gep i8, *%out, %o2
+    %last = eq i32 %iv, 5
+    br %last, @nul, @colon
+  @colon:
+    store i8 58, *%op2
+    jmp @next
+  @nul:
+    store i8 0, *%op2
+    jmp @next
+  @next:
+    %in = add i32 %iv, 1
+    store i32 %in, *%i
+    jmp @cond
+  @done:
+    ret void
+}
+
+fun @net_ifconfig() -> void {
+  @entry:
+    %hdr = gep i8, *@net_IFCONFIG_HDR, 0
+    call @console_puts(%hdr)
+    %iph = gep i8, *@net_IFCONFIG_IP, 0
+    call @console_puts(%iph)
+    %ip = load i32, *@net_MY_IP
+    call @net_print_ip(%ip)
+    %mh = gep i8, *@net_IFCONFIG_MASK, 0
+    call @console_puts(%mh)
+    %mask = load i32, *@net_NETMASK
+    call @net_print_ip(%mask)
+    %gh = gep i8, *@net_IFCONFIG_GW, 0
+    call @console_puts(%gh)
+    %gw = load i32, *@net_GATEWAY
+    call @net_print_ip(%gw)
+    %mach = gep i8, *@net_IFCONFIG_MAC, 0
+    call @console_puts(%mach)
+    %m2 = gep i8, *@net_MACSTR, 0
+    call @console_puts(%m2)
+    call @console_putc(10)
+    ret void
+}

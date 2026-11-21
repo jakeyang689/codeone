@@ -1,0 +1,199 @@
+// ip.bx - IPv4 send/receive (fragment reassembly is not supported)
+
+extern @eth_send(dst: *i8, etype: i32, payload: *i8, len: i32) -> i32
+extern @arp_resolve(ip: i32) -> *i8
+extern @net_my_ip() -> i32
+extern @net_netmask() -> i32
+extern @net_gateway() -> i32
+extern @net_ld8(p: *i8, off: i32) -> i32
+extern @net_be16(p: *i8, off: i32) -> i32
+extern @net_be32(p: *i8, off: i32) -> i32
+extern @net_st8(p: *i8, off: i32, v: i32) -> void
+extern @net_stbe16(p: *i8, off: i32, v: i32) -> void
+extern @net_stbe32(p: *i8, off: i32, v: i32) -> void
+extern @net_cksum(p: *i8, len: i32) -> i32
+extern @kmem_memcpy(dst: *i8, src: *i8, n: i64) -> void
+extern @icmp_input(src: i32, msg: *i8, len: i32) -> void
+extern @udp_input(src: i32, dst: i32, msg: *i8, len: i32) -> void
+extern @tcp_input(src: i32, dst: i32, msg: *i8, len: i32) -> void
+
+const @ip_TYPE: i32 = 0x0800
+const @ip_PROTO_ICMP: i32 = 1
+const @ip_PROTO_TCP: i32 = 6
+const @ip_PROTO_UDP: i32 = 17
+const @ip_HDR_LEN: i32 = 20
+const @ip_TTL: i32 = 64
+
+global @ip_TXBUF: [i8, 1500]
+global @ip_ID: i32
+global @ip_BCAST_MAC: [i8, 6]
+
+fun @ip_route_mac(dst: i32) -> *i8 {
+  @entry:
+    %mask = call @net_netmask()
+    %myip = call @net_my_ip()
+    %dm = and i32 %dst, %mask
+    %mm = and i32 %myip, %mask
+    %local = eq i32 %dm, %mm
+    br %local, @direct, @gw
+  @direct:
+    %p = call @arp_resolve(%dst)
+    ret *i8 %p
+  @gw:
+    %g = call @net_gateway()
+    %p2 = call @arp_resolve(%g)
+    ret *i8 %p2
+}
+
+fun @ip_send(dst: i32, proto: i32, payload: *i8, len: i32) -> i32 {
+  @entry:
+    %toobig = sgt i32 %len, 1480
+    br %toobig, @fail, @route
+  @route:
+    %mac = call @ip_route_mac(%dst)
+    %nomac = eq *i8 %mac, null
+    br %nomac, @fail, @build
+  @build:
+    %tx = gep i8, *@ip_TXBUF, 0
+    call @net_st8(%tx, 0, 0x45)
+    call @net_st8(%tx, 1, 0)
+    %total = add i32 %len, @ip_HDR_LEN
+    call @net_stbe16(%tx, 2, %total)
+    %id = load i32, *@ip_ID
+    %idn = add i32 %id, 1
+    store i32 %idn, *@ip_ID
+    call @net_stbe16(%tx, 4, %id)
+    call @net_stbe16(%tx, 6, 0x4000)
+    call @net_st8(%tx, 8, @ip_TTL)
+    call @net_st8(%tx, 9, %proto)
+    call @net_stbe16(%tx, 10, 0)
+    %myip = call @net_my_ip()
+    call @net_stbe32(%tx, 12, %myip)
+    call @net_stbe32(%tx, 16, %dst)
+    %pl = gep i8, *%tx, @ip_HDR_LEN
+    %len64 = sext i32 %len to i64
+    call @kmem_memcpy(%pl, %payload, %len64)
+    %ck = call @net_cksum(%tx, @ip_HDR_LEN)
+    call @net_stbe16(%tx, 10, %ck)
+    %r = call @eth_send(%mac, @ip_TYPE, %tx, %total)
+    ret i32 %r
+  @fail:
+    ret i32 -1
+}
+
+fun @ip_bcast_mac() -> *i8 {
+  @entry:
+    %p0 = gep i8, *@ip_BCAST_MAC, 0
+    store i8 255, *%p0
+    %p1 = gep i8, *@ip_BCAST_MAC, 1
+    store i8 255, *%p1
+    %p2 = gep i8, *@ip_BCAST_MAC, 2
+    store i8 255, *%p2
+    %p3 = gep i8, *@ip_BCAST_MAC, 3
+    store i8 255, *%p3
+    %p4 = gep i8, *@ip_BCAST_MAC, 4
+    store i8 255, *%p4
+    %p5 = gep i8, *@ip_BCAST_MAC, 5
+    store i8 255, *%p5
+    %r = gep i8, *@ip_BCAST_MAC, 0
+    ret *i8 %r
+}
+
+// Link-layer broadcast send without ARP, used by DHCP before an address is configured.
+fun @ip_send_bcast(src: i32, proto: i32, payload: *i8, len: i32) -> i32 {
+  @entry:
+    %toobig = sgt i32 %len, 1480
+    br %toobig, @fail, @build
+  @build:
+    %mac = call @ip_bcast_mac()
+    %tx = gep i8, *@ip_TXBUF, 0
+    call @net_st8(%tx, 0, 0x45)
+    call @net_st8(%tx, 1, 0)
+    %total = add i32 %len, @ip_HDR_LEN
+    call @net_stbe16(%tx, 2, %total)
+    %id = load i32, *@ip_ID
+    %idn = add i32 %id, 1
+    store i32 %idn, *@ip_ID
+    call @net_stbe16(%tx, 4, %id)
+    call @net_stbe16(%tx, 6, 0x4000)
+    call @net_st8(%tx, 8, @ip_TTL)
+    call @net_st8(%tx, 9, %proto)
+    call @net_stbe16(%tx, 10, 0)
+    call @net_stbe32(%tx, 12, %src)
+    call @net_stbe32(%tx, 16, -1)
+    %pl = gep i8, *%tx, @ip_HDR_LEN
+    %len64 = sext i32 %len to i64
+    call @kmem_memcpy(%pl, %payload, %len64)
+    %ck = call @net_cksum(%tx, @ip_HDR_LEN)
+    call @net_stbe16(%tx, 10, %ck)
+    %r = call @eth_send(%mac, @ip_TYPE, %tx, %total)
+    ret i32 %r
+  @fail:
+    ret i32 -1
+}
+
+fun @ip_input(frame: *i8, len: i32) -> void {
+  @entry:
+    %short = slt i32 %len, 34
+    br %short, @done, @ver
+  @ver:
+    %vihl = call @net_ld8(%frame, 14)
+    %ver = lshr i32 %vihl, 4
+    %v4 = eq i32 %ver, 4
+    br %v4, @ihl, @done
+  @ihl:
+    %ihlb = and i32 %vihl, 15
+    %ihl = mul i32 %ihlb, 4
+    %ihlok = sge i32 %ihl, 20
+    br %ihlok, @tot, @done
+  @tot:
+    %total = call @net_be16(%frame, 16)
+    %maxpay = sub i32 %len, 14
+    %toolong = sgt i32 %total, %maxpay
+    br %toolong, @done, @frag
+  @frag:
+    %fo = call @net_be16(%frame, 20)
+    %off = and i32 %fo, 0x1FFF
+    %mf = and i32 %fo, 0x2000
+    %offz = ne i32 %off, 0
+    %mfz = ne i32 %mf, 0
+    %fragmented = or i1 %offz, %mfz
+    br %fragmented, @done, @ck
+  @ck:
+    %ipp = gep i8, *%frame, 14
+    %sum = call @net_cksum(%ipp, %ihl)
+    %good = eq i32 %sum, 0
+    br %good, @dst, @done
+  @dst:
+    %dip = call @net_be32(%frame, 30)
+    %myip = call @net_my_ip()
+    %forme = eq i32 %dip, %myip
+    %bcast = eq i32 %dip, -1
+    %ok = or i1 %forme, %bcast
+    br %ok, @dispatch, @done
+  @dispatch:
+    %proto = call @net_ld8(%frame, 23)
+    %src = call @net_be32(%frame, 26)
+    %plen = sub i32 %total, %ihl
+    %poff = add i32 %ihl, 14
+    %msg = gep i8, *%frame, %poff
+    %isicmp = eq i32 %proto, @ip_PROTO_ICMP
+    br %isicmp, @icmp, @chkudp
+  @chkudp:
+    %isudp = eq i32 %proto, @ip_PROTO_UDP
+    br %isudp, @udp, @chktcp
+  @chktcp:
+    %istcp = eq i32 %proto, @ip_PROTO_TCP
+    br %istcp, @tcp, @done
+  @icmp:
+    call @icmp_input(%src, %msg, %plen)
+    jmp @done
+  @udp:
+    call @udp_input(%src, %dip, %msg, %plen)
+    jmp @done
+  @tcp:
+    call @tcp_input(%src, %dip, %msg, %plen)
+    jmp @done
+  @done:
+    ret void
+}

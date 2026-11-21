@@ -1,0 +1,1048 @@
+// proc.bx - process control blocks, round-robin scheduler, trap entry, and process syscalls
+//
+// Each process has its own kernel stack. On exception entry, proc_irq_asm / proc_sync_asm
+// save x0-x30, SPSR, and ELR into a 272-byte context frame on the stack; the C handler performs
+// scheduling, returns the next process's frame address, and assembly restores the context and erets.
+//
+// Context frame layout (8 bytes per entry):
+//   0..29  x0-x29
+//   30     x30
+//   31     spsr_el1
+//   32     elr_el1
+//   33     padding
+
+extern @kmem_alloc(size: i64) -> *i8
+extern @kmem_memset(p: *i8, v: i32, n: i64) -> void
+extern @kmem_ptr_addr(p: *i8) -> i64
+extern @console_puts(s: *i8) -> void
+extern @console_printf(fmt: *i8, a: i64, b: i64, c: i64, d: i64, s1: *i8, s2: *i8) -> void
+extern @boot_panic_vec() -> void
+extern @timer_init() -> void
+extern @timer_rearm() -> void
+extern @timer_ack() -> i32
+extern @timer_eoi(id: i32) -> void
+extern @procdemo_dispatch(entry: i32, arg: i64) -> i32
+extern @klog_event(t: i32, a: i32, b: i32, c: i32) -> void
+
+enum @proc_State: i32 {
+  @Unused = 0,
+  @Ready = 1,
+  @Running = 2,
+  @Sleeping = 3,
+  @Waiting = 4,
+  @Zombie = 5
+}
+
+enum @proc_Sys: i32 {
+  @Yield = 0,
+  @Exit = 1,
+  @Sleep = 2,
+  @Getpid = 3,
+  @Getppid = 4,
+  @Spawn = 5,
+  @Wait = 6,
+  @Kill = 7
+}
+
+struct @proc_PCB {
+  @state: i32,
+  @pid: i32,
+  @parent: i32,
+  @entry: i32,
+  @exit_code: i32,
+  @wait_target: i32,
+  @slotid: i32,
+  @wake_tick: i64,
+  @ctx: i64,
+  @sp: i64,
+  @arg: i64,
+  @stack: *i8,
+  @name: *i8
+}
+
+global @proc_table: [@proc_PCB, 16]
+global @proc_current: i32
+global @proc_next_pid: i32
+global @proc_ticks: i64
+global @proc_free_head: *i8
+
+const @proc_IDLE_NAME: [i8, 5] = "idle"
+const @proc_KMAIN_NAME: [i8, 6] = "kmain"
+const @proc_READY_MSG: [i8, 23] = "proc: scheduler ready\n"
+const @proc_PS_HDR: [i8, 18] = "  pid state name\n"
+const @proc_PS_FMT: [i8, 12] = "  %d %s %s\n"
+const @proc_S_UNUSED: [i8, 7] = "unused"
+const @proc_S_READY: [i8, 6] = "ready"
+const @proc_S_RUNNING: [i8, 8] = "running"
+const @proc_S_SLEEP: [i8, 9] = "sleeping"
+const @proc_S_WAIT: [i8, 8] = "waiting"
+const @proc_S_ZOMBIE: [i8, 7] = "zombie"
+const @proc_S_UNKNOWN: [i8, 8] = "unknown"
+
+fun @proc_slot(i: i32) -> *@proc_PCB {
+  @entry:
+    %p = gep @proc_PCB, *@proc_table, %i
+    ret *@proc_PCB %p
+}
+
+fun @proc_ctx_ptr(a: i64) -> *i64 {
+  @entry:
+    %p = asm att *i64, "mov $0, ${a}", "=r,r", i64 %a
+    ret *i64 %p
+}
+
+fun @proc_irq_save() -> i64 {
+  @entry:
+    %f = asm att i64, "mrs $0, daif\nmsr daifset, #2\nisb", "=r,~{memory}"
+    ret i64 %f
+}
+
+fun @proc_irq_restore(flags: i64) -> void {
+  @entry:
+    asm att void, "msr daif, ${flags}\nisb", "r,~{memory}", i64 %flags
+    ret void
+}
+
+fun @proc_alloc_stack() -> *i8 {
+  @entry:
+    %head = load *i8, *@proc_free_head
+    %ha = call @kmem_ptr_addr(%head)
+    %empty = eq i64 %ha, 0
+    br %empty, @fresh, @reuse
+  @reuse:
+    %np = asm att *i8, "ldr $0, [${head}]", "=r,r,~{memory}", *i8 %head
+    store *i8 %np, *@proc_free_head
+    ret *i8 %head
+  @fresh:
+    %s = call @kmem_alloc(16384)
+    ret *i8 %s
+}
+
+fun @proc_free_stack(stack: *i8) -> void {
+  @entry:
+    %a = call @kmem_ptr_addr(%stack)
+    %none = eq i64 %a, 0
+    br %none, @done, @push
+  @push:
+    %head = load *i8, *@proc_free_head
+    asm att void, "str ${head}, [${stack}]", "r,r,~{memory}", *i8 %head, *i8 %stack
+    store *i8 %stack, *@proc_free_head
+    jmp @done
+  @done:
+    ret void
+}
+
+fun @proc_trampoline_addr() -> i64 {
+  @entry:
+    %a = asm att i64, "adrp $0, proc_trampoline\nadd $0, $0, :lo12:proc_trampoline", "=r"
+    ret i64 %a
+}
+
+fun @proc_idle_addr() -> i64 {
+  @entry:
+    %a = asm att i64, "adrp $0, proc_idle_entry\nadd $0, $0, :lo12:proc_idle_entry", "=r"
+    ret i64 %a
+}
+
+fun @proc_sync_addr() -> i64 {
+  @entry:
+    %a = asm att i64, "adrp $0, proc_sync_asm\nadd $0, $0, :lo12:proc_sync_asm", "=r"
+    ret i64 %a
+}
+
+fun @proc_irq_addr() -> i64 {
+  @entry:
+    %a = asm att i64, "adrp $0, proc_irq_asm\nadd $0, $0, :lo12:proc_irq_asm", "=r"
+    ret i64 %a
+}
+
+// Build the initial context for a new process in a 272-byte frame: x0=arg, x1=pid, entry=proc_trampoline.
+fun @proc_new_context(top: i64, arg: i64, pid: i32) -> i64 {
+  @entry:
+    %base = sub i64 %top, 272
+    %p8 = asm att *i8, "mov $0, ${base}", "=r,r", i64 %base
+    call @kmem_memset(%p8, 0, 272)
+    %p = call @proc_ctx_ptr(%base)
+    %x0p = gep i64, *%p, 0
+    store i64 %arg, *%x0p
+    %pid64 = sext i32 %pid to i64
+    %x1p = gep i64, *%p, 1
+    store i64 %pid64, *%x1p
+    %tramp = call @proc_trampoline_addr()
+    %elrp = gep i64, *%p, 32
+    store i64 %tramp, *%elrp
+    %spsrp = gep i64, *%p, 31
+    store i64 5, *%spsrp
+    ret i64 %base
+}
+
+fun @proc_init() -> void {
+  @entry:
+    %t0 = call @proc_slot(0)
+    %t08 = asm att *i8, "mov $0, ${t0}", "=r,r", *@proc_PCB %t0
+    call @kmem_memset(%t08, 0, 1280)
+    store *i8 null, *@proc_free_head
+    store i32 -1, *@proc_current
+    store i32 2, *@proc_next_pid
+    store i64 0, *@proc_ticks
+
+    // Process 0: idle process, always READY (unless currently running).
+    %p0 = call @proc_slot(0)
+    %st0 = field @proc_PCB, *%p0, 0
+    store i32 @proc_State.Ready, *%st0
+    %pid0 = field @proc_PCB, *%p0, 1
+    store i32 0, *%pid0
+    %par0 = field @proc_PCB, *%p0, 2
+    store i32 -1, *%par0
+    %ent0 = field @proc_PCB, *%p0, 3
+    store i32 -1, *%ent0
+    %sid0 = field @proc_PCB, *%p0, 6
+    store i32 0, *%sid0
+    %nm0 = field @proc_PCB, *%p0, 12
+    %idlename = gep i8, *@proc_IDLE_NAME, 0
+    store *i8 %idlename, *%nm0
+
+    %istk = call @proc_alloc_stack()
+    %iaddr = call @kmem_ptr_addr(%istk)
+    %itop = add i64 %iaddr, 16384
+    %ictx = call @proc_new_context(%itop, 0, 0)
+    %ictxp = call @proc_ctx_ptr(%ictx)
+    %ielrp = gep i64, *%ictxp, 32
+    %ientry = call @proc_idle_addr()
+    store i64 %ientry, *%ielrp
+    %icp = field @proc_PCB, *%p0, 8
+    store i64 %ictx, *%icp
+    %isp = field @proc_PCB, *%p0, 9
+    store i64 %itop, *%isp
+    %istp = field @proc_PCB, *%p0, 11
+    store *i8 %istk, *%istp
+
+    // Process 1: the currently executing kmain.
+    %p1 = call @proc_slot(1)
+    %st1 = field @proc_PCB, *%p1, 0
+    store i32 @proc_State.Running, *%st1
+    %pid1 = field @proc_PCB, *%p1, 1
+    store i32 1, *%pid1
+    %par1 = field @proc_PCB, *%p1, 2
+    store i32 -1, *%par1
+    %ent1 = field @proc_PCB, *%p1, 3
+    store i32 -1, *%ent1
+    %sid1 = field @proc_PCB, *%p1, 6
+    store i32 1, *%sid1
+    %nm1 = field @proc_PCB, *%p1, 12
+    %kmname = gep i8, *@proc_KMAIN_NAME, 0
+    store *i8 %kmname, *%nm1
+    store i32 1, *@proc_current
+    call @klog_event(1, 1, 1, 0)
+
+    call @timer_init()
+    asm att void, "msr daifclr, #2\nisb", "~{memory}"
+
+    %msg = gep i8, *@proc_READY_MSG, 0
+    call @console_puts(%msg)
+    ret void
+}
+
+fun @proc_spawn_impl(entry: i32, arg: i64, name: *i8, parent: i32) -> i32 {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @find_cond
+  @find_cond:
+    %iv = load i32, *%i
+    %full = sge i32 %iv, 16
+    br %full, @no_slot, @find_body
+  @find_body:
+    %q = call @proc_slot(%iv)
+    %stp = field @proc_PCB, *%q, 0
+    %st = load i32, *%stp
+    %free = eq i32 %st, @proc_State.Unused
+    br %free, @found, @find_next
+  @find_next:
+    %in = add i32 %iv, 1
+    store i32 %in, *%i
+    jmp @find_cond
+  @found:
+    %slot = load i32, *%i
+    %p = call @proc_slot(%slot)
+    %stack = call @proc_alloc_stack()
+    %sa = call @kmem_ptr_addr(%stack)
+    %saz = eq i64 %sa, 0
+    br %saz, @no_slot, @have_stack
+  @have_stack:
+    %pid = load i32, *@proc_next_pid
+    %pidn = add i32 %pid, 1
+    store i32 %pidn, *@proc_next_pid
+    %top = add i64 %sa, 16384
+    %ctx = call @proc_new_context(%top, %arg, %pid)
+
+    %stp2 = field @proc_PCB, *%p, 0
+    store i32 @proc_State.Ready, *%stp2
+    %pidp = field @proc_PCB, *%p, 1
+    store i32 %pid, *%pidp
+    %parp = field @proc_PCB, *%p, 2
+    store i32 %parent, *%parp
+    %entp = field @proc_PCB, *%p, 3
+    store i32 %entry, *%entp
+    %ecp = field @proc_PCB, *%p, 4
+    store i32 0, *%ecp
+    %wtp = field @proc_PCB, *%p, 5
+    store i32 0, *%wtp
+    %sip = field @proc_PCB, *%p, 6
+    store i32 %slot, *%sip
+    %wkp = field @proc_PCB, *%p, 7
+    store i64 0, *%wkp
+    %ctxp = field @proc_PCB, *%p, 8
+    store i64 %ctx, *%ctxp
+    %spp = field @proc_PCB, *%p, 9
+    store i64 %top, *%spp
+    %argp = field @proc_PCB, *%p, 10
+    store i64 %arg, *%argp
+    %stkp = field @proc_PCB, *%p, 11
+    store *i8 %stack, *%stkp
+    %nmp = field @proc_PCB, *%p, 12
+    store *i8 %name, *%nmp
+    call @klog_event(2, %pid, %slot, %parent)
+    ret i32 %pid
+  @no_slot:
+    ret i32 -1
+}
+
+fun @proc_spawn(entry: i32, arg: i64, name: *i8) -> i32 {
+  @entry:
+    %flags = call @proc_irq_save()
+    %cur = load i32, *@proc_current
+    %p = call @proc_slot(%cur)
+    %pp = field @proc_PCB, *%p, 1
+    %par = load i32, *%pp
+    %pid = call @proc_spawn_impl(%entry, %arg, %name, %par)
+    call @proc_irq_restore(%flags)
+    ret i32 %pid
+}
+
+fun @proc_find_pid(pid: i32) -> i32 {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @cond
+  @cond:
+    %iv = load i32, *%i
+    %done = sge i32 %iv, 16
+    br %done, @not_found, @body
+  @body:
+    %q = call @proc_slot(%iv)
+    %stp = field @proc_PCB, *%q, 0
+    %st = load i32, *%stp
+    %unused = eq i32 %st, @proc_State.Unused
+    br %unused, @next, @chk
+  @chk:
+    %qpidp = field @proc_PCB, *%q, 1
+    %qpid = load i32, *%qpidp
+    %match = eq i32 %qpid, %pid
+    br %match, @found, @next
+  @found:
+    %rv = load i32, *%i
+    ret i32 %rv
+  @next:
+    %in = add i32 %iv, 1
+    store i32 %in, *%i
+    jmp @cond
+  @not_found:
+    ret i32 -1
+}
+
+// Wake a waiting parent when a child exits or is killed, and write (pid<<32)|code into the parent's x0.
+// Reap a zombie child: free its kernel stack, clear the PCB, and return (pid<<32)|code.
+fun @proc_reap(slot: i32) -> i64 {
+  @entry:
+    %q = call @proc_slot(%slot)
+    %qpidp = field @proc_PCB, *%q, 1
+    %qpid = load i32, *%qpidp
+    %qecp = field @proc_PCB, *%q, 4
+    %code = load i32, *%qecp
+    %qstkp = field @proc_PCB, *%q, 11
+    %qstack = load *i8, *%qstkp
+    call @proc_free_stack(%qstack)
+    %rstp = field @proc_PCB, *%q, 0
+    store i32 @proc_State.Unused, *%rstp
+    %rpidp = field @proc_PCB, *%q, 1
+    store i32 0, *%rpidp
+    %rparp = field @proc_PCB, *%q, 2
+    store i32 -1, *%rparp
+    %rentp = field @proc_PCB, *%q, 3
+    store i32 -1, *%rentp
+    %recp = field @proc_PCB, *%q, 4
+    store i32 0, *%recp
+    %rwtp = field @proc_PCB, *%q, 5
+    store i32 0, *%rwtp
+    %rctxp = field @proc_PCB, *%q, 8
+    store i64 0, *%rctxp
+    %rspp = field @proc_PCB, *%q, 9
+    store i64 0, *%rspp
+    %rargp = field @proc_PCB, *%q, 10
+    store i64 0, *%rargp
+    %rstkp = field @proc_PCB, *%q, 11
+    store *i8 null, *%rstkp
+    %rnmp = field @proc_PCB, *%q, 12
+    store *i8 null, *%rnmp
+    %pid64 = zext i32 %qpid to i64
+    %sh = shl i64 %pid64, 32
+    %code64 = sext i32 %code to i64
+    %cmask = and i64 %code64, 0xFFFFFFFF
+    %packed = or i64 %sh, %cmask
+    ret i64 %packed
+}
+
+fun @proc_notify_parent(child_slot: i32, pid: i32, code: i32) -> void {
+  @entry:
+    %p = call @proc_slot(%child_slot)
+    %parp = field @proc_PCB, *%p, 2
+    %par = load i32, *%parp
+    %pslot = call @proc_find_pid(%par)
+    %valid = sge i32 %pslot, 0
+    br %valid, @chk_wait, @done
+  @chk_wait:
+    %q = call @proc_slot(%pslot)
+    %qstp = field @proc_PCB, *%q, 0
+    %qst = load i32, *%qstp
+    %waiting = eq i32 %qst, @proc_State.Waiting
+    br %waiting, @chk_target, @done
+  @chk_target:
+    %wtp = field @proc_PCB, *%q, 5
+    %wt = load i32, *%wtp
+    %any = slt i32 %wt, 0
+    %match = eq i32 %wt, %pid
+    %ok = or i1 %any, %match
+    br %ok, @wake, @done
+  @wake:
+    %packed = call @proc_reap(%child_slot)
+    %ctxp = field @proc_PCB, *%q, 8
+    %ctx = load i64, *%ctxp
+    %cp = call @proc_ctx_ptr(%ctx)
+    %x0p = gep i64, *%cp, 0
+    store i64 %packed, *%x0p
+    %stp = field @proc_PCB, *%q, 0
+    store i32 @proc_State.Ready, *%stp
+    call @klog_event(9, %pid, %par, %code)
+    jmp @done
+  @done:
+    ret void
+}
+
+fun @proc_do_exit(code: i32) -> void {
+  @entry:
+    %cur = load i32, *@proc_current
+    %p = call @proc_slot(%cur)
+    %stp = field @proc_PCB, *%p, 0
+    store i32 @proc_State.Zombie, *%stp
+    %ecp = field @proc_PCB, *%p, 4
+    store i32 %code, *%ecp
+    %pidp = field @proc_PCB, *%p, 1
+    %pid = load i32, *%pidp
+    call @proc_notify_parent(%cur, %pid, %code)
+    ret void
+}
+
+// Return the reaped child's (pid<<32)|code; -1 means no child, -2 means it would block.
+fun @proc_do_wait(target: i32) -> i64 {
+  @entry:
+    %i = let i32
+    %cur = load i32, *@proc_current
+    %p = call @proc_slot(%cur)
+    %mypidp = field @proc_PCB, *%p, 1
+    %mypid = load i32, *%mypidp
+    store i32 0, *%i
+    jmp @scan_cond
+  @scan_cond:
+    %iv = load i32, *%i
+    %scan_done = sge i32 %iv, 16
+    br %scan_done, @has_child_start, @scan_body
+  @scan_body:
+    %q = call @proc_slot(%iv)
+    %qstp = field @proc_PCB, *%q, 0
+    %qst = load i32, *%qstp
+    %zombie = eq i32 %qst, @proc_State.Zombie
+    br %zombie, @chk_parent, @scan_next
+  @chk_parent:
+    %qparp = field @proc_PCB, *%q, 2
+    %qpar = load i32, *%qparp
+    %mine = eq i32 %qpar, %mypid
+    br %mine, @chk_target, @scan_next
+  @chk_target:
+    %qpidp = field @proc_PCB, *%q, 1
+    %qpid = load i32, *%qpidp
+    %any = slt i32 %target, 0
+    %match = eq i32 %qpid, %target
+    %ok = or i1 %any, %match
+    br %ok, @reap, @scan_next
+  @reap:
+    %qecp = field @proc_PCB, *%q, 4
+    %code = load i32, *%qecp
+    call @klog_event(6, %mypid, %qpid, %code)
+    %packed = call @proc_reap(%iv)
+    ret i64 %packed
+  @scan_next:
+    %in = add i32 %iv, 1
+    store i32 %in, *%i
+    jmp @scan_cond
+  @has_child_start:
+    store i32 0, *%i
+    jmp @child_cond
+  @child_cond:
+    %jv = load i32, *%i
+    %cdone = sge i32 %jv, 16
+    br %cdone, @no_child, @child_body
+  @child_body:
+    %cq = call @proc_slot(%jv)
+    %cstp = field @proc_PCB, *%cq, 0
+    %cst = load i32, *%cstp
+    %cunused = eq i32 %cst, @proc_State.Unused
+    br %cunused, @child_next, @child_par
+  @child_par:
+    %cparp = field @proc_PCB, *%cq, 2
+    %cpar = load i32, *%cparp
+    %cmine = eq i32 %cpar, %mypid
+    br %cmine, @block, @child_next
+  @child_next:
+    %jn = add i32 %jv, 1
+    store i32 %jn, *%i
+    jmp @child_cond
+  @block:
+    %bstp = field @proc_PCB, *%p, 0
+    store i32 @proc_State.Waiting, *%bstp
+    %bwtp = field @proc_PCB, *%p, 5
+    store i32 %target, *%bwtp
+    call @klog_event(6, %mypid, %target, -2)
+    ret i64 -2
+  @no_child:
+    call @klog_event(6, %mypid, %target, -1)
+    ret i64 -1
+}
+
+fun @proc_do_kill(pid: i32, code: i32) -> i32 {
+  @entry:
+    %cur = load i32, *@proc_current
+    %p = call @proc_slot(%cur)
+    %mypidp = field @proc_PCB, *%p, 1
+    %mypid = load i32, *%mypidp
+    %self = eq i32 %pid, %mypid
+    br %self, @kill_self, @find
+  @kill_self:
+    call @proc_do_exit(%code)
+    ret i32 0
+  @find:
+    %slot = call @proc_find_pid(%pid)
+    %valid = sge i32 %slot, 0
+    br %valid, @mark, @fail
+  @mark:
+    %q = call @proc_slot(%slot)
+    %qstp = field @proc_PCB, *%q, 0
+    %idle = eq i32 %pid, 0
+    %km = eq i32 %pid, 1
+    %special = or i1 %idle, %km
+    br %special, @fail, @do_mark
+  @do_mark:
+    store i32 @proc_State.Zombie, *%qstp
+    %qecp = field @proc_PCB, *%q, 4
+    store i32 %code, *%qecp
+    call @proc_notify_parent(%slot, %pid, %code)
+    ret i32 0
+  @fail:
+    ret i32 -1
+}
+
+fun @proc_wake_sleepers(now: i64) -> void {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @cond
+  @cond:
+    %iv = load i32, *%i
+    %done = sge i32 %iv, 16
+    br %done, @end, @body
+  @body:
+    %q = call @proc_slot(%iv)
+    %stp = field @proc_PCB, *%q, 0
+    %st = load i32, *%stp
+    %sleeping = eq i32 %st, @proc_State.Sleeping
+    br %sleeping, @chk, @next
+  @chk:
+    %wkp = field @proc_PCB, *%q, 7
+    %wk = load i64, *%wkp
+    %yes = sle i64 %wk, %now
+    br %yes, @wake, @next
+  @wake:
+    store i32 @proc_State.Ready, *%stp
+    %wpidp = field @proc_PCB, *%q, 1
+    %wpid = load i32, *%wpidp
+    %nkl = trunc i64 %now to i32
+    call @klog_event(8, %wpid, %nkl, 0)
+    jmp @next
+  @next:
+    %in = add i32 %iv, 1
+    store i32 %in, *%i
+    jmp @cond
+  @end:
+    ret void
+}
+
+fun @proc_irq_service() -> void {
+  @entry:
+    %id = call @timer_ack()
+    %tmr = eq i32 %id, 30
+    br %tmr, @timer, @other
+  @timer:
+    call @timer_rearm()
+    %t = load i64, *@proc_ticks
+    %tn = add i64 %t, 1
+    store i64 %tn, *@proc_ticks
+    call @proc_wake_sleepers(%tn)
+    call @timer_eoi(%id)
+    ret void
+  @other:
+    %spurious = eq i32 %id, 1023
+    br %spurious, @done, @eoi
+  @eoi:
+    call @timer_eoi(%id)
+    jmp @done
+  @done:
+    ret void
+}
+
+fun @proc_schedule(cur: i32) -> i32 {
+  @entry:
+    %i = let i32
+    %p = call @proc_slot(%cur)
+    %stp = field @proc_PCB, *%p, 0
+    %st = load i32, *%stp
+    %isrun = eq i32 %st, @proc_State.Running
+    br %isrun, @mark_ready, @pick
+  @mark_ready:
+    store i32 @proc_State.Ready, *%stp
+    jmp @pick
+  @pick:
+    store i32 0, *%i
+    jmp @cond
+  @cond:
+    %iv = load i32, *%i
+    %done = sge i32 %iv, 16
+    br %done, @fallback, @body
+  @body:
+    %base = add i32 %cur, %iv
+    %b1 = add i32 %base, 1
+    %j = and i32 %b1, 15
+    %q = call @proc_slot(%j)
+    %qstp = field @proc_PCB, *%q, 0
+    %qst = load i32, *%qstp
+    %ready = eq i32 %qst, @proc_State.Ready
+    br %ready, @found, @next
+  @next:
+    %in = add i32 %iv, 1
+    store i32 %in, *%i
+    jmp @cond
+  @found:
+    %fj = and i32 %j, 15
+    %fq = call @proc_slot(%fj)
+    %fstp = field @proc_PCB, *%fq, 0
+    store i32 @proc_State.Running, *%fstp
+    store i32 %fj, *@proc_current
+    call @klog_event(3, %cur, %fj, 0)
+    ret i32 %fj
+  @fallback:
+    %cstp = field @proc_PCB, *%p, 0
+    %cst = load i32, *%cstp
+    %usable = eq i32 %cst, @proc_State.Ready
+    br %usable, @use_cur, @halt
+  @use_cur:
+    store i32 @proc_State.Running, *%cstp
+    store i32 %cur, *@proc_current
+    call @klog_event(3, %cur, %cur, 0)
+    ret i32 %cur
+  @halt:
+    asm att void, "wfe", "~{memory}"
+    jmp @halt
+}
+
+fun @proc_syscall(ctx: i64, num: i32) -> void {
+  @entry:
+    %tickv = let i32
+    %p = call @proc_ctx_ptr(%ctx)
+    %a0p = gep i64, *%p, 0
+    %a0 = load i64, *%a0p
+    %a1p = gep i64, *%p, 1
+    %a1 = load i64, *%a1p
+    %a2p = gep i64, *%p, 2
+    %a2 = load i64, *%a2p
+    %scur = load i32, *@proc_current
+    %sa0 = trunc i64 %a0 to i32
+    call @klog_event(4, %scur, %num, %sa0)
+
+    %is0 = eq i32 %num, @proc_Sys.Yield
+    br %is0, @s_yield, @c1
+  @s_yield:
+    %cur = load i32, *@proc_current
+    %cp = call @proc_slot(%cur)
+    %cstp = field @proc_PCB, *%cp, 0
+    store i32 @proc_State.Ready, *%cstp
+    jmp @done
+  @c1:
+    %is1 = eq i32 %num, @proc_Sys.Exit
+    br %is1, @s_exit, @c2
+  @s_exit:
+    %code = trunc i64 %a0 to i32
+    %ecur = load i32, *@proc_current
+    call @klog_event(5, %ecur, %code, 0)
+    call @proc_do_exit(%code)
+    jmp @done
+  @c2:
+    %is2 = eq i32 %num, @proc_Sys.Sleep
+    br %is2, @s_sleep, @c3
+  @s_sleep:
+    %tk = trunc i64 %a0 to i32
+    store i32 %tk, *%tickv
+    %pos = sge i32 %tk, 1
+    br %pos, @sleep_go, @sleep_min
+  @sleep_min:
+    store i32 1, *%tickv
+    jmp @sleep_go
+  @sleep_go:
+    %cur2 = load i32, *@proc_current
+    %sp2 = call @proc_slot(%cur2)
+    %sstp = field @proc_PCB, *%sp2, 0
+    store i32 @proc_State.Sleeping, *%sstp
+    %tv = load i32, *%tickv
+    %tv64 = sext i32 %tv to i64
+    %now = load i64, *@proc_ticks
+    %wk = add i64 %now, %tv64
+    %wkp = field @proc_PCB, *%sp2, 7
+    store i64 %wk, *%wkp
+    %spidp = field @proc_PCB, *%sp2, 1
+    %spid = load i32, *%spidp
+    %wkl = trunc i64 %wk to i32
+    call @klog_event(7, %spid, %tv, %wkl)
+    jmp @done
+  @c3:
+    %is3 = eq i32 %num, @proc_Sys.Getpid
+    br %is3, @s_getpid, @c4
+  @s_getpid:
+    %cur3 = load i32, *@proc_current
+    %gp = call @proc_slot(%cur3)
+    %gpidp = field @proc_PCB, *%gp, 1
+    %gpid = load i32, *%gpidp
+    %gpid64 = sext i32 %gpid to i64
+    store i64 %gpid64, *%a0p
+    jmp @done
+  @c4:
+    %is4 = eq i32 %num, @proc_Sys.Getppid
+    br %is4, @s_getppid, @c5
+  @s_getppid:
+    %cur4 = load i32, *@proc_current
+    %gpp = call @proc_slot(%cur4)
+    %gparp = field @proc_PCB, *%gpp, 2
+    %gpar = load i32, *%gparp
+    %gpar64 = sext i32 %gpar to i64
+    store i64 %gpar64, *%a0p
+    jmp @done
+  @c5:
+    %is5 = eq i32 %num, @proc_Sys.Spawn
+    br %is5, @s_spawn, @c6
+  @s_spawn:
+    %entry = trunc i64 %a0 to i32
+    %spname = asm att *i8, "mov $0, ${a2}", "=r,r", i64 %a2
+    %cur5 = load i32, *@proc_current
+    %par5p = call @proc_slot(%cur5)
+    %par5vp = field @proc_PCB, *%par5p, 1
+    %par5 = load i32, *%par5vp
+    %newpid = call @proc_spawn_impl(%entry, %a1, %spname, %par5)
+    %newpid64 = sext i32 %newpid to i64
+    store i64 %newpid64, *%a0p
+    jmp @done
+  @c6:
+    %is6 = eq i32 %num, @proc_Sys.Wait
+    br %is6, @s_wait, @c7
+  @s_wait:
+    %target = trunc i64 %a0 to i32
+    %res = call @proc_do_wait(%target)
+    %blocked = eq i64 %res, -2
+    br %blocked, @done, @wait_store
+  @wait_store:
+    store i64 %res, *%a0p
+    jmp @done
+  @c7:
+    %is7 = eq i32 %num, @proc_Sys.Kill
+    br %is7, @s_kill, @s_bad
+  @s_kill:
+    %kpid = trunc i64 %a0 to i32
+    %kcode = trunc i64 %a1 to i32
+    %kr = call @proc_do_kill(%kpid, %kcode)
+    %kr64 = sext i32 %kr to i64
+    store i64 %kr64, *%a0p
+    jmp @done
+  @s_bad:
+    store i64 -1, *%a0p
+    jmp @done
+  @done:
+    ret void
+}
+
+fun @proc_trap_c(ctx: i64, sp: i64, kind: i32, esr: i64) -> i64 {
+  @entry:
+    %cur = load i32, *@proc_current
+    %p = call @proc_slot(%cur)
+    %ctxp = field @proc_PCB, *%p, 8
+    store i64 %ctx, *%ctxp
+    %spp = field @proc_PCB, *%p, 9
+    store i64 %sp, *%spp
+    %issync = eq i32 %kind, 1
+    br %issync, @sync, @irq
+  @sync:
+    %ec = lshr i64 %esr, 26
+    %ec6 = and i64 %ec, 0x3F
+    %issvc = eq i64 %ec6, 0x15
+    br %issvc, @svc, @fault
+  @svc:
+    // The immediate operand of svc #0 is always 0; per ABI, the call number is read from the saved x8.
+    %frame = call @proc_ctx_ptr(%ctx)
+    %x8p = gep i64, *%frame, 8
+    %num64 = load i64, *%x8p
+    %num = trunc i64 %num64 to i32
+    call @proc_syscall(%ctx, %num)
+    jmp @sched
+  @fault:
+    call @boot_panic_vec()
+    jmp @sched
+  @irq:
+    call @proc_irq_service()
+    jmp @sched
+  @sched:
+    %nxt = call @proc_schedule(%cur)
+    %np = call @proc_slot(%nxt)
+    %nctxp = field @proc_PCB, *%np, 8
+    %nctx = load i64, *%nctxp
+    ret i64 %nctx
+}
+
+// Exception entry: save the full context, call proc_trap_c(ctx, sp, kind, esr), and restore the next process.
+fun @proc_trap_stubs() -> void {
+  @entry:
+    asm att void, ".macro proc_save_ctx\nsub sp, sp, #272\nstp x0, x1, [sp, #0]\nstp x2, x3, [sp, #16]\nstp x4, x5, [sp, #32]\nstp x6, x7, [sp, #48]\nstp x8, x9, [sp, #64]\nstp x10, x11, [sp, #80]\nstp x12, x13, [sp, #96]\nstp x14, x15, [sp, #112]\nstp x16, x17, [sp, #128]\nstp x18, x19, [sp, #144]\nstp x20, x21, [sp, #160]\nstp x22, x23, [sp, #176]\nstp x24, x25, [sp, #192]\nstp x26, x27, [sp, #208]\nstp x28, x29, [sp, #224]\nstr x30, [sp, #240]\nmrs x9, spsr_el1\nmrs x10, elr_el1\nstp x9, x10, [sp, #248]\n.endm\n.macro proc_restore_ctx\nldr x9, [sp, #248]\nmsr spsr_el1, x9\nldr x10, [sp, #256]\nmsr elr_el1, x10\nldp x0, x1, [sp, #0]\nldp x2, x3, [sp, #16]\nldp x4, x5, [sp, #32]\nldp x6, x7, [sp, #48]\nldp x8, x9, [sp, #64]\nldp x10, x11, [sp, #80]\nldp x12, x13, [sp, #96]\nldp x14, x15, [sp, #112]\nldp x16, x17, [sp, #128]\nldp x18, x19, [sp, #144]\nldp x20, x21, [sp, #160]\nldp x22, x23, [sp, #176]\nldp x24, x25, [sp, #192]\nldp x26, x27, [sp, #208]\nldp x28, x29, [sp, #224]\nldr x30, [sp, #240]\nadd sp, sp, #272\neret\n.endm\n.global proc_irq_asm\nproc_irq_asm:\nproc_save_ctx\nmov x0, sp\nadd x1, sp, #272\nmov x2, #0\nmrs x3, esr_el1\nbl proc_trap_c\nmov sp, x0\nproc_restore_ctx\n.global proc_sync_asm\nproc_sync_asm:\nproc_save_ctx\nmov x0, sp\nadd x1, sp, #272\nmov x2, #1\nmrs x3, esr_el1\nbl proc_trap_c\nmov sp, x0\nproc_restore_ctx\n", "~{x0},~{x1},~{x2},~{x3},~{x4},~{x5},~{x6},~{x7},~{x8},~{x9},~{x10},~{x11},~{x12},~{x13},~{x14},~{x15},~{x16},~{x17},~{x18},~{x19},~{x20},~{x21},~{x22},~{x23},~{x24},~{x25},~{x26},~{x27},~{x28},~{x29},~{x30},~{memory},~{cc}"
+    ret void
+}
+
+fun @proc_trampoline() -> void {
+  @entry:
+    %cur = load i32, *@proc_current
+    %p = call @proc_slot(%cur)
+    %entp = field @proc_PCB, *%p, 3
+    %entry = load i32, *%entp
+    %argp = field @proc_PCB, *%p, 10
+    %arg = load i64, *%argp
+    %code = call @procdemo_dispatch(%entry, %arg)
+    call @proc_exit(%code)
+    jmp @spin
+  @spin:
+    asm att void, "wfe", "~{memory}"
+    jmp @spin
+}
+
+fun @proc_idle_entry() -> void {
+  @entry:
+    jmp @loop
+  @loop:
+    asm att void, "wfe", "~{memory}"
+    jmp @loop
+}
+
+// -- syscall wrappers (SVC #0, number in x8, arguments x0..x2, result x0) --
+
+fun @proc_syscall0(num: i32) -> i64 {
+  @entry:
+    %n = zext i32 %num to i64
+    %r = asm att i64, "mov x8, ${n}\nsvc #0\nmov $0, x0", "=r,r,~{x0},~{x8},~{memory},~{cc}", i64 %n
+    ret i64 %r
+}
+
+fun @proc_syscall1(num: i32, a0: i64) -> i64 {
+  @entry:
+    %n = zext i32 %num to i64
+    %r = asm att i64, "mov x8, ${n}\nmov x0, ${a0}\nsvc #0\nmov $0, x0", "=r,r,r,~{x0},~{x8},~{memory},~{cc}", i64 %n, i64 %a0
+    ret i64 %r
+}
+
+fun @proc_syscall2(num: i32, a0: i64, a1: i64) -> i64 {
+  @entry:
+    %n = zext i32 %num to i64
+    %r = asm att i64, "mov x8, ${n}\nmov x0, ${a0}\nmov x1, ${a1}\nsvc #0\nmov $0, x0", "=r,r,r,r,~{x0},~{x1},~{x8},~{memory},~{cc}", i64 %n, i64 %a0, i64 %a1
+    ret i64 %r
+}
+
+fun @proc_syscall3(num: i32, a0: i64, a1: i64, a2: i64) -> i64 {
+  @entry:
+    %n = zext i32 %num to i64
+    %r = asm att i64, "mov x8, ${n}\nmov x0, ${a0}\nmov x1, ${a1}\nmov x2, ${a2}\nsvc #0\nmov $0, x0", "=r,r,r,r,r,~{x0},~{x1},~{x2},~{x8},~{memory},~{cc}", i64 %n, i64 %a0, i64 %a1, i64 %a2
+    ret i64 %r
+}
+
+fun @proc_yield() -> void {
+  @entry:
+    %r = call @proc_syscall0(@proc_Sys.Yield)
+    ret void
+}
+
+fun @proc_exit(code: i32) -> void {
+  @entry:
+    %c = sext i32 %code to i64
+    %r = call @proc_syscall1(@proc_Sys.Exit, %c)
+    ret void
+}
+
+fun @proc_sleep(ticks: i32) -> void {
+  @entry:
+    %t = sext i32 %ticks to i64
+    %r = call @proc_syscall1(@proc_Sys.Sleep, %t)
+    ret void
+}
+
+fun @proc_getpid() -> i32 {
+  @entry:
+    %r = call @proc_syscall0(@proc_Sys.Getpid)
+    %p = trunc i64 %r to i32
+    ret i32 %p
+}
+
+fun @proc_getppid() -> i32 {
+  @entry:
+    %r = call @proc_syscall0(@proc_Sys.Getppid)
+    %p = trunc i64 %r to i32
+    ret i32 %p
+}
+
+fun @proc_wait(pid: i32) -> i64 {
+  @entry:
+    %t = sext i32 %pid to i64
+    %r = call @proc_syscall1(@proc_Sys.Wait, %t)
+    ret i64 %r
+}
+
+fun @proc_kill(pid: i32, code: i32) -> i32 {
+  @entry:
+    %p = sext i32 %pid to i64
+    %c = sext i32 %code to i64
+    %r = call @proc_syscall2(@proc_Sys.Kill, %p, %c)
+    %rv = trunc i64 %r to i32
+    ret i32 %rv
+}
+
+fun @proc_ticks() -> i64 {
+  @entry:
+    %v = load i64, *@proc_ticks
+    ret i64 %v
+}
+
+fun @proc_state_name(s: i32) -> *i8 {
+  @entry:
+    %is0 = eq i32 %s, @proc_State.Unused
+    br %is0, @unused, @c1
+  @unused:
+    %u = gep i8, *@proc_S_UNUSED, 0
+    ret *i8 %u
+  @c1:
+    %is1 = eq i32 %s, @proc_State.Ready
+    br %is1, @ready, @c2
+  @ready:
+    %r = gep i8, *@proc_S_READY, 0
+    ret *i8 %r
+  @c2:
+    %is2 = eq i32 %s, @proc_State.Running
+    br %is2, @running, @c3
+  @running:
+    %n = gep i8, *@proc_S_RUNNING, 0
+    ret *i8 %n
+  @c3:
+    %is3 = eq i32 %s, @proc_State.Sleeping
+    br %is3, @sleeping, @c4
+  @sleeping:
+    %sl = gep i8, *@proc_S_SLEEP, 0
+    ret *i8 %sl
+  @c4:
+    %is4 = eq i32 %s, @proc_State.Waiting
+    br %is4, @waiting, @c5
+  @waiting:
+    %w = gep i8, *@proc_S_WAIT, 0
+    ret *i8 %w
+  @c5:
+    %is5 = eq i32 %s, @proc_State.Zombie
+    br %is5, @zombie, @unknown
+  @zombie:
+    %z = gep i8, *@proc_S_ZOMBIE, 0
+    ret *i8 %z
+  @unknown:
+    %uk = gep i8, *@proc_S_UNKNOWN, 0
+    ret *i8 %uk
+}
+
+fun @proc_ps() -> void {
+  @entry:
+    %i = let i32
+    %hdr = gep i8, *@proc_PS_HDR, 0
+    call @console_puts(%hdr)
+    store i32 0, *%i
+    jmp @cond
+  @cond:
+    %iv = load i32, *%i
+    %done = sge i32 %iv, 16
+    br %done, @end, @body
+  @body:
+    %p = call @proc_slot(%iv)
+    %stp = field @proc_PCB, *%p, 0
+    %st = load i32, *%stp
+    %unused = eq i32 %st, @proc_State.Unused
+    br %unused, @next, @print
+  @print:
+    %pidp = field @proc_PCB, *%p, 1
+    %pid = load i32, *%pidp
+    %pid64 = sext i32 %pid to i64
+    %nmp = field @proc_PCB, *%p, 12
+    %nm = load *i8, *%nmp
+    %sname = call @proc_state_name(%st)
+    %fmt = gep i8, *@proc_PS_FMT, 0
+    call @console_printf(%fmt, %pid64, 0, 0, 0, %sname, %nm)
+    jmp @next
+  @next:
+    %in = add i32 %iv, 1
+    store i32 %in, *%i
+    jmp @cond
+  @end:
+    ret void
+}
+
+fun @proc_count() -> i32 {
+  @entry:
+    %i = let i32
+    %n = let i32
+    store i32 0, *%i
+    store i32 0, *%n
+    jmp @cond
+  @cond:
+    %iv = load i32, *%i
+    %done = sge i32 %iv, 16
+    br %done, @end, @body
+  @body:
+    %p = call @proc_slot(%iv)
+    %stp = field @proc_PCB, *%p, 0
+    %st = load i32, *%stp
+    %unused = eq i32 %st, @proc_State.Unused
+    br %unused, @next, @inc
+  @inc:
+    %nv = load i32, *%n
+    %nv2 = add i32 %nv, 1
+    store i32 %nv2, *%n
+    jmp @next
+  @next:
+    %in = add i32 %iv, 1
+    store i32 %in, *%i
+    jmp @cond
+  @end:
+    %rv = load i32, *%n
+    ret i32 %rv
+}

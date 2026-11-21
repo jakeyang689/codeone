@@ -1,0 +1,1241 @@
+// shell.bx - command line: serial input, line editing, parsing, and dispatch
+//
+// Up/down walk a small command history; left/right move the insert cursor.
+// The built-in commands live in cmd_fs.bx (ls / cd / pwd / cat / mkdir / touch /
+// cp / rm / rmdir / mv), cmd_sys.bx (ps / mem / uptime / uname / date / reboot)
+// and cmd_net.bx (ifconfig / arp / dhcp / ping / nslookup / nettest).
+
+extern @console_putc(ch: i32) -> void
+extern @console_puts(s: *i8) -> void
+extern @console_printf(fmt: *i8, a: i64, b: i64, c: i64, d: i64, s1: *i8, s2: *i8) -> void
+extern @console_getc() -> i32
+extern @net_poll() -> void
+extern @gui_run() -> i32
+extern @urlone_run(args: *i8) -> i32
+extern @agent_run(args: *i8) -> i32
+extern @cmdfs_init() -> void
+extern @cmdfs_ls(arg: *i8) -> void
+extern @cmdfs_cd(arg: *i8) -> void
+extern @cmdfs_pwd() -> void
+extern @cmdfs_cat(arg: *i8) -> void
+extern @cmdfs_mkdir(arg: *i8) -> void
+extern @cmdfs_touch(arg: *i8) -> void
+extern @cmdfs_cp(arg: *i8) -> void
+extern @cmdfs_rm(arg: *i8) -> void
+extern @cmdfs_rmdir(arg: *i8) -> void
+extern @cmdfs_mv(arg: *i8) -> void
+extern @cmd_sys_ps() -> void
+extern @cmd_sys_mem() -> void
+extern @cmd_sys_uptime() -> void
+extern @cmd_sys_clear() -> void
+extern @cmd_sys_uname() -> void
+extern @cmd_sys_echo(arg: *i8) -> void
+extern @cmd_sys_date() -> void
+extern @cmd_sys_time() -> void
+extern @cmd_sys_reboot() -> void
+extern @cmd_sys_poweroff() -> void
+extern @cmdnet_ifconfig() -> void
+extern @cmdnet_arp() -> void
+extern @cmdnet_dhcp() -> void
+extern @cmdnet_ping(arg: *i8) -> void
+extern @cmdnet_nettest() -> void
+extern @cmdnet_nslookup(arg: *i8) -> void
+
+const @shell_WELCOME: [i8, 39] = "osone shell: type 'help' for commands\n"
+const @shell_PROMPT: [i8, 8] = "osone> "
+const @shell_NL: [i8, 2] = "\n"
+const @shell_HELP: [i8, 1121] = "commands:\n  ls [path]     list directory\n  cd [path]     change directory\n  pwd           print working directory\n  cat <file>    print file contents\n  mkdir <dir>   create a directory\n  touch <file>  create an empty file\n  cp <src> <dst> copy a file\n  mv <src> <dst> move or rename a file\n  rm <file>     remove a file\n  rmdir <dir>   remove an empty directory\n  echo <text>   print text\n  ps            list processes\n  mem           show heap usage\n  uptime        show time since boot\n  uname         show kernel name\n  date          show date and time (UTC)\n  time          show the time of day (UTC)\n  clear         clear the screen\n  history       show command history\n  ifconfig      show network config\n  arp           show the ARP cache\n  dhcp          renew address via DHCP\n  ping <host>   ping a host\n  nslookup <h>  resolve a hostname\n  nettest       run network selftest\n  urlone <url>  fetch an HTTP/HTTPS URL\n  agent [cmd]   system agent (ask, tools, config)\n  gui           start graphical desktop\n  reboot        reboot the machine\n  poweroff      power off the machine\n  help          show this help\n"
+const @shell_UNKNOWN: [i8, 27] = "sh: %s: command not found\n"
+const @shell_C_LS: [i8, 3] = "ls"
+const @shell_C_CD: [i8, 3] = "cd"
+const @shell_C_PWD: [i8, 4] = "pwd"
+const @shell_C_CAT: [i8, 4] = "cat"
+const @shell_C_HELP: [i8, 5] = "help"
+const @shell_C_IFCONFIG: [i8, 9] = "ifconfig"
+const @shell_C_PING: [i8, 5] = "ping"
+const @shell_C_NETTEST: [i8, 8] = "nettest"
+const @shell_C_NSLOOKUP: [i8, 9] = "nslookup"
+const @shell_C_DHCP: [i8, 5] = "dhcp"
+const @shell_C_GUI: [i8, 4] = "gui"
+const @shell_C_URLONE: [i8, 7] = "urlone"
+const @shell_C_AGENT: [i8, 6] = "agent"
+const @shell_C_PS: [i8, 3] = "ps"
+const @shell_C_MEM: [i8, 4] = "mem"
+const @shell_C_UPTIME: [i8, 7] = "uptime"
+const @shell_C_CLEAR: [i8, 6] = "clear"
+const @shell_C_UNAME: [i8, 6] = "uname"
+const @shell_C_MKDIR: [i8, 6] = "mkdir"
+const @shell_C_TOUCH: [i8, 6] = "touch"
+const @shell_C_CP: [i8, 3] = "cp"
+const @shell_C_ECHO: [i8, 5] = "echo"
+const @shell_C_HISTORY: [i8, 8] = "history"
+const @shell_C_RM: [i8, 3] = "rm"
+const @shell_C_RMDIR: [i8, 6] = "rmdir"
+const @shell_C_MV: [i8, 3] = "mv"
+const @shell_C_DATE: [i8, 5] = "date"
+const @shell_C_TIME: [i8, 5] = "time"
+const @shell_C_ARP: [i8, 4] = "arp"
+const @shell_C_REBOOT: [i8, 7] = "reboot"
+const @shell_C_POWEROFF: [i8, 9] = "poweroff"
+const @shell_CMDS: [i8, 169] = "ls\ncd\npwd\ncat\nifconfig\narp\ndhcp\nping\nnettest\nnslookup\nurlone\nagent\ngui\nps\nmem\nuptime\nclear\nuname\nmkdir\ntouch\ncp\nrm\nrmdir\nmv\necho\ndate\ntime\nhistory\nreboot\npoweroff\nhelp\n"
+const @shell_INDENT: [i8, 3] = "  "
+const @shell_HIST_FMT: [i8, 10] = "  %d  %s\n"
+const @shell_HIST_MAX: i32 = 8
+const @shell_LINE_MAX: i32 = 254
+
+global @shell_line: [i8, 256]
+global @shell_cmd: [i8, 64]
+global @shell_argoff: i32
+global @shell_hist: [i8, 2048]
+global @shell_hist_count: i32
+global @shell_comp_off: i32
+global @shell_comp_name: [i8, 64]
+// Override prompt for the line editor (0 means @shell_PROMPT).
+global @shell_PROMPT_ALT: i64 = 0
+
+fun @shell_strlen(s: *i8) -> i32 {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @cond
+  @cond:
+    %iv = load i32, *%i
+    %p = gep i8, *%s, %iv
+    %c = load i8, *%p
+    %z = eq i8 %c, 0
+    br %z, @done, @body
+  @body:
+    %n = add i32 %iv, 1
+    store i32 %n, *%i
+    jmp @cond
+  @done:
+    %r = load i32, *%i
+    ret i32 %r
+}
+
+fun @shell_strcpy(dst: *i8, src: *i8) -> void {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @cond
+  @cond:
+    %iv = load i32, *%i
+    %sp = gep i8, *%src, %iv
+    %c = load i8, *%sp
+    %dp = gep i8, *%dst, %iv
+    store i8 %c, *%dp
+    %z = eq i8 %c, 0
+    br %z, @done, @body
+  @body:
+    %n = add i32 %iv, 1
+    store i32 %n, *%i
+    jmp @cond
+  @done:
+    ret void
+}
+
+fun @shell_streq(a: *i8, b: *i8) -> i32 {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @cond
+  @cond:
+    %iv = load i32, *%i
+    %ap = gep i8, *%a, %iv
+    %ac = load i8, *%ap
+    %bp = gep i8, *%b, %iv
+    %bc = load i8, *%bp
+    %eqc = eq i8 %ac, %bc
+    br %eqc, @same, @diff
+  @same:
+    %z = eq i8 %ac, 0
+    br %z, @yes, @next
+  @next:
+    %n = add i32 %iv, 1
+    store i32 %n, *%i
+    jmp @cond
+  @diff:
+    ret i32 0
+  @yes:
+    ret i32 1
+}
+
+// Length of the command name starting at offset off in @shell_CMDS.
+fun @shell_cmd_len(off: i32) -> i32 {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @cond
+  @cond:
+    %iv = load i32, *%i
+    %p = add i32 %off, %iv
+    %cp = gep i8, *@shell_CMDS, %p
+    %c = load i8, *%cp
+    %nl = eq i8 %c, 10
+    %z = eq i8 %c, 0
+    %stop = or i1 %nl, %z
+    br %stop, @ret, @body
+  @body:
+    %n = add i32 %iv, 1
+    store i32 %n, *%i
+    jmp @cond
+  @ret:
+    ret i32 %iv
+}
+
+// Count commands whose name starts with line[start..start+toklen) and record
+// the offset of the first one in @shell_comp_off.
+fun @shell_cmd_match(start: i32, toklen: i32) -> i32 {
+  @entry:
+    %p = let i32
+    %k = let i32
+    %count = let i32
+    store i32 0, *%p
+    store i32 0, *%count
+    store i32 -1, *@shell_comp_off
+    jmp @outer
+  @outer:
+    %pv = load i32, *%p
+    %cp = gep i8, *@shell_CMDS, %pv
+    %ch = load i8, *%cp
+    %fin = eq i8 %ch, 0
+    br %fin, @done, @chkcand
+  @chkcand:
+    store i32 0, *%k
+    jmp @kcond
+  @kcond:
+    %kv = load i32, *%k
+    %kdone = sge i32 %kv, %toklen
+    br %kdone, @hit, @kbody
+  @kbody:
+    %pv2 = load i32, *%p
+    %kp = add i32 %pv2, %kv
+    %ccp = gep i8, *@shell_CMDS, %kp
+    %cc = load i8, *%ccp
+    %nl = eq i8 %cc, 10
+    br %nl, @nextcand, @kcmp
+  @kcmp:
+    %sp = add i32 %start, %kv
+    %lcp = gep i8, *@shell_line, %sp
+    %lc = load i8, *%lcp
+    %same = eq i8 %cc, %lc
+    br %same, @knext, @nextcand
+  @knext:
+    %kn = add i32 %kv, 1
+    store i32 %kn, *%k
+    jmp @kcond
+  @hit:
+    %cnt = load i32, *%count
+    %first = eq i32 %cnt, 0
+    br %first, @record, @inc
+  @record:
+    %pv3 = load i32, *%p
+    store i32 %pv3, *@shell_comp_off
+    jmp @inc
+  @inc:
+    %cnt2 = add i32 %cnt, 1
+    store i32 %cnt2, *%count
+    jmp @nextcand
+  @nextcand:
+    %pv4 = load i32, *%p
+    %cp4 = gep i8, *@shell_CMDS, %pv4
+    %c4 = load i8, *%cp4
+    %en = eq i8 %c4, 10
+    %zz = eq i8 %c4, 0
+    %stop = or i1 %en, %zz
+    br %stop, @adv, @skip
+  @skip:
+    %pn = add i32 %pv4, 1
+    store i32 %pn, *%p
+    jmp @nextcand
+  @adv:
+    %end = eq i8 %c4, 0
+    br %end, @done, @pastnl
+  @pastnl:
+    %pn2 = add i32 %pv4, 1
+    store i32 %pn2, *%p
+    jmp @outer
+  @done:
+    %rv = load i32, *%count
+    ret i32 %rv
+}
+
+// Copy the NUL-terminated command name at offset off from @shell_CMDS to dst.
+fun @shell_cmd_copy(off: i32, dst: *i8) -> void {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @cond
+  @cond:
+    %iv = load i32, *%i
+    %p = add i32 %off, %iv
+    %cp = gep i8, *@shell_CMDS, %p
+    %c = load i8, *%cp
+    %nl = eq i8 %c, 10
+    %z = eq i8 %c, 0
+    %stop = or i1 %nl, %z
+    br %stop, @end, @body
+  @body:
+    %dp = gep i8, *%dst, %iv
+    store i8 %c, *%dp
+    %n = add i32 %iv, 1
+    store i32 %n, *%i
+    jmp @cond
+  @end:
+    %dp2 = gep i8, *%dst, %iv
+    store i8 0, *%dp2
+    ret void
+}
+
+// Print every command matching the first token, one per line.
+fun @shell_list_matches(start: i32, toklen: i32) -> void {
+  @entry:
+    %p = let i32
+    %k = let i32
+    store i32 0, *%p
+    jmp @outer
+  @outer:
+    %pv = load i32, *%p
+    %cp = gep i8, *@shell_CMDS, %pv
+    %ch = load i8, *%cp
+    %fin = eq i8 %ch, 0
+    br %fin, @done, @chkcand
+  @chkcand:
+    store i32 0, *%k
+    jmp @kcond
+  @kcond:
+    %kv = load i32, *%k
+    %kdone = sge i32 %kv, %toklen
+    br %kdone, @hit, @kbody
+  @kbody:
+    %pv2 = load i32, *%p
+    %kp = add i32 %pv2, %kv
+    %ccp = gep i8, *@shell_CMDS, %kp
+    %cc = load i8, *%ccp
+    %nl = eq i8 %cc, 10
+    br %nl, @nextcand, @kcmp
+  @kcmp:
+    %sp = add i32 %start, %kv
+    %lcp = gep i8, *@shell_line, %sp
+    %lc = load i8, *%lcp
+    %same = eq i8 %cc, %lc
+    br %same, @knext, @nextcand
+  @knext:
+    %kn = add i32 %kv, 1
+    store i32 %kn, *%k
+    jmp @kcond
+  @hit:
+    %pv3 = load i32, *%p
+    %name = gep i8, *@shell_comp_name, 0
+    call @shell_cmd_copy(%pv3, %name)
+    %ind = gep i8, *@shell_INDENT, 0
+    call @console_puts(%ind)
+    call @console_puts(%name)
+    %nlp = gep i8, *@shell_NL, 0
+    call @console_puts(%nlp)
+    jmp @nextcand
+  @nextcand:
+    %pv4 = load i32, *%p
+    %cp4 = gep i8, *@shell_CMDS, %pv4
+    %c4 = load i8, *%cp4
+    %en = eq i8 %c4, 10
+    %zz = eq i8 %c4, 0
+    %stop = or i1 %en, %zz
+    br %stop, @adv, @skip
+  @skip:
+    %pn = add i32 %pv4, 1
+    store i32 %pn, *%p
+    jmp @nextcand
+  @adv:
+    %end = eq i8 %c4, 0
+    br %end, @done, @pastnl
+  @pastnl:
+    %pn2 = add i32 %pv4, 1
+    store i32 %pn2, *%p
+    jmp @outer
+  @done:
+    ret void
+}
+
+// Block until one serial byte arrives.
+fun @shell_getc_wait() -> i32 {
+  @entry:
+    jmp @read
+  @read:
+    %c = call @console_getc()
+    %none = slt i32 %c, 0
+    br %none, @idle, @got
+  @idle:
+    call @net_poll()
+    asm att void, "wfe", "~{memory}"
+    jmp @read
+  @got:
+    ret i32 %c
+}
+
+// Read the rest of an escape sequence after ESC.  Returns 1=up, 2=down,
+// 3=right, 4=left, 0=anything else.
+fun @shell_read_arrow() -> i32 {
+  @entry:
+    %c1 = call @shell_getc_wait()
+    %brk = eq i32 %c1, 91
+    %ss3 = eq i32 %c1, 79
+    %prefix = or i1 %brk, %ss3
+    br %prefix, @final, @unknown
+  @final:
+    %c2 = call @shell_getc_wait()
+    %up = eq i32 %c2, 65
+    br %up, @r_up, @chk_down
+  @chk_down:
+    %dn = eq i32 %c2, 66
+    br %dn, @r_down, @chk_right
+  @chk_right:
+    %rt = eq i32 %c2, 67
+    br %rt, @r_right, @chk_left
+  @chk_left:
+    %lf = eq i32 %c2, 68
+    br %lf, @r_left, @unknown
+  @r_up:
+    ret i32 1
+  @r_down:
+    ret i32 2
+  @r_right:
+    ret i32 3
+  @r_left:
+    ret i32 4
+  @unknown:
+    ret i32 0
+}
+
+// Redraw the edited line: CR, prompt, text, erase to EOL, then back up to
+// the insert cursor with BS bytes.
+fun @shell_redraw(cur: i32) -> void {
+  @entry:
+    %i = let i32
+    call @console_putc(13)
+    %pp = call @shell_prompt()
+    call @console_puts(%pp)
+    %lp = gep i8, *@shell_line, 0
+    call @console_puts(%lp)
+    call @console_putc(27)
+    call @console_putc(91)
+    call @console_putc(75)
+    %len = call @shell_strlen(%lp)
+    %left = sub i32 %len, %cur
+    store i32 0, *%i
+    jmp @cond
+  @cond:
+    %iv = load i32, *%i
+    %done = sge i32 %iv, %left
+    br %done, @fin, @body
+  @body:
+    call @console_putc(8)
+    %n = add i32 %iv, 1
+    store i32 %n, *%i
+    jmp @cond
+  @fin:
+    ret void
+}
+
+// Append the current line to the history ring (8 entries, oldest dropped).
+fun @shell_hist_add() -> void {
+  @entry:
+    %i = let i32
+    %cnt = load i32, *@shell_hist_count
+    %has = sgt i32 %cnt, 0
+    br %has, @chkdup, @append
+  @chkdup:
+    %last = sub i32 %cnt, 1
+    %loff = shl i32 %last, 8
+    %lp = gep i8, *@shell_hist, %loff
+    %linep = gep i8, *@shell_line, 0
+    %same = call @shell_streq(%lp, %linep)
+    %dup = eq i32 %same, 1
+    br %dup, @done, @append
+  @append:
+    %cnt2 = load i32, *@shell_hist_count
+    %full = sge i32 %cnt2, @shell_HIST_MAX
+    br %full, @shift, @store
+  @shift:
+    store i32 0, *%i
+    jmp @scond
+  @scond:
+    %iv = load i32, *%i
+    %lim = sub i32 @shell_HIST_MAX, 1
+    %sdone = sge i32 %iv, %lim
+    br %sdone, @store_full, @sbody
+  @sbody:
+    %dof = shl i32 %iv, 8
+    %dp = gep i8, *@shell_hist, %dof
+    %i1 = add i32 %iv, 1
+    %sof = shl i32 %i1, 8
+    %sp = gep i8, *@shell_hist, %sof
+    call @shell_strcpy(%dp, %sp)
+    %in = add i32 %iv, 1
+    store i32 %in, *%i
+    jmp @scond
+  @store_full:
+    %fidx = sub i32 @shell_HIST_MAX, 1
+    %foff = shl i32 %fidx, 8
+    %fdst = gep i8, *@shell_hist, %foff
+    %fsrc = gep i8, *@shell_line, 0
+    call @shell_strcpy(%fdst, %fsrc)
+    jmp @done
+  @store:
+    %soff = shl i32 %cnt2, 8
+    %sdst = gep i8, *@shell_hist, %soff
+    %ssrc = gep i8, *@shell_line, 0
+    call @shell_strcpy(%sdst, %ssrc)
+    %nc = add i32 %cnt2, 1
+    store i32 %nc, *@shell_hist_count
+    jmp @done
+  @done:
+    ret void
+}
+
+// Copy history entry idx into the edit line.
+fun @shell_hist_load(idx: i32) -> void {
+  @entry:
+    %off = shl i32 %idx, 8
+    %sp = gep i8, *@shell_hist, %off
+    %dp = gep i8, *@shell_line, 0
+    call @shell_strcpy(%dp, %sp)
+    ret void
+}
+
+fun @shell_hist_dump() -> void {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @cond
+  @cond:
+    %iv = load i32, *%i
+    %cnt = load i32, *@shell_hist_count
+    %done = sge i32 %iv, %cnt
+    br %done, @ret, @body
+  @body:
+    %off = shl i32 %iv, 8
+    %ep = gep i8, *@shell_hist, %off
+    %n64 = sext i32 %iv to i64
+    %fmt = gep i8, *@shell_HIST_FMT, 0
+    call @console_printf(%fmt, %n64, 0, 0, 0, %ep, null)
+    %iv2 = load i32, *%i
+    %in = add i32 %iv2, 1
+    store i32 %in, *%i
+    jmp @cond
+  @ret:
+    ret void
+}
+
+// `complete` enables Tab command completion (the interactive agent reuses the
+// line editor but has no shell commands to complete against).
+fun @shell_getline(complete: i32) -> i32 {
+  @entry:
+    %len = let i32
+    %cur = let i32
+    %hidx = let i32
+    %j = let i32
+    %tc_i = let i32
+    %tc_start = let i32
+    %tc_k = let i32
+    store i32 0, *%len
+    store i32 0, *%cur
+    store i32 -1, *%hidx
+    %lp = gep i8, *@shell_line, 0
+    store i8 0, *%lp
+    jmp @read
+  @read:
+    %c = call @shell_getc_wait()
+    %isesc = eq i32 %c, 27
+    br %isesc, @esc, @chk_enter
+  @esc:
+    %a = call @shell_read_arrow()
+    %isup = eq i32 %a, 1
+    br %isup, @up, @chk_down
+  @chk_down:
+    %isdn = eq i32 %a, 2
+    br %isdn, @down, @chk_left
+  @chk_left:
+    %islf = eq i32 %a, 4
+    br %islf, @left, @chk_right
+  @chk_right:
+    %isrt = eq i32 %a, 3
+    br %isrt, @right, @read
+  @up:
+    %cnt = load i32, *@shell_hist_count
+    %has = sgt i32 %cnt, 0
+    br %has, @up_sel, @read
+  @up_sel:
+    %h = load i32, *%hidx
+    %fresh = slt i32 %h, 0
+    br %fresh, @up_newest, @up_dec
+  @up_newest:
+    %cnt2 = load i32, *@shell_hist_count
+    %ni = sub i32 %cnt2, 1
+    store i32 %ni, *%hidx
+    jmp @up_load
+  @up_dec:
+    %h2 = load i32, *%hidx
+    %top = eq i32 %h2, 0
+    br %top, @read, @up_dec2
+  @up_dec2:
+    %h3 = sub i32 %h2, 1
+    store i32 %h3, *%hidx
+    jmp @up_load
+  @up_load:
+    %hi = load i32, *%hidx
+    call @shell_hist_load(%hi)
+    %hln = call @shell_strlen(%lp)
+    store i32 %hln, *%len
+    store i32 %hln, *%cur
+    call @shell_redraw(%hln)
+    jmp @read
+  @down:
+    %hd = load i32, *%hidx
+    %none = slt i32 %hd, 0
+    br %none, @read, @down_chk
+  @down_chk:
+    %cnt3 = load i32, *@shell_hist_count
+    %last3 = sub i32 %cnt3, 1
+    %at = eq i32 %hd, %last3
+    br %at, @down_clear, @down_dec
+  @down_dec:
+    %h4 = add i32 %hd, 1
+    store i32 %h4, *%hidx
+    jmp @up_load
+  @down_clear:
+    store i32 -1, *%hidx
+    store i32 0, *%len
+    store i32 0, *%cur
+    store i8 0, *%lp
+    call @shell_redraw(0)
+    jmp @read
+  @left:
+    %cv = load i32, *%cur
+    %lz = sle i32 %cv, 0
+    br %lz, @read, @left_go
+  @left_go:
+    %cv2 = sub i32 %cv, 1
+    store i32 %cv2, *%cur
+    call @console_putc(27)
+    call @console_putc(91)
+    call @console_putc(68)
+    jmp @read
+  @right:
+    %cv3 = load i32, *%cur
+    %lv = load i32, *%len
+    %rend = sge i32 %cv3, %lv
+    br %rend, @read, @right_go
+  @right_go:
+    %cv4 = add i32 %cv3, 1
+    store i32 %cv4, *%cur
+    call @console_putc(27)
+    call @console_putc(91)
+    call @console_putc(67)
+    jmp @read
+  @chk_enter:
+    %isnl = eq i32 %c, 10
+    %iscr = eq i32 %c, 13
+    %enter = or i1 %isnl, %iscr
+    br %enter, @enter, @chk_bs
+  @chk_bs:
+    %isbs = eq i32 %c, 8
+    %isdel = eq i32 %c, 127
+    %back = or i1 %isbs, %isdel
+    br %back, @back, @chk_tab
+  @chk_tab:
+    %istab = eq i32 %c, 9
+    br %istab, @tab_gate, @chk_ctrl
+  @tab_gate:
+    %no_comp = eq i32 %complete, 0
+    br %no_comp, @read, @tab
+  @tab:
+    %tc_cv = load i32, *%cur
+    %tc_len = load i32, *%len
+    %tc_atend = eq i32 %tc_cv, %tc_len
+    br %tc_atend, @tab_scan, @read
+  @tab_scan:
+    store i32 0, *%tc_i
+    jmp @tab_lead
+  @tab_lead:
+    %tc_iv = load i32, *%tc_i
+    %tc_lp = gep i8, *@shell_line, %tc_iv
+    %tc_ch = load i8, *%tc_lp
+    %tc_sp = eq i8 %tc_ch, 32
+    %tc_tab = eq i8 %tc_ch, 9
+    %tc_ws = or i1 %tc_sp, %tc_tab
+    br %tc_ws, @tab_lead_next, @tab_word
+  @tab_lead_next:
+    %tc_in = add i32 %tc_iv, 1
+    store i32 %tc_in, *%tc_i
+    jmp @tab_lead
+  @tab_word:
+    %tc_sv = load i32, *%tc_i
+    store i32 %tc_sv, *%tc_start
+    jmp @tab_scan2
+  @tab_scan2:
+    %tc_iv2 = load i32, *%tc_i
+    %tc_lv2 = load i32, *%len
+    %tc_end = sge i32 %tc_iv2, %tc_lv2
+    br %tc_end, @tab_word_end, @tab_chk_ws
+  @tab_chk_ws:
+    %tc_lp2 = gep i8, *@shell_line, %tc_iv2
+    %tc_ch2 = load i8, *%tc_lp2
+    %tc_sp2 = eq i8 %tc_ch2, 32
+    %tc_tab2 = eq i8 %tc_ch2, 9
+    %tc_ws2 = or i1 %tc_sp2, %tc_tab2
+    br %tc_ws2, @read, @tab_scan_next
+  @tab_scan_next:
+    %tc_in2 = add i32 %tc_iv2, 1
+    store i32 %tc_in2, *%tc_i
+    jmp @tab_scan2
+  @tab_word_end:
+    %tc_s0 = load i32, *%tc_start
+    %tc_lv3 = load i32, *%len
+    %tc_tok = sub i32 %tc_lv3, %tc_s0
+    %tc_zero = sle i32 %tc_tok, 0
+    br %tc_zero, @read, @tab_match
+  @tab_match:
+    %tc_s1 = load i32, *%tc_start
+    %tc_lv4 = load i32, *%len
+    %tc_tok2 = sub i32 %tc_lv4, %tc_s1
+    %tc_n = call @shell_cmd_match(%tc_s1, %tc_tok2)
+    %tc_none = eq i32 %tc_n, 0
+    br %tc_none, @read, @tab_chk_one
+  @tab_chk_one:
+    %tc_one = eq i32 %tc_n, 1
+    br %tc_one, @tab_fill, @tab_list
+  @tab_fill:
+    %tc_off = load i32, *@shell_comp_off
+    %tc_nlen = call @shell_cmd_len(%tc_off)
+    %tc_s2 = load i32, *%tc_start
+    %tc_buf = gep i8, *@shell_comp_name, 0
+    call @shell_cmd_copy(%tc_off, %tc_buf)
+    store i32 0, *%tc_k
+    jmp @tc_cond
+  @tc_cond:
+    %tc_kv = load i32, *%tc_k
+    %tc_kdone = sge i32 %tc_kv, %tc_nlen
+    br %tc_kdone, @tc_end, @tc_body
+  @tc_body:
+    %tc_kv2 = load i32, *%tc_k
+    %tc_np = gep i8, *@shell_comp_name, %tc_kv2
+    %tc_nc = load i8, *%tc_np
+    %tc_pos = add i32 %tc_s2, %tc_kv2
+    %tc_dp = gep i8, *@shell_line, %tc_pos
+    store i8 %tc_nc, *%tc_dp
+    %tc_kn = add i32 %tc_kv2, 1
+    store i32 %tc_kn, *%tc_k
+    jmp @tc_cond
+  @tc_end:
+    %tc_pos2 = add i32 %tc_s2, %tc_nlen
+    %tc_sp3 = gep i8, *@shell_line, %tc_pos2
+    store i8 32, *%tc_sp3
+    %tc_nl = add i32 %tc_pos2, 1
+    %tc_zp = gep i8, *@shell_line, %tc_nl
+    store i8 0, *%tc_zp
+    store i32 %tc_nl, *%len
+    store i32 %tc_nl, *%cur
+    call @shell_redraw(%tc_nl)
+    jmp @read
+  @tab_list:
+    call @console_putc(10)
+    %tc_s3 = load i32, *%tc_start
+    %tc_lv5 = load i32, *%len
+    %tc_tok3 = sub i32 %tc_lv5, %tc_s3
+    call @shell_list_matches(%tc_s3, %tc_tok3)
+    %tc_cv2 = load i32, *%cur
+    call @shell_redraw(%tc_cv2)
+    jmp @read
+  @chk_ctrl:
+    %ctrl = slt i32 %c, 32
+    br %ctrl, @read, @store
+  @store:
+    %lv2 = load i32, *%len
+    %full = sge i32 %lv2, @shell_LINE_MAX
+    br %full, @read, @store_kind
+  @store_kind:
+    %cv0 = load i32, *%cur
+    %lv0 = load i32, *%len
+    %atend = eq i32 %cv0, %lv0
+    br %atend, @append, @insert
+  @append:
+    %c8a = trunc i32 %c to i8
+    %ap = gep i8, *@shell_line, %lv0
+    store i8 %c8a, *%ap
+    %nlp = add i32 %lv0, 1
+    %zp = gep i8, *@shell_line, %nlp
+    store i8 0, *%zp
+    store i32 %nlp, *%len
+    store i32 %nlp, *%cur
+    call @console_putc(%c)
+    jmp @read
+  @insert:
+    %cv8 = load i32, *%cur
+    %lvi = load i32, *%len
+    store i32 %lvi, *%j
+    jmp @icond
+  @icond:
+    %jv = load i32, *%j
+    %jdone = slt i32 %jv, %cv8
+    br %jdone, @ifin, @ibody
+  @ibody:
+    %jv2 = load i32, *%j
+    %srcp = gep i8, *@shell_line, %jv2
+    %ch2 = load i8, *%srcp
+    %dstn = add i32 %jv2, 1
+    %dstp = gep i8, *@shell_line, %dstn
+    store i8 %ch2, *%dstp
+    %jn = sub i32 %jv2, 1
+    store i32 %jn, *%j
+    jmp @icond
+  @ifin:
+    %c8 = trunc i32 %c to i8
+    %cp = gep i8, *@shell_line, %cv8
+    store i8 %c8, *%cp
+    %lv3 = load i32, *%len
+    %nlen = add i32 %lv3, 1
+    store i32 %nlen, *%len
+    %cv9 = add i32 %cv8, 1
+    store i32 %cv9, *%cur
+    call @shell_redraw(%cv9)
+    jmp @read
+  @back:
+    %cv5 = load i32, *%cur
+    %bz = sle i32 %cv5, 0
+    br %bz, @read, @back_kind
+  @back_kind:
+    %cvb = load i32, *%cur
+    %lvb = load i32, *%len
+    %bend = eq i32 %cvb, %lvb
+    br %bend, @back_end, @del
+  @back_end:
+    %lve = load i32, *%len
+    %nle = sub i32 %lve, 1
+    %zpe = gep i8, *@shell_line, %nle
+    store i8 0, *%zpe
+    store i32 %nle, *%len
+    %cve = sub i32 %cvb, 1
+    store i32 %cve, *%cur
+    call @console_putc(8)
+    call @console_putc(32)
+    call @console_putc(8)
+    jmp @read
+  @del:
+    %cv6 = load i32, *%cur
+    %dstart = sub i32 %cv6, 1
+    store i32 %dstart, *%j
+    jmp @dcond
+  @dcond:
+    %jv3 = load i32, *%j
+    %lv4 = load i32, *%len
+    %ddone = sge i32 %jv3, %lv4
+    br %ddone, @dfin, @dbody
+  @dbody:
+    %jv4 = load i32, *%j
+    %dsrcn = add i32 %jv4, 1
+    %dsrc = gep i8, *@shell_line, %dsrcn
+    %dch = load i8, *%dsrc
+    %ddst = gep i8, *@shell_line, %jv4
+    store i8 %dch, *%ddst
+    %jn2 = add i32 %jv4, 1
+    store i32 %jn2, *%j
+    jmp @dcond
+  @dfin:
+    %lv5 = load i32, *%len
+    %nlen2 = sub i32 %lv5, 1
+    store i32 %nlen2, *%len
+    %cv7 = load i32, *%cur
+    %ncur = sub i32 %cv7, 1
+    store i32 %ncur, *%cur
+    call @shell_redraw(%ncur)
+    jmp @read
+  @enter:
+    %lv6 = load i32, *%len
+    %tp = gep i8, *@shell_line, %lv6
+    store i8 0, *%tp
+    call @console_putc(10)
+    %any = sgt i32 %lv6, 0
+    br %any, @save_hist, @ret
+  @save_hist:
+    call @shell_hist_add()
+    jmp @ret
+  @ret:
+    %rv = load i32, *%len
+    ret i32 %rv
+}
+
+fun @shell_line_ptr() -> *i8 {
+  @entry:
+    %p = gep i8, *@shell_line, 0
+    ret *i8 %p
+}
+
+// The interactive agent reuses the line editor, so it swaps the prompt that
+// the redraw path prints. A null pointer restores `osone> `.
+fun @shell_set_prompt(p: *i8) -> void {
+  @entry:
+    %a = asm att i64, "mov $0, ${p}", "=r,r", *i8 %p
+    store i64 %a, *@shell_PROMPT_ALT
+    ret void
+}
+
+fun @shell_prompt() -> *i8 {
+  @entry:
+    %v = load i64, *@shell_PROMPT_ALT
+    %nz = ne i64 %v, 0
+    br %nz, @alt, @def
+  @alt:
+    %p = asm att *i8, "mov $0, ${v}", "=r,r", i64 %v
+    ret *i8 %p
+  @def:
+    %d = gep i8, *@shell_PROMPT, 0
+    ret *i8 %d
+}
+
+fun @shell_parse() -> void {
+  @entry:
+    %i = let i32
+    %ci = let i32
+    store i32 0, *%i
+    store i32 0, *%ci
+    jmp @skip1
+  @skip1:
+    %iv = load i32, *%i
+    %cp = gep i8, *@shell_line, %iv
+    %ch = load i8, *%cp
+    %sp = eq i8 %ch, 32
+    %tab = eq i8 %ch, 9
+    %ws = or i1 %sp, %tab
+    br %ws, @s1, @cmd_load
+  @s1:
+    %n1 = add i32 %iv, 1
+    store i32 %n1, *%i
+    jmp @skip1
+  @cmd_load:
+    %ivl = load i32, *%i
+    %cpl = gep i8, *@shell_line, %ivl
+    %chl = load i8, *%cpl
+    jmp @cmd_chk
+  @cmd_chk:
+    %z = eq i8 %chl, 0
+    br %z, @cmd_end, @cmd_cmp
+  @cmd_cmp:
+    %sp2 = eq i8 %chl, 32
+    %tab2 = eq i8 %chl, 9
+    %ws2 = or i1 %sp2, %tab2
+    br %ws2, @cmd_end, @cmd_copy
+  @cmd_copy:
+    %civ = load i32, *%ci
+    %lim = sge i32 %civ, 63
+    br %lim, @cmd_adv, @cmd_store
+  @cmd_store:
+    %dp = gep i8, *@shell_cmd, %civ
+    store i8 %chl, *%dp
+    %cn = add i32 %civ, 1
+    store i32 %cn, *%ci
+    jmp @cmd_adv
+  @cmd_adv:
+    %iv2 = load i32, *%i
+    %n2 = add i32 %iv2, 1
+    store i32 %n2, *%i
+    jmp @cmd_load
+  @cmd_end:
+    %civ2 = load i32, *%ci
+    %tp = gep i8, *@shell_cmd, %civ2
+    store i8 0, *%tp
+    jmp @skip2
+  @skip2:
+    %iv3 = load i32, *%i
+    %cp3 = gep i8, *@shell_line, %iv3
+    %ch3 = load i8, *%cp3
+    %z3 = eq i8 %ch3, 0
+    br %z3, @arg_set, @chk_ws2
+  @chk_ws2:
+    %sp3 = eq i8 %ch3, 32
+    %tab3 = eq i8 %ch3, 9
+    %ws3 = or i1 %sp3, %tab3
+    br %ws3, @s2, @arg_set
+  @s2:
+    %n3 = add i32 %iv3, 1
+    store i32 %n3, *%i
+    jmp @skip2
+  @arg_set:
+    %iv4 = load i32, *%i
+    store i32 %iv4, *@shell_argoff
+    ret void
+}
+
+fun @shell_run() -> void {
+  @entry:
+    call @cmdfs_init()
+    %w = gep i8, *@shell_WELCOME, 0
+    call @console_puts(%w)
+    jmp @prompt
+  @prompt:
+    %p = gep i8, *@shell_PROMPT, 0
+    call @console_puts(%p)
+    call @shell_getline(1)
+    call @shell_parse()
+    %cmd = gep i8, *@shell_cmd, 0
+    %c0 = load i8, *%cmd
+    %empty = eq i8 %c0, 0
+    br %empty, @prompt, @argload
+  @argload:
+    %ao = load i32, *@shell_argoff
+    %arg = gep i8, *@shell_line, %ao
+    %ls = gep i8, *@shell_C_LS, 0
+    %isls = call @shell_streq(%cmd, %ls)
+    %okls = eq i32 %isls, 1
+    br %okls, @do_ls, @c_cd
+  @do_ls:
+    call @cmdfs_ls(%arg)
+    jmp @prompt
+  @c_cd:
+    %cd = gep i8, *@shell_C_CD, 0
+    %iscd = call @shell_streq(%cmd, %cd)
+    %okcd = eq i32 %iscd, 1
+    br %okcd, @do_cd, @c_pwd
+  @do_cd:
+    call @cmdfs_cd(%arg)
+    jmp @prompt
+  @c_pwd:
+    %pw = gep i8, *@shell_C_PWD, 0
+    %ispw = call @shell_streq(%cmd, %pw)
+    %okpw = eq i32 %ispw, 1
+    br %okpw, @do_pwd, @c_cat
+  @do_pwd:
+    call @cmdfs_pwd()
+    jmp @prompt
+  @c_cat:
+    %ct = gep i8, *@shell_C_CAT, 0
+    %isct = call @shell_streq(%cmd, %ct)
+    %okct = eq i32 %isct, 1
+    br %okct, @do_cat, @c_ifconfig
+  @do_cat:
+    call @cmdfs_cat(%arg)
+    jmp @prompt
+  @c_ifconfig:
+    %ifc = gep i8, *@shell_C_IFCONFIG, 0
+    %isifc = call @shell_streq(%cmd, %ifc)
+    %okifc = eq i32 %isifc, 1
+    br %okifc, @do_ifconfig, @c_arp
+  @do_ifconfig:
+    call @cmdnet_ifconfig()
+    jmp @prompt
+  @c_arp:
+    %arpc = gep i8, *@shell_C_ARP, 0
+    %isarp = call @shell_streq(%cmd, %arpc)
+    %okarp = eq i32 %isarp, 1
+    br %okarp, @do_arp, @c_dhcp
+  @do_arp:
+    call @cmdnet_arp()
+    jmp @prompt
+  @c_dhcp:
+    %dh = gep i8, *@shell_C_DHCP, 0
+    %isdh = call @shell_streq(%cmd, %dh)
+    %okdh = eq i32 %isdh, 1
+    br %okdh, @do_dhcp, @c_ping
+  @do_dhcp:
+    call @cmdnet_dhcp()
+    jmp @prompt
+  @c_ping:
+    %pg = gep i8, *@shell_C_PING, 0
+    %ispg = call @shell_streq(%cmd, %pg)
+    %okpg = eq i32 %ispg, 1
+    br %okpg, @do_ping, @c_nettest
+  @do_ping:
+    call @cmdnet_ping(%arg)
+    jmp @prompt
+  @c_nettest:
+    %nt = gep i8, *@shell_C_NETTEST, 0
+    %isnt = call @shell_streq(%cmd, %nt)
+    %oknt = eq i32 %isnt, 1
+    br %oknt, @do_nettest, @c_nslookup
+  @do_nettest:
+    call @cmdnet_nettest()
+    jmp @prompt
+  @c_nslookup:
+    %ns = gep i8, *@shell_C_NSLOOKUP, 0
+    %isns = call @shell_streq(%cmd, %ns)
+    %okns = eq i32 %isns, 1
+    br %okns, @do_nslookup, @c_urlone
+  @do_nslookup:
+    call @cmdnet_nslookup(%arg)
+    jmp @prompt
+  @c_urlone:
+    %ul = gep i8, *@shell_C_URLONE, 0
+    %isul = call @shell_streq(%cmd, %ul)
+    %okul = eq i32 %isul, 1
+    br %okul, @do_urlone, @c_agent
+  @do_urlone:
+    call @urlone_run(%arg)
+    jmp @prompt
+  @c_agent:
+    %ag = gep i8, *@shell_C_AGENT, 0
+    %isag = call @shell_streq(%cmd, %ag)
+    %okag = eq i32 %isag, 1
+    br %okag, @do_agent, @c_gui
+  @do_agent:
+    call @agent_run(%arg)
+    jmp @prompt
+  @c_gui:
+    %gu = gep i8, *@shell_C_GUI, 0
+    %isgu = call @shell_streq(%cmd, %gu)
+    %okgu = eq i32 %isgu, 1
+    br %okgu, @do_gui, @c_ps
+  @do_gui:
+    call @gui_run()
+    %nl2 = gep i8, *@shell_NL, 0
+    call @console_puts(%nl2)
+    jmp @prompt
+  @c_ps:
+    %ps = gep i8, *@shell_C_PS, 0
+    %isps = call @shell_streq(%cmd, %ps)
+    %okps = eq i32 %isps, 1
+    br %okps, @do_ps, @c_mem
+  @do_ps:
+    call @cmd_sys_ps()
+    jmp @prompt
+  @c_mem:
+    %mem = gep i8, *@shell_C_MEM, 0
+    %ismem = call @shell_streq(%cmd, %mem)
+    %okmem = eq i32 %ismem, 1
+    br %okmem, @do_mem, @c_uptime
+  @do_mem:
+    call @cmd_sys_mem()
+    jmp @prompt
+  @c_uptime:
+    %upt = gep i8, *@shell_C_UPTIME, 0
+    %isupt = call @shell_streq(%cmd, %upt)
+    %okupt = eq i32 %isupt, 1
+    br %okupt, @do_uptime, @c_date
+  @do_uptime:
+    call @cmd_sys_uptime()
+    jmp @prompt
+  @c_date:
+    %dat = gep i8, *@shell_C_DATE, 0
+    %isdat = call @shell_streq(%cmd, %dat)
+    %okdat = eq i32 %isdat, 1
+    br %okdat, @do_date, @c_time
+  @do_date:
+    call @cmd_sys_date()
+    jmp @prompt
+  @c_time:
+    %tim = gep i8, *@shell_C_TIME, 0
+    %istim = call @shell_streq(%cmd, %tim)
+    %oktim = eq i32 %istim, 1
+    br %oktim, @do_time, @c_clear
+  @do_time:
+    call @cmd_sys_time()
+    jmp @prompt
+  @c_clear:
+    %clr = gep i8, *@shell_C_CLEAR, 0
+    %isclr = call @shell_streq(%cmd, %clr)
+    %okclr = eq i32 %isclr, 1
+    br %okclr, @do_clear, @c_uname
+  @do_clear:
+    call @cmd_sys_clear()
+    jmp @prompt
+  @c_uname:
+    %unm = gep i8, *@shell_C_UNAME, 0
+    %isunm = call @shell_streq(%cmd, %unm)
+    %okunm = eq i32 %isunm, 1
+    br %okunm, @do_uname, @c_mkdir
+  @do_uname:
+    call @cmd_sys_uname()
+    jmp @prompt
+  @c_mkdir:
+    %mkd = gep i8, *@shell_C_MKDIR, 0
+    %ismkd = call @shell_streq(%cmd, %mkd)
+    %okmkd = eq i32 %ismkd, 1
+    br %okmkd, @do_mkdir, @c_touch
+  @do_mkdir:
+    call @cmdfs_mkdir(%arg)
+    jmp @prompt
+  @c_touch:
+    %tch = gep i8, *@shell_C_TOUCH, 0
+    %istch = call @shell_streq(%cmd, %tch)
+    %oktch = eq i32 %istch, 1
+    br %oktch, @do_touch, @c_cp
+  @do_touch:
+    call @cmdfs_touch(%arg)
+    jmp @prompt
+  @c_cp:
+    %cpc = gep i8, *@shell_C_CP, 0
+    %iscpc = call @shell_streq(%cmd, %cpc)
+    %okcpc = eq i32 %iscpc, 1
+    br %okcpc, @do_cp, @c_mv
+  @do_cp:
+    call @cmdfs_cp(%arg)
+    jmp @prompt
+  @c_mv:
+    %mvc = gep i8, *@shell_C_MV, 0
+    %ismvc = call @shell_streq(%cmd, %mvc)
+    %okmvc = eq i32 %ismvc, 1
+    br %okmvc, @do_mv, @c_rm
+  @do_mv:
+    call @cmdfs_mv(%arg)
+    jmp @prompt
+  @c_rm:
+    %rmc = gep i8, *@shell_C_RM, 0
+    %isrmc = call @shell_streq(%cmd, %rmc)
+    %okrmc = eq i32 %isrmc, 1
+    br %okrmc, @do_rm, @c_rmdir
+  @do_rm:
+    call @cmdfs_rm(%arg)
+    jmp @prompt
+  @c_rmdir:
+    %rdc = gep i8, *@shell_C_RMDIR, 0
+    %isrdc = call @shell_streq(%cmd, %rdc)
+    %okrdc = eq i32 %isrdc, 1
+    br %okrdc, @do_rmdir, @c_echo
+  @do_rmdir:
+    call @cmdfs_rmdir(%arg)
+    jmp @prompt
+  @c_echo:
+    %ech = gep i8, *@shell_C_ECHO, 0
+    %isech = call @shell_streq(%cmd, %ech)
+    %okech = eq i32 %isech, 1
+    br %okech, @do_echo, @c_history
+  @do_echo:
+    call @cmd_sys_echo(%arg)
+    jmp @prompt
+  @c_history:
+    %his = gep i8, *@shell_C_HISTORY, 0
+    %ishis = call @shell_streq(%cmd, %his)
+    %okhis = eq i32 %ishis, 1
+    br %okhis, @do_history, @c_reboot
+  @do_history:
+    call @shell_hist_dump()
+    jmp @prompt
+  @c_reboot:
+    %rbc = gep i8, *@shell_C_REBOOT, 0
+    %isrbc = call @shell_streq(%cmd, %rbc)
+    %okrbc = eq i32 %isrbc, 1
+    br %okrbc, @do_reboot, @c_poweroff
+  @do_reboot:
+    call @cmd_sys_reboot()
+    jmp @prompt
+  @c_poweroff:
+    %poc = gep i8, *@shell_C_POWEROFF, 0
+    %ispoc = call @shell_streq(%cmd, %poc)
+    %okpoc = eq i32 %ispoc, 1
+    br %okpoc, @do_poweroff, @c_help
+  @do_poweroff:
+    call @cmd_sys_poweroff()
+    jmp @prompt
+  @c_help:
+    %hp = gep i8, *@shell_C_HELP, 0
+    %ishp = call @shell_streq(%cmd, %hp)
+    %okhp = eq i32 %ishp, 1
+    br %okhp, @do_help, @unknown
+  @do_help:
+    %h = gep i8, *@shell_HELP, 0
+    call @console_puts(%h)
+    jmp @prompt
+  @unknown:
+    %uf = gep i8, *@shell_UNKNOWN, 0
+    call @console_printf(%uf, 0, 0, 0, 0, %cmd, null)
+    jmp @prompt
+}

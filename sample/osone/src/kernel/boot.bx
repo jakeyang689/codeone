@@ -1,0 +1,148 @@
+// boot.bx - reset entry, BSS clearing, exception vectors, panic
+//
+// _start must be a leaf function: SP is uninitialized at reset, so any compiler-generated stack prologue would immediately corrupt memory.
+// Therefore SP setup and the jump to boot_entry are both done in a single asm template.
+
+extern @console_init() -> void
+extern @console_puts(s: *i8) -> void
+extern @console_printf(fmt: *i8, a: i64, b: i64, c: i64, d: i64, s1: *i8, s2: *i8) -> void
+extern @kmain(dtb: i64) -> void
+extern @proc_sync_addr() -> i64
+extern @proc_irq_addr() -> i64
+extern @klog_dump() -> void
+
+const @boot_BOOT_MSG: [i8, 14] = "\nosone: boot\n"
+const @boot_EL_MSG: [i8, 23] = "kernel must run at EL1"
+const @boot_EXC_MSG: [i8, 29] = "\nPANIC: unhandled exception\n"
+const @boot_EXC_FMT: [i8, 38] = "  esr=%x\n  far=%x\n  elr=%x\n  spsr=%x\n"
+const @boot_PANIC_PRE: [i8, 9] = "\nPANIC: "
+const @boot_NL: [i8, 2] = "\n"
+
+fun @_start(dtb: i64) -> void {
+  @entry:
+    %top = asm att i64, "adrp $0, __stack_top\nadd $0, $0, :lo12:__stack_top", "=r"
+    asm att void, "mov x9, ${top}\nmsr spsel, #1\nmov sp, x9\nmov x0, ${dtb}\nbl boot_entry", "r,r,~{x9},~{memory}", i64 %top, i64 %dtb
+    ret void
+}
+
+fun @boot_entry(dtb: i64) -> void {
+  @entry:
+    // Clear .bss byte by byte to avoid crossing into the next section.
+    asm att void, "adrp x9, __bss_start\nadd x9, x9, :lo12:__bss_start\nadrp x10, __bss_end\nadd x10, x10, :lo12:__bss_end\n1: cmp x9, x10\nb.hs 2f\nstrb wzr, [x9], #1\nb 1b\n2:", "~{x9},~{x10},~{memory}"
+    call @console_init()
+    %bm = gep i8, *@boot_BOOT_MSG, 0
+    call @console_puts(%bm)
+    %el = asm att i64, "mrs $0, CurrentEL", "=r"
+    %elv = and i64 %el, 12
+    %is1 = eq i64 %elv, 4
+    br %is1, @el_ok, @el_bad
+  @el_bad:
+    %em = gep i8, *@boot_EL_MSG, 0
+    call @boot_panic(%em)
+    ret void
+  @el_ok:
+    call @boot_vectors_init()
+    call @kmain(%dtb)
+    ret void
+}
+
+fun @boot_vectors_init() -> void {
+  @entry:
+    %vec = asm att *i32, "adrp $0, __vectors\nadd $0, $0, :lo12:__vectors", "=r"
+    %vaddr = asm att i64, "adrp $0, __vectors\nadd $0, $0, :lo12:__vectors", "=r"
+    %haddr = asm att i64, "adrp $0, boot_panic_vec\nadd $0, $0, :lo12:boot_panic_vec", "=r"
+    %i = let i32
+    %j = let i32
+    store i32 0, *%i
+    store i32 0, *%j
+    jmp @slot_cond
+  @slot_cond:
+    %iv = load i32, *%i
+    %sdone = sge i32 %iv, 16
+    br %sdone, @patch_handlers, @slot_body
+  @slot_body:
+    %word = mul i32 %iv, 32
+    %slotoff = mul i32 %iv, 128
+    %slotoff64 = zext i32 %slotoff to i64
+    %slotaddr = add i64 %vaddr, %slotoff64
+    %delta = sub i64 %haddr, %slotaddr
+    %dshift = ashr i64 %delta, 2
+    %dmask = and i64 %dshift, 0x03FFFFFF
+    %enc64 = or i64 %dmask, 0x14000000
+    %enc = trunc i64 %enc64 to i32
+    %sp = gep i32, *%vec, %word
+    store i32 %enc, *%sp
+    store i32 1, *%j
+    jmp @fill_cond
+  @fill_cond:
+    %jv = load i32, *%j
+    %fdone = sge i32 %jv, 32
+    br %fdone, @slot_next, @fill_body
+  @fill_body:
+    %fidx = add i32 %word, %jv
+    %fp = gep i32, *%vec, %fidx
+    store i32 0xD503201F, *%fp
+    %jn = add i32 %jv, 1
+    store i32 %jn, *%j
+    jmp @fill_cond
+  @slot_next:
+    %iv2 = load i32, *%i
+    %in = add i32 %iv2, 1
+    store i32 %in, *%i
+    jmp @slot_cond
+  // Point the SVC (0x200) and IRQ (0x280) slots at the process trap entry before the MMU is enabled.
+  // The vector page is later mapped read-only executable, so it cannot be changed at runtime.
+  @patch_handlers:
+    %syncaddr = call @proc_sync_addr()
+    %saddr = add i64 %vaddr, 0x200
+    %sdelta = sub i64 %syncaddr, %saddr
+    %sshift = ashr i64 %sdelta, 2
+    %smask = and i64 %sshift, 0x03FFFFFF
+    %senc64 = or i64 %smask, 0x14000000
+    %senc = trunc i64 %senc64 to i32
+    %sslot = gep i32, *%vec, 128
+    store i32 %senc, *%sslot
+    %irqaddr = call @proc_irq_addr()
+    %iaddr = add i64 %vaddr, 0x280
+    %idelta = sub i64 %irqaddr, %iaddr
+    %ishift = ashr i64 %idelta, 2
+    %imask = and i64 %ishift, 0x03FFFFFF
+    %ienc64 = or i64 %imask, 0x14000000
+    %ienc = trunc i64 %ienc64 to i32
+    %islot = gep i32, *%vec, 160
+    store i32 %ienc, *%islot
+    jmp @install
+  @install:
+    asm att void, "msr vbar_el1, ${vec}\nisb", "r,~{memory}", *i32 %vec
+    ret void
+}
+
+fun @boot_panic_vec() -> void {
+  @entry:
+    %esr = asm att i64, "mrs $0, esr_el1", "=r,~{memory}"
+    %far = asm att i64, "mrs $0, far_el1", "=r,~{memory}"
+    %elr = asm att i64, "mrs $0, elr_el1", "=r,~{memory}"
+    %spsr = asm att i64, "mrs $0, spsr_el1", "=r,~{memory}"
+    %xm = gep i8, *@boot_EXC_MSG, 0
+    call @console_puts(%xm)
+    %xf = gep i8, *@boot_EXC_FMT, 0
+    call @console_printf(%xf, %esr, %far, %elr, %spsr, null, null)
+    call @klog_dump()
+    jmp @halt
+  @halt:
+    asm att void, "wfe", "~{memory}"
+    jmp @halt
+}
+
+fun @boot_panic(msg: *i8) -> void {
+  @entry:
+    %pre = gep i8, *@boot_PANIC_PRE, 0
+    call @console_puts(%pre)
+    call @console_puts(%msg)
+    %nl = gep i8, *@boot_NL, 0
+    call @console_puts(%nl)
+    jmp @halt
+  @halt:
+    asm att void, "wfe", "~{memory}"
+    jmp @halt
+}

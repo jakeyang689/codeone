@@ -1,0 +1,102 @@
+// eth.bx - Ethernet II frame encapsulation and dispatch
+
+extern @virtio_net_send(frame: *i8, len: i32) -> i32
+extern @net_my_mac() -> *i8
+extern @net_be16(p: *i8, off: i32) -> i32
+extern @net_stbe16(p: *i8, off: i32, v: i32) -> void
+extern @kmem_memcpy(dst: *i8, src: *i8, n: i64) -> void
+extern @kmem_memset(p: *i8, v: i32, n: i64) -> void
+extern @arp_input(frame: *i8, len: i32) -> void
+extern @ip_input(frame: *i8, len: i32) -> void
+
+const @eth_TYPE_IP: i32 = 0x0800
+const @eth_TYPE_ARP: i32 = 0x0806
+const @eth_HDR_LEN: i32 = 14
+
+// Ethernet minimum frame length (excluding FCS). QEMU's vmnet backend does not pad short frames,
+// and 42-byte ARP requests are dropped by the macOS bridge, so the sender pads them with zeros.
+const @eth_MIN_FRAME: i32 = 60
+
+global @eth_TXBUF: [i8, 1600]
+
+fun @eth_send(dst: *i8, etype: i32, payload: *i8, len: i32) -> i32 {
+  @entry:
+    %framelen = add i32 %len, @eth_HDR_LEN
+    %toobig = sgt i32 %framelen, 1514
+    br %toobig, @fail, @build
+  @build:
+    %frame = gep i8, *@eth_TXBUF, 0
+    %i = let i32
+    store i32 0, *%i
+    jmp @cp_cond
+  @cp_cond:
+    %iv = load i32, *%i
+    %done = sge i32 %iv, 6
+    br %done, @src, @cp_body
+  @cp_body:
+    %dp = gep i8, *%dst, %iv
+    %b = load i8, *%dp
+    %fp = gep i8, *%frame, %iv
+    store i8 %b, *%fp
+    %in = add i32 %iv, 1
+    store i32 %in, *%i
+    jmp @cp_cond
+  @src:
+    %mac = call @net_my_mac()
+    %j = let i32
+    store i32 0, *%j
+    jmp @src_cond
+  @src_cond:
+    %jv = load i32, *%j
+    %sdone = sge i32 %jv, 6
+    br %sdone, @type, @src_body
+  @src_body:
+    %mp = gep i8, *%mac, %jv
+    %mb = load i8, *%mp
+    %o = add i32 %jv, 6
+    %fp2 = gep i8, *%frame, %o
+    store i8 %mb, *%fp2
+    %jn = add i32 %jv, 1
+    store i32 %jn, *%j
+    jmp @src_cond
+  @type:
+    call @net_stbe16(%frame, 12, %etype)
+    %pl = gep i8, *%frame, @eth_HDR_LEN
+    %len64 = sext i32 %len to i64
+    call @kmem_memcpy(%pl, %payload, %len64)
+    %short = slt i32 %framelen, @eth_MIN_FRAME
+    br %short, @pad, @send
+  @pad:
+    %padp = gep i8, *%frame, %framelen
+    %padn = sub i32 @eth_MIN_FRAME, %framelen
+    %padn64 = sext i32 %padn to i64
+    call @kmem_memset(%padp, 0, %padn64)
+    %rp = call @virtio_net_send(%frame, @eth_MIN_FRAME)
+    ret i32 %rp
+  @send:
+    %r = call @virtio_net_send(%frame, %framelen)
+    ret i32 %r
+  @fail:
+    ret i32 -1
+}
+
+fun @eth_input(frame: *i8, len: i32) -> void {
+  @entry:
+    %short = slt i32 %len, @eth_HDR_LEN
+    br %short, @done, @chk
+  @chk:
+    %type = call @net_be16(%frame, 12)
+    %isip = eq i32 %type, @eth_TYPE_IP
+    br %isip, @ip, @chkarp
+  @chkarp:
+    %isarp = eq i32 %type, @eth_TYPE_ARP
+    br %isarp, @arp, @done
+  @ip:
+    call @ip_input(%frame, %len)
+    jmp @done
+  @arp:
+    call @arp_input(%frame, %len)
+    jmp @done
+  @done:
+    ret void
+}

@@ -1,0 +1,165 @@
+// tls_glue.bx - platform hooks required by the toolchain TLS/crypto boxes
+//
+// The toolchain crypto implementation dispatches to hardware through c1_*
+// symbols.  The kernel does not provide those routines, so cpu_features
+// reports zero and the software paths are used.  The hardware entry points
+// still have to exist for the linker; they are never executed.
+
+extern @rng_fill(buf: *i8, len: i32) -> i32
+extern @console_putc(ch: i32) -> void
+extern @kmem_memset(p: *i8, v: i32, n: i64) -> void
+extern @timer_now() -> i64
+extern @timer_freq() -> i64
+extern @tcp_send(id: i32, data: *i8, len: i32) -> i32
+extern @tcp_recv(id: i32, buf: *i8, max: i32, timeout_ms: i32) -> i32
+
+const @tlsglue_RECV_TIMEOUT_MS: i32 = 10000
+const @tlsglue_RNG_CHUNK: i32 = 256
+
+fun @c1_random_buf(buf: *i8, len: i64) -> void {
+  @entry:
+    %off = let i64
+    %chunk = let i32
+    store i64 0, *%off
+    jmp @cond
+  @cond:
+    %ov = load i64, *%off
+    %done = sge i64 %ov, %len
+    br %done, @ok, @body
+  @body:
+    %rem = sub i64 %len, %ov
+    %big = sgt i64 %rem, 256
+    br %big, @chunk_max, @chunk_rem
+  @chunk_max:
+    store i32 @tlsglue_RNG_CHUNK, *%chunk
+    jmp @fill
+  @chunk_rem:
+    %rem32 = trunc i64 %rem to i32
+    store i32 %rem32, *%chunk
+    jmp @fill
+  @fill:
+    %ov32 = trunc i64 %ov to i32
+    %bp = gep i8, *%buf, %ov32
+    %cv = load i32, *%chunk
+    call @rng_fill(%bp, %cv)
+    %cv64 = sext i32 %cv to i64
+    %no = add i64 %ov, %cv64
+    store i64 %no, *%off
+    jmp @cond
+  @ok:
+    ret void
+}
+
+fun @c1_cpu_features() -> i64 {
+  @entry:
+    ret i64 0
+}
+
+fun @c1_sha256_transform(a: *i32, b: *i32, c: *i32, d: *i32,
+                         e: *i32, f: *i32, g: *i32, h: *i32,
+                         block: *i8) -> void {
+  @entry:
+    ret void
+}
+
+fun @c1_aes128_encrypt_block(in: *i8, key: *i8, out: *i8) -> void {
+  @entry:
+    ret void
+}
+
+fun @c1_aes128_decrypt_block(in: *i8, key: *i8, out: *i8) -> void {
+  @entry:
+    ret void
+}
+
+fun @c1_aes256_encrypt_block(in: *i8, key: *i8, out: *i8) -> void {
+  @entry:
+    ret void
+}
+
+fun @c1_aes256_decrypt_block(in: *i8, key: *i8, out: *i8) -> void {
+  @entry:
+    ret void
+}
+
+fun @c1_aes128_cbc_encrypt(in: *i8, len: i32, key: *i8, iv: *i8, out: *i8) -> void {
+  @entry:
+    ret void
+}
+
+fun @c1_aes128_cbc_decrypt(in: *i8, len: i32, key: *i8, iv: *i8, out: *i8) -> void {
+  @entry:
+    ret void
+}
+
+fun @c1_aes256_cbc_encrypt(in: *i8, len: i32, key: *i8, iv: *i8, out: *i8) -> void {
+  @entry:
+    ret void
+}
+
+fun @c1_aes256_cbc_decrypt(in: *i8, len: i32, key: *i8, iv: *i8, out: *i8) -> void {
+  @entry:
+    ret void
+}
+
+fun @c1_aes128_gcm_encrypt(pt: *i8, pt_len: i32, aad: *i8, aad_len: i32,
+                           key: *i8, iv: *i8, ct: *i8, tag: *i8) -> i32 {
+  @entry:
+    ret i32 0
+}
+
+fun @c1_aes128_gcm_decrypt(ct: *i8, ct_len: i32, aad: *i8, aad_len: i32,
+                           key: *i8, iv: *i8, pt: *i8, tag: *i8) -> i32 {
+  @entry:
+    ret i32 0
+}
+
+fun @c1_aes256_gcm_encrypt(pt: *i8, pt_len: i32, aad: *i8, aad_len: i32,
+                           key: *i8, iv: *i8, ct: *i8, tag: *i8) -> i32 {
+  @entry:
+    ret i32 0
+}
+
+fun @c1_aes256_gcm_decrypt(ct: *i8, ct_len: i32, aad: *i8, aad_len: i32,
+                           key: *i8, iv: *i8, pt: *i8, tag: *i8) -> i32 {
+  @entry:
+    ret i32 0
+}
+
+fun @c1_secure_zero(p: *i8, n: i64) -> void {
+  @entry:
+    call @kmem_memset(%p, 0, %n)
+    ret void
+}
+
+fun @c1_time_now_ms() -> i64 {
+  @entry:
+    %f = call @timer_freq()
+    %z = eq i64 %f, 0
+    br %z, @zero, @calc
+  @zero:
+    ret i64 0
+  @calc:
+    %t = call @timer_now()
+    %k = mul i64 %t, 1000
+    %ms = udiv i64 %k, %f
+    ret i64 %ms
+}
+
+fun @putchar(c: i32) -> i32 {
+  @entry:
+    call @console_putc(%c)
+    ret i32 %c
+}
+
+fun @net_socket_send(fd: i32, buf: *i8, len: i32) -> i32 {
+  @entry:
+    %r = call @tcp_send(%fd, %buf, %len)
+    ret i32 %r
+}
+
+fun @net_socket_recv(fd: i32, buf: *i8, len: i32) -> i32 {
+  @entry:
+    %r = call @tcp_recv(%fd, %buf, %len, @tlsglue_RECV_TIMEOUT_MS)
+    ret i32 %r
+}

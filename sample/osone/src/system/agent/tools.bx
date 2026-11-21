@@ -1,0 +1,1060 @@
+// tools.bx - capability layer for the osone agent
+//
+// Every tool takes one argument string of the form "key=value;key=value" and
+// writes a textual result into the caller's buffer. Tools never print: the
+// CLI shows the buffer and the LLM loop feeds it back as an observation.
+//
+// Policy levels: 0 read-only, 1 may modify files/net config, 2 destructive
+// (reboot, poweroff, remove). The active level defaults to 1.
+
+extern @console_printf(fmt: *i8, a: i64, b: i64, c: i64, d: i64, s1: *i8, s2: *i8) -> void
+extern @vfs_lookup(path: *i8) -> i32
+extern @vfs_open(path: *i8, flags: i32) -> i32
+extern @vfs_close(fd: i32) -> i32
+extern @vfs_readdir(fd: i32, idx: i32) -> i32
+extern @vfs_read(fd: i32, buf: *i8, len: i64) -> i64
+extern @vfs_write(fd: i32, buf: *i8, len: i64) -> i64
+extern @vfs_mkdir(path: *i8) -> i32
+extern @vfs_remove(path: *i8) -> i32
+extern @vfs_name(ino: i32) -> *i8
+extern @vfs_size(ino: i32) -> i64
+extern @vfs_type(ino: i32) -> i32
+extern @net_ready() -> i32
+extern @net_my_ip() -> i32
+extern @net_netmask() -> i32
+extern @net_gateway() -> i32
+extern @net_dns() -> i32
+extern @net_my_mac() -> *i8
+extern @net_parse_ip(s: *i8) -> i32
+extern @dns_resolve(name: *i8, timeout_ms: i32) -> i32
+extern @icmp_ping(dst: i32, seq: i32, timeout_ms: i32) -> i32
+extern @dhcp_acquire() -> i32
+extern @timer_now() -> i64
+extern @timer_freq() -> i64
+extern @kmem_used() -> i64
+extern @kmem_total() -> i64
+extern @psci_system_off() -> void
+extern @psci_system_reset() -> void
+
+const @agtools_ROOT: [i8, 2] = "/"
+const @agtools_HEX: [i8, 17] = "0123456789abcdef"
+
+global @agtools_POLICY: i32 = 1
+
+fun @agtools_strlen(s: *i8) -> i32 {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @cond
+  @cond:
+    %iv = load i32, *%i
+    %p = gep i8, *%s, %iv
+    %c = load i8, *%p
+    %end = eq i8 %c, 0
+    br %end, @done, @body
+  @body:
+    %n = add i32 %iv, 1
+    store i32 %n, *%i
+    jmp @cond
+  @done:
+    %r = load i32, *%i
+    ret i32 %r
+}
+
+fun @agtools_streq(a: *i8, b: *i8) -> i32 {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @cond
+  @cond:
+    %iv = load i32, *%i
+    %ap = gep i8, *%a, %iv
+    %ac = load i8, *%ap
+    %bp = gep i8, *%b, %iv
+    %bc = load i8, *%bp
+    %diff = ne i8 %ac, %bc
+    br %diff, @no, @same
+  @same:
+    %end = eq i8 %ac, 0
+    br %end, @yes, @next
+  @next:
+    %n = add i32 %iv, 1
+    store i32 %n, *%i
+    jmp @cond
+  @yes:
+    ret i32 1
+  @no:
+    ret i32 0
+}
+
+fun @agtools_copy(dst: *i8, src: *i8, cap: i32) -> void {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @cond
+  @cond:
+    %iv = load i32, *%i
+    %lim = sub i32 %cap, 1
+    %full = sge i32 %iv, %lim
+    br %full, @term, @body
+  @body:
+    %sp = gep i8, *%src, %iv
+    %c = load i8, *%sp
+    %end = eq i8 %c, 0
+    br %end, @term, @put
+  @put:
+    %dp = gep i8, *%dst, %iv
+    store i8 %c, *%dp
+    %n = add i32 %iv, 1
+    store i32 %n, *%i
+    jmp @cond
+  @term:
+    %tv = load i32, *%i
+    %tp = gep i8, *%dst, %tv
+    store i8 0, *%tp
+    ret void
+}
+
+// Append a NUL-terminated string, always keeping a terminating NUL.
+fun @agtools_puts(out: *i8, lenp: *i32, cap: i32, s: *i8) -> void {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @cond
+  @cond:
+    %iv = load i32, *%i
+    %sp = gep i8, *%s, %iv
+    %c = load i8, *%sp
+    %end = eq i8 %c, 0
+    br %end, @done, @chkroom
+  @chkroom:
+    %lv = load i32, *%lenp
+    %lim = sub i32 %cap, 1
+    %full = sge i32 %lv, %lim
+    br %full, @done, @put
+  @put:
+    %op = gep i8, *%out, %lv
+    store i8 %c, *%op
+    %ln = add i32 %lv, 1
+    store i32 %ln, *%lenp
+    %in = add i32 %iv, 1
+    store i32 %in, *%i
+    jmp @cond
+  @done:
+    %lv2 = load i32, *%lenp
+    %lim2 = sub i32 %cap, 1
+    %over = sgt i32 %lv2, %lim2
+    br %over, @overfix, @term
+  @overfix:
+    store i32 %lim2, *%lenp
+    %np = gep i8, *%out, %lim2
+    store i8 0, *%np
+    ret void
+  @term:
+    %np2 = gep i8, *%out, %lv2
+    store i8 0, *%np2
+    ret void
+}
+
+fun @agtools_putc(out: *i8, lenp: *i32, cap: i32, ch: i32) -> void {
+  @entry:
+    %lv = load i32, *%lenp
+    %lim = sub i32 %cap, 1
+    %full = sge i32 %lv, %lim
+    br %full, @done, @put
+  @put:
+    %op = gep i8, *%out, %lv
+    %t = trunc i32 %ch to i8
+    store i8 %t, *%op
+    %ln = add i32 %lv, 1
+    store i32 %ln, *%lenp
+    %np = gep i8, *%out, %ln
+    store i8 0, *%np
+    ret void
+  @done:
+    %np2 = gep i8, *%out, %lv
+    store i8 0, *%np2
+    ret void
+}
+
+fun @agtools_putdec(out: *i8, lenp: *i32, cap: i32, v: i64) -> void {
+  @entry:
+    %buf = let [i8, 24]
+    %digits = let i32
+    %val = let i64
+    store i32 0, *%digits
+    store i64 %v, *%val
+    %zero = eq i64 %v, 0
+    br %zero, @emit_zero, @gen
+  @gen:
+    %cv = load i64, *%val
+    %q = udiv i64 %cv, 10
+    %r = urem i64 %cv, 10
+    %ri = trunc i64 %r to i32
+    %di = add i32 %ri, 48
+    %dv = load i32, *%digits
+    %bp = gep i8, *%buf, %dv
+    %ci = trunc i32 %di to i8
+    store i8 %ci, *%bp
+    %dn = add i32 %dv, 1
+    store i32 %dn, *%digits
+    store i64 %q, *%val
+    %qzero = eq i64 %q, 0
+    br %qzero, @emit, @gen
+  @emit:
+    %k = let i32
+    store i32 0, *%k
+    jmp @emit_cond
+  @emit_cond:
+    %kv = load i32, *%k
+    %dv2 = load i32, *%digits
+    %done = sge i32 %kv, %dv2
+    br %done, @fin, @emit_body
+  @emit_body:
+    %idx = sub i32 %dv2, %kv
+    %idx2 = sub i32 %idx, 1
+    %cp = gep i8, *%buf, %idx2
+    %ch = load i8, *%cp
+    %chi = zext i8 %ch to i32
+    call @agtools_putc(%out, %lenp, %cap, %chi)
+    %kn = add i32 %kv, 1
+    store i32 %kn, *%k
+    jmp @emit_cond
+  @emit_zero:
+    call @agtools_putc(%out, %lenp, %cap, 48)
+    jmp @fin
+  @fin:
+    ret void
+}
+
+fun @agtools_putip(out: *i8, lenp: *i32, cap: i32, ip: i32) -> void {
+  @entry:
+    %b0 = lshr i32 %ip, 24
+    %m1 = and i32 %ip, 0x00FF0000
+    %b1 = lshr i32 %m1, 16
+    %m2 = and i32 %ip, 0x0000FF00
+    %b2 = lshr i32 %m2, 8
+    %b3 = and i32 %ip, 0xFF
+    %z0 = zext i32 %b0 to i64
+    call @agtools_putdec(%out, %lenp, %cap, %z0)
+    call @agtools_putc(%out, %lenp, %cap, 46)
+    %z1 = zext i32 %b1 to i64
+    call @agtools_putdec(%out, %lenp, %cap, %z1)
+    call @agtools_putc(%out, %lenp, %cap, 46)
+    %z2 = zext i32 %b2 to i64
+    call @agtools_putdec(%out, %lenp, %cap, %z2)
+    call @agtools_putc(%out, %lenp, %cap, 46)
+    %z3 = zext i32 %b3 to i64
+    call @agtools_putdec(%out, %lenp, %cap, %z3)
+    ret void
+}
+
+fun @agtools_putmac(out: *i8, lenp: *i32, cap: i32, mac: *i8) -> void {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @cond
+  @cond:
+    %iv = load i32, *%i
+    %done = sge i32 %iv, 6
+    br %done, @fin, @body
+  @body:
+    %first = eq i32 %iv, 0
+    br %first, @byte, @sep
+  @sep:
+    call @agtools_putc(%out, %lenp, %cap, 58)
+    jmp @byte
+  @byte:
+    %bp = gep i8, *%mac, %iv
+    %b = load i8, *%bp
+    %bi = zext i8 %b to i32
+    %hi = lshr i32 %bi, 4
+    %lo = and i32 %bi, 15
+    %hp = gep i8, *@agtools_HEX, %hi
+    %hc = load i8, *%hp
+    %hci = zext i8 %hc to i32
+    call @agtools_putc(%out, %lenp, %cap, %hci)
+    %lp = gep i8, *@agtools_HEX, %lo
+    %lc = load i8, *%lp
+    %lci = zext i8 %lc to i32
+    call @agtools_putc(%out, %lenp, %cap, %lci)
+    %n = add i32 %iv, 1
+    store i32 %n, *%i
+    jmp @cond
+  @fin:
+    ret void
+}
+
+// Find key in "k=v;k=v" and copy its value to out. Returns the value length or -1.
+fun @agtools_arg(args: *i8, key: *i8, out: *i8, cap: i32) -> i32 {
+  @entry:
+    %i = let i32
+    %klen = call @agtools_strlen(%key)
+    store i32 0, *%i
+    jmp @seg
+  @seg:
+    %iv = load i32, *%i
+    %cp = gep i8, *%args, %iv
+    %ch = load i8, *%cp
+    %end = eq i8 %ch, 0
+    br %end, @miss, @match
+  @match:
+    %j = let i32
+    store i32 0, *%j
+    jmp @cmp
+  @cmp:
+    %jv = load i32, *%j
+    %kdone = sge i32 %jv, %klen
+    br %kdone, @afterkey, @cmpbody
+  @cmpbody:
+    %iv2 = load i32, *%i
+    %off = add i32 %iv2, %jv
+    %ap = gep i8, *%args, %off
+    %ac = load i8, *%ap
+    %kp = gep i8, *%key, %jv
+    %kc = load i8, *%kp
+    %same = eq i8 %ac, %kc
+    br %same, @cmpnext, @seek
+  @cmpnext:
+    %jv2 = load i32, *%j
+    %jn = add i32 %jv2, 1
+    store i32 %jn, *%j
+    jmp @cmp
+  @afterkey:
+    %iv3 = load i32, *%i
+    %eoff = add i32 %iv3, %klen
+    %ep = gep i8, *%args, %eoff
+    %ec = load i8, *%ep
+    %iseq = eq i8 %ec, 61
+    br %iseq, @copy, @seek
+  @copy:
+    %vo = add i32 %eoff, 1
+    %k = let i32
+    store i32 0, *%k
+    jmp @copy_cond
+  @copy_cond:
+    %kv = load i32, *%k
+    %lim = sub i32 %cap, 1
+    %full = sge i32 %kv, %lim
+    br %full, @copy_term, @copy_body
+  @copy_body:
+    %soff = add i32 %vo, %kv
+    %sp = gep i8, *%args, %soff
+    %sc = load i8, *%sp
+    %nul = eq i8 %sc, 0
+    %semi = eq i8 %sc, 59
+    %stop = or i1 %nul, %semi
+    br %stop, @copy_term, @copy_put
+  @copy_put:
+    %dp = gep i8, *%out, %kv
+    store i8 %sc, *%dp
+    %kn = add i32 %kv, 1
+    store i32 %kn, *%k
+    jmp @copy_cond
+  @copy_term:
+    %kv2 = load i32, *%k
+    %tp = gep i8, *%out, %kv2
+    store i8 0, *%tp
+    ret i32 %kv2
+  @seek:
+    %sv = load i32, *%i
+    %sp2 = gep i8, *%args, %sv
+    %sc2 = load i8, *%sp2
+    %send = eq i8 %sc2, 0
+    br %send, @miss, @seek_chk
+  @seek_chk:
+    %ssemi = eq i8 %sc2, 59
+    br %ssemi, @seek_next, @seek_adv
+  @seek_adv:
+    %sn = add i32 %sv, 1
+    store i32 %sn, *%i
+    jmp @seek
+  @seek_next:
+    %sn2 = add i32 %sv, 1
+    store i32 %sn2, *%i
+    jmp @seg
+  @miss:
+    ret i32 -1
+}
+
+fun @agtools_level(name: *i8) -> i32 {
+  @entry:
+    %n1 = gep i8, *@agtools_LVL_REMOVE, 0
+    %r1 = call @agtools_streq(%name, %n1)
+    %d1 = eq i32 %r1, 1
+    br %d1, @two, @n2
+  @n2:
+    %n2p = gep i8, *@agtools_LVL_REBOOT, 0
+    %r2 = call @agtools_streq(%name, %n2p)
+    %d2 = eq i32 %r2, 1
+    br %d2, @two, @n3
+  @n3:
+    %n3p = gep i8, *@agtools_LVL_POWER, 0
+    %r3 = call @agtools_streq(%name, %n3p)
+    %d3 = eq i32 %r3, 1
+    br %d3, @two, @n4
+  @n4:
+    %n4p = gep i8, *@agtools_LVL_WRITE, 0
+    %r4 = call @agtools_streq(%name, %n4p)
+    %d4 = eq i32 %r4, 1
+    br %d4, @one, @n5
+  @n5:
+    %n5p = gep i8, *@agtools_LVL_MKDIR, 0
+    %r5 = call @agtools_streq(%name, %n5p)
+    %d5 = eq i32 %r5, 1
+    br %d5, @one, @n6
+  @n6:
+    %n6p = gep i8, *@agtools_LVL_DHCP, 0
+    %r6 = call @agtools_streq(%name, %n6p)
+    %d6 = eq i32 %r6, 1
+    br %d6, @one, @zero
+  @zero:
+    ret i32 0
+  @one:
+    ret i32 1
+  @two:
+    ret i32 2
+}
+
+const @agtools_LVL_REMOVE: [i8, 10] = "fs.remove"
+const @agtools_LVL_REBOOT: [i8, 11] = "sys.reboot"
+const @agtools_LVL_POWER: [i8, 13] = "sys.poweroff"
+const @agtools_LVL_WRITE: [i8, 9] = "fs.write"
+const @agtools_LVL_MKDIR: [i8, 9] = "fs.mkdir"
+const @agtools_LVL_DHCP: [i8, 9] = "net.dhcp"
+
+fun @agtools_get_policy() -> i32 {
+  @entry:
+    %p = load i32, *@agtools_POLICY
+    ret i32 %p
+}
+
+fun @agtools_set_policy(p: i32) -> void {
+  @entry:
+    store i32 %p, *@agtools_POLICY
+    ret void
+}
+
+fun @agtools_err(out: *i8, lenp: *i32, cap: i32, msg: *i8) -> void {
+  @entry:
+    call @agtools_puts(%out, %lenp, %cap, "error: ")
+    call @agtools_puts(%out, %lenp, %cap, %msg)
+    call @agtools_puts(%out, %lenp, %cap, "\n")
+    ret void
+}
+
+fun @agtools_fs_list(args: *i8, out: *i8, cap: i32) -> i32 {
+  @entry:
+    %len = let i32
+    %path = let [i8, 160]
+    %pp = gep i8, *%path, 0
+    store i32 0, *%len
+    %ar = call @agtools_arg(%args, "path", %pp, 160)
+    %nopath = slt i32 %ar, 0
+    br %nopath, @defpath, @chkabs
+  @defpath:
+    call @agtools_copy(%pp, "/", 160)
+    jmp @chkabs
+  @chkabs:
+    %c0 = load i8, *%pp
+    %abs = eq i8 %c0, 47
+    br %abs, @lookup, @notabs
+  @notabs:
+    call @agtools_err(%out, %len, %cap, "path must be absolute")
+    %rv1 = load i32, *%len
+    ret i32 %rv1
+  @lookup:
+    %ino = call @vfs_lookup(%pp)
+    %found = sge i32 %ino, 0
+    br %found, @type, @notfound
+  @notfound:
+    call @agtools_err(%out, %len, %cap, "not found")
+    %rv2 = load i32, *%len
+    ret i32 %rv2
+  @type:
+    %ty = call @vfs_type(%ino)
+    %isdir = eq i32 %ty, 2
+    br %isdir, @dir, @file
+  @file:
+    call @agtools_putc(%out, %len, %cap, 102)
+    call @agtools_putc(%out, %len, %cap, 32)
+    %nm = call @vfs_name(%ino)
+    call @agtools_puts(%out, %len, %cap, %nm)
+    call @agtools_putc(%out, %len, %cap, 32)
+    %sz = call @vfs_size(%ino)
+    call @agtools_putdec(%out, %len, %cap, %sz)
+    call @agtools_putc(%out, %len, %cap, 10)
+    %rv3 = load i32, *%len
+    ret i32 %rv3
+  @dir:
+    %fd = call @vfs_open(%pp, 0)
+    %ok = sge i32 %fd, 0
+    br %ok, @scan, @notfound2
+  @notfound2:
+    call @agtools_err(%out, %len, %cap, "cannot open directory")
+    %rv4 = load i32, *%len
+    ret i32 %rv4
+  @scan:
+    %idx = let i32
+    store i32 0, *%idx
+    jmp @cond
+  @cond:
+    %iv = load i32, *%idx
+    %child = call @vfs_readdir(%fd, %iv)
+    %none = slt i32 %child, 0
+    br %none, @close, @show
+  @show:
+    %cty = call @vfs_type(%child)
+    %cdir = eq i32 %cty, 2
+    br %cdir, @pdir, @pfile
+  @pdir:
+    call @agtools_putc(%out, %len, %cap, 100)
+    jmp @pname
+  @pfile:
+    call @agtools_putc(%out, %len, %cap, 102)
+    jmp @pname
+  @pname:
+    call @agtools_putc(%out, %len, %cap, 32)
+    %cnm = call @vfs_name(%child)
+    call @agtools_puts(%out, %len, %cap, %cnm)
+    %isfile = eq i32 %cty, 1
+    br %isfile, @psize, @pnext
+  @psize:
+    call @agtools_putc(%out, %len, %cap, 32)
+    %csz = call @vfs_size(%child)
+    call @agtools_putdec(%out, %len, %cap, %csz)
+    jmp @pnext
+  @pnext:
+    call @agtools_putc(%out, %len, %cap, 10)
+    %iv2 = load i32, *%idx
+    %in = add i32 %iv2, 1
+    store i32 %in, *%idx
+    jmp @cond
+  @close:
+    call @vfs_close(%fd)
+    %rv5 = load i32, *%len
+    ret i32 %rv5
+}
+
+fun @agtools_fs_read(args: *i8, out: *i8, cap: i32) -> i32 {
+  @entry:
+    %len = let i32
+    %path = let [i8, 160]
+    %pp = gep i8, *%path, 0
+    store i32 0, *%len
+    %ar = call @agtools_arg(%args, "path", %pp, 160)
+    %no = slt i32 %ar, 0
+    br %no, @badargs, @chkabs
+  @badargs:
+    call @agtools_err(%out, %len, %cap, "missing path")
+    %rv6 = load i32, *%len
+    ret i32 %rv6
+  @chkabs:
+    %c0 = load i8, *%pp
+    %abs = eq i8 %c0, 47
+    br %abs, @open, @notabs
+  @notabs:
+    call @agtools_err(%out, %len, %cap, "path must be absolute")
+    %rv7 = load i32, *%len
+    ret i32 %rv7
+  @open:
+    %ino = call @vfs_lookup(%pp)
+    %found = sge i32 %ino, 0
+    br %found, @chktype, @notfound
+  @notfound:
+    call @agtools_err(%out, %len, %cap, "not found")
+    %rv8 = load i32, *%len
+    ret i32 %rv8
+  @chktype:
+    %ty = call @vfs_type(%ino)
+    %isfile = eq i32 %ty, 1
+    br %isfile, @read, @isdir
+  @isdir:
+    call @agtools_err(%out, %len, %cap, "is a directory")
+    %rv9 = load i32, *%len
+    ret i32 %rv9
+  @read:
+    %fd = call @vfs_open(%pp, 0)
+    %fok = sge i32 %fd, 0
+    br %fok, @do_read, @notfound
+  @do_read:
+    %lim = sub i32 %cap, 1
+    %lim64 = sext i32 %lim to i64
+    %n = call @vfs_read(%fd, %out, %lim64)
+    %ni = trunc i64 %n to i32
+    call @vfs_close(%fd)
+    %np = gep i8, *%out, %ni
+    store i8 0, *%np
+    ret i32 %ni
+}
+
+fun @agtools_fs_stat(args: *i8, out: *i8, cap: i32) -> i32 {
+  @entry:
+    %len = let i32
+    %path = let [i8, 160]
+    %pp = gep i8, *%path, 0
+    store i32 0, *%len
+    %ar = call @agtools_arg(%args, "path", %pp, 160)
+    %no = slt i32 %ar, 0
+    br %no, @badargs, @lookup
+  @badargs:
+    call @agtools_err(%out, %len, %cap, "missing path")
+    %rv10 = load i32, *%len
+    ret i32 %rv10
+  @lookup:
+    %ino = call @vfs_lookup(%pp)
+    %found = sge i32 %ino, 0
+    br %found, @show, @notfound
+  @notfound:
+    call @agtools_err(%out, %len, %cap, "not found")
+    %rv11 = load i32, *%len
+    ret i32 %rv11
+  @show:
+    %ty = call @vfs_type(%ino)
+    %isdir = eq i32 %ty, 2
+    br %isdir, @d, @f
+  @d:
+    call @agtools_puts(%out, %len, %cap, "type=dir\n")
+    jmp @name
+  @f:
+    call @agtools_puts(%out, %len, %cap, "type=file\n")
+    jmp @name
+  @name:
+    call @agtools_puts(%out, %len, %cap, "name=")
+    %nm = call @vfs_name(%ino)
+    call @agtools_puts(%out, %len, %cap, %nm)
+    call @agtools_putc(%out, %len, %cap, 10)
+    %sz = call @vfs_size(%ino)
+    call @agtools_puts(%out, %len, %cap, "size=")
+    call @agtools_putdec(%out, %len, %cap, %sz)
+    call @agtools_putc(%out, %len, %cap, 10)
+    %rv12 = load i32, *%len
+    ret i32 %rv12
+}
+
+fun @agtools_fs_write(args: *i8, out: *i8, cap: i32) -> i32 {
+  @entry:
+    %len = let i32
+    %path = let [i8, 160]
+    %text = let [i8, 512]
+    %pp = gep i8, *%path, 0
+    %tp = gep i8, *%text, 0
+    store i32 0, *%len
+    %ar = call @agtools_arg(%args, "path", %pp, 160)
+    %no = slt i32 %ar, 0
+    br %no, @badargs, @gettext
+  @badargs:
+    call @agtools_err(%out, %len, %cap, "missing path")
+    %rv13 = load i32, *%len
+    ret i32 %rv13
+  @gettext:
+    %tr = call @agtools_arg(%args, "text", %tp, 512)
+    %tnone = slt i32 %tr, 0
+    br %tnone, @emptytext, @chkabs
+  @emptytext:
+    store i8 0, *%tp
+    jmp @chkabs
+  @chkabs:
+    %c0 = load i8, *%pp
+    %abs = eq i8 %c0, 47
+    br %abs, @open, @notabs
+  @notabs:
+    call @agtools_err(%out, %len, %cap, "path must be absolute")
+    %rv14 = load i32, *%len
+    ret i32 %rv14
+  @open:
+    %fd = call @vfs_open(%pp, 1)
+    %ok = sge i32 %fd, 0
+    br %ok, @do_write, @openfail
+  @openfail:
+    call @agtools_err(%out, %len, %cap, "cannot open for write")
+    %rv15 = load i32, *%len
+    ret i32 %rv15
+  @do_write:
+    %tl = call @agtools_strlen(%tp)
+    %tl64 = sext i32 %tl to i64
+    %w = call @vfs_write(%fd, %tp, %tl64)
+    call @vfs_close(%fd)
+    %wi = trunc i64 %w to i32
+    call @agtools_puts(%out, %len, %cap, "ok ")
+    %zz = zext i32 %wi to i64
+    call @agtools_putdec(%out, %len, %cap, %zz)
+    call @agtools_puts(%out, %len, %cap, " bytes\n")
+    %rv16 = load i32, *%len
+    ret i32 %rv16
+}
+
+fun @agtools_fs_mkdir(args: *i8, out: *i8, cap: i32) -> i32 {
+  @entry:
+    %len = let i32
+    %path = let [i8, 160]
+    %pp = gep i8, *%path, 0
+    store i32 0, *%len
+    %ar = call @agtools_arg(%args, "path", %pp, 160)
+    %no = slt i32 %ar, 0
+    br %no, @badargs, @run
+  @badargs:
+    call @agtools_err(%out, %len, %cap, "missing path")
+    %rv17 = load i32, *%len
+    ret i32 %rv17
+  @run:
+    %r = call @vfs_mkdir(%pp)
+    %ok = sge i32 %r, 0
+    br %ok, @yes, @no
+  @yes:
+    call @agtools_puts(%out, %len, %cap, "ok\n")
+    %rv18 = load i32, *%len
+    ret i32 %rv18
+  @no:
+    call @agtools_err(%out, %len, %cap, "mkdir failed")
+    %rv19 = load i32, *%len
+    ret i32 %rv19
+}
+
+fun @agtools_fs_remove(args: *i8, out: *i8, cap: i32) -> i32 {
+  @entry:
+    %len = let i32
+    %path = let [i8, 160]
+    %pp = gep i8, *%path, 0
+    store i32 0, *%len
+    %ar = call @agtools_arg(%args, "path", %pp, 160)
+    %no = slt i32 %ar, 0
+    br %no, @badargs, @run
+  @badargs:
+    call @agtools_err(%out, %len, %cap, "missing path")
+    %rv20 = load i32, *%len
+    ret i32 %rv20
+  @run:
+    %r = call @vfs_remove(%pp)
+    %z = eq i32 %r, 0
+    br %z, @ok, @notz
+  @ok:
+    call @agtools_puts(%out, %len, %cap, "ok\n")
+    %rv21 = load i32, *%len
+    ret i32 %rv21
+  @notz:
+    %m1 = eq i32 %r, -1
+    br %m1, @nf, @chk2
+  @nf:
+    call @agtools_err(%out, %len, %cap, "not found")
+    %rv22 = load i32, *%len
+    ret i32 %rv22
+  @chk2:
+    %m2 = eq i32 %r, -2
+    br %m2, @ne, @bad
+  @ne:
+    call @agtools_err(%out, %len, %cap, "directory not empty")
+    %rv23 = load i32, *%len
+    ret i32 %rv23
+  @bad:
+    call @agtools_err(%out, %len, %cap, "cannot remove")
+    %rv24 = load i32, *%len
+    ret i32 %rv24
+}
+
+fun @agtools_net_status(args: *i8, out: *i8, cap: i32) -> i32 {
+  @entry:
+    %len = let i32
+    store i32 0, *%len
+    call @agtools_puts(%out, %len, %cap, "ip=")
+    %ip = call @net_my_ip()
+    call @agtools_putip(%out, %len, %cap, %ip)
+    call @agtools_putc(%out, %len, %cap, 10)
+    call @agtools_puts(%out, %len, %cap, "netmask=")
+    %nm = call @net_netmask()
+    call @agtools_putip(%out, %len, %cap, %nm)
+    call @agtools_putc(%out, %len, %cap, 10)
+    call @agtools_puts(%out, %len, %cap, "gateway=")
+    %gw = call @net_gateway()
+    call @agtools_putip(%out, %len, %cap, %gw)
+    call @agtools_putc(%out, %len, %cap, 10)
+    call @agtools_puts(%out, %len, %cap, "dns=")
+    %dns = call @net_dns()
+    call @agtools_putip(%out, %len, %cap, %dns)
+    call @agtools_putc(%out, %len, %cap, 10)
+    call @agtools_puts(%out, %len, %cap, "mac=")
+    %mac = call @net_my_mac()
+    call @agtools_putmac(%out, %len, %cap, %mac)
+    call @agtools_putc(%out, %len, %cap, 10)
+    call @agtools_puts(%out, %len, %cap, "ready=")
+    %rd = call @net_ready()
+    %rd64 = sext i32 %rd to i64
+    call @agtools_putdec(%out, %len, %cap, %rd64)
+    call @agtools_putc(%out, %len, %cap, 10)
+    %rv25 = load i32, *%len
+    ret i32 %rv25
+}
+
+fun @agtools_net_dhcp(args: *i8, out: *i8, cap: i32) -> i32 {
+  @entry:
+    %len = let i32
+    store i32 0, *%len
+    %r = call @dhcp_acquire()
+    %ok = eq i32 %r, 1
+    br %ok, @yes, @no
+  @yes:
+    call @agtools_puts(%out, %len, %cap, "ok\n")
+    %rv26 = load i32, *%len
+    ret i32 %rv26
+  @no:
+    call @agtools_err(%out, %len, %cap, "dhcp failed")
+    %rv27 = load i32, *%len
+    ret i32 %rv27
+}
+
+fun @agtools_net_dns(args: *i8, out: *i8, cap: i32) -> i32 {
+  @entry:
+    %len = let i32
+    %host = let [i8, 160]
+    %hp = gep i8, *%host, 0
+    store i32 0, *%len
+    %ar = call @agtools_arg(%args, "name", %hp, 160)
+    %no = slt i32 %ar, 0
+    br %no, @tryhost, @run
+  @tryhost:
+    %ar2 = call @agtools_arg(%args, "host", %hp, 160)
+    %no2 = slt i32 %ar2, 0
+    br %no2, @badargs, @run
+  @badargs:
+    call @agtools_err(%out, %len, %cap, "missing name")
+    %rv28 = load i32, *%len
+    ret i32 %rv28
+  @run:
+    %ip = call @dns_resolve(%hp, 1500)
+    %ok = ne i32 %ip, 0
+    br %ok, @yes, @no
+  @yes:
+    call @agtools_putip(%out, %len, %cap, %ip)
+    call @agtools_putc(%out, %len, %cap, 10)
+    %rv29 = load i32, *%len
+    ret i32 %rv29
+  @no:
+    call @agtools_err(%out, %len, %cap, "resolve failed")
+    %rv30 = load i32, *%len
+    ret i32 %rv30
+}
+
+fun @agtools_net_ping(args: *i8, out: *i8, cap: i32) -> i32 {
+  @entry:
+    %len = let i32
+    %host = let [i8, 160]
+    %hp = gep i8, *%host, 0
+    store i32 0, *%len
+    %ar = call @agtools_arg(%args, "host", %hp, 160)
+    %no = slt i32 %ar, 0
+    br %no, @badargs, @parse
+  @badargs:
+    call @agtools_err(%out, %len, %cap, "missing host")
+    %rv31 = load i32, *%len
+    ret i32 %rv31
+  @parse:
+    %lit = call @net_parse_ip(%hp)
+    %isip = ne i32 %lit, 0
+    br %isip, @have, @resolve
+  @resolve:
+    %rip = call @dns_resolve(%hp, 1500)
+    %rok = ne i32 %rip, 0
+    br %rok, @have2, @nores
+  @nores:
+    call @agtools_err(%out, %len, %cap, "resolve failed")
+    %rv32 = load i32, *%len
+    ret i32 %rv32
+  @have2:
+    %ip2 = phi i32 [%rip, @resolve]
+    jmp @ping
+  @have:
+    %ip = phi i32 [%lit, @parse]
+    jmp @ping
+  @ping:
+    %addr = phi i32 [%ip2, @have2], [%ip, @have]
+    call @agtools_puts(%out, %len, %cap, "ping ")
+    call @agtools_putip(%out, %len, %cap, %addr)
+    call @agtools_puts(%out, %len, %cap, ": ")
+    %r = call @icmp_ping(%addr, 1, 1000)
+    %one = eq i32 %r, 1
+    br %one, @up, @chkfail
+  @up:
+    call @agtools_puts(%out, %len, %cap, "ok\n")
+    %rv33 = load i32, *%len
+    ret i32 %rv33
+  @chkfail:
+    %zero = eq i32 %r, 0
+    br %zero, @down, @sendfail
+  @down:
+    call @agtools_puts(%out, %len, %cap, "timeout\n")
+    %rv34 = load i32, *%len
+    ret i32 %rv34
+  @sendfail:
+    call @agtools_puts(%out, %len, %cap, "send failed\n")
+    %rv35 = load i32, *%len
+    ret i32 %rv35
+}
+
+fun @agtools_sys_info(args: *i8, out: *i8, cap: i32) -> i32 {
+  @entry:
+    %len = let i32
+    store i32 0, *%len
+    call @agtools_puts(%out, %len, %cap, "os=osone arch=aarch64\n")
+    call @agtools_puts(%out, %len, %cap, "uptime=")
+    %now = call @timer_now()
+    %freq = call @timer_freq()
+    %fz = eq i64 %freq, 0
+    br %fz, @notime, @uptime
+  @uptime:
+    %secs = udiv i64 %now, %freq
+    call @agtools_putdec(%out, %len, %cap, %secs)
+    jmp @aftertime
+  @notime:
+    call @agtools_putc(%out, %len, %cap, 48)
+    jmp @aftertime
+  @aftertime:
+    call @agtools_puts(%out, %len, %cap, "s\nmem_used=")
+    %u = call @kmem_used()
+    %uk = udiv i64 %u, 1024
+    call @agtools_putdec(%out, %len, %cap, %uk)
+    call @agtools_puts(%out, %len, %cap, "KB mem_total=")
+    %t = call @kmem_total()
+    %tk = udiv i64 %t, 1024
+    call @agtools_putdec(%out, %len, %cap, %tk)
+    call @agtools_puts(%out, %len, %cap, "KB\n")
+    %rd = call @net_ready()
+    %rd64 = sext i32 %rd to i64
+    call @agtools_puts(%out, %len, %cap, "net_ready=")
+    call @agtools_putdec(%out, %len, %cap, %rd64)
+    call @agtools_putc(%out, %len, %cap, 10)
+    %rv36 = load i32, *%len
+    ret i32 %rv36
+}
+
+fun @agtools_sys_reboot(args: *i8, out: *i8, cap: i32) -> i32 {
+  @entry:
+    %len = let i32
+    store i32 0, *%len
+    call @agtools_puts(%out, %len, %cap, "rebooting\n")
+    call @psci_system_reset()
+    %rv37 = load i32, *%len
+    ret i32 %rv37
+}
+
+fun @agtools_sys_poweroff(args: *i8, out: *i8, cap: i32) -> i32 {
+  @entry:
+    %len = let i32
+    store i32 0, *%len
+    call @agtools_puts(%out, %len, %cap, "powering off\n")
+    call @psci_system_off()
+    %rv38 = load i32, *%len
+    ret i32 %rv38
+}
+
+fun @agtools_call(name: *i8, args: *i8, out: *i8, cap: i32) -> i32 {
+  @entry:
+    %lvl = call @agtools_level(%name)
+    %pol = call @agtools_get_policy()
+    %deny = sgt i32 %lvl, %pol
+    br %deny, @denied, @dispatch
+  @denied:
+    %len0 = let i32
+    store i32 0, *%len0
+    call @agtools_puts(%out, %len0, %cap, "error: ")
+    call @agtools_puts(%out, %len0, %cap, %name)
+    call @agtools_puts(%out, %len0, %cap, " denied by policy\n")
+    %rvd = load i32, *%len0
+    ret i32 %rvd
+  @dispatch:
+    %n1 = call @agtools_streq(%name, "fs.list")
+    %b1 = eq i32 %n1, 1
+    br %b1, @d_list, @c2
+  @d_list:
+    %r1 = call @agtools_fs_list(%args, %out, %cap)
+    ret i32 %r1
+  @c2:
+    %n2 = call @agtools_streq(%name, "fs.read")
+    %b2 = eq i32 %n2, 1
+    br %b2, @d_read, @c3
+  @d_read:
+    %r2 = call @agtools_fs_read(%args, %out, %cap)
+    ret i32 %r2
+  @c3:
+    %n3 = call @agtools_streq(%name, "fs.stat")
+    %b3 = eq i32 %n3, 1
+    br %b3, @d_stat, @c4
+  @d_stat:
+    %r3 = call @agtools_fs_stat(%args, %out, %cap)
+    ret i32 %r3
+  @c4:
+    %n4 = call @agtools_streq(%name, "fs.write")
+    %b4 = eq i32 %n4, 1
+    br %b4, @d_write, @c5
+  @d_write:
+    %r4 = call @agtools_fs_write(%args, %out, %cap)
+    ret i32 %r4
+  @c5:
+    %n5 = call @agtools_streq(%name, "fs.mkdir")
+    %b5 = eq i32 %n5, 1
+    br %b5, @d_mkdir, @c6
+  @d_mkdir:
+    %r5 = call @agtools_fs_mkdir(%args, %out, %cap)
+    ret i32 %r5
+  @c6:
+    %n6 = call @agtools_streq(%name, "fs.remove")
+    %b6 = eq i32 %n6, 1
+    br %b6, @d_remove, @c7
+  @d_remove:
+    %r6 = call @agtools_fs_remove(%args, %out, %cap)
+    ret i32 %r6
+  @c7:
+    %n7 = call @agtools_streq(%name, "net.status")
+    %b7 = eq i32 %n7, 1
+    br %b7, @d_status, @c8
+  @d_status:
+    %r7 = call @agtools_net_status(%args, %out, %cap)
+    ret i32 %r7
+  @c8:
+    %n8 = call @agtools_streq(%name, "net.dhcp")
+    %b8 = eq i32 %n8, 1
+    br %b8, @d_dhcp, @c9
+  @d_dhcp:
+    %r8 = call @agtools_net_dhcp(%args, %out, %cap)
+    ret i32 %r8
+  @c9:
+    %n9 = call @agtools_streq(%name, "net.dns")
+    %b9 = eq i32 %n9, 1
+    br %b9, @d_dns, @c10
+  @d_dns:
+    %r9 = call @agtools_net_dns(%args, %out, %cap)
+    ret i32 %r9
+  @c10:
+    %n10 = call @agtools_streq(%name, "net.ping")
+    %b10 = eq i32 %n10, 1
+    br %b10, @d_ping, @c11
+  @d_ping:
+    %r10 = call @agtools_net_ping(%args, %out, %cap)
+    ret i32 %r10
+  @c11:
+    %n11 = call @agtools_streq(%name, "sys.info")
+    %b11 = eq i32 %n11, 1
+    br %b11, @d_info, @c12
+  @d_info:
+    %r11 = call @agtools_sys_info(%args, %out, %cap)
+    ret i32 %r11
+  @c12:
+    %n12 = call @agtools_streq(%name, "sys.reboot")
+    %b12 = eq i32 %n12, 1
+    br %b12, @d_reboot, @c13
+  @d_reboot:
+    %r12 = call @agtools_sys_reboot(%args, %out, %cap)
+    ret i32 %r12
+  @c13:
+    %n13 = call @agtools_streq(%name, "sys.poweroff")
+    %b13 = eq i32 %n13, 1
+    br %b13, @d_power, @unknown
+  @d_power:
+    %r13 = call @agtools_sys_poweroff(%args, %out, %cap)
+    ret i32 %r13
+  @unknown:
+    %lenu = let i32
+    store i32 0, *%lenu
+    call @agtools_err(%out, %lenu, %cap, "unknown tool")
+    %rvu = load i32, *%lenu
+    ret i32 %rvu
+}

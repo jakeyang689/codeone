@@ -1,0 +1,157 @@
+// mmu.bx - 4KB granule / 39-bit VA / 3-level page tables, identity mapping
+//
+// Layout (1GB per entry):
+//   L1[0]  -> 0x00000000-0x3FFFFFFF  Device-nGnRnE (UART and other MMIO)
+//   L1[1]  -> L2 table covering 0x40000000-0x7FFFFFFF (kernel + RAM)
+//   L2[0]  -> L3 table; the first 2MB is split into 4KB pages: .text and the vector page RO+X, .rodata RO+NX, the rest RW+NX
+//   L2[1..511] -> 2MB blocks, RW+NX
+//   L1[2..511] invalid (useful for testing exception vectors)
+
+const @mmu_DEV_BLOCK: i64 = 0x0060000000000401
+const @mmu_TABLE: i64 = 3
+const @mmu_BLOCK_RW_NX: i64 = 0x0060000000000705
+const @mmu_PAGE_RW_NX: i64 = 0x0060000000000707
+const @mmu_PAGE_RO_X: i64 = 0x0040000000000787
+const @mmu_PAGE_RO_NX: i64 = 0x0060000000000787
+const @mmu_MAIR: i64 = 0x000000000000FF00
+const @mmu_TCR: i64 = 0x0000000200003519
+
+global @mmu_on: i32
+global @mmu_probe: i64
+
+fun @mmu_phys64(addr: i64) -> *i64 {
+  @entry:
+    %p = asm att *i64, "mov $0, ${addr}", "=r,r", i64 %addr
+    ret *i64 %p
+}
+
+fun @mmu_is_on() -> i32 {
+  @entry:
+    %v = load i32, *@mmu_on
+    ret i32 %v
+}
+
+fun @mmu_init() -> i32 {
+  @entry:
+    %base = asm att i64, "adrp $0, __pgt_area\nadd $0, $0, :lo12:__pgt_area", "=r"
+    %ts = asm att i64, "adrp $0, __text_start\nadd $0, $0, :lo12:__text_start", "=r"
+    %te = asm att i64, "adrp $0, __text_end\nadd $0, $0, :lo12:__text_end", "=r"
+    %rs = asm att i64, "adrp $0, __rodata_start\nadd $0, $0, :lo12:__rodata_start", "=r"
+    %re = asm att i64, "adrp $0, __rodata_end\nadd $0, $0, :lo12:__rodata_end", "=r"
+    %vs = asm att i64, "adrp $0, __vectors\nadd $0, $0, :lo12:__vectors", "=r"
+    %ve = add i64 %vs, 0x800
+    %l1p = call @mmu_phys64(%base)
+    %l2a = add i64 %base, 4096
+    %l2p = call @mmu_phys64(%l2a)
+    %l3a = add i64 %base, 8192
+    %l3p = call @mmu_phys64(%l3a)
+    %zi = let i32
+    %i2 = let i32
+    %i3 = let i32
+    store i32 0, *%zi
+    jmp @zcond
+  @zcond:
+    %zv = load i32, *%zi
+    %zdone = sge i32 %zv, 1536
+    br %zdone, @z_done, @zbody
+  @zbody:
+    %zp = gep i64, *%l1p, %zv
+    store i64 0, *%zp
+    %zn = add i32 %zv, 1
+    store i32 %zn, *%zi
+    jmp @zcond
+  @z_done:
+    %dev = load i64, *@mmu_DEV_BLOCK
+    %l1e0 = gep i64, *%l1p, 0
+    store i64 %dev, *%l1e0
+    %tab = load i64, *@mmu_TABLE
+    %l2desc = or i64 %l2a, %tab
+    %l1e1 = gep i64, *%l1p, 1
+    store i64 %l2desc, *%l1e1
+    %l3desc = or i64 %l3a, %tab
+    %l2e0 = gep i64, *%l2p, 0
+    store i64 %l3desc, *%l2e0
+    store i32 1, *%i2
+    jmp @l2cond
+  @l2cond:
+    %i2v = load i32, *%i2
+    %l2done = sge i32 %i2v, 512
+    br %l2done, @l2_done, @l2body
+  @l2body:
+    %o2 = sub i32 %i2v, 1
+    %o2_64 = zext i32 %o2 to i64
+    %m2 = mul i64 %o2_64, 0x200000
+    %pa2 = add i64 0x40200000, %m2
+    %rwblk = load i64, *@mmu_BLOCK_RW_NX
+    %d2 = or i64 %pa2, %rwblk
+    %e2 = gep i64, *%l2p, %i2v
+    store i64 %d2, *%e2
+    %i2n = add i32 %i2v, 1
+    store i32 %i2n, *%i2
+    jmp @l2cond
+  @l2_done:
+    store i32 0, *%i3
+    jmp @l3cond
+  @l3cond:
+    %i3v = load i32, *%i3
+    %l3done = sge i32 %i3v, 512
+    br %l3done, @l3_done, @l3body
+  @l3body:
+    %o3 = zext i32 %i3v to i64
+    %m3 = mul i64 %o3, 4096
+    %pa3 = add i64 0x40000000, %m3
+    %ge_t = sge i64 %pa3, %ts
+    %lt_t = slt i64 %pa3, %te
+    %is_text = and i1 %ge_t, %lt_t
+    br %is_text, @attr_x, @chk_ro
+  @attr_x:
+    %stat_x = load i64, *@mmu_PAGE_RO_X
+    %dx = or i64 %pa3, %stat_x
+    jmp @store_page
+  @chk_ro:
+    %ge_r = sge i64 %pa3, %rs
+    %lt_r = slt i64 %pa3, %re
+    %is_ro = and i1 %ge_r, %lt_r
+    br %is_ro, @attr_r, @chk_vec
+  @attr_r:
+    %stat_r = load i64, *@mmu_PAGE_RO_NX
+    %dr = or i64 %pa3, %stat_r
+    jmp @store_page
+  @chk_vec:
+    %ge_v = sge i64 %pa3, %vs
+    %lt_v = slt i64 %pa3, %ve
+    %is_vec = and i1 %ge_v, %lt_v
+    br %is_vec, @attr_x, @attr_w
+  @attr_w:
+    %stat_w = load i64, *@mmu_PAGE_RW_NX
+    %dw = or i64 %pa3, %stat_w
+    jmp @store_page
+  @store_page:
+    %desc = phi i64 [%dx, @attr_x], [%dr, @attr_r], [%dw, @attr_w]
+    %pe = gep i64, *%l3p, %i3v
+    store i64 %desc, *%pe
+    %i3n = add i32 %i3v, 1
+    store i32 %i3n, *%i3
+    jmp @l3cond
+  @l3_done:
+    %mair = load i64, *@mmu_MAIR
+    %tcr = load i64, *@mmu_TCR
+    asm att void, "msr mair_el1, ${mair}\nmsr tcr_el1, ${tcr}\nmsr ttbr0_el1, ${base}\ndsb sy\ntlbi vmalle1\ndsb sy\nisb", "r,r,r,~{memory}", i64 %mair, i64 %tcr, i64 %base
+    %sctlr = asm att i64, "mrs $0, sctlr_el1", "=r,~{memory}"
+    %flags = or i64 %sctlr, 0x30D01805
+    asm att void, "ic iallu\ndsb sy\nisb\nmsr sctlr_el1, ${flags}\nisb", "r,~{memory}", i64 %flags
+    %cpacr = asm att i64, "mrs $0, cpacr_el1", "=r,~{memory}"
+    %fpen = or i64 %cpacr, 0x00300000
+    asm att void, "msr cpacr_el1, ${fpen}\nisb", "r,~{memory}", i64 %fpen
+    // Self-check after enabling: write and read one kernel data page.
+    store i64 0x5A5A5A5A5A5A5A5A, *@mmu_probe
+    %pv = load i64, *@mmu_probe
+    %ok = eq i64 %pv, 0x5A5A5A5A5A5A5A5A
+    br %ok, @ok_lbl, @fail_lbl
+  @ok_lbl:
+    store i32 1, *@mmu_on
+    ret i32 1
+  @fail_lbl:
+    store i32 0, *@mmu_on
+    ret i32 0
+}

@@ -1,0 +1,291 @@
+// dns.bx - minimal DNS client: A-record queries
+//
+// One UDP query, no retries and no caching. Ask the gateway first, then 8.8.8.8 on failure.
+// Only A/IN records in the answer section are parsed; name compression pointers are supported.
+
+extern @udp_send(dst: i32, dport: i32, sport: i32, data: *i8, len: i32) -> i32
+extern @udp_recv(port: i32, buf: *i8, max: i32, timeout_ms: i32) -> i32
+extern @net_ld8(p: *i8, off: i32) -> i32
+extern @net_be16(p: *i8, off: i32) -> i32
+extern @net_be32(p: *i8, off: i32) -> i32
+extern @net_st8(p: *i8, off: i32, v: i32) -> void
+extern @net_stbe16(p: *i8, off: i32, v: i32) -> void
+extern @net_dns() -> i32
+
+const @dns_PORT: i32 = 53
+const @dns_FALLBACK: i32 = 0x08080808
+const @dns_PKT_MAX: i32 = 512
+const @dns_ID_HI: i32 = 0x4F
+const @dns_ID_LO: i32 = 0x53
+const @dns_TYPE_A: i32 = 1
+const @dns_CLASS_IN: i32 = 1
+
+global @dns_TXBUF: [i8, 512]
+global @dns_RXBUF: [i8, 512]
+
+fun @dns_strlen(s: *i8) -> i32 {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @cond
+  @cond:
+    %iv = load i32, *%i
+    %cp = gep i8, *%s, %iv
+    %ch = load i8, *%cp
+    %z = eq i8 %ch, 0
+    br %z, @done, @body
+  @body:
+    %in = add i32 %iv, 1
+    store i32 %in, *%i
+    jmp @cond
+  @done:
+    %r = load i32, *%i
+    ret i32 %r
+}
+
+// Encode a dotted domain name as a DNS QNAME and return the end offset; -1 on failure.
+fun @dns_build_qname(msg: *i8, name: *i8) -> i32 {
+  @entry:
+    %len = call @dns_strlen(%name)
+    %empty = eq i32 %len, 0
+    br %empty, @fail, @init
+  @init:
+    %pos = let i32
+    %lab = let i32
+    %cnt = let i32
+    %i = let i32
+    store i32 13, *%pos
+    store i32 12, *%lab
+    store i32 0, *%cnt
+    store i32 0, *%i
+    jmp @cond
+  @cond:
+    %iv = load i32, *%i
+    %done = sge i32 %iv, %len
+    br %done, @finish, @body
+  @body:
+    %ch = call @net_ld8(%name, %iv)
+    %isdot = eq i32 %ch, 46
+    br %isdot, @dot, @char
+  @char:
+    %cv = load i32, *%cnt
+    %toolong = sgt i32 %cv, 62
+    br %toolong, @fail, @put
+  @put:
+    %pv = load i32, *%pos
+    call @net_st8(%msg, %pv, %ch)
+    %pv2 = add i32 %pv, 1
+    store i32 %pv2, *%pos
+    %cv2 = load i32, *%cnt
+    %cvn = add i32 %cv2, 1
+    store i32 %cvn, *%cnt
+    %iv2 = load i32, *%i
+    %in = add i32 %iv2, 1
+    store i32 %in, *%i
+    jmp @cond
+  @dot:
+    %cv3 = load i32, *%cnt
+    %empty2 = eq i32 %cv3, 0
+    br %empty2, @fail, @closedot
+  @closedot:
+    %lb = load i32, *%lab
+    %cv4 = load i32, *%cnt
+    call @net_st8(%msg, %lb, %cv4)
+    %pv3 = load i32, *%pos
+    store i32 %pv3, *%lab
+    %pv4 = add i32 %pv3, 1
+    store i32 %pv4, *%pos
+    store i32 0, *%cnt
+    %iv3 = load i32, *%i
+    %in2 = add i32 %iv3, 1
+    store i32 %in2, *%i
+    jmp @cond
+  @finish:
+    %pv5 = load i32, *%pos
+    %toolong2 = sgt i32 %pv5, 250
+    br %toolong2, @fail, @close
+  @close:
+    %lb2 = load i32, *%lab
+    %cv5 = load i32, *%cnt
+    %trailing = eq i32 %cv5, 0
+    br %trailing, @trail, @normal
+  @normal:
+    call @net_st8(%msg, %lb2, %cv5)
+    call @net_st8(%msg, %pv5, 0)
+    %end = add i32 %pv5, 1
+    ret i32 %end
+  @trail:
+    call @net_st8(%msg, %lb2, 0)
+    ret i32 %pv5
+  @fail:
+    ret i32 -1
+}
+
+// Skip a (possibly compressed) name and return the position of the next field; -1 on overflow.
+fun @dns_skip_name(msg: *i8, pos: i32, max: i32) -> i32 {
+  @entry:
+    %p = let i32
+    store i32 %pos, *%p
+    jmp @loop
+  @loop:
+    %pv = load i32, *%p
+    %oob = sge i32 %pv, %max
+    br %oob, @fail, @read
+  @read:
+    %b = call @net_ld8(%msg, %pv)
+    %top = and i32 %b, 0xC0
+    %isptr = eq i32 %top, 0xC0
+    br %isptr, @ptr, @chk
+  @ptr:
+    %pn = add i32 %pv, 2
+    %oob2 = sgt i32 %pn, %max
+    br %oob2, @fail, @pret
+  @pret:
+    ret i32 %pn
+  @chk:
+    %z = eq i32 %b, 0
+    br %z, @zero, @label
+  @label:
+    %pn2 = add i32 %pv, %b
+    %pn3 = add i32 %pn2, 1
+    %oob3 = sgt i32 %pn3, %max
+    br %oob3, @fail, @next
+  @next:
+    store i32 %pn3, *%p
+    jmp @loop
+  @zero:
+    %pn4 = add i32 %pv, 1
+    ret i32 %pn4
+  @fail:
+    ret i32 -1
+}
+
+fun @dns_try(server: i32, name: *i8, timeout_ms: i32, sport: i32) -> i32 {
+  @entry:
+    %p = gep i8, *@dns_TXBUF, 0
+    call @net_st8(%p, 0, @dns_ID_HI)
+    call @net_st8(%p, 1, @dns_ID_LO)
+    call @net_st8(%p, 2, 0x01)
+    call @net_st8(%p, 3, 0x00)
+    call @net_stbe16(%p, 4, 1)
+    call @net_stbe16(%p, 6, 0)
+    call @net_stbe16(%p, 8, 0)
+    call @net_stbe16(%p, 10, 0)
+    %ql = call @dns_build_qname(%p, %name)
+    %qbad = slt i32 %ql, 0
+    br %qbad, @fail, @qtail
+  @qtail:
+    call @net_stbe16(%p, %ql, @dns_TYPE_A)
+    %q2 = add i32 %ql, 2
+    call @net_stbe16(%p, %q2, @dns_CLASS_IN)
+    %q3 = add i32 %q2, 2
+    %sr = call @udp_send(%server, @dns_PORT, %sport, %p, %q3)
+    %sok = sge i32 %sr, 0
+    br %sok, @rx, @fail
+  @rx:
+    %rxb = gep i8, *@dns_RXBUF, 0
+    %n = call @udp_recv(%sport, %rxb, @dns_PKT_MAX, %timeout_ms)
+    %short = slt i32 %n, 12
+    br %short, @fail, @hdr
+  @hdr:
+    %i0 = call @net_ld8(%rxb, 0)
+    %i1 = call @net_ld8(%rxb, 1)
+    %idok = eq i32 %i0, @dns_ID_HI
+    br %idok, @idlo, @fail
+  @idlo:
+    %idok2 = eq i32 %i1, @dns_ID_LO
+    br %idok2, @flags, @fail
+  @flags:
+    %fl = call @net_ld8(%rxb, 2)
+    %qr = and i32 %fl, 0x80
+    %qrok = ne i32 %qr, 0
+    br %qrok, @counts, @fail
+  @counts:
+    %qd = call @net_be16(%rxb, 4)
+    %an = call @net_be16(%rxb, 6)
+    %hasan = sgt i32 %an, 0
+    br %hasan, @qinit, @fail
+  @qinit:
+    %qi = let i32
+    %pos = let i32
+    store i32 0, *%qi
+    store i32 12, *%pos
+    jmp @qcond
+  @qcond:
+    %qiv = load i32, *%qi
+    %qdone = sge i32 %qiv, %qd
+    br %qdone, @ainit, @qbody
+  @qbody:
+    %pv = load i32, *%pos
+    %np = call @dns_skip_name(%rxb, %pv, %n)
+    %nbad = slt i32 %np, 0
+    br %nbad, @fail, @qnext
+  @qnext:
+    %np2 = add i32 %np, 4
+    store i32 %np2, *%pos
+    %qin = add i32 %qiv, 1
+    store i32 %qin, *%qi
+    jmp @qcond
+  @ainit:
+    %ai = let i32
+    store i32 0, *%ai
+    jmp @acond
+  @acond:
+    %aiv = load i32, *%ai
+    %adone = sge i32 %aiv, %an
+    br %adone, @fail, @abody
+  @abody:
+    %pv2 = load i32, *%pos
+    %np3 = call @dns_skip_name(%rxb, %pv2, %n)
+    %nbad2 = slt i32 %np3, 0
+    br %nbad2, @fail, @rrhdr
+  @rrhdr:
+    %rend = add i32 %np3, 10
+    %oob = sgt i32 %rend, %n
+    br %oob, @fail, @rdfields
+  @rdfields:
+    %typ = call @net_be16(%rxb, %np3)
+    %c2 = add i32 %np3, 2
+    %cls = call @net_be16(%rxb, %c2)
+    %r8 = add i32 %np3, 8
+    %rdl = call @net_be16(%rxb, %r8)
+    %isA = eq i32 %typ, @dns_TYPE_A
+    br %isA, @rclass, @nextans
+  @rclass:
+    %isIn = eq i32 %cls, @dns_CLASS_IN
+    br %isIn, @lenchk, @nextans
+  @lenchk:
+    %len4 = eq i32 %rdl, 4
+    br %len4, @take, @nextans
+  @take:
+    %rd = add i32 %np3, 10
+    %ip = call @net_be32(%rxb, %rd)
+    ret i32 %ip
+  @nextans:
+    %rd2 = add i32 %np3, 10
+    %end2 = add i32 %rd2, %rdl
+    %oob2 = sgt i32 %end2, %n
+    br %oob2, @fail, @advance
+  @advance:
+    %aiv2 = load i32, *%ai
+    %ain = add i32 %aiv2, 1
+    store i32 %ain, *%ai
+    store i32 %end2, *%pos
+    jmp @acond
+  @fail:
+    ret i32 0
+}
+
+// Resolve a domain name; returns an IPv4 address in host order, or 0 on failure.
+fun @dns_resolve(name: *i8, timeout_ms: i32) -> i32 {
+  @entry:
+    %srv = call @net_dns()
+    %ip = call @dns_try(%srv, %name, %timeout_ms, 53001)
+    %ok = ne i32 %ip, 0
+    br %ok, @done, @fallback
+  @fallback:
+    %ip2 = call @dns_try(@dns_FALLBACK, %name, %timeout_ms, 53002)
+    ret i32 %ip2
+  @done:
+    ret i32 %ip
+}

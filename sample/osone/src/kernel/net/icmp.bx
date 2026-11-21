@@ -1,0 +1,115 @@
+// icmp.bx - ICMP echo (ping)
+
+extern @ip_send(dst: i32, proto: i32, payload: *i8, len: i32) -> i32
+extern @net_ld8(p: *i8, off: i32) -> i32
+extern @net_be16(p: *i8, off: i32) -> i32
+extern @net_be32(p: *i8, off: i32) -> i32
+extern @net_st8(p: *i8, off: i32, v: i32) -> void
+extern @net_stbe16(p: *i8, off: i32, v: i32) -> void
+extern @net_cksum(p: *i8, len: i32) -> i32
+extern @net_now_ms() -> i64
+extern @net_poll() -> void
+extern @kmem_memcpy(dst: *i8, src: *i8, n: i64) -> void
+
+const @icmp_ECHO_REQ: i32 = 8
+const @icmp_ECHO_REP: i32 = 0
+const @icmp_ID: i32 = 0x4F53
+const @icmp_PROBE_LEN: i32 = 16
+const @icmp_MSG_LEN: i32 = 24
+const @icmp_PATTERN: [i8, 17] = "osone-ping-probe"
+
+global @icmp_TXBUF: [i8, 1480]
+global @icmp_REPLY: i32
+global @icmp_REPLY_SEQ: i32
+global @icmp_REPLY_ID: i32
+global @icmp_REPLY_SRC: i32
+global @icmp_REPLY_LEN: i32
+
+fun @icmp_input(src: i32, msg: *i8, len: i32) -> void {
+  @entry:
+    %short = slt i32 %len, 8
+    br %short, @done, @type
+  @type:
+    %t = call @net_ld8(%msg, 0)
+    %isreq = eq i32 %t, @icmp_ECHO_REQ
+    br %isreq, @reply, @chkrep
+  @chkrep:
+    %isrep = eq i32 %t, @icmp_ECHO_REP
+    br %isrep, @record, @done
+  @reply:
+    %tx = gep i8, *@icmp_TXBUF, 0
+    %len64 = sext i32 %len to i64
+    call @kmem_memcpy(%tx, %msg, %len64)
+    call @net_st8(%tx, 0, @icmp_ECHO_REP)
+    call @net_st8(%tx, 1, 0)
+    call @net_stbe16(%tx, 2, 0)
+    %ck = call @net_cksum(%tx, %len)
+    call @net_stbe16(%tx, 2, %ck)
+    call @ip_send(%src, 1, %tx, %len)
+    jmp @done
+  @record:
+    %id = call @net_be16(%msg, 4)
+    %seq = call @net_be16(%msg, 6)
+    store i32 %id, *@icmp_REPLY_ID
+    store i32 %seq, *@icmp_REPLY_SEQ
+    store i32 %src, *@icmp_REPLY_SRC
+    store i32 %len, *@icmp_REPLY_LEN
+    store i32 1, *@icmp_REPLY
+    jmp @done
+  @done:
+    ret void
+}
+
+fun @icmp_ping(dst: i32, seq: i32, timeout_ms: i32) -> i32 {
+  @entry:
+    store i32 0, *@icmp_REPLY
+    %tx = gep i8, *@icmp_TXBUF, 0
+    call @net_st8(%tx, 0, @icmp_ECHO_REQ)
+    call @net_st8(%tx, 1, 0)
+    call @net_stbe16(%tx, 2, 0)
+    call @net_stbe16(%tx, 4, @icmp_ID)
+    call @net_stbe16(%tx, 6, %seq)
+    %pat = gep i8, *@icmp_PATTERN, 0
+    %dstp = gep i8, *%tx, 8
+    %patlen = zext i32 @icmp_PROBE_LEN to i64
+    call @kmem_memcpy(%dstp, %pat, %patlen)
+    %ck = call @net_cksum(%tx, @icmp_MSG_LEN)
+    call @net_stbe16(%tx, 2, %ck)
+    %r = call @ip_send(%dst, 1, %tx, @icmp_MSG_LEN)
+    %sent = sge i32 %r, 0
+    br %sent, @wait, @sendfail
+  @wait:
+    %start = call @net_now_ms()
+    %t64 = sext i32 %timeout_ms to i64
+    %end = add i64 %start, %t64
+    jmp @cond
+  @cond:
+    call @net_poll()
+    %flag = load i32, *@icmp_REPLY
+    %got = eq i32 %flag, 1
+    br %got, @check, @timeout
+  @check:
+    %sid = load i32, *@icmp_REPLY_ID
+    %sseq = load i32, *@icmp_REPLY_SEQ
+    %ssrc = load i32, *@icmp_REPLY_SRC
+    %okid = eq i32 %sid, @icmp_ID
+    %okseq = eq i32 %sseq, %seq
+    %oksrc = eq i32 %ssrc, %dst
+    %a = and i1 %okid, %okseq
+    %b = and i1 %a, %oksrc
+    br %b, @success, @timeout
+  @success:
+    store i32 0, *@icmp_REPLY
+    ret i32 1
+  @timeout:
+    %now = call @net_now_ms()
+    %late = sge i64 %now, %end
+    br %late, @fail, @sleep
+  @sleep:
+    asm att void, "wfe", "~{memory}"
+    jmp @cond
+  @fail:
+    ret i32 0
+  @sendfail:
+    ret i32 -1
+}

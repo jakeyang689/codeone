@@ -1,0 +1,14 @@
+// pl031.bx - PL031 real-time clock on QEMU virt
+//
+// The RTC sits at 0x09010000 (Device memory under the identity map); its data
+// register at offset 0 holds seconds since the Unix epoch in UTC.
+
+const @rtc_ADDR: i64 = 0x09010000
+
+fun @rtc_now() -> i64 {
+  @entry:
+    %addr = load i64, *@rtc_ADDR
+    %v = asm att i32, "ldr ${0:w}, [${addr}]", "=r,r,~{memory}", i64 %addr
+    %s = zext i32 %v to i64
+    ret i64 %s
+}

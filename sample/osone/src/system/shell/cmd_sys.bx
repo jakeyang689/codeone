@@ -1,0 +1,211 @@
+// cmd_sys.bx - system shell commands: ps / mem / uptime / clear / uname / echo / date / reboot
+
+extern @console_putc(ch: i32) -> void
+extern @console_puts(s: *i8) -> void
+extern @console_printf(fmt: *i8, a: i64, b: i64, c: i64, d: i64, s1: *i8, s2: *i8) -> void
+extern @proc_ps() -> void
+extern @kmem_used() -> i64
+extern @kmem_total() -> i64
+extern @timer_now() -> i64
+extern @timer_freq() -> i64
+extern @rtc_now() -> i64
+extern @psci_system_off() -> void
+extern @psci_system_reset() -> void
+
+const @sys_NL: [i8, 2] = "\n"
+const @sys_CLEAR: [i8, 8] = "\x1b[2J\x1b[H"
+const @sys_UNAME: [i8, 42] = "osone (aarch64, bare metal, codeone SSA)\n"
+const @sys_MEM_FMT: [i8, 42] = "mem: %d KB used, %d KB free, %d KB total\n"
+const @sys_UP_FMT: [i8, 25] = "uptime: %d s (%d ticks)\n"
+const @sys_UTC: [i8, 6] = " UTC\n"
+const @sys_REBOOT: [i8, 14] = "rebooting...\n"
+const @sys_POWEROFF: [i8, 17] = "powering off...\n"
+
+fun @cmd_sys_ps() -> void {
+  @entry:
+    call @proc_ps()
+    ret void
+}
+
+fun @cmd_sys_mem() -> void {
+  @entry:
+    %u = call @kmem_used()
+    %t = call @kmem_total()
+    %f = sub i64 %t, %u
+    %uk = udiv i64 %u, 1024
+    %fk = udiv i64 %f, 1024
+    %tk = udiv i64 %t, 1024
+    %fmt = gep i8, *@sys_MEM_FMT, 0
+    call @console_printf(%fmt, %uk, %fk, %tk, 0, null, null)
+    ret void
+}
+
+fun @cmd_sys_uptime() -> void {
+  @entry:
+    %now = call @timer_now()
+    %freq = call @timer_freq()
+    %zero = eq i64 %freq, 0
+    %secs = let i64
+    store i64 0, *%secs
+    br %zero, @print, @calc
+  @calc:
+    %s = udiv i64 %now, %freq
+    store i64 %s, *%secs
+    jmp @print
+  @print:
+    %sv = load i64, *%secs
+    %fmt = gep i8, *@sys_UP_FMT, 0
+    call @console_printf(%fmt, %sv, %now, 0, 0, null, null)
+    ret void
+}
+
+fun @cmd_sys_clear() -> void {
+  @entry:
+    %s = gep i8, *@sys_CLEAR, 0
+    call @console_puts(%s)
+    ret void
+}
+
+fun @cmd_sys_uname() -> void {
+  @entry:
+    %s = gep i8, *@sys_UNAME, 0
+    call @console_puts(%s)
+    ret void
+}
+
+fun @cmd_sys_echo(arg: *i8) -> void {
+  @entry:
+    call @console_puts(%arg)
+    %nl = gep i8, *@sys_NL, 0
+    call @console_puts(%nl)
+    ret void
+}
+
+fun @cmd_sys_put2(v: i32) -> void {
+  @entry:
+    %hi = udiv i32 %v, 10
+    %lo = urem i32 %v, 10
+    %hc = add i32 %hi, 48
+    call @console_putc(%hc)
+    %lc = add i32 %lo, 48
+    call @console_putc(%lc)
+    ret void
+}
+
+fun @cmd_sys_put4(v: i32) -> void {
+  @entry:
+    %hi = udiv i32 %v, 100
+    %lo = urem i32 %v, 100
+    call @cmd_sys_put2(%hi)
+    call @cmd_sys_put2(%lo)
+    ret void
+}
+
+// Print the PL031 clock as YYYY-MM-DD HH:MM:SS UTC using Hinnant's
+// civil_from_days on the days-since-epoch field.
+fun @cmd_sys_date() -> void {
+  @entry:
+    %secs = call @rtc_now()
+    %s32 = trunc i64 %secs to i32
+    %days = udiv i32 %s32, 86400
+    %rem = urem i32 %s32, 86400
+    %hour = udiv i32 %rem, 3600
+    %rem2 = urem i32 %rem, 3600
+    %min = udiv i32 %rem2, 60
+    %sec = urem i32 %rem2, 60
+    %z = add i32 %days, 719468
+    %era = udiv i32 %z, 146097
+    %erat = mul i32 %era, 146097
+    %doe = sub i32 %z, %erat
+    %q1 = udiv i32 %doe, 1460
+    %q2 = udiv i32 %doe, 36524
+    %q3 = udiv i32 %doe, 146096
+    %n1 = sub i32 %doe, %q1
+    %n2 = add i32 %n1, %q2
+    %n3 = sub i32 %n2, %q3
+    %yoe = udiv i32 %n3, 365
+    %ey = mul i32 %era, 400
+    %y = add i32 %yoe, %ey
+    %y365 = mul i32 %yoe, 365
+    %y4 = udiv i32 %yoe, 4
+    %y100 = udiv i32 %yoe, 100
+    %ya = add i32 %y365, %y4
+    %yb = sub i32 %ya, %y100
+    %doy = sub i32 %doe, %yb
+    %mp5 = mul i32 %doy, 5
+    %mp2 = add i32 %mp5, 2
+    %mp = udiv i32 %mp2, 153
+    %m153 = mul i32 %mp, 153
+    %m2 = add i32 %m153, 2
+    %m5 = udiv i32 %m2, 5
+    %d0 = sub i32 %doy, %m5
+    %d = add i32 %d0, 1
+    %lt = slt i32 %mp, 10
+    br %lt, @m_early, @m_late
+  @m_early:
+    %me = add i32 %mp, 3
+    jmp @have_m
+  @m_late:
+    %ml = sub i32 %mp, 9
+    jmp @have_m
+  @have_m:
+    %m = phi i32 [%me, @m_early], [%ml, @m_late]
+    %isjanfeb = sle i32 %m, 2
+    br %isjanfeb, @y_next, @y_same
+  @y_next:
+    %yn = add i32 %y, 1
+    jmp @print
+  @y_same:
+    jmp @print
+  @print:
+    %yy = phi i32 [%yn, @y_next], [%y, @y_same]
+    call @cmd_sys_put4(%yy)
+    call @console_putc(45)
+    call @cmd_sys_put2(%m)
+    call @console_putc(45)
+    call @cmd_sys_put2(%d)
+    call @console_putc(32)
+    call @cmd_sys_put2(%hour)
+    call @console_putc(58)
+    call @cmd_sys_put2(%min)
+    call @console_putc(58)
+    call @cmd_sys_put2(%sec)
+    %utc = gep i8, *@sys_UTC, 0
+    call @console_puts(%utc)
+    ret void
+}
+
+fun @cmd_sys_time() -> void {
+  @entry:
+    %secs = call @rtc_now()
+    %s32 = trunc i64 %secs to i32
+    %rem = urem i32 %s32, 86400
+    %hour = udiv i32 %rem, 3600
+    %rem2 = urem i32 %rem, 3600
+    %min = udiv i32 %rem2, 60
+    %sec = urem i32 %rem2, 60
+    call @cmd_sys_put2(%hour)
+    call @console_putc(58)
+    call @cmd_sys_put2(%min)
+    call @console_putc(58)
+    call @cmd_sys_put2(%sec)
+    %utc = gep i8, *@sys_UTC, 0
+    call @console_puts(%utc)
+    ret void
+}
+
+fun @cmd_sys_reboot() -> void {
+  @entry:
+    %m = gep i8, *@sys_REBOOT, 0
+    call @console_puts(%m)
+    call @psci_system_reset()
+    ret void
+}
+
+fun @cmd_sys_poweroff() -> void {
+  @entry:
+    %m = gep i8, *@sys_POWEROFF, 0
+    call @console_puts(%m)
+    call @psci_system_off()
+    ret void
+}

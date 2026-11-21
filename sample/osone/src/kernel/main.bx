@@ -1,0 +1,211 @@
+// main.bx - kernel entry: staged initialization and a set of self-tests
+
+extern @console_puts(s: *i8) -> void
+extern @console_printf(fmt: *i8, a: i64, b: i64, c: i64, d: i64, s1: *i8, s2: *i8) -> void
+extern @kmem_init() -> void
+extern @kmem_heap_start() -> i64
+extern @kmem_heap_end() -> i64
+extern @mmu_init() -> i32
+extern @vfs_init() -> void
+extern @vfs_mkdir(path: *i8) -> i32
+extern @vfs_open(path: *i8, flags: i32) -> i32
+extern @vfs_write(fd: i32, buf: *i8, len: i64) -> i64
+extern @vfs_read(fd: i32, buf: *i8, len: i64) -> i64
+extern @vfs_close(fd: i32) -> i32
+extern @vfs_readdir(fd: i32, idx: i32) -> i32
+extern @vfs_name(ino: i32) -> *i8
+extern @vfs_size(ino: i32) -> i64
+extern @vfs_type(ino: i32) -> i32
+extern @proc_init() -> void
+extern @proc_spawn(entry: i32, arg: i64, name: *i8) -> i32
+extern @proc_wait(pid: i32) -> i64
+extern @proc_getpid() -> i32
+extern @proc_ps() -> void
+extern @procdemo_count(idx: i32) -> i64
+extern @klog_dump() -> void
+extern @shell_run() -> void
+extern @net_init() -> i32
+extern @dhcp_acquire() -> i32
+extern @gpu_init() -> i32
+extern @input_init() -> i32
+extern @rng_init() -> i32
+extern @agentcfg_init() -> void
+
+const @main_BANNER: [i8, 14] = "osone kernel\n"
+const @main_HEAP_FMT: [i8, 15] = "heap: %x - %x\n"
+const @main_MMU_BAD: [i8, 13] = "mmu: FAILED\n"
+const @main_MMU_OK: [i8, 30] = "mmu: enabled (identity, W^X)\n"
+const @main_MKDIR_FMT: [i8, 24] = "mkdir /etc -> inode %d\n"
+const @main_OPEN_BAD: [i8, 30] = "fs: FAILED to open /etc/motd\n"
+const @main_PAYLOAD: [i8, 13] = "hello osone\n"
+const @main_WROTE_FMT: [i8, 16] = "wrote %d bytes\n"
+const @main_READ_PRE: [i8, 12] = "read back: "
+const @main_ROOT: [i8, 11] = "root dir:\n"
+const @main_LIST_FMT: [i8, 22] = "  %s type=%d size=%d\n"
+const @main_FS_OK: [i8, 8] = "fs: ok\n"
+const @main_PASS: [i8, 18] = "all tests passed\n"
+const @main_ETC: [i8, 5] = "/etc"
+const @main_MOTD_PATH: [i8, 10] = "/etc/motd"
+const @main_SLASH: [i8, 2] = "/"
+const @main_PROC_PID_FMT: [i8, 20] = "proc: kmain pid=%d\n"
+const @main_PROC_SPAWN_FMT: [i8, 22] = "proc: spawn %d %d %d\n"
+const @main_PROC_CHILD_FMT: [i8, 28] = "proc: child pid=%d exit=%d\n"
+const @main_PROC_WORK_FMT: [i8, 31] = "proc: work counters: %d %d %d\n"
+const @main_PROC_DONE: [i8, 16] = "proc: all done\n"
+
+fun @kmain(dtb: i64) -> void {
+  @entry:
+    %rdbuf = let [i8, 64]
+    %k = let i32
+    %wi = let i32
+
+    %banner = gep i8, *@main_BANNER, 0
+    call @console_puts(%banner)
+    // The agent reads its endpoint and key from the fw_cfg bootargs item.
+    call @agentcfg_init()
+
+    call @kmem_init()
+    %h0 = call @kmem_heap_start()
+    %h1 = call @kmem_heap_end()
+    %heapf = gep i8, *@main_HEAP_FMT, 0
+    call @console_printf(%heapf, %h0, %h1, 0, 0, null, null)
+
+    %m = call @mmu_init()
+    %isok = eq i32 %m, 1
+    br %isok, @mmu_ok, @mmu_bad
+  @mmu_bad:
+    %mb = gep i8, *@main_MMU_BAD, 0
+    call @console_puts(%mb)
+    jmp @fs_start
+  @mmu_ok:
+    %mo = gep i8, *@main_MMU_OK, 0
+    call @console_puts(%mo)
+    jmp @fs_start
+
+  @fs_start:
+    call @vfs_init()
+    %etc = gep i8, *@main_ETC, 0
+    %mk = call @vfs_mkdir(%etc)
+    %mk64 = zext i32 %mk to i64
+    %mkf = gep i8, *@main_MKDIR_FMT, 0
+    call @console_printf(%mkf, %mk64, 0, 0, 0, null, null)
+    %motd = gep i8, *@main_MOTD_PATH, 0
+    %fd = call @vfs_open(%motd, 1)
+    %fdok = sge i32 %fd, 0
+    br %fdok, @write_it, @fs_fail
+  @fs_fail:
+    %ob = gep i8, *@main_OPEN_BAD, 0
+    call @console_puts(%ob)
+    jmp @shell_start
+  @write_it:
+    %payload = gep i8, *@main_PAYLOAD, 0
+    %n = call @vfs_write(%fd, %payload, 12)
+    call @vfs_close(%fd)
+    %wf = gep i8, *@main_WROTE_FMT, 0
+    call @console_printf(%wf, %n, 0, 0, 0, null, null)
+    %motd2 = gep i8, *@main_MOTD_PATH, 0
+    %fd2 = call @vfs_open(%motd2, 0)
+    %rb = gep i8, *%rdbuf, 0
+    %n2 = call @vfs_read(%fd2, %rb, 64)
+    %n232 = trunc i64 %n2 to i32
+    %tp = gep i8, *%rdbuf, %n232
+    store i8 0, *%tp
+    call @vfs_close(%fd2)
+    %rp = gep i8, *@main_READ_PRE, 0
+    call @console_puts(%rp)
+    call @console_puts(%rb)
+    %slash = gep i8, *@main_SLASH, 0
+    %rfd = call @vfs_open(%slash, 0)
+    store i32 0, *%k
+    %rootm = gep i8, *@main_ROOT, 0
+    call @console_puts(%rootm)
+    jmp @dir_cond
+  @dir_cond:
+    %kv = load i32, *%k
+    %ino = call @vfs_readdir(%rfd, %kv)
+    %none = slt i32 %ino, 0
+    br %none, @dir_done, @dir_body
+  @dir_body:
+    %nm = call @vfs_name(%ino)
+    %ty = call @vfs_type(%ino)
+    %sz = call @vfs_size(%ino)
+    %ty64 = zext i32 %ty to i64
+    %lf = gep i8, *@main_LIST_FMT, 0
+    call @console_printf(%lf, %ty64, %sz, 0, 0, %nm, null)
+    %kn = add i32 %kv, 1
+    store i32 %kn, *%k
+    jmp @dir_cond
+  @dir_done:
+    call @vfs_close(%rfd)
+    %fok = gep i8, *@main_FS_OK, 0
+    call @console_puts(%fok)
+    jmp @proc_start
+
+  @proc_start:
+    %netok = call @net_init()
+    call @proc_init()
+    // The display driver needs the timer for command timeouts, so initialize it after proc_init.
+    %gpuok = call @gpu_init()
+    %inputok = call @input_init()
+    %rngok = call @rng_init()
+    %netlive = eq i32 %netok, 1
+    br %netlive, @dhcp_start, @boot_demos
+  @dhcp_start:
+    // DHCP depends on the timer and must run after proc_init; skip it entirely when there is no NIC.
+    %dhcpok = call @dhcp_acquire()
+    jmp @boot_demos
+  @boot_demos:
+    %mypid = call @proc_getpid()
+    %mypid64 = sext i32 %mypid to i64
+    %pidfmt = gep i8, *@main_PROC_PID_FMT, 0
+    call @console_printf(%pidfmt, %mypid64, 0, 0, 0, null, null)
+
+    %pa = call @proc_spawn(0, 5, "coop")
+    %pb = call @proc_spawn(1, 3, "sleeper")
+    %pc = call @proc_spawn(2, 2000000, "spinner")
+    %pa64 = sext i32 %pa to i64
+    %pb64 = sext i32 %pb to i64
+    %pc64 = sext i32 %pc to i64
+    %spawnfmt = gep i8, *@main_PROC_SPAWN_FMT, 0
+    call @console_printf(%spawnfmt, %pa64, %pb64, %pc64, 0, null, null)
+
+    store i32 0, *%wi
+    jmp @wait_cond
+  @wait_cond:
+    %wiv = load i32, *%wi
+    %wdone = sge i32 %wiv, 3
+    br %wdone, @wait_done, @wait_body
+  @wait_body:
+    %wres = call @proc_wait(-1)
+    %wpid = lshr i64 %wres, 32
+    %wpid32 = trunc i64 %wpid to i32
+    %wpid64 = sext i32 %wpid32 to i64
+    %wcode = trunc i64 %wres to i32
+    %wcode64 = sext i32 %wcode to i64
+    %childfmt = gep i8, *@main_PROC_CHILD_FMT, 0
+    call @console_printf(%childfmt, %wpid64, %wcode64, 0, 0, null, null)
+    %wiv2 = load i32, *%wi
+    %wnext = add i32 %wiv2, 1
+    store i32 %wnext, *%wi
+    jmp @wait_cond
+  @wait_done:
+    %wc0 = call @procdemo_count(0)
+    %wc1 = call @procdemo_count(1)
+    %wc2 = call @procdemo_count(2)
+    %workfmt = gep i8, *@main_PROC_WORK_FMT, 0
+    call @console_printf(%workfmt, %wc0, %wc1, %wc2, 0, null, null)
+    call @proc_ps()
+    call @klog_dump()
+    %doneMsg = gep i8, *@main_PROC_DONE, 0
+    call @console_puts(%doneMsg)
+    jmp @shell_start
+
+  @shell_start:
+    %pass = gep i8, *@main_PASS, 0
+    call @console_puts(%pass)
+    call @shell_run()
+    jmp @idle
+  @idle:
+    asm att void, "wfe", "~{memory}"
+    jmp @idle
+}

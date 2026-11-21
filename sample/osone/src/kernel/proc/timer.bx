@@ -1,0 +1,114 @@
+// timer.bx - GICv2 interrupt controller and EL1 physical timer
+//
+// QEMU virt with gic-version=2 provides:
+//   GICD 0x08000000 (distributor)  GICC 0x08010000 (CPU interface)
+// The EL1 non-secure physical timer uses PPI 30; the CNTPCT_EL0 frequency is given by CNTFRQ_EL0.
+
+const @timer_GICD: i64 = 0x08000000
+const @timer_GICC: i64 = 0x08010000
+const @timer_IRQ_TIMER: i32 = 30
+const @timer_IRQ_SPURIOUS: i32 = 1023
+const @timer_TICK_HZ: i64 = 100
+const @timer_FALLBACK_FREQ: i64 = 62500000
+
+global @timer_FREQ: i64
+global @timer_PERIOD: i64
+
+fun @timer_w32(addr: i64, val: i32) -> void {
+  @entry:
+    asm att void, "str ${val:w}, [${addr}]", "r,r,~{memory}", i64 %addr, i32 %val
+    ret void
+}
+
+fun @timer_r32(addr: i64) -> i32 {
+  @entry:
+    %v = asm att i32, "ldr ${0:w}, [${addr}]", "=r,r,~{memory}", i64 %addr
+    ret i32 %v
+}
+
+fun @timer_barrier() -> void {
+  @entry:
+    asm att void, "dsb sy\nisb", "~{memory}"
+    ret void
+}
+
+fun @timer_init() -> void {
+  @entry:
+    %gicd = load i64, *@timer_GICD
+    %gicc = load i64, *@timer_GICC
+
+    // Distributor: disable -> set PPI 30 priority -> enable PPI 30 -> turn on
+    call @timer_w32(%gicd, 0)
+    %prio = add i64 %gicd, 0x41C
+    call @timer_w32(%prio, 0xA0A0A0A0)
+    %isen = add i64 %gicd, 0x100
+    call @timer_w32(%isen, 0x40000000)
+
+    // CPU interface: priority mask and enable
+    %pmr = add i64 %gicc, 0x004
+    call @timer_w32(%pmr, 0xF0)
+    call @timer_w32(%gicc, 1)
+    call @timer_w32(%gicd, 1)
+    call @timer_barrier()
+
+    %f = asm att i64, "mrs $0, cntfrq_el0", "=r,~{memory}"
+    %fz = eq i64 %f, 0
+    br %fz, @freq_fallback, @freq_ok
+  @freq_fallback:
+    %ff = load i64, *@timer_FALLBACK_FREQ
+    store i64 %ff, *@timer_FREQ
+    jmp @set_period
+  @freq_ok:
+    store i64 %f, *@timer_FREQ
+    jmp @set_period
+  @set_period:
+    %fv = load i64, *@timer_FREQ
+    %q = udiv i64 %fv, @timer_TICK_HZ
+    %qz = eq i64 %q, 0
+    br %qz, @period_min, @period_ok
+  @period_min:
+    store i64 1, *@timer_PERIOD
+    jmp @arm
+  @period_ok:
+    store i64 %q, *@timer_PERIOD
+    jmp @arm
+  @arm:
+    %pv = load i64, *@timer_PERIOD
+    asm att void, "msr cntp_tval_el0, $0\nmsr cntp_ctl_el0, $1\nisb", "r,r,~{memory}", i64 %pv, i64 1
+    ret void
+}
+
+fun @timer_rearm() -> void {
+  @entry:
+    %pv = load i64, *@timer_PERIOD
+    asm att void, "msr cntp_tval_el0, $0\nmsr cntp_ctl_el0, $1\nisb", "r,r,~{memory}", i64 %pv, i64 1
+    ret void
+}
+
+fun @timer_ack() -> i32 {
+  @entry:
+    %gicc = load i64, *@timer_GICC
+    %iar = add i64 %gicc, 0x00C
+    %id = call @timer_r32(%iar)
+    ret i32 %id
+}
+
+fun @timer_eoi(id: i32) -> void {
+  @entry:
+    %gicc = load i64, *@timer_GICC
+    %eoir = add i64 %gicc, 0x010
+    call @timer_w32(%eoir, %id)
+    ret void
+}
+
+fun @timer_now() -> i64 {
+  @entry:
+    %t = asm att i64, "mrs $0, cntpct_el0", "=r"
+    ret i64 %t
+}
+
+fun @timer_freq() -> i64 {
+  @entry:
+    %v = load i64, *@timer_FREQ
+    ret i64 %v
+}

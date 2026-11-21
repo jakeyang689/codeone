@@ -1,0 +1,66 @@
+// tlsclient.bx - thin wrapper around the toolchain TLS client
+//
+// One connection at a time is sufficient for the shell client.  The context
+// lives in a global i64 array so it is 8-byte aligned; the TLS boxes treat it
+// as an opaque byte buffer.
+
+extern @net_tls_init(ctx: *i8) -> void
+extern @net_tls_set_host(ctx: *i8, host: *i8, len: i32) -> void
+extern @net_tls13_connect(ctx: *i8, fd: i32, limbs: i32) -> i32
+extern @net_tls12_connect(ctx: *i8, fd: i32, limbs: i32) -> i32
+extern @net_tls_send(ctx: *i8, data: *i8, len: i32) -> i32
+extern @net_tls_recv(ctx: *i8, buf: *i8, cap: i32, out_len: *i32) -> i32
+extern @net_tls_close(ctx: *i8) -> i32
+
+// RSA bignum limb count: 64 limbs cover 2048-bit keys and 128 cover 4096.
+const @tlsclient_LIMBS: i32 = 64
+
+global @tlsclient_CTX: [i64, 256]
+
+fun @tlsclient_connect(host: *i8, hostlen: i32, fd: i32) -> i32 {
+  @entry:
+    %ctx = gep i8, *@tlsclient_CTX, 0
+    call @net_tls_init(%ctx)
+    call @net_tls_set_host(%ctx, %host, %hostlen)
+    %r = call @net_tls13_connect(%ctx, %fd, @tlsclient_LIMBS)
+    ret i32 %r
+}
+
+fun @tlsclient_connect12(host: *i8, hostlen: i32, fd: i32) -> i32 {
+  @entry:
+    %ctx = gep i8, *@tlsclient_CTX, 0
+    call @net_tls_init(%ctx)
+    call @net_tls_set_host(%ctx, %host, %hostlen)
+    %r = call @net_tls12_connect(%ctx, %fd, @tlsclient_LIMBS)
+    ret i32 %r
+}
+
+fun @tlsclient_send(buf: *i8, len: i32) -> i32 {
+  @entry:
+    %ctx = gep i8, *@tlsclient_CTX, 0
+    %r = call @net_tls_send(%ctx, %buf, %len)
+    ret i32 %r
+}
+
+fun @tlsclient_recv(buf: *i8, cap: i32) -> i32 {
+  @entry:
+    %ctx = gep i8, *@tlsclient_CTX, 0
+    %out = let i32
+    store i32 0, *%out
+    %op = gep i32, *%out, 0
+    %r = call @net_tls_recv(%ctx, %buf, %cap, %op)
+    %err = slt i32 %r, 0
+    br %err, @fail, @ok
+  @ok:
+    %n = load i32, *%out
+    ret i32 %n
+  @fail:
+    ret i32 -1
+}
+
+fun @tlsclient_close() -> i32 {
+  @entry:
+    %ctx = gep i8, *@tlsclient_CTX, 0
+    %r = call @net_tls_close(%ctx)
+    ret i32 %r
+}

@@ -1,0 +1,104 @@
+// demo.bx - process management demo workloads
+//
+// Three entry ids correspond to three workload types:
+//   0 coop    voluntarily yields, testing cooperative switching
+//   1 sleeper sleeps on the timer, testing tick wakeups
+//   2 spinner pure computation, testing timer preemption
+
+extern @proc_yield() -> void
+extern @proc_sleep(ticks: i32) -> void
+
+global @procdemo_c0: i64
+global @procdemo_c1: i64
+global @procdemo_c2: i64
+
+fun @procdemo_dispatch(entry: i32, arg: i64) -> i32 {
+  @entry:
+    %i = let i64
+    %j = let i64
+    %is0 = eq i32 %entry, 0
+    br %is0, @coop_setup, @chk1
+  @coop_setup:
+    store i64 0, *%i
+    jmp @coop_cond
+  @coop_cond:
+    %iv = load i64, *%i
+    %done = sge i64 %iv, %arg
+    br %done, @coop_done, @coop_body
+  @coop_body:
+    %c = load i64, *@procdemo_c0
+    %cn = add i64 %c, 1
+    store i64 %cn, *@procdemo_c0
+    call @proc_yield()
+    %iv2 = load i64, *%i
+    %inext = add i64 %iv2, 1
+    store i64 %inext, *%i
+    jmp @coop_cond
+  @coop_done:
+    ret i32 10
+
+  @chk1:
+    %is1 = eq i32 %entry, 1
+    br %is1, @sleep_setup, @chk2
+  @sleep_setup:
+    store i64 0, *%j
+    jmp @sleep_cond
+  @sleep_cond:
+    %jv = load i64, *%j
+    %sdone = sge i64 %jv, %arg
+    br %sdone, @sleep_done, @sleep_body
+  @sleep_body:
+    %sc = load i64, *@procdemo_c1
+    %scn = add i64 %sc, 1
+    store i64 %scn, *@procdemo_c1
+    call @proc_sleep(3)
+    %jv2 = load i64, *%j
+    %jnext = add i64 %jv2, 1
+    store i64 %jnext, *%j
+    jmp @sleep_cond
+  @sleep_done:
+    ret i32 20
+
+  @chk2:
+    %is2 = eq i32 %entry, 2
+    br %is2, @spin_body, @unknown
+  @spin_body:
+    jmp @spin_cond
+  @spin_cond:
+    %sv = load i64, *@procdemo_c2
+    %spdone = sge i64 %sv, %arg
+    br %spdone, @spin_done, @spin_loop
+  @spin_loop:
+    %sv2 = load i64, *@procdemo_c2
+    %svn = add i64 %sv2, 1
+    store i64 %svn, *@procdemo_c2
+    jmp @spin_cond
+  @spin_done:
+    ret i32 30
+
+  @unknown:
+    ret i32 0
+}
+
+fun @procdemo_count(idx: i32) -> i64 {
+  @entry:
+    %is0 = eq i32 %idx, 0
+    br %is0, @c0, @chk1
+  @c0:
+    %v0 = load i64, *@procdemo_c0
+    ret i64 %v0
+  @chk1:
+    %is1 = eq i32 %idx, 1
+    br %is1, @c1, @chk2
+  @c1:
+    %v1 = load i64, *@procdemo_c1
+    ret i64 %v1
+  @chk2:
+    %is2 = eq i32 %idx, 2
+    br %is2, @c2, @none
+  @c2:
+    %v2 = load i64, *@procdemo_c2
+    ret i64 %v2
+  @none:
+    ret i64 0
+}

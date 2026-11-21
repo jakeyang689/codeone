@@ -1,0 +1,124 @@
+// klog.bx - kernel runtime log: fixed-capacity ring buffer
+//
+// Events go to memory instead of directly to the serial port, so interleaved output from
+// multiple processes/interrupts stays readable; call klog_dump() to dump it all at once. Interrupts are disabled while writing a record so each record is atomic.
+//
+// Record format (type, a, b, c):
+//   1 init     (cur, pid, 0)
+//   2 spawn    (pid, slot, parent)
+//   3 switch   (from, to, 0)
+//   4 syscall  (cur, num, arg0)
+//   5 exit     (cur, code, 0)
+//   6 wait     (cur, target, ret)
+//   7 sleep    (pid, ticks, wake_tick)
+//   8 wake     (pid, tick, 0)
+//   9 notify   (pid, parent, code)
+
+extern @console_printf(fmt: *i8, a: i64, b: i64, c: i64, d: i64, s1: *i8, s2: *i8) -> void
+
+const @klog_CAP: i32 = 512
+const @klog_HDR: [i8, 18] = "klog: %d records\n"
+const @klog_ROW: [i8, 15] = "  %d %d %d %d\n"
+
+struct @klog_Rec {
+  @type: i32,
+  @a: i32,
+  @b: i32,
+  @c: i32
+}
+
+global @klog_BUF: [@klog_Rec, 512]
+global @klog_HEAD: i32
+global @klog_TOTAL: i32
+
+fun @klog_irq_save() -> i64 {
+  @entry:
+    %flags = asm att i64, "mrs $0, daif\nmsr daifset, #2", "=r,~{memory}"
+    ret i64 %flags
+}
+
+fun @klog_irq_restore(flags: i64) -> void {
+  @entry:
+    asm att void, "msr daif, $0", "r,~{memory}", i64 %flags
+    ret void
+}
+
+fun @klog_event(t: i32, a: i32, b: i32, c: i32) -> void {
+  @entry:
+    %flags = call @klog_irq_save()
+    %h = load i32, *@klog_HEAD
+    %rp = gep @klog_Rec, *@klog_BUF, %h
+    %f0 = field @klog_Rec, *%rp, 0
+    store i32 %t, *%f0
+    %f1 = field @klog_Rec, *%rp, 1
+    store i32 %a, *%f1
+    %f2 = field @klog_Rec, *%rp, 2
+    store i32 %b, *%f2
+    %f3 = field @klog_Rec, *%rp, 3
+    store i32 %c, *%f3
+    %hn = add i32 %h, 1
+    %hm = urem i32 %hn, @klog_CAP
+    store i32 %hm, *@klog_HEAD
+    %tot = load i32, *@klog_TOTAL
+    %tn = add i32 %tot, 1
+    store i32 %tn, *@klog_TOTAL
+    call @klog_irq_restore(%flags)
+    ret void
+}
+
+fun @klog_dump() -> void {
+  @entry:
+    %flags = call @klog_irq_save()
+    %i = let i32
+    %n = let i32
+    %start = let i32
+    %tot = load i32, *@klog_TOTAL
+    %old = sgt i32 %tot, @klog_CAP
+    br %old, @full, @partial
+  @partial:
+    store i32 0, *%start
+    store i32 0, *%i
+    store i32 %tot, *%n
+    jmp @header
+  @full:
+    %h = load i32, *@klog_HEAD
+    store i32 %h, *%start
+    store i32 0, *%i
+    store i32 @klog_CAP, *%n
+    jmp @header
+  @header:
+    %hf = gep i8, *@klog_HDR, 0
+    %tot64 = sext i32 %tot to i64
+    call @console_printf(%hf, %tot64, 0, 0, 0, null, null)
+    jmp @cond
+  @cond:
+    %iv = load i32, *%i
+    %nv = load i32, *%n
+    %done = sge i32 %iv, %nv
+    br %done, @end, @body
+  @body:
+    %sv = load i32, *%start
+    %idx = add i32 %sv, %iv
+    %idxm = urem i32 %idx, @klog_CAP
+    %rp = gep @klog_Rec, *@klog_BUF, %idxm
+    %f0 = field @klog_Rec, *%rp, 0
+    %tv = load i32, *%f0
+    %f1 = field @klog_Rec, *%rp, 1
+    %av = load i32, *%f1
+    %f2 = field @klog_Rec, *%rp, 2
+    %bv = load i32, *%f2
+    %f3 = field @klog_Rec, *%rp, 3
+    %cv = load i32, *%f3
+    %t64 = sext i32 %tv to i64
+    %a64 = sext i32 %av to i64
+    %b64 = sext i32 %bv to i64
+    %c64 = sext i32 %cv to i64
+    %rf = gep i8, *@klog_ROW, 0
+    call @console_printf(%rf, %t64, %a64, %b64, %c64, null, null)
+    %in = add i32 %iv, 1
+    store i32 %in, *%i
+    jmp @cond
+  @end:
+    call @klog_irq_restore(%flags)
+    ret void
+}

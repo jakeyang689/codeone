@@ -1,0 +1,226 @@
+// kmem.bx - memory primitives and kernel bump allocator
+//
+// These functions are also exported under libc names (memset/memcpy/memmove/memcmp)
+// so that LLVM's external calls for aggregate copies at -O2 resolve at link time.
+
+global @kmem_next: i64
+global @kmem_limit: i64
+global @kmem_BASE: i64
+
+fun @kmem_phys(addr: i64) -> *i8 {
+  @entry:
+    %p = asm att *i8, "mov $0, ${addr}", "=r,r", i64 %addr
+    ret *i8 %p
+}
+
+fun @kmem_ptr_addr(p: *i8) -> i64 {
+  @entry:
+    %a = asm att i64, "mov $0, ${p}", "=r,r", *i8 %p
+    ret i64 %a
+}
+
+fun @kmem_init() -> void {
+  @entry:
+    %end = asm att i64, "adrp $0, __kernel_end\nadd $0, $0, :lo12:__kernel_end", "=r"
+    %up = add i64 %end, 15
+    %q = udiv i64 %up, 16
+    %aligned = mul i64 %q, 16
+    store i64 %aligned, *@kmem_next
+    store i64 %aligned, *@kmem_BASE
+    store i64 0x60000000, *@kmem_limit
+    ret void
+}
+
+fun @kmem_heap_start() -> i64 {
+  @entry:
+    %v = load i64, *@kmem_next
+    ret i64 %v
+}
+
+fun @kmem_heap_end() -> i64 {
+  @entry:
+    %v = load i64, *@kmem_limit
+    ret i64 %v
+}
+
+fun @kmem_used() -> i64 {
+  @entry:
+    %n = load i64, *@kmem_next
+    %b = load i64, *@kmem_BASE
+    %u = sub i64 %n, %b
+    ret i64 %u
+}
+
+fun @kmem_total() -> i64 {
+  @entry:
+    %l = load i64, *@kmem_limit
+    %b = load i64, *@kmem_BASE
+    %t = sub i64 %l, %b
+    ret i64 %t
+}
+
+fun @kmem_alloc(size: i64) -> *i8 {
+  @entry:
+    %nextv = load i64, *@kmem_next
+    %need = add i64 %size, 15
+    %q = udiv i64 %need, 16
+    %bytes = mul i64 %q, 16
+    %newend = add i64 %nextv, %bytes
+    %limit = load i64, *@kmem_limit
+    %over = sgt i64 %newend, %limit
+    br %over, @fail, @ok
+  @ok:
+    store i64 %newend, *@kmem_next
+    %p = call @kmem_phys(%nextv)
+    ret *i8 %p
+  @fail:
+    ret *i8 null
+}
+
+fun @kmem_alloc_page() -> *i64 {
+  @entry:
+    %nextv = load i64, *@kmem_next
+    %up = add i64 %nextv, 4095
+    %q = udiv i64 %up, 4096
+    %aligned = mul i64 %q, 4096
+    %newend = add i64 %aligned, 4096
+    %limit = load i64, *@kmem_limit
+    %over = sgt i64 %newend, %limit
+    br %over, @fail, @ok
+  @ok:
+    store i64 %newend, *@kmem_next
+    %p = call @kmem_phys(%aligned)
+    %p64 = asm att *i64, "mov $0, ${p}", "=r,r", *i8 %p
+    ret *i64 %p64
+  @fail:
+    ret *i64 null
+}
+
+fun @kmem_memset(p: *i8, v: i32, n: i64) -> void {
+  @entry:
+    %i = let i64
+    %v8 = trunc i32 %v to i8
+    store i64 0, *%i
+    jmp @cond
+  @cond:
+    %iv = load i64, *%i
+    %done = sge i64 %iv, %n
+    br %done, @end, @body
+  @body:
+    %i32 = trunc i64 %iv to i32
+    %dp = gep i8, *%p, %i32
+    store i8 %v8, *%dp
+    %n2 = add i64 %iv, 1
+    store i64 %n2, *%i
+    jmp @cond
+  @end:
+    ret void
+}
+
+fun @kmem_memcpy(dst: *i8, src: *i8, n: i64) -> void {
+  @entry:
+    %i = let i64
+    store i64 0, *%i
+    jmp @cond
+  @cond:
+    %iv = load i64, *%i
+    %done = sge i64 %iv, %n
+    br %done, @end, @body
+  @body:
+    %i32 = trunc i64 %iv to i32
+    %sp = gep i8, *%src, %i32
+    %sb = load i8, *%sp
+    %dp = gep i8, *%dst, %i32
+    store i8 %sb, *%dp
+    %n2 = add i64 %iv, 1
+    store i64 %n2, *%i
+    jmp @cond
+  @end:
+    ret void
+}
+
+fun @kmem_memmove(dst: *i8, src: *i8, n: i64) -> void {
+  @entry:
+    %i = let i64
+    %daddr = call @kmem_ptr_addr(%dst)
+    %saddr = call @kmem_ptr_addr(%src)
+    %safe = sle i64 %daddr, %saddr
+    br %safe, @fwd, @bwd
+  @fwd:
+    call @kmem_memcpy(%dst, %src, %n)
+    ret void
+  @bwd:
+    %last = sub i64 %n, 1
+    store i64 %last, *%i
+    jmp @bcond
+  @bcond:
+    %iv = load i64, *%i
+    %neg = slt i64 %iv, 0
+    br %neg, @bend, @bbody
+  @bbody:
+    %i32 = trunc i64 %iv to i32
+    %sp = gep i8, *%src, %i32
+    %sb = load i8, *%sp
+    %dp = gep i8, *%dst, %i32
+    store i8 %sb, *%dp
+    %n2 = sub i64 %iv, 1
+    store i64 %n2, *%i
+    jmp @bcond
+  @bend:
+    ret void
+}
+
+fun @kmem_memcmp(a: *i8, b: *i8, n: i64) -> i32 {
+  @entry:
+    %i = let i64
+    store i64 0, *%i
+    jmp @cond
+  @cond:
+    %iv = load i64, *%i
+    %done = sge i64 %iv, %n
+    br %done, @eq, @body
+  @body:
+    %i32 = trunc i64 %iv to i32
+    %ap = gep i8, *%a, %i32
+    %av8 = load i8, *%ap
+    %av = zext i8 %av8 to i32
+    %bp = gep i8, *%b, %i32
+    %bv8 = load i8, *%bp
+    %bv = zext i8 %bv8 to i32
+    %neq = ne i32 %av, %bv
+    br %neq, @diff, @next
+  @diff:
+    %d = sub i32 %av, %bv
+    ret i32 %d
+  @next:
+    %n2 = add i64 %iv, 1
+    store i64 %n2, *%i
+    jmp @cond
+  @eq:
+    ret i32 0
+}
+
+// libc name aliases
+fun @memset(p: *i8, v: i32, n: i64) -> void {
+  @entry:
+    call @kmem_memset(%p, %v, %n)
+    ret void
+}
+
+fun @memcpy(d: *i8, s: *i8, n: i64) -> void {
+  @entry:
+    call @kmem_memmove(%d, %s, %n)
+    ret void
+}
+
+fun @memmove(d: *i8, s: *i8, n: i64) -> void {
+  @entry:
+    call @kmem_memmove(%d, %s, %n)
+    ret void
+}
+
+fun @memcmp(a: *i8, b: *i8, n: i64) -> i32 {
+  @entry:
+    %r = call @kmem_memcmp(%a, %b, %n)
+    ret i32 %r
+}

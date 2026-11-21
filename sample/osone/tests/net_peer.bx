@@ -1,0 +1,667 @@
+// net_peer.bx - host-side L2 peer for `make run-peer`
+//
+// QEMU's socket network backend exchanges raw Ethernet frames with the host
+// over TCP; every frame is prefixed by a 4-byte big-endian length. This
+// program connects to 127.0.0.1:12400 and plays the role of the gateway
+// 192.168.1.1: it answers ARP, echoes ICMP requests, echoes datagrams sent to
+// UDP port 7, and serves a TCP echo on port 7000 that finishes with FIN.
+
+extern @net_socket_tcp() -> i32
+extern @net_socket_connect(fd: i32, port: i32) -> i32
+extern @net_socket_send(fd: i32, buf: *i8, len: i32) -> i32
+extern @net_socket_recv(fd: i32, buf: *i8, len: i32) -> i32
+extern @net_socket_close(fd: i32) -> i32
+extern @usleep(usec: i32) -> i32
+extern @dprintf(fd: i32, fmt: *i8, ...) -> i32
+
+const @peer_PEER_IP: i32 = 0xC0A80101
+const @peer_ETH_ARP: i32 = 0x0806
+const @peer_ETH_IP: i32 = 0x0800
+const @peer_IP_ICMP: i32 = 1
+const @peer_IP_TCP: i32 = 6
+const @peer_IP_UDP: i32 = 17
+const @peer_UDP_ECHO: i32 = 7
+const @peer_TCP_PORT: i32 = 7000
+const @peer_TCP_ISN: i32 = 0x30000000
+const @peer_FLAG_FIN: i32 = 1
+const @peer_FLAG_SYN: i32 = 2
+const @peer_FLAG_PSH: i32 = 8
+const @peer_FLAG_ACK: i32 = 16
+const @peer_MAX_FRAME: i32 = 2048
+const @peer_MAC: [i8, 6] = [2, 0, 0, 0, 0, 1]
+const @peer_READY: [i8, 17] = "net_peer: ready\n"
+const @peer_NO_CONN: [i8, 26] = "net_peer: connect failed\n"
+
+global @peer_FD: i32
+global @peer_HDR: [i8, 4]
+global @peer_RXBUF: [i8, 2048]
+global @peer_TXBUF: [i8, 2048]
+global @peer_GUEST_MAC: [i8, 6]
+global @peer_GUEST_IP: i32
+global @peer_IP_ID: i32
+global @peer_ISN_OFF: i32
+global @peer_TCP_STATE: i32
+global @peer_TCP_SND: i32
+global @peer_TCP_RCV: i32
+
+fun @peer_ld8(p: *i8, off: i32) -> i32 {
+  @entry:
+    %q = gep i8, *%p, %off
+    %b = load i8, *%q
+    %v = zext i8 %b to i32
+    ret i32 %v
+}
+
+fun @peer_st8(p: *i8, off: i32, v: i32) -> void {
+  @entry:
+    %q = gep i8, *%p, %off
+    %t = trunc i32 %v to i8
+    store i8 %t, *%q
+    ret void
+}
+
+fun @peer_be16(p: *i8, off: i32) -> i32 {
+  @entry:
+    %b0 = call @peer_ld8(%p, %off)
+    %hi = shl i32 %b0, 8
+    %o1 = add i32 %off, 1
+    %b1 = call @peer_ld8(%p, %o1)
+    %v = or i32 %hi, %b1
+    ret i32 %v
+}
+
+fun @peer_be32(p: *i8, off: i32) -> i32 {
+  @entry:
+    %w0 = call @peer_be16(%p, %off)
+    %hi = shl i32 %w0, 16
+    %o2 = add i32 %off, 2
+    %w1 = call @peer_be16(%p, %o2)
+    %v = or i32 %hi, %w1
+    ret i32 %v
+}
+
+fun @peer_stbe16(p: *i8, off: i32, v: i32) -> void {
+  @entry:
+    %s = lshr i32 %v, 8
+    %hi = and i32 %s, 0xFF
+    call @peer_st8(%p, %off, %hi)
+    %o1 = add i32 %off, 1
+    %lo = and i32 %v, 0xFF
+    call @peer_st8(%p, %o1, %lo)
+    ret void
+}
+
+fun @peer_stbe32(p: *i8, off: i32, v: i32) -> void {
+  @entry:
+    %s = lshr i32 %v, 16
+    call @peer_stbe16(%p, %off, %s)
+    %o2 = add i32 %off, 2
+    %lo = and i32 %v, 0xFFFF
+    call @peer_stbe16(%p, %o2, %lo)
+    ret void
+}
+
+fun @peer_copy(dst: *i8, src: *i8, n: i32) -> void {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @cond
+  @cond:
+    %iv = load i32, *%i
+    %done = sge i32 %iv, %n
+    br %done, @out, @body
+  @body:
+    %sp = gep i8, *%src, %iv
+    %b = load i8, *%sp
+    %dp = gep i8, *%dst, %iv
+    store i8 %b, *%dp
+    %in = add i32 %iv, 1
+    store i32 %in, *%i
+    jmp @cond
+  @out:
+    ret void
+}
+
+// Sum big-endian 16-bit words; an odd trailing byte is the high half of a word.
+fun @peer_sum(init: i32, p: *i8, len: i32) -> i32 {
+  @entry:
+    %acc = let i32
+    %i = let i32
+    store i32 %init, *%acc
+    store i32 0, *%i
+    jmp @cond
+  @cond:
+    %iv = load i32, *%i
+    %iv1 = add i32 %iv, 1
+    %pair = slt i32 %iv1, %len
+    br %pair, @word, @tail
+  @word:
+    %w = call @peer_be16(%p, %iv)
+    %av = load i32, *%acc
+    %na = add i32 %av, %w
+    store i32 %na, *%acc
+    %i2 = add i32 %iv, 2
+    store i32 %i2, *%i
+    jmp @cond
+  @tail:
+    %iv2 = load i32, *%i
+    %more = slt i32 %iv2, %len
+    br %more, @odd, @done
+  @odd:
+    %b = call @peer_ld8(%p, %iv2)
+    %bs = shl i32 %b, 8
+    %av2 = load i32, *%acc
+    %na2 = add i32 %av2, %bs
+    store i32 %na2, *%acc
+    jmp @done
+  @done:
+    %r = load i32, *%acc
+    ret i32 %r
+}
+
+fun @peer_finish(sum: i32) -> i32 {
+  @entry:
+    %s = let i32
+    store i32 %sum, *%s
+    jmp @fold
+  @fold:
+    %v = load i32, *%s
+    %hi = lshr i32 %v, 16
+    %nz = ne i32 %hi, 0
+    br %nz, @body, @done
+  @body:
+    %lo = and i32 %v, 0xFFFF
+    %n = add i32 %lo, %hi
+    store i32 %n, *%s
+    jmp @fold
+  @done:
+    %f = load i32, *%s
+    %c = sub i32 0xFFFF, %f
+    %z = eq i32 %c, 0
+    br %z, @negzero, @ret
+  @negzero:
+    ret i32 0xFFFF
+  @ret:
+    ret i32 %c
+}
+
+fun @peer_send_exact(fd: i32, buf: *i8, n: i32) -> i32 {
+  @entry:
+    %off = let i32
+    store i32 0, *%off
+    jmp @cond
+  @cond:
+    %ov = load i32, *%off
+    %done = sge i32 %ov, %n
+    br %done, @ok, @body
+  @body:
+    %p = gep i8, *%buf, %ov
+    %rem = sub i32 %n, %ov
+    %r = call @net_socket_send(%fd, %p, %rem)
+    %bad = slt i32 %r, 0
+    br %bad, @fail, @chkzero
+  @chkzero:
+    %zero = eq i32 %r, 0
+    br %zero, @fail, @adv
+  @adv:
+    %ov2 = load i32, *%off
+    %no = add i32 %ov2, %r
+    store i32 %no, *%off
+    jmp @cond
+  @ok:
+    ret i32 0
+  @fail:
+    ret i32 -1
+}
+
+fun @peer_recv_exact(fd: i32, buf: *i8, n: i32) -> i32 {
+  @entry:
+    %off = let i32
+    store i32 0, *%off
+    jmp @cond
+  @cond:
+    %ov = load i32, *%off
+    %done = sge i32 %ov, %n
+    br %done, @ok, @body
+  @body:
+    %p = gep i8, *%buf, %ov
+    %rem = sub i32 %n, %ov
+    %r = call @net_socket_recv(%fd, %p, %rem)
+    %bad = sle i32 %r, 0
+    br %bad, @fail, @adv
+  @adv:
+    %ov2 = load i32, *%off
+    %no = add i32 %ov2, %r
+    store i32 %no, *%off
+    jmp @cond
+  @ok:
+    ret i32 0
+  @fail:
+    ret i32 -1
+}
+
+fun @peer_connect() -> i32 {
+  @entry:
+    %tries = let i32
+    store i32 0, *%tries
+    jmp @cond
+  @cond:
+    %tv = load i32, *%tries
+    %giveup = sge i32 %tv, 100
+    br %giveup, @fail, @body
+  @body:
+    %fd = call @net_socket_tcp()
+    %r = call @net_socket_connect(%fd, 12400)
+    %ok = eq i32 %r, 0
+    br %ok, @out, @retry
+  @retry:
+    call @net_socket_close(%fd)
+    call @usleep(100000)
+    %tn = add i32 %tv, 1
+    store i32 %tn, *%tries
+    jmp @cond
+  @out:
+    ret i32 %fd
+  @fail:
+    ret i32 -1
+}
+
+fun @peer_send_frame(len: i32) -> i32 {
+  @entry:
+    %hdr = let [i8, 4]
+    %hp = gep i8, *%hdr, 0
+    call @peer_stbe32(%hp, 0, %len)
+    %fd = load i32, *@peer_FD
+    %r = call @peer_send_exact(%fd, %hp, 4)
+    %bad = slt i32 %r, 0
+    br %bad, @fail, @body
+  @body:
+    %tx = gep i8, *@peer_TXBUF, 0
+    %r2 = call @peer_send_exact(%fd, %tx, %len)
+    ret i32 %r2
+  @fail:
+    ret i32 -1
+}
+
+// Write the Ethernet header; returns the transmit buffer.
+fun @peer_tx_eth(dstmac: *i8, etype: i32) -> *i8 {
+  @entry:
+    %tx = gep i8, *@peer_TXBUF, 0
+    call @peer_copy(%tx, %dstmac, 6)
+    %sm = gep i8, *%tx, 6
+    %pm = gep i8, *@peer_MAC, 0
+    call @peer_copy(%sm, %pm, 6)
+    call @peer_stbe16(%tx, 12, %etype)
+    ret *i8 %tx
+}
+
+// Write the IPv4 header at offset 14; returns the IP total length.
+fun @peer_tx_ip(tx: *i8, proto: i32, paylen: i32, dstip: i32) -> i32 {
+  @entry:
+    %total = add i32 %paylen, 20
+    call @peer_st8(%tx, 14, 0x45)
+    call @peer_st8(%tx, 15, 0)
+    call @peer_stbe16(%tx, 16, %total)
+    %id = load i32, *@peer_IP_ID
+    call @peer_stbe16(%tx, 18, %id)
+    %idn = add i32 %id, 1
+    store i32 %idn, *@peer_IP_ID
+    call @peer_stbe16(%tx, 20, 0x4000)
+    call @peer_st8(%tx, 22, 64)
+    call @peer_st8(%tx, 23, %proto)
+    call @peer_stbe16(%tx, 24, 0)
+    call @peer_stbe32(%tx, 26, @peer_PEER_IP)
+    call @peer_stbe32(%tx, 30, %dstip)
+    %ihp = gep i8, *%tx, 14
+    %s = call @peer_sum(0, %ihp, 20)
+    %ck = call @peer_finish(%s)
+    call @peer_stbe16(%tx, 24, %ck)
+    ret i32 %total
+}
+
+fun @peer_learn(src: i32) -> void {
+  @entry:
+    %nz = ne i32 %src, 0
+    br %nz, @save, @done
+  @save:
+    store i32 %src, *@peer_GUEST_IP
+    %rx = gep i8, *@peer_RXBUF, 0
+    %rs = gep i8, *%rx, 6
+    %gm = gep i8, *@peer_GUEST_MAC, 0
+    call @peer_copy(%gm, %rs, 6)
+    jmp @done
+  @done:
+    ret void
+}
+
+fun @peer_on_arp() -> void {
+  @entry:
+    %rx = gep i8, *@peer_RXBUF, 0
+    %op = call @peer_be16(%rx, 20)
+    %isreq = eq i32 %op, 1
+    br %isreq, @chk, @done
+  @chk:
+    %tpa = call @peer_be32(%rx, 38)
+    %mine = eq i32 %tpa, @peer_PEER_IP
+    br %mine, @reply, @done
+  @reply:
+    %spa = call @peer_be32(%rx, 28)
+    call @peer_learn(%spa)
+    %rs = gep i8, *%rx, 6
+    %tx = call @peer_tx_eth(%rs, @peer_ETH_ARP)
+    call @peer_stbe16(%tx, 14, 1)
+    call @peer_stbe16(%tx, 16, 0x0800)
+    call @peer_st8(%tx, 18, 6)
+    call @peer_st8(%tx, 19, 4)
+    call @peer_stbe16(%tx, 20, 2)
+    %pm = gep i8, *@peer_MAC, 0
+    %sha = gep i8, *%tx, 22
+    call @peer_copy(%sha, %pm, 6)
+    call @peer_stbe32(%tx, 28, @peer_PEER_IP)
+    %tha = gep i8, *%tx, 32
+    call @peer_copy(%tha, %rs, 6)
+    %gip = load i32, *@peer_GUEST_IP
+    call @peer_stbe32(%tx, 38, %gip)
+    %r = call @peer_send_frame(42)
+    jmp @done
+  @done:
+    ret void
+}
+
+fun @peer_on_icmp(ihl: i32, total: i32) -> void {
+  @entry:
+    %rx = gep i8, *@peer_RXBUF, 0
+    %off = add i32 %ihl, 14
+    %t = call @peer_ld8(%rx, %off)
+    %req = eq i32 %t, 8
+    br %req, @reply, @done
+  @reply:
+    %plen = sub i32 %total, %ihl
+    %rs = gep i8, *%rx, 6
+    %tx = call @peer_tx_eth(%rs, @peer_ETH_IP)
+    %gip = load i32, *@peer_GUEST_IP
+    call @peer_tx_ip(%tx, @peer_IP_ICMP, %plen, %gip)
+    %src = gep i8, *%rx, %off
+    %dst = gep i8, *%tx, 34
+    call @peer_copy(%dst, %src, %plen)
+    call @peer_st8(%tx, 34, 0)
+    call @peer_st8(%tx, 35, 0)
+    call @peer_stbe16(%tx, 36, 0)
+    %seg = gep i8, *%tx, 34
+    %s = call @peer_sum(0, %seg, %plen)
+    %ck = call @peer_finish(%s)
+    call @peer_stbe16(%tx, 36, %ck)
+    %flen = add i32 %plen, 34
+    %r = call @peer_send_frame(%flen)
+    jmp @done
+  @done:
+    ret void
+}
+
+fun @peer_on_udp(ihl: i32, total: i32) -> void {
+  @entry:
+    %rx = gep i8, *@peer_RXBUF, 0
+    %off = add i32 %ihl, 14
+    %do = add i32 %off, 2
+    %dport = call @peer_be16(%rx, %do)
+    %echo = eq i32 %dport, @peer_UDP_ECHO
+    br %echo, @reply, @done
+  @reply:
+    %sport = call @peer_be16(%rx, %off)
+    %lo = add i32 %off, 4
+    %ulen = call @peer_be16(%rx, %lo)
+    %plen = sub i32 %ulen, 8
+    %rs = gep i8, *%rx, 6
+    %tx = call @peer_tx_eth(%rs, @peer_ETH_IP)
+    %gip = load i32, *@peer_GUEST_IP
+    call @peer_tx_ip(%tx, @peer_IP_UDP, %ulen, %gip)
+    call @peer_stbe16(%tx, 34, @peer_UDP_ECHO)
+    call @peer_stbe16(%tx, 36, %sport)
+    call @peer_stbe16(%tx, 38, %ulen)
+    call @peer_stbe16(%tx, 40, 0)
+    %psrc = add i32 %off, 8
+    %src = gep i8, *%rx, %psrc
+    %dst = gep i8, *%tx, 42
+    call @peer_copy(%dst, %src, %plen)
+    %flen = add i32 %ulen, 34
+    %r = call @peer_send_frame(%flen)
+    jmp @done
+  @done:
+    ret void
+}
+
+fun @peer_tcp_seg(dport: i32, flags: i32, seq: i32, ack: i32, payload: *i8, plen: i32) -> void {
+  @entry:
+    %gm = gep i8, *@peer_GUEST_MAC, 0
+    %tx = call @peer_tx_eth(%gm, @peer_ETH_IP)
+    %seglen = add i32 %plen, 20
+    %gip = load i32, *@peer_GUEST_IP
+    call @peer_tx_ip(%tx, @peer_IP_TCP, %seglen, %gip)
+    call @peer_stbe16(%tx, 34, @peer_TCP_PORT)
+    call @peer_stbe16(%tx, 36, %dport)
+    call @peer_stbe32(%tx, 38, %seq)
+    call @peer_stbe32(%tx, 42, %ack)
+    call @peer_st8(%tx, 46, 0x50)
+    call @peer_st8(%tx, 47, %flags)
+    call @peer_stbe16(%tx, 48, 4096)
+    call @peer_stbe16(%tx, 50, 0)
+    call @peer_stbe16(%tx, 52, 0)
+    %hasdata = sgt i32 %plen, 0
+    br %hasdata, @copy, @csum
+  @copy:
+    %dst = gep i8, *%tx, 54
+    call @peer_copy(%dst, %payload, %plen)
+    jmp @csum
+  @csum:
+    %ph = let [i8, 12]
+    %php = gep i8, *%ph, 0
+    call @peer_stbe32(%php, 0, @peer_PEER_IP)
+    %gip2 = load i32, *@peer_GUEST_IP
+    call @peer_stbe32(%php, 4, %gip2)
+    call @peer_st8(%php, 8, 0)
+    call @peer_st8(%php, 9, @peer_IP_TCP)
+    call @peer_stbe16(%php, 10, %seglen)
+    %a0 = call @peer_sum(0, %php, 12)
+    %seg = gep i8, *%tx, 34
+    %a1 = call @peer_sum(%a0, %seg, %seglen)
+    %ck = call @peer_finish(%a1)
+    call @peer_stbe16(%tx, 50, %ck)
+    %flen = add i32 %seglen, 34
+    %r = call @peer_send_frame(%flen)
+    ret void
+}
+
+fun @peer_on_tcp(ihl: i32, total: i32) -> void {
+  @entry:
+    %rx = gep i8, *@peer_RXBUF, 0
+    %off = add i32 %ihl, 14
+    %do = add i32 %off, 2
+    %dport = call @peer_be16(%rx, %do)
+    %mine = eq i32 %dport, @peer_TCP_PORT
+    br %mine, @work, @done
+  @work:
+    %sport = call @peer_be16(%rx, %off)
+    %so = add i32 %off, 4
+    %seq = call @peer_be32(%rx, %so)
+    %ao = add i32 %off, 8
+    %ack = call @peer_be32(%rx, %ao)
+    %fo = add i32 %off, 12
+    %doffb = call @peer_ld8(%rx, %fo)
+    %doff4 = lshr i32 %doffb, 4
+    %doff = mul i32 %doff4, 4
+    %flo = add i32 %off, 13
+    %fl = call @peer_ld8(%rx, %flo)
+    %hdr = add i32 %ihl, %doff
+    %plen = sub i32 %total, %hdr
+    %rstb = and i32 %fl, 4
+    %rst = ne i32 %rstb, 0
+    br %rst, @reset, @chksyn
+  @reset:
+    store i32 0, *@peer_TCP_STATE
+    jmp @done
+  @chksyn:
+    %synb = and i32 %fl, @peer_FLAG_SYN
+    %syn = ne i32 %synb, 0
+    br %syn, @chksynack, @bystate
+  @chksynack:
+    %ackb = and i32 %fl, @peer_FLAG_ACK
+    %noack = eq i32 %ackb, 0
+    br %noack, @open, @bystate
+  @open:
+    %cnt = load i32, *@peer_ISN_OFF
+    %isn = add i32 @peer_TCP_ISN, %cnt
+    %cnt2 = add i32 %cnt, 65536
+    store i32 %cnt2, *@peer_ISN_OFF
+    store i32 %isn, *@peer_TCP_SND
+    %rcv1 = add i32 %seq, 1
+    store i32 %rcv1, *@peer_TCP_RCV
+    store i32 1, *@peer_TCP_STATE
+    %flags = or i32 @peer_FLAG_SYN, @peer_FLAG_ACK
+    call @peer_tcp_seg(%sport, %flags, %isn, %rcv1, null, 0)
+    %snd1 = add i32 %isn, 1
+    store i32 %snd1, *@peer_TCP_SND
+    jmp @done
+  @bystate:
+    %st = load i32, *@peer_TCP_STATE
+    %is1 = eq i32 %st, 1
+    br %is1, @st_syn, @chk2
+  @st_syn:
+    %ackb2 = and i32 %fl, @peer_FLAG_ACK
+    %hask = ne i32 %ackb2, 0
+    br %hask, @established, @done
+  @established:
+    store i32 2, *@peer_TCP_STATE
+    jmp @done
+  @chk2:
+    %is2 = eq i32 %st, 2
+    br %is2, @st_est, @done
+  @st_est:
+    %finb = and i32 %fl, @peer_FLAG_FIN
+    %fin = ne i32 %finb, 0
+    br %fin, @fin_path, @data_path
+  @fin_path:
+    %finpos = add i32 %seq, %plen
+    %rcv2 = load i32, *@peer_TCP_RCV
+    %match = eq i32 %finpos, %rcv2
+    br %match, @take_fin, @ack_any
+  @take_fin:
+    %rcv3 = add i32 %rcv2, 1
+    store i32 %rcv3, *@peer_TCP_RCV
+    %snd2 = load i32, *@peer_TCP_SND
+    call @peer_tcp_seg(%sport, @peer_FLAG_ACK, %snd2, %rcv3, null, 0)
+    jmp @done
+  @ack_any:
+    %snd3 = load i32, *@peer_TCP_SND
+    call @peer_tcp_seg(%sport, @peer_FLAG_ACK, %snd3, %rcv2, null, 0)
+    jmp @done
+  @data_path:
+    %hasdata = sgt i32 %plen, 0
+    br %hasdata, @data, @done
+  @data:
+    %rcv4 = load i32, *@peer_TCP_RCV
+    %inorder = eq i32 %seq, %rcv4
+    br %inorder, @accept, @dup
+  @dup:
+    %snd4 = load i32, *@peer_TCP_SND
+    call @peer_tcp_seg(%sport, @peer_FLAG_ACK, %snd4, %rcv4, null, 0)
+    jmp @done
+  @accept:
+    %rcv5 = add i32 %seq, %plen
+    store i32 %rcv5, *@peer_TCP_RCV
+    %snd5 = load i32, *@peer_TCP_SND
+    %psrc = add i32 %off, %doff
+    %pay = gep i8, *%rx, %psrc
+    %flags2 = or i32 @peer_FLAG_PSH, @peer_FLAG_ACK
+    call @peer_tcp_seg(%sport, %flags2, %snd5, %rcv5, %pay, %plen)
+    %snd6 = add i32 %snd5, %plen
+    store i32 %snd6, *@peer_TCP_SND
+    %flags3 = or i32 @peer_FLAG_FIN, @peer_FLAG_ACK
+    call @peer_tcp_seg(%sport, %flags3, %snd6, %rcv5, null, 0)
+    %snd7 = add i32 %snd6, 1
+    store i32 %snd7, *@peer_TCP_SND
+    jmp @done
+  @done:
+    ret void
+}
+
+fun @peer_handle(len: i32) -> void {
+  @entry:
+    %rx = gep i8, *@peer_RXBUF, 0
+    %etype = call @peer_be16(%rx, 12)
+    %isarp = eq i32 %etype, @peer_ETH_ARP
+    br %isarp, @arp, @chkip
+  @arp:
+    call @peer_on_arp()
+    jmp @done
+  @chkip:
+    %isip = eq i32 %etype, @peer_ETH_IP
+    br %isip, @ip, @done
+  @ip:
+    %vihl = call @peer_ld8(%rx, 14)
+    %ihlb = and i32 %vihl, 15
+    %ihl = mul i32 %ihlb, 4
+    %total = call @peer_be16(%rx, 16)
+    %src = call @peer_be32(%rx, 26)
+    %dst = call @peer_be32(%rx, 30)
+    call @peer_learn(%src)
+    %own = eq i32 %dst, @peer_PEER_IP
+    br %own, @dispatch, @done
+  @dispatch:
+    %proto = call @peer_ld8(%rx, 23)
+    %isicmp = eq i32 %proto, @peer_IP_ICMP
+    br %isicmp, @icmp, @chku
+  @icmp:
+    call @peer_on_icmp(%ihl, %total)
+    jmp @done
+  @chku:
+    %isudp = eq i32 %proto, @peer_IP_UDP
+    br %isudp, @udp, @chkt
+  @udp:
+    call @peer_on_udp(%ihl, %total)
+    jmp @done
+  @chkt:
+    %istcp = eq i32 %proto, @peer_IP_TCP
+    br %istcp, @tcp, @done
+  @tcp:
+    call @peer_on_tcp(%ihl, %total)
+    jmp @done
+  @done:
+    ret void
+}
+
+fun @main() -> i32 {
+  @entry:
+    %fd = call @peer_connect()
+    %bad = slt i32 %fd, 0
+    br %bad, @fail, @ready
+  @ready:
+    store i32 %fd, *@peer_FD
+    %msg = gep i8, *@peer_READY, 0
+    call @dprintf(2, %msg)
+    jmp @loop
+  @loop:
+    %hdr = gep i8, *@peer_HDR, 0
+    %r = call @peer_recv_exact(%fd, %hdr, 4)
+    %ok = eq i32 %r, 0
+    br %ok, @len, @done
+  @len:
+    %len = call @peer_be32(%hdr, 0)
+    %small = slt i32 %len, 14
+    %big = sgt i32 %len, @peer_MAX_FRAME
+    %badlen = or i1 %small, %big
+    br %badlen, @done, @read
+  @read:
+    %buf = gep i8, *@peer_RXBUF, 0
+    %r2 = call @peer_recv_exact(%fd, %buf, %len)
+    %ok2 = eq i32 %r2, 0
+    br %ok2, @handle, @done
+  @handle:
+    call @peer_handle(%len)
+    jmp @loop
+  @done:
+    ret i32 0
+  @fail:
+    %em = gep i8, *@peer_NO_CONN, 0
+    call @dprintf(2, %em)
+    ret i32 1
+}
