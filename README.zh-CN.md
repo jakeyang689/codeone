@@ -1,4 +1,4 @@
-# codeone
+# <img src="assets/logo.svg" width="40" alt="codeone logo"> <span style="vertical-align: 0.36em">codeone</span>
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
@@ -62,3 +62,10 @@ mkdir -p llvm/build
 ```
 
 环境要求：macOS 或 Linux，`cc`、`clang++`、`make`、`ar`；LLVM 首次构建另需 `cmake`、`ninja`（macOS 还需 `xcode-select --install`）。构建结果位于 `toolchain/<target-triple>/`。
+
+## 示例项目
+
+[`sample/`](sample/) 下的两个完整应用展示了工具链的能力：
+
+- **[`sample/osone`](sample/osone/)** —— 完全用 SSA 编写的 `aarch64` 裸机内核：W^X 页表与 MMU、内存 ramfs、virtio 网卡/显卡/输入驱动、Ethernet/ARP/IP/ICMP/UDP/TCP 及 DHCP、DNS、轮转调度器、交互式 shell、保留模式 GUI 和 LLM 代理 CLI。用 `c1 --cpu aarch64 --os none` 与 `ld.lld` 构建，在 QEMU 中运行。
+- **[`sample/docsite`](sample/docsite/)** —— 基于标准库 TLS 1.2 服务端栈的 HTTPS 静态站点服务器：在 8443 端口通过 TLS 提供 `public/` 目录并记录访问日志，全部配置通过环境变量完成。

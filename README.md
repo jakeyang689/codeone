@@ -1,4 +1,4 @@
-# codeone
+# <img src="assets/logo.svg" width="40" alt="codeone logo"> <span style="vertical-align: 0.36em">codeone</span>
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
@@ -62,3 +62,10 @@ mkdir -p llvm/build
 ```
 
 Requirements: macOS or Linux with `cc`, `clang++`, `make` and `ar`; the first LLVM build also needs `cmake` and `ninja` (`xcode-select --install` on macOS). Build output lands in `toolchain/<target-triple>/`.
+
+## Samples
+
+Two complete applications under [`sample/`](sample/) show what the toolchain can build:
+
+- **[`sample/osone`](sample/osone/)** — a bare-metal `aarch64` kernel written entirely in SSA: MMU with W^X, an in-memory ramfs, virtio network/GPU/input drivers, Ethernet/ARP/IP/ICMP/UDP/TCP with DHCP and DNS, a round-robin scheduler, an interactive shell, a retained-mode GUI and an LLM agent CLI. Built with `c1 --cpu aarch64 --os none` and `ld.lld`, then run under QEMU.
+- **[`sample/docsite`](sample/docsite/)** — an HTTPS static-site server built on the standard library's TLS 1.2 server stack: serves `public/` over TLS on port 8443 with access logging, configured entirely through environment variables.
