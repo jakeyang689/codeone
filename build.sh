@@ -149,7 +149,7 @@ if [ "$REBUILD_LLVM" -eq 1 ]; then
     -DLLVM_INCLUDE_DOCS=OFF \
     -DLLVM_ENABLE_BINDINGS=OFF
 
-  CPU_COUNT="$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)"
+  CPU_COUNT="${CODEONE_JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)}"
   ninja -j"$CPU_COUNT" lld
 
   # MLIR lives in its own build tree, and c1 links against that tree rather

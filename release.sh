@@ -34,6 +34,7 @@ RELEASE_DIR="$SCRIPT_DIR/release"
 # refers to have to keep the same paths for the cache to be reusable.
 WORK_DIR="$SCRIPT_DIR/build/release"
 LLVM_CACHE="$WORK_DIR/llvm-build"
+LLVM_MLIR_CACHE="$WORK_DIR/llvm-build-mlir"
 LINUX_IMAGE="${CODEONE_LINUX_IMAGE:-codeone-linux-builder:24.04}"
 # Set when the Linux toolchain is built in a lima VM, so packaging can strip
 # ELF binaries with the VM's strip.
@@ -274,7 +275,7 @@ build_linux_image() {
   docker build -t "$LINUX_IMAGE" - <<'DOCKERFILE'
 FROM ubuntu:24.04
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-      build-essential clang cmake ninja-build python3 zlib1g-dev libtinfo-dev ca-certificates \
+      build-essential clang cmake ninja-build python3 zlib1g-dev libzstd-dev libtinfo-dev ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 DOCKERFILE
 }
@@ -319,25 +320,31 @@ build_linux_via_lima() {
   # they are read in place, while objects go to the VM's own disk so the
   # virtiofs mount does not carry the build I/O.
   mkdir -p "$l/llvm"
-  local entry name
+  local entry name dir
   for entry in "$SCRIPT_DIR"/llvm/*; do
     name="$(basename "$entry")"
-    if [ "$name" != "build" ]; then
-      ln -sfn "$entry" "$l/llvm/$name"
-    fi
+    # Both build trees belong to the host; the Linux build gets its own.
+    case "$name" in build|build-mlir) continue ;; esac
+    ln -sfn "$entry" "$l/llvm/$name"
   done
   # Kept between runs (and versions) so ninja only rebuilds what changed.
   # The VM's home is not the host home, so resolve it on the guest side.
   vm_build="$(limactl shell "$vm" -- bash -lc 'printf "%s\n" "$HOME/.cache/codeone/llvm-build"' | tail -1)"
-  # A cache left by an older generator cannot be reused or reconfigured.
-  if limactl shell "$vm" -- test -f "$vm_build/CMakeCache.txt" 2>/dev/null &&
-     ! limactl shell "$vm" -- grep -q 'CMAKE_GENERATOR:INTERNAL=Ninja' "$vm_build/CMakeCache.txt" 2>/dev/null; then
-    limactl shell "$vm" -- rm -rf "$vm_build"
-  fi
-  limactl shell "$vm" -- mkdir -p "$vm_build"
+  vm_mlir_build="$(limactl shell "$vm" -- bash -lc 'printf "%s\n" "$HOME/.cache/codeone/llvm-build-mlir"' | tail -1)"
+  for dir in "$vm_build" "$vm_mlir_build"; do
+    # A cache left by an older generator cannot be reused or reconfigured.
+    if limactl shell "$vm" -- test -f "$dir/CMakeCache.txt" 2>/dev/null &&
+       ! limactl shell "$vm" -- grep -q 'CMAKE_GENERATOR:INTERNAL=Ninja' "$dir/CMakeCache.txt" 2>/dev/null; then
+      limactl shell "$vm" -- rm -rf "$dir"
+    fi
+    limactl shell "$vm" -- mkdir -p "$dir"
+  done
   ln -sfn "$vm_build" "$l/llvm/build"
+  ln -sfn "$vm_mlir_build" "$l/llvm/build-mlir"
 
-  limactl shell "$vm" -- bash -lc "cd '$l' && ./build.sh --rebuild-llvm --cpu $HOST_CPU --os Linux"
+  # MLIR's -O3 translation units are large; the VM's memory, not its CPU
+  # count, is the limit, so the default job count is capped.
+  limactl shell "$vm" -- bash -lc "cd '$l' && CODEONE_JOBS=${CODEONE_JOBS:-4} ./build.sh --rebuild-llvm --cpu $HOST_CPU --os Linux"
 
   package "$l/toolchain/$triple" "$triple"
 }
@@ -380,19 +387,22 @@ build_linux() {
 
   # Reused across runs and versions; only a cache from another generator has
   # to be thrown away.
-  mkdir -p "$LLVM_CACHE"
-  if [ -f "$LLVM_CACHE/CMakeCache.txt" ] &&
-     ! grep -q 'CMAKE_GENERATOR:INTERNAL=Ninja' "$LLVM_CACHE/CMakeCache.txt"; then
-    rm -rf "$LLVM_CACHE"
-    mkdir -p "$LLVM_CACHE"
-  fi
+  for cache in "$LLVM_CACHE" "$LLVM_MLIR_CACHE"; do
+    if [ -f "$cache/CMakeCache.txt" ] &&
+       ! grep -q 'CMAKE_GENERATOR:INTERNAL=Ninja' "$cache/CMakeCache.txt"; then
+      rm -rf "$cache"
+    fi
+    mkdir -p "$cache"
+  done
 
   docker run --rm \
     -v "$l:/work" \
     -v "$SCRIPT_DIR/llvm:/work/llvm:ro" \
     -v "$LLVM_CACHE:/work/llvm/build" \
+    -v "$LLVM_MLIR_CACHE:/work/llvm/build-mlir" \
     -u "$(id -u):$(id -g)" \
     -e HOME=/tmp \
+    -e CODEONE_JOBS="${CODEONE_JOBS:-4}" \
     -w /work \
     "$LINUX_IMAGE" \
     bash -lc "./build.sh --rebuild-llvm --cpu $HOST_CPU --os Linux"
