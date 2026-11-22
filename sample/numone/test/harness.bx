@@ -1,0 +1,184 @@
+// numone test/harness — reporting helpers and the test driver.
+
+extern @printf(fmt: *i8, ...) -> i32
+
+// Test functions live in test/*_test.bx.
+extern @numone_test_fill() -> i32
+extern @numone_test_add_2x2() -> i32
+extern @numone_test_sub_2x2() -> i32
+extern @numone_test_mul_2x2() -> i32
+extern @numone_test_add_2x3() -> i32
+extern @numone_test_mul_2x3() -> i32
+extern @numone_test_scale() -> i32
+extern @numone_test_copy() -> i32
+extern @numone_test_sum() -> i32
+extern @numone_test_dot() -> i32
+extern @numone_test_transpose() -> i32
+extern @numone_test_matmul_2x2() -> i32
+extern @numone_test_matmul_2x3x2() -> i32
+extern @numone_test_matmul_scalar_cross() -> i32
+
+const @numone_check_count: i32 = 14
+
+const @numone_fmt_pass = "PASS  %s\n"
+const @numone_fmt_fail = "FAIL  %s\n"
+const @numone_fmt_summary = "%d of %d checks failed\n"
+
+// Prints one line per check; returns 1 on failure so the driver can total them.
+fun @numone_report(name: *i8, ok: i32) -> i32 {
+  @entry:
+    %failed = eq i32 %ok, 0
+    br %failed, @fail, @pass
+
+  @fail:
+    %ff = gep i8, *@numone_fmt_fail, 0
+    %r = call @printf(%ff, %name)
+    ret i32 1
+
+  @pass:
+    %pf = gep i8, *@numone_fmt_pass, 0
+    %r2 = call @printf(%pf, %name)
+    ret i32 0
+}
+
+// Fills a[0..n) with start, start + step, start + 2 * step, ...
+fun @numone_seq(a: *f32, start: f32, step: f32, n: i32) -> void {
+  @entry:
+    %i = let i32
+    %v = let f32
+    store i32 0, *%i
+    store f32 %start, *%v
+    jmp @loop
+
+  @loop:
+    %iv = load i32, *%i
+    %lt = slt i32 %iv, %n
+    br %lt, @body, @done
+
+  @body:
+    %p = gep f32, *%a, %iv
+    %cv = load f32, *%v
+    store f32 %cv, *%p
+    %nv = add f32 %cv, %step
+    store f32 %nv, *%v
+    %next = add i32 %iv, 1
+    store i32 %next, *%i
+    jmp @loop
+
+  @done:
+    ret void
+}
+
+fun @numone_put4(a: *f32, v0: f32, v1: f32, v2: f32, v3: f32) -> void {
+  @entry:
+    %p0 = gep f32, *%a, 0
+    store f32 %v0, *%p0
+    %p1 = gep f32, *%a, 1
+    store f32 %v1, *%p1
+    %p2 = gep f32, *%a, 2
+    store f32 %v2, *%p2
+    %p3 = gep f32, *%a, 3
+    store f32 %v3, *%p3
+    ret void
+}
+
+fun @numone_put6(a: *f32, v0: f32, v1: f32, v2: f32, v3: f32, v4: f32, v5: f32) -> void {
+  @entry:
+    %p0 = gep f32, *%a, 0
+    store f32 %v0, *%p0
+    %p1 = gep f32, *%a, 1
+    store f32 %v1, *%p1
+    %p2 = gep f32, *%a, 2
+    store f32 %v2, *%p2
+    %p3 = gep f32, *%a, 3
+    store f32 %v3, *%p3
+    %p4 = gep f32, *%a, 4
+    store f32 %v4, *%p4
+    %p5 = gep f32, *%a, 5
+    store f32 %v5, *%p5
+    ret void
+}
+
+// Runs every check and returns the number of failures (0 = all passed).
+fun @numone_run_tests() -> i32 {
+  @entry:
+    %f = let i32
+    store i32 0, *%f
+
+    %t1 = call @numone_test_fill()
+    %f1 = load i32, *%f
+    %s1 = add i32 %f1, %t1
+    store i32 %s1, *%f
+
+    %t2 = call @numone_test_add_2x2()
+    %f2 = load i32, *%f
+    %s2 = add i32 %f2, %t2
+    store i32 %s2, *%f
+
+    %t3 = call @numone_test_sub_2x2()
+    %f3 = load i32, *%f
+    %s3 = add i32 %f3, %t3
+    store i32 %s3, *%f
+
+    %t4 = call @numone_test_mul_2x2()
+    %f4 = load i32, *%f
+    %s4 = add i32 %f4, %t4
+    store i32 %s4, *%f
+
+    %t5 = call @numone_test_add_2x3()
+    %f5 = load i32, *%f
+    %s5 = add i32 %f5, %t5
+    store i32 %s5, *%f
+
+    %t6 = call @numone_test_mul_2x3()
+    %f6 = load i32, *%f
+    %s6 = add i32 %f6, %t6
+    store i32 %s6, *%f
+
+    %t7 = call @numone_test_scale()
+    %f7 = load i32, *%f
+    %s7 = add i32 %f7, %t7
+    store i32 %s7, *%f
+
+    %t8 = call @numone_test_copy()
+    %f8 = load i32, *%f
+    %s8 = add i32 %f8, %t8
+    store i32 %s8, *%f
+
+    %t9 = call @numone_test_sum()
+    %f9 = load i32, *%f
+    %s9 = add i32 %f9, %t9
+    store i32 %s9, *%f
+
+    %t10 = call @numone_test_dot()
+    %f10 = load i32, *%f
+    %s10 = add i32 %f10, %t10
+    store i32 %s10, *%f
+
+    %t11 = call @numone_test_transpose()
+    %f11 = load i32, *%f
+    %s11 = add i32 %f11, %t11
+    store i32 %s11, *%f
+
+    %t12 = call @numone_test_matmul_2x2()
+    %f12 = load i32, *%f
+    %s12 = add i32 %f12, %t12
+    store i32 %s12, *%f
+
+    %t13 = call @numone_test_matmul_2x3x2()
+    %f13 = load i32, *%f
+    %s13 = add i32 %f13, %t13
+    store i32 %s13, *%f
+
+    %t14 = call @numone_test_matmul_scalar_cross()
+    %f14 = load i32, *%f
+    %s14 = add i32 %f14, %t14
+    store i32 %s14, *%f
+
+    %fails = load i32, *%f
+    %count = load i32, *@numone_check_count
+    %sf = gep i8, *@numone_fmt_summary, 0
+    %r = call @printf(%sf, %fails, %count)
+    %total = load i32, *%f
+    ret i32 %total
+}

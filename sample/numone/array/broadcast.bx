@@ -1,0 +1,25 @@
+// numone array/elementwise — scalar elementwise operations.
+
+fun @numone_scale(a: *f32, n: i32, k: f32) -> void {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @loop
+
+  @loop:
+    %iv = load i32, *%i
+    %lt = slt i32 %iv, %n
+    br %lt, @body, @done
+
+  @body:
+    %p = gep f32, *%a, %iv
+    %v = load f32, *%p
+    %s = mul f32 %v, %k
+    store f32 %s, *%p
+    %next = add i32 %iv, 1
+    store i32 %next, *%i
+    jmp @loop
+
+  @done:
+    ret void
+}

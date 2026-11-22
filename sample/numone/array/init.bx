@@ -1,0 +1,49 @@
+// numone array/init — buffer creation and copying.
+// These are plain SSA loops: the scalar reference the MLIR kernels are checked
+// against (see test/).
+
+fun @numone_fill(a: *f32, n: i32, v: f32) -> void {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @loop
+
+  @loop:
+    %iv = load i32, *%i
+    %lt = slt i32 %iv, %n
+    br %lt, @body, @done
+
+  @body:
+    %p = gep f32, *%a, %iv
+    store f32 %v, *%p
+    %next = add i32 %iv, 1
+    store i32 %next, *%i
+    jmp @loop
+
+  @done:
+    ret void
+}
+
+fun @numone_copy(dst: *f32, src: *f32, n: i32) -> void {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @loop
+
+  @loop:
+    %iv = load i32, *%i
+    %lt = slt i32 %iv, %n
+    br %lt, @body, @done
+
+  @body:
+    %sp = gep f32, *%src, %iv
+    %v = load f32, *%sp
+    %dp = gep f32, *%dst, %iv
+    store f32 %v, *%dp
+    %next = add i32 %iv, 1
+    store i32 %next, *%i
+    jmp @loop
+
+  @done:
+    ret void
+}

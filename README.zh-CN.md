@@ -65,7 +65,9 @@ mkdir -p llvm/build
 
 ## 示例项目
 
-[`sample/`](sample/) 下的两个完整应用展示了工具链的能力：
+[`sample/`](sample/) 下的四个完整应用展示了工具链的能力：
 
 - **[`sample/osone`](sample/osone/)** —— 完全用 SSA 编写的 `aarch64` 裸机内核：W^X 页表与 MMU、内存 ramfs、virtio 网卡/显卡/输入驱动、Ethernet/ARP/IP/ICMP/UDP/TCP 及 DHCP、DNS、轮转调度器、交互式 shell、保留模式 GUI 和 LLM 代理 CLI。用 `c1 --cpu aarch64 --os none` 与 `ld.lld` 构建，在 QEMU 中运行。
 - **[`sample/docsite`](sample/docsite/)** —— 基于标准库 TLS 1.2 服务端栈的 HTTPS 静态站点服务器：在 8443 端口通过 TLS 提供 `public/` 目录并记录访问日志，全部配置通过环境变量完成。
+- **[`sample/numone`](sample/numone/)** —— 基于 `tensor` 指令的类 numpy 数组库：逐元素 add/sub/mul、matmul、转置、fill/copy 与归约，并用 14 项检查逐位比较 MLIR 生成的内核与手写标量 SSA 循环的结果。`make` 同时构建默认 LLVM 后端和 `--backend=mlir` 两个版本。
+- **[`sample/llmone`](sample/llmone/)** —— 完全用 SSA 编写的 GPT 风格语言模型：前向、反向传播、Adam 与检查点保存，`tensor` 矩阵乘经 MLIR 下降。同一份源码可生成秒级验证训练流程的小模型和 9950 万参数的大模型；语料由 `tools/fetch-corpus.sh` 下载。

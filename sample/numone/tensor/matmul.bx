@@ -1,0 +1,14 @@
+// numone tensor/matmul — tensor-backed matrix multiplication.
+// Shapes are [M, K, N]; dst is MxN, lhs MxK, rhs KxN, all row-major.
+
+fun @numone_matmul_2x2(dst: *f32, a: *f32, b: *f32) -> void {
+  @entry:
+    tensor matmul, f32, [2, 2, 2], *%dst, *%a, *%b
+    ret void
+}
+
+fun @numone_matmul_2x3x2(dst: *f32, a: *f32, b: *f32) -> void {
+  @entry:
+    tensor matmul, f32, [2, 3, 2], *%dst, *%a, *%b
+    ret void
+}

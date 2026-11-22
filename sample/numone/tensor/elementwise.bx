@@ -1,0 +1,33 @@
+// numone tensor/elementwise — tensor-backed elementwise ops.
+// Each wrapper is a numpy-like entry point whose body is a single `tensor`
+// instruction, so c1 lowers it through the in-process MLIR backend.
+
+fun @numone_add_2x2(dst: *f32, a: *f32, b: *f32) -> void {
+  @entry:
+    tensor add, f32, [2, 2], *%dst, *%a, *%b
+    ret void
+}
+
+fun @numone_sub_2x2(dst: *f32, a: *f32, b: *f32) -> void {
+  @entry:
+    tensor sub, f32, [2, 2], *%dst, *%a, *%b
+    ret void
+}
+
+fun @numone_mul_2x2(dst: *f32, a: *f32, b: *f32) -> void {
+  @entry:
+    tensor mul, f32, [2, 2], *%dst, *%a, *%b
+    ret void
+}
+
+fun @numone_add_2x3(dst: *f32, a: *f32, b: *f32) -> void {
+  @entry:
+    tensor add, f32, [2, 3], *%dst, *%a, *%b
+    ret void
+}
+
+fun @numone_mul_2x3(dst: *f32, a: *f32, b: *f32) -> void {
+  @entry:
+    tensor mul, f32, [2, 3], *%dst, *%a, *%b
+    ret void
+}

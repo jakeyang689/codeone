@@ -1,0 +1,60 @@
+// numone array/reduce — reductions.
+
+fun @numone_sum(a: *f32, n: i32) -> f32 {
+  @entry:
+    %i = let i32
+    %acc = let f32
+    store i32 0, *%i
+    store f32 0.0, *%acc
+    jmp @loop
+
+  @loop:
+    %iv = load i32, *%i
+    %lt = slt i32 %iv, %n
+    br %lt, @body, @done
+
+  @body:
+    %p = gep f32, *%a, %iv
+    %v = load f32, *%p
+    %s = load f32, *%acc
+    %sum = add f32 %s, %v
+    store f32 %sum, *%acc
+    %next = add i32 %iv, 1
+    store i32 %next, *%i
+    jmp @loop
+
+  @done:
+    %r = load f32, *%acc
+    ret f32 %r
+}
+
+fun @numone_dot(x: *f32, y: *f32, n: i32) -> f32 {
+  @entry:
+    %i = let i32
+    %acc = let f32
+    store i32 0, *%i
+    store f32 0.0, *%acc
+    jmp @loop
+
+  @loop:
+    %iv = load i32, *%i
+    %lt = slt i32 %iv, %n
+    br %lt, @body, @done
+
+  @body:
+    %xp = gep f32, *%x, %iv
+    %yp = gep f32, *%y, %iv
+    %xv = load f32, *%xp
+    %yv = load f32, *%yp
+    %m = mul f32 %xv, %yv
+    %s = load f32, *%acc
+    %sum = add f32 %s, %m
+    store f32 %sum, *%acc
+    %next = add i32 %iv, 1
+    store i32 %next, *%i
+    jmp @loop
+
+  @done:
+    %r = load f32, *%acc
+    ret f32 %r
+}

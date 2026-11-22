@@ -1,0 +1,441 @@
+// llmone model — GPT-style transformer, forward and backward.
+//
+// Shapes and offsets are substituted by tools/gen.sh, because `tensor`
+// matmul requires literal dims. Layouts (see gen.sh):
+//   parameters  embeddings, L layer blocks, final LN; weights stored [in, out]
+//               so a forward matmul needs no transpose
+//   activations per layer: ln1 in/out, qkv, attention probs, attention out,
+//               x1 (post-attn residual), ln2 out, gelu in/out, x2 (post-mlp)
+//   workspace   scratch reused by every layer and both passes
+//
+// Gradients accumulate into g at the same offsets as the parameters.
+
+extern @malloc(size: i64) -> *f32
+extern @llmone_rsqrtf(x: f32) -> f32
+
+extern @llmone_fill(x: *f32, v: f32, n: i32) -> void
+extern @llmone_copy(dst: *f32, src: *f32, n: i32) -> void
+extern @llmone_acc(dst: *f32, src: *f32, n: i32) -> void
+extern @llmone_scale(x: *f32, k: f32, n: i32) -> void
+extern @llmone_transpose(src: *f32, dst: *f32, rows: i32, cols: i32) -> void
+extern @llmone_softmax(p: *f32, rows: i32, cols: i32) -> void
+extern @llmone_causal_mask(p: *f32, rows: i32, cols: i32) -> void
+extern @llmone_softmax_bwd(p: *f32, ds: *f32, rows: i32, cols: i32) -> void
+extern @llmone_ln_stats(x: *f32, rows: i32, cols: i32, inv_n: f32, mean: *f32, rstd: *f32) -> void
+extern @llmone_ln_apply(x: *f32, g: *f32, b: *f32, rows: i32, cols: i32, mean: *f32, rstd: *f32, out: *f32) -> void
+extern @llmone_ln_bwd(dy: *f32, x: *f32, g: *f32, rows: i32, cols: i32, inv_n: f32, mean: *f32, rstd: *f32, dx: *f32, dg: *f32, db: *f32) -> void
+extern @llmone_gelu_apply(src: *f32, dst: *f32, n: i32) -> void
+extern @llmone_gelu_bwd_apply(dst: *f32, src: *f32, n: i32) -> void
+extern @llmone_gather_cols(dst: *f32, src: *f32, rows: i32, src_cols: i32, col_off: i32, cols: i32) -> void
+extern @llmone_scatter_cols(dst: *f32, src: *f32, rows: i32, dst_cols: i32, col_off: i32, cols: i32) -> void
+extern @llmone_emb_fwd(dst: *f32, wte: *f32, wpe: *f32, x: *i32, T: i32, D: i32) -> void
+extern @llmone_emb_bwd(gwte: *f32, demb: *f32, x: *i32, T: i32, D: i32) -> void
+extern @llmone_add3(dst: *f32, base: *f32, inc: *f32, n: i32) -> void
+extern @llmone_bias_add(x: *f32, b: *f32, rows: i32, cols: i32) -> void
+extern @llmone_bias_bwd(dy: *f32, db: *f32, rows: i32, cols: i32) -> void
+extern @llmone_fill_rand(p: *f32, n: i32, scale: f32, s: *i32) -> void
+
+// Small random weights, LN gains 1, biases 0.
+fun @llmone_init(p: *f32, seed: i32) -> void {
+  @entry:
+    %st = let i32
+    %l = let i32
+    store i32 %seed, *%st
+    call @llmone_fill_rand(%p, __N_WTE__, 0.02, %st)
+    %wpe = gep f32, *%p, __N_WTE__
+    call @llmone_fill_rand(%wpe, __N_WPE__, 0.01, %st)
+    store i32 0, *%l
+    jmp @lcond
+
+  @lcond:
+    %lv = load i32, *%l
+    %lt = slt i32 %lv, __L__
+    br %lt, @lbody, @final
+
+  @lbody:
+    %off = mul i32 %lv, __PL__
+    %bidx = add i32 %off, __N_EMB__
+    %bp = gep f32, *%p, %bidx
+    %ln1g = gep f32, *%bp, __OFF_LN1G__
+    call @llmone_fill(%ln1g, 1.0, __D__)
+    %ln1b = gep f32, *%bp, __OFF_LN1B__
+    call @llmone_fill(%ln1b, 0.0, __D__)
+    %wqkv = gep f32, *%bp, __OFF_WQKV__
+    call @llmone_fill_rand(%wqkv, __N_WQKV__, 0.02, %st)
+    %bqkv = gep f32, *%bp, __OFF_BQKV__
+    call @llmone_fill(%bqkv, 0.0, __N_3D__)
+    %wo = gep f32, *%bp, __OFF_WO__
+    call @llmone_fill_rand(%wo, __N_D2__, 0.02, %st)
+    %bo = gep f32, *%bp, __OFF_BO__
+    call @llmone_fill(%bo, 0.0, __D__)
+    %ln2g = gep f32, *%bp, __OFF_LN2G__
+    call @llmone_fill(%ln2g, 1.0, __D__)
+    %ln2b = gep f32, *%bp, __OFF_LN2B__
+    call @llmone_fill(%ln2b, 0.0, __D__)
+    %w1 = gep f32, *%bp, __OFF_W1__
+    call @llmone_fill_rand(%w1, __N_W1__, 0.02, %st)
+    %b1 = gep f32, *%bp, __OFF_B1__
+    call @llmone_fill(%b1, 0.0, __N_FF__)
+    %w2 = gep f32, *%bp, __OFF_W2__
+    call @llmone_fill_rand(%w2, __N_W1__, 0.02, %st)
+    %b2 = gep f32, *%bp, __OFF_B2__
+    call @llmone_fill(%b2, 0.0, __D__)
+    %ln = add i32 %lv, 1
+    store i32 %ln, *%l
+    jmp @lcond
+
+  @final:
+    %fg = gep f32, *%p, __LN_BASE__
+    call @llmone_fill(%fg, 1.0, __D__)
+    %fb = gep f32, *%fg, __D__
+    call @llmone_fill(%fb, 0.0, __D__)
+    ret void
+}
+
+// One transformer block, forward. Writes the block's activations and the
+// residual stream into the next layer's A_X.
+fun @llmone_block_fwd(p: *f32, acts: *f32, ws: *f32, l: i32) -> void {
+  @entry:
+    %h = let i32
+    %scale = call @llmone_rsqrtf(__DHF__)
+    %alb = mul i32 %l, __AL__
+    %ap = gep f32, *%acts, %alb
+    %x = gep f32, *%ap, __A_X__
+    %h1 = gep f32, *%ap, __A_H1__
+    %qkv = gep f32, *%ap, __A_QKV__
+    %prob = gep f32, *%ap, __A_PROB__
+    %att = gep f32, *%ap, __A_ATT__
+    %res1 = gep f32, *%ap, __A_RES1__
+    %h2 = gep f32, *%ap, __A_H2__
+    %ffp = gep f32, *%ap, __A_FFP__
+    %ff = gep f32, *%ap, __A_FF__
+    %res2 = gep f32, *%ap, __A_RES2__
+    %plb = mul i32 %l, __PL__
+    %pbi = add i32 %plb, __N_EMB__
+    %bp = gep f32, *%p, %pbi
+    %ln1g = gep f32, *%bp, __OFF_LN1G__
+    %ln1b = gep f32, *%bp, __OFF_LN1B__
+    %wqkv = gep f32, *%bp, __OFF_WQKV__
+    %bqkv = gep f32, *%bp, __OFF_BQKV__
+    %wo = gep f32, *%bp, __OFF_WO__
+    %bo = gep f32, *%bp, __OFF_BO__
+    %ln2g = gep f32, *%bp, __OFF_LN2G__
+    %ln2b = gep f32, *%bp, __OFF_LN2B__
+    %w1 = gep f32, *%bp, __OFF_W1__
+    %b1 = gep f32, *%bp, __OFF_B1__
+    %w2 = gep f32, *%bp, __OFF_W2__
+    %b2 = gep f32, *%bp, __OFF_B2__
+    %mean = gep f32, *%ws, __W_MEAN__
+    %rstd = gep f32, *%ws, __W_RSTD__
+    %scr = gep f32, *%ws, __W_SCR__
+    %qh = gep f32, *%ws, __W_QH__
+    %kh = gep f32, *%ws, __W_KH__
+    %vh = gep f32, *%ws, __W_VH__
+    %vt = gep f32, *%ws, __W_VT__
+    %dz = gep f32, *%ws, __W_DZ__
+    %proj = gep f32, *%ws, __W_PROJ__
+    %mlp = gep f32, *%ws, __W_MLP__
+
+    // ---- attention path ----
+    call @llmone_ln_stats(%x, __T__, __D__, __INVD__, %mean, %rstd)
+    call @llmone_ln_apply(%x, %ln1g, %ln1b, __T__, __D__, %mean, %rstd, %h1)
+    tensor matmul, f32, [__T__, __D__, __N_3D__], *%qkv, *%h1, *%wqkv
+    call @llmone_bias_add(%qkv, %bqkv, __T__, __N_3D__)
+    store i32 0, *%h
+    jmp @hcond
+
+  @hcond:
+    %hv = load i32, *%h
+    %hlt = slt i32 %hv, __H__
+    br %hlt, @hbody, @proj
+
+  @hbody:
+    %hd = load i32, *%h
+    %qoff = mul i32 %hd, __DH__
+    %koff = add i32 %qoff, __D__
+    %voff = add i32 %koff, __D__
+    call @llmone_gather_cols(%qh, %qkv, __T__, __N_3D__, %qoff, __DH__)
+    call @llmone_gather_cols(%kh, %qkv, __T__, __N_3D__, %koff, __DH__)
+    call @llmone_gather_cols(%vh, %qkv, __T__, __N_3D__, %voff, __DH__)
+    call @llmone_transpose(%kh, %vt, __T__, __DH__)
+    tensor matmul, f32, [__T__, __DH__, __T__], *%scr, *%qh, *%vt
+    call @llmone_scale(%scr, %scale, __N_TT__)
+    call @llmone_causal_mask(%scr, __T__, __T__)
+    call @llmone_softmax(%scr, __T__, __T__)
+    %poff = mul i32 %hd, __N_TT__
+    %pp = gep f32, *%prob, %poff
+    call @llmone_copy(%pp, %scr, __N_TT__)
+    tensor matmul, f32, [__T__, __T__, __DH__], *%dz, *%scr, *%vh
+    call @llmone_scatter_cols(%att, %dz, __T__, __D__, %qoff, __DH__)
+    %hn = add i32 %hd, 1
+    store i32 %hn, *%h
+    jmp @hcond
+
+  @proj:
+    tensor matmul, f32, [__T__, __D__, __D__], *%proj, *%att, *%wo
+    call @llmone_bias_add(%proj, %bo, __T__, __D__)
+    call @llmone_add3(%res1, %x, %proj, __N_TD__)
+    // ---- mlp path ----
+    call @llmone_ln_stats(%res1, __T__, __D__, __INVD__, %mean, %rstd)
+    call @llmone_ln_apply(%res1, %ln2g, %ln2b, __T__, __D__, %mean, %rstd, %h2)
+    tensor matmul, f32, [__T__, __D__, __FF__], *%ffp, *%h2, *%w1
+    call @llmone_bias_add(%ffp, %b1, __T__, __FF__)
+    call @llmone_gelu_apply(%ffp, %ff, __N_TFF__)
+    tensor matmul, f32, [__T__, __FF__, __D__], *%mlp, *%ff, *%w2
+    call @llmone_bias_add(%mlp, %b2, __T__, __D__)
+    call @llmone_add3(%res2, %res1, %mlp, __N_TD__)
+    ret void
+}
+
+// Forward pass for one sample of T tokens.
+fun @llmone_forward(p: *f32, acts: *f32, ws: *f32, x: *i32, logits: *f32) -> void {
+  @entry:
+    %l = let i32
+    %wte = gep f32, *%p, 0
+    %wpe = gep f32, *%p, __N_WTE__
+    %emb = gep f32, *%ws, __W_EMB__
+    %lnf = gep f32, *%ws, __W_LNF__
+    %mean = gep f32, *%ws, __W_MEAN__
+    %rstd = gep f32, *%ws, __W_RSTD__
+    %wt = gep f32, *%ws, __W_WT__
+    call @llmone_emb_fwd(%emb, %wte, %wpe, %x, __T__, __D__)
+    %a0 = gep f32, *%acts, __A_X__
+    call @llmone_copy(%a0, %emb, __N_TD__)
+    store i32 0, *%l
+    jmp @lcond
+
+  @lcond:
+    %lv = load i32, *%l
+    %lt = slt i32 %lv, __L__
+    br %lt, @lbody, @head
+
+  @lbody:
+    call @llmone_block_fwd(%p, %acts, %ws, %lv)
+    %lm1 = sub i32 __L__, 1
+    %more = slt i32 %lv, %lm1
+    br %more, @carry, @lnext
+
+  @carry:
+    %alv = load i32, *%l
+    %alb = mul i32 %alv, __AL__
+    %ap = gep f32, *%acts, %alb
+    %res2 = gep f32, *%ap, __A_RES2__
+    %alb1 = add i32 %alb, __AL__
+    %ap1 = gep f32, *%acts, %alb1
+    %xnext = gep f32, *%ap1, __A_X__
+    call @llmone_copy(%xnext, %res2, __N_TD__)
+    jmp @lnext
+
+  @lnext:
+    %lvv = load i32, *%l
+    %ln = add i32 %lvv, 1
+    store i32 %ln, *%l
+    jmp @lcond
+
+  @head:
+    %last = mul i32 __LM1__, __AL__
+    %lastp = gep f32, *%acts, %last
+    %x2 = gep f32, *%lastp, __A_RES2__
+    %fg = gep f32, *%p, __LN_BASE__
+    %fb = gep f32, *%fg, __D__
+    call @llmone_ln_stats(%x2, __T__, __D__, __INVD__, %mean, %rstd)
+    call @llmone_ln_apply(%x2, %fg, %fb, __T__, __D__, %mean, %rstd, %lnf)
+    call @llmone_transpose(%wte, %wt, __V__, __D__)
+    tensor matmul, f32, [__T__, __D__, __V__], *%logits, *%lnf, *%wt
+    ret void
+}
+
+// One transformer block, backward. dcur (workspace W_CUR) holds d(x2) on
+// entry and d(layer input) on exit; gradients accumulate into g.
+fun @llmone_block_bwd(p: *f32, g: *f32, acts: *f32, ws: *f32, l: i32) -> void {
+  @entry:
+    %h = let i32
+    %scale = call @llmone_rsqrtf(__DHF__)
+    %alb = mul i32 %l, __AL__
+    %ap = gep f32, *%acts, %alb
+    %x = gep f32, *%ap, __A_X__
+    %h1 = gep f32, *%ap, __A_H1__
+    %qkv = gep f32, *%ap, __A_QKV__
+    %prob = gep f32, *%ap, __A_PROB__
+    %att = gep f32, *%ap, __A_ATT__
+    %res1 = gep f32, *%ap, __A_RES1__
+    %h2 = gep f32, *%ap, __A_H2__
+    %ffp = gep f32, *%ap, __A_FFP__
+    %ff = gep f32, *%ap, __A_FF__
+    %plb = mul i32 %l, __PL__
+    %pbi = add i32 %plb, __N_EMB__
+    %bp = gep f32, *%p, %pbi
+    %gp = gep f32, *%g, %pbi
+    %ln1g = gep f32, *%bp, __OFF_LN1G__
+    %wqkv = gep f32, *%bp, __OFF_WQKV__
+    %wo = gep f32, *%bp, __OFF_WO__
+    %ln2g = gep f32, *%bp, __OFF_LN2G__
+    %w1 = gep f32, *%bp, __OFF_W1__
+    %w2 = gep f32, *%bp, __OFF_W2__
+    %g_ln1g = gep f32, *%gp, __OFF_LN1G__
+    %g_ln1b = gep f32, *%gp, __OFF_LN1B__
+    %g_wqkv = gep f32, *%gp, __OFF_WQKV__
+    %g_bqkv = gep f32, *%gp, __OFF_BQKV__
+    %g_wo = gep f32, *%gp, __OFF_WO__
+    %g_bo = gep f32, *%gp, __OFF_BO__
+    %g_ln2g = gep f32, *%gp, __OFF_LN2G__
+    %g_ln2b = gep f32, *%gp, __OFF_LN2B__
+    %g_w1 = gep f32, *%gp, __OFF_W1__
+    %g_b1 = gep f32, *%gp, __OFF_B1__
+    %g_w2 = gep f32, *%gp, __OFF_W2__
+    %g_b2 = gep f32, *%gp, __OFF_B2__
+    %cur = gep f32, *%ws, __W_CUR__
+    %dw = gep f32, *%ws, __W_DW__
+    %wt = gep f32, *%ws, __W_WT__
+    %at = gep f32, *%ws, __W_AT__
+    %mean = gep f32, *%ws, __W_MEAN__
+    %rstd = gep f32, *%ws, __W_RSTD__
+    %dff = gep f32, *%ws, __W_DFF2__
+    %dh2 = gep f32, *%ws, __W_DH2__
+    %dh1 = gep f32, *%ws, __W_DH1__
+    %dx = gep f32, *%ws, __W_DX__
+    %datt = gep f32, *%ws, __W_DATT__
+    %dqkv = gep f32, *%ws, __W_DQKV__
+    %doh = gep f32, *%ws, __W_DOH__
+    %qh = gep f32, *%ws, __W_QH__
+    %kh = gep f32, *%ws, __W_KH__
+    %vh = gep f32, *%ws, __W_VH__
+    %vt = gep f32, *%ws, __W_VT__
+    %ds = gep f32, *%ws, __W_DS__
+    %scr = gep f32, *%ws, __W_SCR__
+    %st = gep f32, *%ws, __W_ST__
+    %dz = gep f32, *%ws, __W_DZ__
+
+    // ---- mlp backward ----
+    call @llmone_transpose(%ff, %at, __T__, __N_FF__)
+    tensor matmul, f32, [__N_FF__, __T__, __D__], *%dw, *%at, *%cur
+    call @llmone_acc(%g_w2, %dw, __N_W1__)
+    call @llmone_bias_bwd(%cur, %g_b2, __T__, __D__)
+    call @llmone_transpose(%w2, %wt, __N_FF__, __D__)
+    tensor matmul, f32, [__T__, __D__, __N_FF__], *%dff, *%cur, *%wt
+    call @llmone_gelu_bwd_apply(%dff, %ffp, __N_TFF__)
+    call @llmone_transpose(%h2, %at, __T__, __D__)
+    tensor matmul, f32, [__D__, __T__, __N_FF__], *%dw, *%at, *%dff
+    call @llmone_acc(%g_w1, %dw, __N_W1__)
+    call @llmone_bias_bwd(%dff, %g_b1, __T__, __N_FF__)
+    call @llmone_transpose(%w1, %wt, __D__, __N_FF__)
+    tensor matmul, f32, [__T__, __N_FF__, __D__], *%dh2, *%dff, *%wt
+    call @llmone_ln_stats(%res1, __T__, __D__, __INVD__, %mean, %rstd)
+    %ln2b = gep f32, *%bp, __OFF_LN2B__
+    call @llmone_ln_bwd(%dh2, %res1, %ln2g, __T__, __D__, __INVD__, %mean, %rstd, %dh1, %g_ln2g, %g_ln2b)
+    call @llmone_acc(%dh1, %cur, __N_TD__)
+    call @llmone_copy(%cur, %dh1, __N_TD__)
+
+    // ---- attention backward ----
+    call @llmone_transpose(%att, %at, __T__, __D__)
+    tensor matmul, f32, [__D__, __T__, __D__], *%dw, *%at, *%cur
+    call @llmone_acc(%g_wo, %dw, __N_D2__)
+    call @llmone_bias_bwd(%cur, %g_bo, __T__, __D__)
+    call @llmone_transpose(%wo, %wt, __D__, __D__)
+    tensor matmul, f32, [__T__, __D__, __D__], *%datt, *%cur, *%wt
+    call @llmone_fill(%dqkv, 0.0, __N_QKV__)
+    store i32 0, *%h
+    jmp @hcond
+
+  @hcond:
+    %hv = load i32, *%h
+    %hlt = slt i32 %hv, __H__
+    br %hlt, @hbody, @qkv_bwd
+
+  @hbody:
+    %hd = load i32, *%h
+    %qoff = mul i32 %hd, __DH__
+    %koff = add i32 %qoff, __D__
+    %voff = add i32 %koff, __D__
+    %poff = mul i32 %hd, __N_TT__
+    %psrc = gep f32, *%prob, %poff
+    call @llmone_gather_cols(%scr, %psrc, __T__, __T__, 0, __T__)
+    call @llmone_gather_cols(%doh, %datt, __T__, __D__, %qoff, __DH__)
+    call @llmone_gather_cols(%qh, %qkv, __T__, __N_3D__, %qoff, __DH__)
+    call @llmone_gather_cols(%kh, %qkv, __T__, __N_3D__, %koff, __DH__)
+    call @llmone_gather_cols(%vh, %qkv, __T__, __N_3D__, %voff, __DH__)
+    call @llmone_transpose(%vh, %vt, __T__, __DH__)
+    tensor matmul, f32, [__T__, __DH__, __T__], *%ds, *%doh, *%vt
+    call @llmone_softmax_bwd(%scr, %ds, __T__, __T__)
+    call @llmone_scale(%ds, %scale, __N_TT__)
+    call @llmone_transpose(%scr, %st, __T__, __T__)
+    tensor matmul, f32, [__T__, __T__, __DH__], *%dz, *%st, *%doh
+    %v2off = add i32 %voff, 0
+    call @llmone_scatter_cols(%dqkv, %dz, __T__, __N_3D__, %voff, __DH__)
+    tensor matmul, f32, [__T__, __T__, __DH__], *%dz, *%ds, *%kh
+    call @llmone_scatter_cols(%dqkv, %dz, __T__, __N_3D__, %qoff, __DH__)
+    call @llmone_transpose(%ds, %st, __T__, __T__)
+    tensor matmul, f32, [__T__, __T__, __DH__], *%dz, *%st, *%qh
+    call @llmone_scatter_cols(%dqkv, %dz, __T__, __N_3D__, %koff, __DH__)
+    %hn2 = load i32, *%h
+    %hn = add i32 %hn2, 1
+    store i32 %hn, *%h
+    jmp @hcond
+
+  @qkv_bwd:
+    call @llmone_transpose(%h1, %at, __T__, __D__)
+    tensor matmul, f32, [__D__, __T__, __N_3D__], *%dw, *%at, *%dqkv
+    call @llmone_acc(%g_wqkv, %dw, __N_WQKV__)
+    call @llmone_bias_bwd(%dqkv, %g_bqkv, __T__, __N_3D__)
+    call @llmone_transpose(%wqkv, %wt, __D__, __N_3D__)
+    tensor matmul, f32, [__T__, __N_3D__, __D__], *%dh1, *%dqkv, *%wt
+    %ln1b = gep f32, *%bp, __OFF_LN1B__
+    call @llmone_ln_stats(%x, __T__, __D__, __INVD__, %mean, %rstd)
+    call @llmone_ln_bwd(%dh1, %x, %ln1g, __T__, __D__, __INVD__, %mean, %rstd, %dx, %g_ln1g, %g_ln1b)
+    call @llmone_acc(%dx, %cur, __N_TD__)
+    call @llmone_copy(%cur, %dx, __N_TD__)
+    ret void
+}
+
+// Backward pass for one sample. dlogits comes from llmone_ce.
+fun @llmone_backward(p: *f32, g: *f32, acts: *f32, ws: *f32, dlogits: *f32, x: *i32) -> void {
+  @entry:
+    %l = let i32
+    %wte = gep f32, *%p, 0
+    %gwte = gep f32, *%g, 0
+    %lnf = gep f32, *%ws, __W_LNF__
+    %cur = gep f32, *%ws, __W_CUR__
+    %dw = gep f32, *%ws, __W_DW__
+    %wt = gep f32, *%ws, __W_WT__
+    %at = gep f32, *%ws, __W_AT__
+    %tmp = gep f32, *%ws, __W_TMPVD__
+    %dh = gep f32, *%ws, __W_DH1__
+    %mean = gep f32, *%ws, __W_MEAN__
+    %rstd = gep f32, *%ws, __W_RSTD__
+
+    // tied LM head: dWTE += (lnf^T · dlogits)^T
+    call @llmone_transpose(%lnf, %at, __T__, __D__)
+    tensor matmul, f32, [__D__, __T__, __V__], *%dw, *%at, *%dlogits
+    call @llmone_transpose(%dw, %tmp, __D__, __V__)
+    call @llmone_acc(%gwte, %tmp, __N_VD__)
+    tensor matmul, f32, [__T__, __V__, __D__], *%dh, *%dlogits, *%wte
+
+    // final LN backward
+    %last = mul i32 __LM1__, __AL__
+    %lastp = gep f32, *%acts, %last
+    %x2 = gep f32, *%lastp, __A_RES2__
+    %fg = gep f32, *%p, __LN_BASE__
+    %gfg = gep f32, *%g, __LN_BASE__
+    %gfb = gep f32, *%gfg, __D__
+    call @llmone_ln_stats(%x2, __T__, __D__, __INVD__, %mean, %rstd)
+    call @llmone_ln_bwd(%dh, %x2, %fg, __T__, __D__, __INVD__, %mean, %rstd, %cur, %gfg, %gfb)
+
+    store i32 __LM1__, *%l
+    jmp @lcond
+
+  @lcond:
+    %lv = load i32, *%l
+    %ge = sge i32 %lv, 0
+    br %ge, @lbody, @emb
+
+  @lbody:
+    call @llmone_block_bwd(%p, %g, %acts, %ws, %lv)
+    %ln2 = sub i32 %lv, 1
+    store i32 %ln2, *%l
+    jmp @lcond
+
+  @emb:
+    %demb = gep f32, *%ws, __W_CUR__
+    call @llmone_emb_bwd(%gwte, %demb, %x, __T__, __D__)
+    ret void
+}

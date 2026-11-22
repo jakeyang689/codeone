@@ -1,0 +1,341 @@
+// llmone data — corpus IO, xorshift32 PRNG, batch sampling, checkpoints.
+//
+// The corpus is raw bytes and the vocabulary is 0..255, so "tokenising" is a
+// byte load. Floating-point weights are initialised from the same PRNG; the
+// uniform values are built by reinterpreting an i32 with exponent 0x3F800000.
+// All sizes are runtime i32, so both configs share this file.
+
+extern @printf(fmt: *i8, ...) -> i32
+extern @fopen(path: *i8, mode: *i8) -> *i8
+extern @fread(buf: *i8, size: i64, count: i64, fp: *i8) -> i64
+extern @fwrite(buf: *i8, size: i64, count: i64, fp: *i8) -> i64
+extern @fclose(fp: *i8) -> i32
+extern @fseek(fp: *i8, offset: i64, whence: i32) -> i32
+extern @ftell(fp: *i8) -> i64
+extern @malloc(size: i64) -> *i8
+extern @free(ptr: *i8) -> void
+
+const @llmone_mode_rb: [i8, 3] = [114, 98, 0]
+const @llmone_mode_wb: [i8, 3] = [119, 98, 0]
+const @llmone_seek_end: i32 = 2
+const @llmone_seek_set: i32 = 0
+
+// Read a whole file. Returns a malloc'd buffer; *out_len gets the byte count
+// (0 with a null return when the file cannot be opened).
+fun @llmone_read_file(path: *i8, out_len: *i32) -> *i8 {
+  @entry:
+    %rbp = gep i8, *@llmone_mode_rb, 0
+    %fp = call @fopen(%path, %rbp)
+    store i32 0, *%out_len
+    %ok = ne *i8 %fp, null
+    br %ok, @size, @fail
+
+  @fail:
+    ret *i8 null
+
+  @size:
+    %endp = gep i32, *@llmone_seek_end, 0
+    %end = load i32, *%endp
+    %z1 = sext i32 0 to i64
+    call @fseek(%fp, %z1, %end)
+    %sz = call @ftell(%fp)
+    %setpp = gep i32, *@llmone_seek_set, 0
+    %setp = load i32, *%setpp
+    call @fseek(%fp, %z1, %setp)
+    %n = trunc i64 %sz to i32
+    %nz = sle i32 %n, 0
+    br %nz, @close_empty, @alloc
+
+  @close_empty:
+    call @fclose(%fp)
+    ret *i8 null
+
+  @alloc:
+    %szn = sext i32 %n to i64
+    %buf = call @malloc(%szn)
+    %gotbuf = ne *i8 %buf, null
+    br %gotbuf, @read, @close_empty
+
+  @read:
+    %cnt = sext i32 %n to i64
+    %rd = call @fread(%buf, 1, %cnt, %fp)
+    call @fclose(%fp)
+    %rdn = trunc i64 %rd to i32
+    store i32 %rdn, *%out_len
+    ret *i8 %buf
+}
+
+// Write len bytes. Returns 0 on success, -1 on a short write.
+fun @llmone_write_file(path: *i8, data: *i8, len: i32) -> i32 {
+  @entry:
+    %wbp = gep i8, *@llmone_mode_wb, 0
+    %fp = call @fopen(%path, %wbp)
+    %ok = ne *i8 %fp, null
+    br %ok, @write, @fail
+
+  @fail:
+    ret i32 -1
+
+  @write:
+    %cnt = sext i32 %len to i64
+    %wr = call @fwrite(%data, 1, %cnt, %fp)
+    call @fclose(%fp)
+    %wr32 = trunc i64 %wr to i32
+    %same = eq i32 %wr32, %len
+    br %same, @good, @short
+
+  @good:
+    ret i32 0
+
+  @short:
+    ret i32 -1
+}
+
+// xorshift32. The state must be non-zero.
+fun @llmone_rand_bits(s: *i32) -> i32 {
+  @entry:
+    %x = load i32, *%s
+    %a = shl i32 %x, 13
+    %b = xor i32 %x, %a
+    %c = lshr i32 %b, 17
+    %d = xor i32 %b, %c
+    %e = shl i32 %d, 5
+    %f = xor i32 %d, %e
+    store i32 %f, *%s
+    ret i32 %f
+}
+
+// Uniform in [0, 1): take 23 bits, set the exponent to 0x3F800000, read as f32.
+fun @llmone_rand_unit(s: *i32) -> f32 {
+  @entry:
+    %tmp = let i32
+    %x = call @llmone_rand_bits(%s)
+    %m = lshr i32 %x, 9
+    %bits = or i32 %m, 1065353216
+    %tp = gep i8, *%tmp, 0
+    store i32 %bits, *%tp
+    %fp = gep f32, *%tmp, 0
+    %v = load f32, *%fp
+    %r = sub f32 %v, 1.0
+    ret f32 %r
+}
+
+// Uniform in [-scale, scale).
+fun @llmone_fill_rand(p: *f32, n: i32, scale: f32, s: *i32) -> void {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @cond
+
+  @cond:
+    %iv = load i32, *%i
+    %lt = slt i32 %iv, %n
+    br %lt, @body, @done
+
+  @body:
+    %u = call @llmone_rand_unit(%s)
+    %u2 = mul f32 %u, 2.0
+    %sgn = sub f32 %u2, 1.0
+    %val = mul f32 %sgn, %scale
+    %pp = gep f32, *%p, %iv
+    store f32 %val, *%pp
+    %next = add i32 %iv, 1
+    store i32 %next, *%i
+    jmp @cond
+
+  @done:
+    ret void
+}
+
+// Random window start in [0, data_len - T - 1].
+fun @llmone_batch_offsets(off: *i32, batch: i32, data_len: i32, T: i32, s: *i32) -> void {
+  @entry:
+    %b = let i32
+    %max = sub i32 %data_len, %T
+    %max2 = sub i32 %max, 1
+    store i32 0, *%b
+    jmp @cond
+
+  @cond:
+    %bv = load i32, *%b
+    %lt = slt i32 %bv, %batch
+    br %lt, @body, @done
+
+  @body:
+    %x = call @llmone_rand_bits(%s)
+    %pos = and i32 %x, 2147483647
+    %idx = urem i32 %pos, %max2
+    %op = gep i32, *%off, %bv
+    store i32 %idx, *%op
+    %next = add i32 %bv, 1
+    store i32 %next, *%b
+    jmp @cond
+
+  @done:
+    ret void
+}
+
+// Gather x[b, t] = data[off[b] + t] and y[b, t] = data[off[b] + t + 1].
+fun @llmone_gather(x: *i32, y: *i32, data: *i8, off: *i32, batch: i32, T: i32) -> void {
+  @entry:
+    %b = let i32
+    %t = let i32
+    store i32 0, *%b
+    jmp @bcond
+
+  @bcond:
+    %bv = load i32, *%b
+    %blt = slt i32 %bv, %batch
+    br %blt, @tinit, @done
+
+  @tinit:
+    store i32 0, *%t
+    jmp @tcond
+
+  @tcond:
+    %tv = load i32, *%t
+    %tlt = slt i32 %tv, %T
+    br %tlt, @body, @bnext
+
+  @body:
+    %bv2 = load i32, *%b
+    %tv2 = load i32, *%t
+    %op = gep i32, *%off, %bv2
+    %o = load i32, *%op
+    %pos = add i32 %o, %tv2
+    %bp = gep i8, *%data, %pos
+    %byte = load i8, *%bp
+    %tok = zext i8 %byte to i32
+    %pos1 = add i32 %pos, 1
+    %bp1 = gep i8, *%data, %pos1
+    %byte1 = load i8, *%bp1
+    %tok1 = zext i8 %byte1 to i32
+    %bi = mul i32 %bv2, %T
+    %idx = add i32 %bi, %tv2
+    %xp = gep i32, *%x, %idx
+    store i32 %tok, *%xp
+    %yp = gep i32, *%y, %idx
+    store i32 %tok1, *%yp
+    %tn = add i32 %tv2, 1
+    store i32 %tn, *%t
+    jmp @tcond
+
+  @bnext:
+    %bn = load i32, *%b
+    %bn2 = add i32 %bn, 1
+    store i32 %bn2, *%b
+    jmp @bcond
+
+  @done:
+    ret void
+}
+
+// Checkpoint format: [magic i32 0x4C4D4F31][n i32][step i32][n floats].
+const @llmone_ckpt_magic: i32 = 1279754545
+
+fun @llmone_save(path: *i8, params: *f32, n: i32, step: i32) -> i32 {
+  @entry:
+    %head = let [i32, 3]
+    %i = let i32
+    %wbp = gep i8, *@llmone_mode_wb, 0
+    %fp = call @fopen(%path, %wbp)
+    %ok = ne *i8 %fp, null
+    br %ok, @header, @fail
+
+  @fail:
+    ret i32 -1
+
+  @header:
+    %h0 = gep i32, *%head, 0
+    store i32 1279754545, *%h0
+    %h1 = gep i32, *%head, 1
+    store i32 %n, *%h1
+    %h2 = gep i32, *%head, 2
+    store i32 %step, *%h2
+    %hp = gep i8, *%head, 0
+    %wr0 = call @fwrite(%hp, 1, 12, %fp)
+    %w0 = trunc i64 %wr0 to i32
+    %bits = mul i32 %n, 4
+    %bad0 = ne i32 %w0, 12
+    br %bad0, @fail_close, @body
+
+  @body:
+    %pp = gep i8, *%params, 0
+    %cnt = sext i32 %bits to i64
+    %wr = call @fwrite(%pp, 1, %cnt, %fp)
+    call @fclose(%fp)
+    %wr32 = trunc i64 %wr to i32
+    %same = eq i32 %wr32, %bits
+    br %same, @good, @fail
+
+  @fail_close:
+    call @fclose(%fp)
+    ret i32 -1
+
+  @good:
+    ret i32 0
+}
+
+// Load params from a checkpoint. *step receives the saved step.
+fun @llmone_load(path: *i8, params: *f32, n: i32, step: *i32) -> i32 {
+  @entry:
+    %len = let i32
+    %i = let i32
+    %buf = call @llmone_read_file(%path, %len)
+    %ok = ne *i8 %buf, null
+    br %ok, @check, @fail
+
+  @fail:
+    ret i32 -1
+
+  @check:
+    %bytes = mul i32 %n, 4
+    %need = add i32 %bytes, 12
+    %lv = load i32, *%len
+    %big = sge i32 %lv, %need
+    br %big, @header, @fail2
+
+  @fail2:
+    call @free(%buf)
+    ret i32 -1
+
+  @header:
+    %h0 = gep i8, *%buf, 0
+    %magic = load i32, *%h0
+    %mg = eq i32 %magic, 1279754545
+    br %mg, @copy, @fail2
+
+  @copy:
+    %h1 = gep i8, *%buf, 4
+    %sn = load i32, *%h1
+    %nmatch = eq i32 %sn, %n
+    br %nmatch, @do_copy, @fail2
+
+  @do_copy:
+    %h2 = gep i8, *%buf, 8
+    %sv = load i32, *%h2
+    store i32 %sv, *%step
+    store i32 0, *%i
+    jmp @cond
+
+  @cond:
+    %iv = load i32, *%i
+    %lt = slt i32 %iv, %n
+    br %lt, @body, @done
+
+  @body:
+    %off = mul i32 %iv, 4
+    %soff = add i32 %off, 12
+    %sp = gep i8, *%buf, %soff
+    %bits = load i32, *%sp
+    %dof = mul i32 %iv, 4
+    %dp = gep i8, *%params, %dof
+    store i32 %bits, *%dp
+    %next = add i32 %iv, 1
+    store i32 %next, *%i
+    jmp @cond
+
+  @done:
+    call @free(%buf)
+    ret i32 0
+}

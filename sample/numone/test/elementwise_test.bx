@@ -1,0 +1,137 @@
+// numone test/elementwise — elementwise kernels vs the scalar reference.
+
+extern @numone_add_2x2(dst: *f32, a: *f32, b: *f32) -> void
+extern @numone_sub_2x2(dst: *f32, a: *f32, b: *f32) -> void
+extern @numone_mul_2x2(dst: *f32, a: *f32, b: *f32) -> void
+extern @numone_add_2x3(dst: *f32, a: *f32, b: *f32) -> void
+extern @numone_mul_2x3(dst: *f32, a: *f32, b: *f32) -> void
+extern @numone_scale(a: *f32, n: i32, k: f32) -> void
+extern @numone_fill(a: *f32, n: i32, v: f32) -> void
+extern @numone_equal(a: *f32, b: *f32, n: i32) -> i32
+
+extern @numone_report(name: *i8, ok: i32) -> i32
+extern @numone_seq(a: *f32, start: f32, step: f32, n: i32) -> void
+extern @numone_put4(a: *f32, v0: f32, v1: f32, v2: f32, v3: f32) -> void
+extern @numone_put6(a: *f32, v0: f32, v1: f32, v2: f32, v3: f32, v4: f32, v5: f32) -> void
+
+fun @numone_test_fill() -> i32 {
+  @entry:
+    %a = let [f32, 4]
+    %e = let [f32, 4]
+    %ap = gep f32, *%a, 0
+    %ep = gep f32, *%e, 0
+    call @numone_put4(%ep, 2.5, 2.5, 2.5, 2.5)
+    call @numone_fill(%ap, 4, 2.5)
+    %ok = call @numone_equal(%ap, %ep, 4)
+    %r0 = call @numone_report("fill [2,2] = 2.5", %ok)
+    ret i32 %r0
+}
+
+fun @numone_test_add_2x2() -> i32 {
+  @entry:
+    %a = let [f32, 4]
+    %b = let [f32, 4]
+    %c = let [f32, 4]
+    %e = let [f32, 4]
+    %ap = gep f32, *%a, 0
+    %bp = gep f32, *%b, 0
+    %cp = gep f32, *%c, 0
+    %ep = gep f32, *%e, 0
+    call @numone_seq(%ap, 1.0, 1.0, 4)
+    call @numone_seq(%bp, 10.0, 10.0, 4)
+    call @numone_seq(%ep, 11.0, 11.0, 4)
+    call @numone_add_2x2(%cp, %ap, %bp)
+    %ok = call @numone_equal(%cp, %ep, 4)
+    %r1 = call @numone_report("tensor add 2x2", %ok)
+    ret i32 %r1
+}
+
+fun @numone_test_sub_2x2() -> i32 {
+  @entry:
+    %a = let [f32, 4]
+    %b = let [f32, 4]
+    %c = let [f32, 4]
+    %e = let [f32, 4]
+    %ap = gep f32, *%a, 0
+    %bp = gep f32, *%b, 0
+    %cp = gep f32, *%c, 0
+    %ep = gep f32, *%e, 0
+    call @numone_seq(%ap, 1.0, 1.0, 4)
+    call @numone_seq(%bp, 10.0, 10.0, 4)
+    call @numone_put4(%ep, -9.0, -18.0, -27.0, -36.0)
+    call @numone_sub_2x2(%cp, %ap, %bp)
+    %ok = call @numone_equal(%cp, %ep, 4)
+    %r2 = call @numone_report("tensor sub 2x2", %ok)
+    ret i32 %r2
+}
+
+fun @numone_test_mul_2x2() -> i32 {
+  @entry:
+    %a = let [f32, 4]
+    %b = let [f32, 4]
+    %c = let [f32, 4]
+    %e = let [f32, 4]
+    %ap = gep f32, *%a, 0
+    %bp = gep f32, *%b, 0
+    %cp = gep f32, *%c, 0
+    %ep = gep f32, *%e, 0
+    call @numone_seq(%ap, 1.0, 1.0, 4)
+    call @numone_seq(%bp, 10.0, 10.0, 4)
+    call @numone_put4(%ep, 10.0, 40.0, 90.0, 160.0)
+    call @numone_mul_2x2(%cp, %ap, %bp)
+    %ok = call @numone_equal(%cp, %ep, 4)
+    %r3 = call @numone_report("tensor mul 2x2", %ok)
+    ret i32 %r3
+}
+
+fun @numone_test_add_2x3() -> i32 {
+  @entry:
+    %a = let [f32, 6]
+    %b = let [f32, 6]
+    %c = let [f32, 6]
+    %e = let [f32, 6]
+    %ap = gep f32, *%a, 0
+    %bp = gep f32, *%b, 0
+    %cp = gep f32, *%c, 0
+    %ep = gep f32, *%e, 0
+    call @numone_seq(%ap, 1.0, 1.0, 6)
+    call @numone_seq(%bp, 10.0, 10.0, 6)
+    call @numone_seq(%ep, 11.0, 11.0, 6)
+    call @numone_add_2x3(%cp, %ap, %bp)
+    %ok = call @numone_equal(%cp, %ep, 6)
+    %r4 = call @numone_report("tensor add 2x3", %ok)
+    ret i32 %r4
+}
+
+fun @numone_test_mul_2x3() -> i32 {
+  @entry:
+    %a = let [f32, 6]
+    %b = let [f32, 6]
+    %c = let [f32, 6]
+    %e = let [f32, 6]
+    %ap = gep f32, *%a, 0
+    %bp = gep f32, *%b, 0
+    %cp = gep f32, *%c, 0
+    %ep = gep f32, *%e, 0
+    call @numone_seq(%ap, 1.0, 1.0, 6)
+    call @numone_seq(%bp, 10.0, 10.0, 6)
+    call @numone_put6(%ep, 10.0, 40.0, 90.0, 160.0, 250.0, 360.0)
+    call @numone_mul_2x3(%cp, %ap, %bp)
+    %ok = call @numone_equal(%cp, %ep, 6)
+    %r5 = call @numone_report("tensor mul 2x3", %ok)
+    ret i32 %r5
+}
+
+fun @numone_test_scale() -> i32 {
+  @entry:
+    %a = let [f32, 4]
+    %e = let [f32, 4]
+    %ap = gep f32, *%a, 0
+    %ep = gep f32, *%e, 0
+    call @numone_seq(%ap, 1.0, 1.0, 4)
+    call @numone_put4(%ep, 2.5, 5.0, 7.5, 10.0)
+    call @numone_scale(%ap, 4, 2.5)
+    %ok = call @numone_equal(%ap, %ep, 4)
+    %r6 = call @numone_report("scalar scale by 2.5", %ok)
+    ret i32 %r6
+}

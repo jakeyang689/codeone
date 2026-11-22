@@ -1,0 +1,225 @@
+// Smoke tests for data.bx: file round trip, PRNG range, batch gather,
+// checkpoint save/load.
+
+extern @printf(fmt: *i8, ...) -> i32
+extern @llmone_read_file(path: *i8, out_len: *i32) -> *i8
+extern @llmone_write_file(path: *i8, data: *i8, len: i32) -> i32
+extern @llmone_rand_unit(s: *i32) -> f32
+extern @llmone_fill_rand(p: *f32, n: i32, scale: f32, s: *i32) -> void
+extern @llmone_batch_offsets(off: *i32, batch: i32, data_len: i32, T: i32, s: *i32) -> void
+extern @llmone_gather(x: *i32, y: *i32, data: *i8, off: *i32, batch: i32, T: i32) -> void
+extern @llmone_save(path: *i8, params: *f32, n: i32, step: i32) -> i32
+extern @llmone_load(path: *i8, params: *f32, n: i32, step: *i32) -> i32
+
+fun @report(name: *i8, ok: i32) -> i32 {
+  @entry:
+    %pass = eq i32 %ok, 1
+    br %pass, @p, @f
+
+  @p:
+    call @printf("PASS %s\n", %name)
+    ret i32 0
+
+  @f:
+    call @printf("FAIL %s\n", %name)
+    ret i32 1
+}
+
+fun @main() -> i32 {
+  @entry:
+    %fails = let i32
+    %len = let i32
+    %st = let i32
+    %step = let i32
+    %off = let [i32, 3]
+    %x = let [i32, 12]
+    %y = let [i32, 12]
+    %w = let [f32, 4]
+    %w2 = let [f32, 4]
+    store i32 0, *%fails
+
+    // ---- file round trip ----
+    %msg = gep i8, *@msg_txt, 0
+    %w1 = call @llmone_write_file("/tmp/llmone_data_test.txt", %msg, 20)
+    %rd = call @llmone_read_file("/tmp/llmone_data_test.txt", %len)
+    %lv = load i32, *%len
+    %c_len = eq i32 %lv, 20
+    %len_ok = zext i1 %c_len to i32
+    %o0 = gep i8, *%rd, 0
+    %b0 = load i8, *%o0
+    %o1 = gep i8, *%rd, 6
+    %b1 = load i8, *%o1
+    %c_h = eq i8 %b0, 104
+    %h_ok = zext i1 %c_h to i32
+    %c_l = eq i8 %b1, 108
+    %l_ok = zext i1 %c_l to i32
+    %c_w = eq i32 %w1, 0
+    %w_ok = zext i1 %c_w to i32
+    %all0 = mul i32 %len_ok, %h_ok
+    %all1 = mul i32 %all0, %l_ok
+    %all2 = mul i32 %all1, %w_ok
+    %r0 = call @report("file_roundtrip", %all2)
+    %nv0 = load i32, *%fails
+    %n0 = add i32 %nv0, %r0
+    store i32 %n0, *%fails
+
+    // ---- PRNG in [0,1) ----
+    store i32 12345, *%st
+    %u0 = call @llmone_rand_unit(%st)
+    %u1 = call @llmone_rand_unit(%st)
+    %u2 = call @llmone_rand_unit(%st)
+    %c_lo0 = sge f32 %u0, 0.0
+    %c_hi0 = slt f32 %u0, 1.0
+    %c_lo1 = sge f32 %u1, 0.0
+    %c_hi1 = slt f32 %u1, 1.0
+    %c_lo2 = sge f32 %u2, 0.0
+    %c_hi2 = slt f32 %u2, 1.0
+    %lo0 = zext i1 %c_lo0 to i32
+    %hi0 = zext i1 %c_hi0 to i32
+    %lo1 = zext i1 %c_lo1 to i32
+    %hi1 = zext i1 %c_hi1 to i32
+    %lo2 = zext i1 %c_lo2 to i32
+    %hi2 = zext i1 %c_hi2 to i32
+    %aa = mul i32 %lo0, %hi0
+    %ab = mul i32 %lo1, %hi1
+    %ac = mul i32 %lo2, %hi2
+    %ad = mul i32 %aa, %ab
+    %ae = mul i32 %ad, %ac
+    %r1 = call @report("rand_unit_range", %ae)
+    %nv1 = load i32, *%fails
+    %n1 = add i32 %nv1, %r1
+    store i32 %n1, *%fails
+
+    // ---- fill_rand in [-0.5, 0.5) ----
+    %wb = gep f32, *%w, 0
+    %wp = gep f32, *%w, 1
+    %wq = gep f32, *%w, 2
+    %wr = gep f32, *%w, 3
+    %wfp = gep f32, *%w, 0
+    call @llmone_fill_rand(%wfp, 4, 0.5, %st)
+    %v0 = load f32, *%wb
+    %v1 = load f32, *%wp
+    %v2 = load f32, *%wq
+    %v3 = load f32, *%wr
+    %c0a = sge f32 %v0, -0.5
+    %c0b = slt f32 %v0, 0.5
+    %c1a = sge f32 %v1, -0.5
+    %c1b = slt f32 %v1, 0.5
+    %c2a = sge f32 %v2, -0.5
+    %c2b = slt f32 %v2, 0.5
+    %c3a = sge f32 %v3, -0.5
+    %c3b = slt f32 %v3, 0.5
+    %d0 = zext i1 %c0a to i32
+    %d1 = zext i1 %c0b to i32
+    %d2 = zext i1 %c1a to i32
+    %d3 = zext i1 %c1b to i32
+    %d4 = zext i1 %c2a to i32
+    %d5 = zext i1 %c2b to i32
+    %d6 = zext i1 %c3a to i32
+    %d7 = zext i1 %c3b to i32
+    %ca = mul i32 %d0, %d1
+    %cb = mul i32 %d2, %d3
+    %cc = mul i32 %d4, %d5
+    %cd = mul i32 %d6, %d7
+    %ce = mul i32 %ca, %cb
+    %cf = mul i32 %ce, %cc
+    %cg = mul i32 %cf, %cd
+    %r2 = call @report("fill_rand_range", %cg)
+    %nv2 = load i32, *%fails
+    %n2 = add i32 %nv2, %r2
+    store i32 %n2, *%fails
+
+    // ---- batch offsets and gather ----
+    %msg2 = gep i8, *@msg_txt, 0
+    call @llmone_batch_offsets(%off, 3, 20, 4, %st)
+    %op0 = gep i32, *%off, 0
+    %op1 = gep i32, *%off, 1
+    %op2 = gep i32, *%off, 2
+    %o0v = load i32, *%op0
+    %o1v = load i32, *%op1
+    %o2v = load i32, *%op2
+    %c8 = sge i32 %o0v, 0
+    %c9 = slt i32 %o0v, 16
+    %c10 = sge i32 %o1v, 0
+    %c11 = slt i32 %o1v, 16
+    %c12 = sge i32 %o2v, 0
+    %c13 = slt i32 %o2v, 16
+    %e0 = zext i1 %c8 to i32
+    %e1 = zext i1 %c9 to i32
+    %e2 = zext i1 %c10 to i32
+    %e3 = zext i1 %c11 to i32
+    %e4 = zext i1 %c12 to i32
+    %e5 = zext i1 %c13 to i32
+    call @llmone_gather(%x, %y, %msg2, %off, 3, 4)
+    %xp = gep i32, *%x, 0
+    %yp = gep i32, *%y, 0
+    %xv = load i32, *%xp
+    %yv = load i32, *%yp
+    %msgp = gep i8, *@msg_txt, %o0v
+    %mb = load i8, *%msgp
+    %mb32 = zext i8 %mb to i32
+    %o0p1 = add i32 %o0v, 1
+    %msgp1 = gep i8, *@msg_txt, %o0p1
+    %mb1 = load i8, *%msgp1
+    %mb132 = zext i8 %mb1 to i32
+    %c14 = eq i32 %xv, %mb32
+    %c15 = eq i32 %yv, %mb132
+    %e6 = zext i1 %c14 to i32
+    %e7 = zext i1 %c15 to i32
+    %oa = mul i32 %e0, %e1
+    %ob = mul i32 %e2, %e3
+    %oc = mul i32 %e4, %e5
+    %od = mul i32 %oa, %ob
+    %oe = mul i32 %od, %oc
+    %of = mul i32 %oe, %e6
+    %og = mul i32 %of, %e7
+    %r3 = call @report("batch_gather", %og)
+    %nv3 = load i32, *%fails
+    %n3 = add i32 %nv3, %r3
+    store i32 %n3, *%fails
+
+    // ---- checkpoint save/load ----
+    %wpf = gep f32, *%w, 0
+    %sv = call @llmone_save("/tmp/llmone_ckpt_test.bin", %wpf, 4, 7)
+    %w2f = gep f32, *%w2, 0
+    %cl = call @llmone_load("/tmp/llmone_ckpt_test.bin", %w2f, 4, %step)
+    %w2b = gep f32, *%w2, 0
+    %w2c = gep f32, *%w2, 1
+    %w2d = gep f32, *%w2, 2
+    %w2e = gep f32, *%w2, 3
+    %z0 = load f32, *%w2b
+    %z1 = load f32, *%w2c
+    %z2 = load f32, *%w2d
+    %z3 = load f32, *%w2e
+    %c16 = eq f32 %z0, %v0
+    %c17 = eq f32 %z1, %v1
+    %c18 = eq f32 %z2, %v2
+    %c19 = eq f32 %z3, %v3
+    %f0 = zext i1 %c16 to i32
+    %f1 = zext i1 %c17 to i32
+    %f2 = zext i1 %c18 to i32
+    %f3 = zext i1 %c19 to i32
+    %c20 = eq i32 %sv, 0
+    %c21 = eq i32 %cl, 0
+    %stv = load i32, *%step
+    %c22 = eq i32 %stv, 7
+    %f4 = zext i1 %c20 to i32
+    %f5 = zext i1 %c21 to i32
+    %f6 = zext i1 %c22 to i32
+    %fa = mul i32 %f0, %f1
+    %fb = mul i32 %fa, %f2
+    %fc = mul i32 %fb, %f3
+    %fd = mul i32 %fc, %f4
+    %fe = mul i32 %fd, %f5
+    %ff = mul i32 %fe, %f6
+    %r4 = call @report("checkpoint_roundtrip", %ff)
+    %nv4 = load i32, *%fails
+    %n4 = add i32 %nv4, %r4
+    store i32 %n4, *%fails
+
+    %fv = load i32, *%fails
+    call @printf("data_test: %d failure(s)\n", %fv)
+    ret i32 %fv
+}
+
+const @msg_txt: [i8, 21] = "hello llmone corpus!"

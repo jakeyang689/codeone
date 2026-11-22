@@ -1,0 +1,1379 @@
+// llmone nn — row/matrix kernels used by the transformer.
+//
+// Everything takes runtime sizes; row-major buffers throughout. Sizes that
+// need a float reciprocal (layernorm, cross entropy) receive it as a f32
+// parameter because SSA has no int->float conversion.
+
+extern @llmone_expf(x: f32) -> f32
+extern @llmone_logf(x: f32) -> f32
+extern @llmone_rsqrtf(x: f32) -> f32
+extern @llmone_sqrtf(x: f32) -> f32
+extern @llmone_gelu(x: f32) -> f32
+extern @llmone_gelu_bwd(x: f32) -> f32
+
+fun @llmone_fill(x: *f32, v: f32, n: i32) -> void {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @cond
+
+  @cond:
+    %iv = load i32, *%i
+    %lt = slt i32 %iv, %n
+    br %lt, @body, @done
+
+  @body:
+    %p = gep f32, *%x, %iv
+    store f32 %v, *%p
+    %next = add i32 %iv, 1
+    store i32 %next, *%i
+    jmp @cond
+
+  @done:
+    ret void
+}
+
+fun @llmone_copy(dst: *f32, src: *f32, n: i32) -> void {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @cond
+
+  @cond:
+    %iv = load i32, *%i
+    %lt = slt i32 %iv, %n
+    br %lt, @body, @done
+
+  @body:
+    %sp = gep f32, *%src, %iv
+    %v = load f32, *%sp
+    %dp = gep f32, *%dst, %iv
+    store f32 %v, *%dp
+    %next = add i32 %iv, 1
+    store i32 %next, *%i
+    jmp @cond
+
+  @done:
+    ret void
+}
+
+fun @llmone_acc(dst: *f32, src: *f32, n: i32) -> void {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @cond
+
+  @cond:
+    %iv = load i32, *%i
+    %lt = slt i32 %iv, %n
+    br %lt, @body, @done
+
+  @body:
+    %sp = gep f32, *%src, %iv
+    %sv = load f32, *%sp
+    %dp = gep f32, *%dst, %iv
+    %dv = load f32, *%dp
+    %s = add f32 %dv, %sv
+    store f32 %s, *%dp
+    %next = add i32 %iv, 1
+    store i32 %next, *%i
+    jmp @cond
+
+  @done:
+    ret void
+}
+
+fun @llmone_scale(x: *f32, k: f32, n: i32) -> void {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @cond
+
+  @cond:
+    %iv = load i32, *%i
+    %lt = slt i32 %iv, %n
+    br %lt, @body, @done
+
+  @body:
+    %p = gep f32, *%x, %iv
+    %v = load f32, *%p
+    %s = mul f32 %v, %k
+    store f32 %s, *%p
+    %next = add i32 %iv, 1
+    store i32 %next, *%i
+    jmp @cond
+
+  @done:
+    ret void
+}
+
+// dst[c, r] = src[r, c]
+fun @llmone_transpose(src: *f32, dst: *f32, rows: i32, cols: i32) -> void {
+  @entry:
+    %r = let i32
+    %c = let i32
+    store i32 0, *%r
+    jmp @rcond
+
+  @rcond:
+    %rv = load i32, *%r
+    %rlt = slt i32 %rv, %rows
+    br %rlt, @cinit, @done
+
+  @cinit:
+    store i32 0, *%c
+    jmp @ccond
+
+  @ccond:
+    %cv = load i32, *%c
+    %clt = slt i32 %cv, %cols
+    br %clt, @body, @rnext
+
+  @body:
+    %rv2 = load i32, *%r
+    %cv2 = load i32, *%c
+    %si = mul i32 %rv2, %cols
+    %si2 = add i32 %si, %cv2
+    %sp = gep f32, *%src, %si2
+    %v = load f32, *%sp
+    %di = mul i32 %cv2, %rows
+    %di2 = add i32 %di, %rv2
+    %dp = gep f32, *%dst, %di2
+    store f32 %v, *%dp
+    %cn = add i32 %cv2, 1
+    store i32 %cn, *%c
+    jmp @ccond
+
+  @rnext:
+    %rnt = load i32, *%r
+    %rn = add i32 %rnt, 1
+    store i32 %rn, *%r
+    jmp @rcond
+
+  @done:
+    ret void
+}
+
+// Row-wise softmax, in place.
+fun @llmone_softmax(p: *f32, rows: i32, cols: i32) -> void {
+  @entry:
+    %r = let i32
+    %c = let i32
+    %mx = let f32
+    %sum = let f32
+    store i32 0, *%r
+    jmp @row_cond
+
+  @row_cond:
+    %rv = load i32, *%r
+    %rlt = slt i32 %rv, %rows
+    br %rlt, @row_body, @done
+
+  @row_body:
+    %base = mul i32 %rv, %cols
+    %rp = gep f32, *%p, %base
+    %m0 = load f32, *%rp
+    store f32 %m0, *%mx
+    store i32 0, *%c
+    jmp @max_cond
+
+  @max_cond:
+    %cv = load i32, *%c
+    %clt = slt i32 %cv, %cols
+    br %clt, @max_body, @exp_init
+
+  @max_body:
+    %rv2 = load i32, *%r
+    %cv2 = load i32, *%c
+    %b2 = mul i32 %rv2, %cols
+    %idx = add i32 %b2, %cv2
+    %ep = gep f32, *%p, %idx
+    %ev = load f32, *%ep
+    %cur = load f32, *%mx
+    %gt = sgt f32 %ev, %cur
+    br %gt, @max_up, @max_step
+
+  @max_up:
+    store f32 %ev, *%mx
+    jmp @max_step
+
+  @max_step:
+    %cv3 = load i32, *%c
+    %cn = add i32 %cv3, 1
+    store i32 %cn, *%c
+    jmp @max_cond
+
+  @exp_init:
+    store f32 0.0, *%sum
+    store i32 0, *%c
+    jmp @exp_cond
+
+  @exp_cond:
+    %cv4 = load i32, *%c
+    %clt2 = slt i32 %cv4, %cols
+    br %clt2, @exp_body, @div_init
+
+  @exp_body:
+    %rv3 = load i32, *%r
+    %cv5 = load i32, *%c
+    %b3 = mul i32 %rv3, %cols
+    %idx2 = add i32 %b3, %cv5
+    %ep2 = gep f32, *%p, %idx2
+    %ev2 = load f32, *%ep2
+    %mv2 = load f32, *%mx
+    %sh = sub f32 %ev2, %mv2
+    %ex = call @llmone_expf(%sh)
+    store f32 %ex, *%ep2
+    %sv = load f32, *%sum
+    %ns = add f32 %sv, %ex
+    store f32 %ns, *%sum
+    %cn2 = add i32 %cv5, 1
+    store i32 %cn2, *%c
+    jmp @exp_cond
+
+  @div_init:
+    store i32 0, *%c
+    jmp @div_cond
+
+  @div_cond:
+    %cv6 = load i32, *%c
+    %clt3 = slt i32 %cv6, %cols
+    br %clt3, @div_body, @row_next
+
+  @div_body:
+    %rv4 = load i32, *%r
+    %cv7 = load i32, *%c
+    %b4 = mul i32 %rv4, %cols
+    %idx3 = add i32 %b4, %cv7
+    %ep3 = gep f32, *%p, %idx3
+    %ev3 = load f32, *%ep3
+    %sv2 = load f32, *%sum
+    %dv = div f32 %ev3, %sv2
+    store f32 %dv, *%ep3
+    %cn3 = add i32 %cv7, 1
+    store i32 %cn3, *%c
+    jmp @div_cond
+
+  @row_next:
+    %rv5 = load i32, *%r
+    %rn = add i32 %rv5, 1
+    store i32 %rn, *%r
+    jmp @row_cond
+
+  @done:
+    ret void
+}
+
+// Per-row mean and 1/sqrt(var+eps).
+fun @llmone_ln_stats(x: *f32, rows: i32, cols: i32, inv_n: f32, mean: *f32, rstd: *f32) -> void {
+  @entry:
+    %r = let i32
+    %c = let i32
+    %acc = let f32
+    %var = let f32
+    store i32 0, *%r
+    jmp @row_cond
+
+  @row_cond:
+    %rv = load i32, *%r
+    %rlt = slt i32 %rv, %rows
+    br %rlt, @mean_init, @done
+
+  @mean_init:
+    store f32 0.0, *%acc
+    store i32 0, *%c
+    jmp @mean_cond
+
+  @mean_cond:
+    %cv = load i32, *%c
+    %clt = slt i32 %cv, %cols
+    br %clt, @mean_body, @mean_done
+
+  @mean_body:
+    %rv2 = load i32, *%r
+    %cv2 = load i32, *%c
+    %b = mul i32 %rv2, %cols
+    %idx = add i32 %b, %cv2
+    %xp = gep f32, *%x, %idx
+    %xv = load f32, *%xp
+    %av = load f32, *%acc
+    %na = add f32 %av, %xv
+    store f32 %na, *%acc
+    %cn = add i32 %cv2, 1
+    store i32 %cn, *%c
+    jmp @mean_cond
+
+  @mean_done:
+    %av2 = load f32, *%acc
+    %mn = mul f32 %av2, %inv_n
+    %rvi = load i32, *%r
+    %mp = gep f32, *%mean, %rvi
+    store f32 %mn, *%mp
+    store f32 0.0, *%var
+    store i32 0, *%c
+    jmp @var_cond
+
+  @var_cond:
+    %cv3 = load i32, *%c
+    %clt2 = slt i32 %cv3, %cols
+    br %clt2, @var_body, @stats_done
+
+  @var_body:
+    %rvb = load i32, *%r
+    %cv4 = load i32, *%c
+    %b2 = mul i32 %rvb, %cols
+    %idx2 = add i32 %b2, %cv4
+    %xp2 = gep f32, *%x, %idx2
+    %xv2 = load f32, *%xp2
+    %mn2 = load f32, *%mp
+    %d = sub f32 %xv2, %mn2
+    %d2 = mul f32 %d, %d
+    %vv = load f32, *%var
+    %nv = add f32 %vv, %d2
+    store f32 %nv, *%var
+    %cn2 = add i32 %cv4, 1
+    store i32 %cn2, *%c
+    jmp @var_cond
+
+  @stats_done:
+    %vv2 = load f32, *%var
+    %vg = mul f32 %vv2, %inv_n
+    %ve = add f32 %vg, 0.00001
+    %rs = call @llmone_rsqrtf(%ve)
+    %rvs = load i32, *%r
+    %rp = gep f32, *%rstd, %rvs
+    store f32 %rs, *%rp
+    %rn = add i32 %rvs, 1
+    store i32 %rn, *%r
+    jmp @row_cond
+
+  @done:
+    ret void
+}
+
+// out[r, c] = (x[r, c] - mean[r]) * rstd[r] * g[c] + b[c]
+fun @llmone_ln_apply(x: *f32, g: *f32, b: *f32, rows: i32, cols: i32, mean: *f32, rstd: *f32, out: *f32) -> void {
+  @entry:
+    %r = let i32
+    %c = let i32
+    store i32 0, *%r
+    jmp @row_cond
+
+  @row_cond:
+    %rv = load i32, *%r
+    %rlt = slt i32 %rv, %rows
+    br %rlt, @body_init, @done
+
+  @body_init:
+    store i32 0, *%c
+    jmp @cond
+
+  @cond:
+    %cv = load i32, *%c
+    %clt = slt i32 %cv, %cols
+    br %clt, @body, @row_next
+
+  @body:
+    %rv2 = load i32, *%r
+    %cv2 = load i32, *%c
+    %idx = mul i32 %rv2, %cols
+    %idx2 = add i32 %idx, %cv2
+    %xp = gep f32, *%x, %idx2
+    %xv = load f32, *%xp
+    %mp = gep f32, *%mean, %rv2
+    %mv = load f32, *%mp
+    %rp = gep f32, *%rstd, %rv2
+    %rsv = load f32, *%rp
+    %d = sub f32 %xv, %mv
+    %xh = mul f32 %d, %rsv
+    %gp = gep f32, *%g, %cv2
+    %gv = load f32, *%gp
+    %bp = gep f32, *%b, %cv2
+    %bv = load f32, *%bp
+    %t = mul f32 %xh, %gv
+    %o = add f32 %t, %bv
+    %op = gep f32, *%out, %idx2
+    store f32 %o, *%op
+    %cn = add i32 %cv2, 1
+    store i32 %cn, *%c
+    jmp @cond
+
+  @row_next:
+    %rna = load i32, *%r
+    %rn = add i32 %rna, 1
+    store i32 %rn, *%r
+    jmp @row_cond
+
+  @done:
+    ret void
+}
+
+// LayerNorm backward.
+//   dhat = dy * g ; sum1 = sum(dhat) ; sum2 = sum(dhat * xhat)
+//   dx = rstd * (dhat - (sum1 + xhat * sum2) * inv_n)
+//   dg += dy * xhat ; db += dy
+fun @llmone_ln_bwd(dy: *f32, x: *f32, g: *f32, rows: i32, cols: i32, inv_n: f32, mean: *f32, rstd: *f32, dx: *f32, dg: *f32, db: *f32) -> void {
+  @entry:
+    %r = let i32
+    %c = let i32
+    %s1 = let f32
+    %s2 = let f32
+    store i32 0, *%r
+    jmp @row_cond
+
+  @row_cond:
+    %rv = load i32, *%r
+    %rlt = slt i32 %rv, %rows
+    br %rlt, @sum_init, @done
+
+  @sum_init:
+    store f32 0.0, *%s1
+    store f32 0.0, *%s2
+    store i32 0, *%c
+    jmp @sum_cond
+
+  @sum_cond:
+    %cv = load i32, *%c
+    %clt = slt i32 %cv, %cols
+    br %clt, @sum_body, @apply_init
+
+  @sum_body:
+    %rv2 = load i32, *%r
+    %cv2 = load i32, *%c
+    %idx = mul i32 %rv2, %cols
+    %idx2 = add i32 %idx, %cv2
+    %dyp = gep f32, *%dy, %idx2
+    %dyv = load f32, *%dyp
+    %gp = gep f32, *%g, %cv2
+    %gv = load f32, *%gp
+    %dh = mul f32 %dyv, %gv
+    %xp = gep f32, *%x, %idx2
+    %xv = load f32, *%xp
+    %mp = gep f32, *%mean, %rv2
+    %mv = load f32, *%mp
+    %rp = gep f32, *%rstd, %rv2
+    %rsv = load f32, *%rp
+    %d = sub f32 %xv, %mv
+    %xh = mul f32 %d, %rsv
+    %prod = mul f32 %dh, %xh
+    %a1 = load f32, *%s1
+    %a2 = load f32, *%s2
+    %n1 = add f32 %a1, %dh
+    %n2 = add f32 %a2, %prod
+    store f32 %n1, *%s1
+    store f32 %n2, *%s2
+    %cn = add i32 %cv2, 1
+    store i32 %cn, *%c
+    jmp @sum_cond
+
+  @apply_init:
+    store i32 0, *%c
+    jmp @apply_cond
+
+  @apply_cond:
+    %cv3 = load i32, *%c
+    %clt2 = slt i32 %cv3, %cols
+    br %clt2, @apply_body, @row_next
+
+  @apply_body:
+    %rv3 = load i32, *%r
+    %cv4 = load i32, *%c
+    %idx3 = mul i32 %rv3, %cols
+    %idx4 = add i32 %idx3, %cv4
+    %dyp2 = gep f32, *%dy, %idx4
+    %dyv2 = load f32, *%dyp2
+    %gp2 = gep f32, *%g, %cv4
+    %gv2 = load f32, *%gp2
+    %dh2 = mul f32 %dyv2, %gv2
+    %xp2 = gep f32, *%x, %idx4
+    %xv2 = load f32, *%xp2
+    %mp2 = gep f32, *%mean, %rv3
+    %mv2 = load f32, *%mp2
+    %rp2 = gep f32, *%rstd, %rv3
+    %rsv2 = load f32, *%rp2
+    %d2 = sub f32 %xv2, %mv2
+    %xh2 = mul f32 %d2, %rsv2
+    %a1v = load f32, *%s1
+    %a2v = load f32, *%s2
+    %dhx = mul f32 %xh2, %a2v
+    %sp = add f32 %a1v, %dhx
+    %spn = mul f32 %sp, %inv_n
+    %inner2 = sub f32 %dh2, %spn
+    %dxv = mul f32 %rsv2, %inner2
+    %dxp = gep f32, *%dx, %idx4
+    store f32 %dxv, *%dxp
+    %dgp = gep f32, *%dg, %cv4
+    %dgv = load f32, *%dgp
+    %dgx = mul f32 %dyv2, %xh2
+    %dgn = add f32 %dgv, %dgx
+    store f32 %dgn, *%dgp
+    %dbp = gep f32, *%db, %cv4
+    %dbv = load f32, *%dbp
+    %dbn = add f32 %dbv, %dyv2
+    store f32 %dbn, *%dbp
+    %cn2 = add i32 %cv4, 1
+    store i32 %cn2, *%c
+    jmp @apply_cond
+
+  @row_next:
+    %rnb = load i32, *%r
+    %rn = add i32 %rnb, 1
+    store i32 %rn, *%r
+    jmp @row_cond
+
+  @done:
+    ret void
+}
+
+// Softmax cross entropy over full-vocabulary logits.
+// dlogits = p - onehot(tgt); *loss accumulates sum of -log p[tgt].
+fun @llmone_ce(logits: *f32, tgt: *i32, rows: i32, cols: i32, dlogits: *f32, loss: *f32) -> void {
+  @entry:
+    %r = let i32
+    %c = let i32
+    %mx = let f32
+    %sum = let f32
+    store i32 0, *%r
+    jmp @row_cond
+
+  @row_cond:
+    %rv = load i32, *%r
+    %rlt = slt i32 %rv, %rows
+    br %rlt, @max_init, @done
+
+  @max_init:
+    %base = mul i32 %rv, %cols
+    %lp = gep f32, *%logits, %base
+    %m0 = load f32, *%lp
+    store f32 %m0, *%mx
+    store i32 0, *%c
+    jmp @max_cond
+
+  @max_cond:
+    %cv = load i32, *%c
+    %clt = slt i32 %cv, %cols
+    br %clt, @max_body, @exp_init
+
+  @max_body:
+    %rv2 = load i32, *%r
+    %cv2 = load i32, *%c
+    %b = mul i32 %rv2, %cols
+    %idx = add i32 %b, %cv2
+    %ep = gep f32, *%logits, %idx
+    %ev = load f32, *%ep
+    %cur = load f32, *%mx
+    %gt = sgt f32 %ev, %cur
+    br %gt, @max_up, @max_step
+
+  @max_up:
+    store f32 %ev, *%mx
+    jmp @max_step
+
+  @max_step:
+    %cv3 = load i32, *%c
+    %cn = add i32 %cv3, 1
+    store i32 %cn, *%c
+    jmp @max_cond
+
+  @exp_init:
+    store f32 0.0, *%sum
+    store i32 0, *%c
+    jmp @exp_cond
+
+  @exp_cond:
+    %cv4 = load i32, *%c
+    %clt2 = slt i32 %cv4, %cols
+    br %clt2, @exp_body, @loss_row
+
+  @exp_body:
+    %rv3 = load i32, *%r
+    %cv5 = load i32, *%c
+    %b2 = mul i32 %rv3, %cols
+    %idx2 = add i32 %b2, %cv5
+    %lp2 = gep f32, *%logits, %idx2
+    %lv = load f32, *%lp2
+    %mv = load f32, *%mx
+    %sh = sub f32 %lv, %mv
+    %ex = call @llmone_expf(%sh)
+    %dp = gep f32, *%dlogits, %idx2
+    store f32 %ex, *%dp
+    %sv = load f32, *%sum
+    %ns = add f32 %sv, %ex
+    store f32 %ns, *%sum
+    %cn2 = add i32 %cv5, 1
+    store i32 %cn2, *%c
+    jmp @exp_cond
+
+  @loss_row:
+    // loss += max + log(sum) - logit[tgt]
+    %rv4 = load i32, *%r
+    %tp = gep i32, *%tgt, %rv4
+    %t = load i32, *%tp
+    %b3 = mul i32 %rv4, %cols
+    %ti = add i32 %b3, %t
+    %ltp = gep f32, *%logits, %ti
+    %lt = load f32, *%ltp
+    %sv2 = load f32, *%sum
+    %ls = call @llmone_logf(%sv2)
+    %mv2 = load f32, *%mx
+    %part = add f32 %mv2, %ls
+    %row_loss = sub f32 %part, %lt
+    %op = gep f32, *%loss, 0
+    %ov = load f32, *%op
+    %nl = add f32 %ov, %row_loss
+    store f32 %nl, *%op
+    store i32 0, *%c
+    jmp @div_cond
+
+  @div_cond:
+    %cv6 = load i32, *%c
+    %clt3 = slt i32 %cv6, %cols
+    br %clt3, @div_body, @row_next
+
+  @div_body:
+    %rv5 = load i32, *%r
+    %cv7 = load i32, *%c
+    %b4 = mul i32 %rv5, %cols
+    %idx3 = add i32 %b4, %cv7
+    %dp2 = gep f32, *%dlogits, %idx3
+    %ev2 = load f32, *%dp2
+    %sv3 = load f32, *%sum
+    %p = div f32 %ev2, %sv3
+    store f32 %p, *%dp2
+    %cn3 = add i32 %cv7, 1
+    store i32 %cn3, *%c
+    jmp @div_cond
+
+  @row_next:
+    // dlogits[tgt] -= 1
+    %rv6 = load i32, *%r
+    %tp2 = gep i32, *%tgt, %rv6
+    %t2 = load i32, *%tp2
+    %b5 = mul i32 %rv6, %cols
+    %ti2 = add i32 %b5, %t2
+    %tp3 = gep f32, *%dlogits, %ti2
+    %tv = load f32, *%tp3
+    %tv2 = sub f32 %tv, 1.0
+    store f32 %tv2, *%tp3
+    %rn = add i32 %rv6, 1
+    store i32 %rn, *%r
+    jmp @row_cond
+
+  @done:
+    ret void
+}
+
+// out[r, c] = x[r, c] + b[c]
+fun @llmone_bias_add(x: *f32, b: *f32, rows: i32, cols: i32) -> void {
+  @entry:
+    %r = let i32
+    %c = let i32
+    store i32 0, *%r
+    jmp @row_cond
+
+  @row_cond:
+    %rv = load i32, *%r
+    %rlt = slt i32 %rv, %rows
+    br %rlt, @cinit, @done
+
+  @cinit:
+    store i32 0, *%c
+    jmp @cond
+
+  @cond:
+    %cv = load i32, *%c
+    %clt = slt i32 %cv, %cols
+    br %clt, @body, @rnext
+
+  @body:
+    %rv2 = load i32, *%r
+    %cv2 = load i32, *%c
+    %idx = mul i32 %rv2, %cols
+    %idx2 = add i32 %idx, %cv2
+    %xp = gep f32, *%x, %idx2
+    %xv = load f32, *%xp
+    %bp = gep f32, *%b, %cv2
+    %bv = load f32, *%bp
+    %s = add f32 %xv, %bv
+    store f32 %s, *%xp
+    %cn = add i32 %cv2, 1
+    store i32 %cn, *%c
+    jmp @cond
+
+  @rnext:
+    %rnc = load i32, *%r
+    %rn = add i32 %rnc, 1
+    store i32 %rn, *%r
+    jmp @row_cond
+
+  @done:
+    ret void
+}
+
+// db[c] += sum_r dy[r, c]
+fun @llmone_bias_bwd(dy: *f32, db: *f32, rows: i32, cols: i32) -> void {
+  @entry:
+    %r = let i32
+    %c = let i32
+    store i32 0, *%r
+    jmp @row_cond
+
+  @row_cond:
+    %rv = load i32, *%r
+    %rlt = slt i32 %rv, %rows
+    br %rlt, @cinit, @done
+
+  @cinit:
+    store i32 0, *%c
+    jmp @cond
+
+  @cond:
+    %cv = load i32, *%c
+    %clt = slt i32 %cv, %cols
+    br %clt, @body, @rnext
+
+  @body:
+    %rv2 = load i32, *%r
+    %cv2 = load i32, *%c
+    %idx = mul i32 %rv2, %cols
+    %idx2 = add i32 %idx, %cv2
+    %yp = gep f32, *%dy, %idx2
+    %yv = load f32, *%yp
+    %bp = gep f32, *%db, %cv2
+    %bv = load f32, *%bp
+    %s = add f32 %bv, %yv
+    store f32 %s, *%bp
+    %cn = add i32 %cv2, 1
+    store i32 %cn, *%c
+    jmp @cond
+
+  @rnext:
+    %rnd = load i32, *%r
+    %rn = add i32 %rnd, 1
+    store i32 %rn, *%r
+    jmp @row_cond
+
+  @done:
+    ret void
+}
+
+// Softmax backward: converts incoming d(out) in *%ds into d(pre-softmax)
+// using the stored probabilities in *%p. In place.
+fun @llmone_softmax_bwd(p: *f32, ds: *f32, rows: i32, cols: i32) -> void {
+  @entry:
+    %r = let i32
+    %c = let i32
+    %dot = let f32
+    store i32 0, *%r
+    jmp @row_cond
+
+  @row_cond:
+    %rv = load i32, *%r
+    %rlt = slt i32 %rv, %rows
+    br %rlt, @dot_init, @done
+
+  @dot_init:
+    store f32 0.0, *%dot
+    store i32 0, *%c
+    jmp @dot_cond
+
+  @dot_cond:
+    %cv = load i32, *%c
+    %clt = slt i32 %cv, %cols
+    br %clt, @dot_body, @apply_init
+
+  @dot_body:
+    %rv2 = load i32, *%r
+    %cv2 = load i32, *%c
+    %b = mul i32 %rv2, %cols
+    %idx = add i32 %b, %cv2
+    %pp = gep f32, *%p, %idx
+    %pv = load f32, *%pp
+    %dp = gep f32, *%ds, %idx
+    %dv = load f32, *%dp
+    %prod = mul f32 %pv, %dv
+    %av = load f32, *%dot
+    %nv = add f32 %av, %prod
+    store f32 %nv, *%dot
+    %cn = add i32 %cv2, 1
+    store i32 %cn, *%c
+    jmp @dot_cond
+
+  @apply_init:
+    store i32 0, *%c
+    jmp @apply_cond
+
+  @apply_cond:
+    %cv3 = load i32, *%c
+    %clt2 = slt i32 %cv3, %cols
+    br %clt2, @apply_body, @row_next
+
+  @apply_body:
+    %rv3 = load i32, *%r
+    %cv4 = load i32, *%c
+    %b2 = mul i32 %rv3, %cols
+    %idx2 = add i32 %b2, %cv4
+    %pp2 = gep f32, *%p, %idx2
+    %pv2 = load f32, *%pp2
+    %dp2 = gep f32, *%ds, %idx2
+    %dv2 = load f32, *%dp2
+    %av2 = load f32, *%dot
+    %sub = sub f32 %dv2, %av2
+    %res = mul f32 %pv2, %sub
+    store f32 %res, *%dp2
+    %cn2 = add i32 %cv4, 1
+    store i32 %cn2, *%c
+    jmp @apply_cond
+
+  @row_next:
+    %rnb = load i32, *%r
+    %rn = add i32 %rnb, 1
+    store i32 %rn, *%r
+    jmp @row_cond
+
+  @done:
+    ret void
+}
+
+// dst[i] = gelu(src[i])
+fun @llmone_gelu_apply(src: *f32, dst: *f32, n: i32) -> void {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @cond
+
+  @cond:
+    %iv = load i32, *%i
+    %lt = slt i32 %iv, %n
+    br %lt, @body, @done
+
+  @body:
+    %sp = gep f32, *%src, %iv
+    %v = load f32, *%sp
+    %g = call @llmone_gelu(%v)
+    %dp = gep f32, *%dst, %iv
+    store f32 %g, *%dp
+    %next = add i32 %iv, 1
+    store i32 %next, *%i
+    jmp @cond
+
+  @done:
+    ret void
+}
+
+// dst[i] = dst[i] * gelu'(src[i])
+fun @llmone_gelu_bwd_apply(dst: *f32, src: *f32, n: i32) -> void {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @cond
+
+  @cond:
+    %iv = load i32, *%i
+    %lt = slt i32 %iv, %n
+    br %lt, @body, @done
+
+  @body:
+    %sp = gep f32, *%src, %iv
+    %v = load f32, *%sp
+    %d = call @llmone_gelu_bwd(%v)
+    %dp = gep f32, *%dst, %iv
+    %dv = load f32, *%dp
+    %r = mul f32 %dv, %d
+    store f32 %r, *%dp
+    %next = add i32 %iv, 1
+    store i32 %next, *%i
+    jmp @cond
+
+  @done:
+    ret void
+}
+
+// dst[r, c] = src[r, col_off + c]
+fun @llmone_gather_cols(dst: *f32, src: *f32, rows: i32, src_cols: i32, col_off: i32, cols: i32) -> void {
+  @entry:
+    %r = let i32
+    %c = let i32
+    store i32 0, *%r
+    jmp @rcond
+
+  @rcond:
+    %rv = load i32, *%r
+    %rlt = slt i32 %rv, %rows
+    br %rlt, @cinit, @done
+
+  @cinit:
+    store i32 0, *%c
+    jmp @ccond
+
+  @ccond:
+    %cv = load i32, *%c
+    %clt = slt i32 %cv, %cols
+    br %clt, @body, @rnext
+
+  @body:
+    %rv2 = load i32, *%r
+    %cv2 = load i32, *%c
+    %srow = mul i32 %rv2, %src_cols
+    %sidx = add i32 %srow, %col_off
+    %sidx2 = add i32 %sidx, %cv2
+    %sp = gep f32, *%src, %sidx2
+    %v = load f32, *%sp
+    %drow = mul i32 %rv2, %cols
+    %didx = add i32 %drow, %cv2
+    %dp = gep f32, *%dst, %didx
+    store f32 %v, *%dp
+    %cn = add i32 %cv2, 1
+    store i32 %cn, *%c
+    jmp @ccond
+
+  @rnext:
+    %rng = load i32, *%r
+    %rn = add i32 %rng, 1
+    store i32 %rn, *%r
+    jmp @rcond
+
+  @done:
+    ret void
+}
+
+// dst[r, col_off + c] = src[r, c]
+fun @llmone_scatter_cols(dst: *f32, src: *f32, rows: i32, dst_cols: i32, col_off: i32, cols: i32) -> void {
+  @entry:
+    %r = let i32
+    %c = let i32
+    store i32 0, *%r
+    jmp @rcond
+
+  @rcond:
+    %rv = load i32, *%r
+    %rlt = slt i32 %rv, %rows
+    br %rlt, @cinit, @done
+
+  @cinit:
+    store i32 0, *%c
+    jmp @ccond
+
+  @ccond:
+    %cv = load i32, *%c
+    %clt = slt i32 %cv, %cols
+    br %clt, @body, @rnext
+
+  @body:
+    %rv2 = load i32, *%r
+    %cv2 = load i32, *%c
+    %sidx = mul i32 %rv2, %cols
+    %sidx2 = add i32 %sidx, %cv2
+    %sp = gep f32, *%src, %sidx2
+    %v = load f32, *%sp
+    %drow = mul i32 %rv2, %dst_cols
+    %didx = add i32 %drow, %col_off
+    %didx2 = add i32 %didx, %cv2
+    %dp = gep f32, *%dst, %didx2
+    store f32 %v, *%dp
+    %cn = add i32 %cv2, 1
+    store i32 %cn, *%c
+    jmp @ccond
+
+  @rnext:
+    %rns = load i32, *%r
+    %rn = add i32 %rns, 1
+    store i32 %rn, *%r
+    jmp @rcond
+
+  @done:
+    ret void
+}
+
+// dst[t, c] = wte[token[t], c] + wpe[t, c]
+fun @llmone_emb_fwd(dst: *f32, wte: *f32, wpe: *f32, x: *i32, T: i32, D: i32) -> void {
+  @entry:
+    %t = let i32
+    %c = let i32
+    store i32 0, *%t
+    jmp @tcond
+
+  @tcond:
+    %tv = load i32, *%t
+    %tlt = slt i32 %tv, %T
+    br %tlt, @cinit, @done
+
+  @cinit:
+    store i32 0, *%c
+    jmp @ccond
+
+  @ccond:
+    %cv = load i32, *%c
+    %clt = slt i32 %cv, %D
+    br %clt, @body, @tnext
+
+  @body:
+    %tv2 = load i32, *%t
+    %cv2 = load i32, *%c
+    %tp = gep i32, *%x, %tv2
+    %tok = load i32, *%tp
+    %row = mul i32 %tok, %D
+    %widx = add i32 %row, %cv2
+    %wp = gep f32, *%wte, %widx
+    %wv = load f32, *%wp
+    %pidx = mul i32 %tv2, %D
+    %pidx2 = add i32 %pidx, %cv2
+    %pp = gep f32, *%wpe, %pidx2
+    %pv = load f32, *%pp
+    %sum = add f32 %wv, %pv
+    %dp = gep f32, *%dst, %pidx2
+    store f32 %sum, *%dp
+    %cn = add i32 %cv2, 1
+    store i32 %cn, *%c
+    jmp @ccond
+
+  @tnext:
+    %tne = load i32, *%t
+    %tn = add i32 %tne, 1
+    store i32 %tn, *%t
+    jmp @tcond
+
+  @done:
+    ret void
+}
+
+// dWTE[token[t], c] += demb[t, c]
+fun @llmone_emb_bwd(gwte: *f32, demb: *f32, x: *i32, T: i32, D: i32) -> void {
+  @entry:
+    %t = let i32
+    %c = let i32
+    store i32 0, *%t
+    jmp @tcond
+
+  @tcond:
+    %tv = load i32, *%t
+    %tlt = slt i32 %tv, %T
+    br %tlt, @cinit, @done
+
+  @cinit:
+    store i32 0, *%c
+    jmp @ccond
+
+  @ccond:
+    %cv = load i32, *%c
+    %clt = slt i32 %cv, %D
+    br %clt, @body, @tnext
+
+  @body:
+    %tv2 = load i32, *%t
+    %cv2 = load i32, *%c
+    %tp = gep i32, *%x, %tv2
+    %tok = load i32, *%tp
+    %row = mul i32 %tok, %D
+    %widx = add i32 %row, %cv2
+    %wp = gep f32, *%gwte, %widx
+    %wv = load f32, *%wp
+    %pidx = mul i32 %tv2, %D
+    %pidx2 = add i32 %pidx, %cv2
+    %dp = gep f32, *%demb, %pidx2
+    %dv = load f32, *%dp
+    %sum = add f32 %wv, %dv
+    store f32 %sum, *%wp
+    %cn = add i32 %cv2, 1
+    store i32 %cn, *%c
+    jmp @ccond
+
+  @tnext:
+    %tne = load i32, *%t
+    %tn = add i32 %tne, 1
+    store i32 %tn, *%t
+    jmp @tcond
+
+  @done:
+    ret void
+}
+
+// dst[i] = base[i] + inc[i]
+fun @llmone_add3(dst: *f32, base: *f32, inc: *f32, n: i32) -> void {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @cond
+
+  @cond:
+    %iv = load i32, *%i
+    %lt = slt i32 %iv, %n
+    br %lt, @body, @done
+
+  @body:
+    %bp = gep f32, *%base, %iv
+    %bv = load f32, *%bp
+    %ap = gep f32, *%inc, %iv
+    %av = load f32, *%ap
+    %s = add f32 %bv, %av
+    %dp = gep f32, *%dst, %iv
+    store f32 %s, *%dp
+    %next = add i32 %iv, 1
+    store i32 %next, *%i
+    jmp @cond
+
+  @done:
+    ret void
+}
+
+fun @llmone_argmax(p: *f32, n: i32) -> i32 {
+  @entry:
+    %i = let i32
+    %best = let i32
+    %bv = let f32
+    store i32 0, *%i
+    store i32 0, *%best
+    %p0 = gep f32, *%p, 0
+    %v0 = load f32, *%p0
+    store f32 %v0, *%bv
+    store i32 1, *%i
+    jmp @cond
+
+  @cond:
+    %iv = load i32, *%i
+    %lt = slt i32 %iv, %n
+    br %lt, @body, @done
+
+  @body:
+    %pp = gep f32, *%p, %iv
+    %v = load f32, *%pp
+    %cur = load f32, *%bv
+    %gt = sgt f32 %v, %cur
+    br %gt, @upd, @next
+
+  @upd:
+    store f32 %v, *%bv
+    store i32 %iv, *%best
+    jmp @next
+
+  @next:
+    %iv2 = load i32, *%i
+    %in = add i32 %iv2, 1
+    store i32 %in, *%i
+    jmp @cond
+
+  @done:
+    %r = load i32, *%best
+    ret i32 %r
+}
+
+// Adam update for one parameter array.
+fun @llmone_adam(p: *f32, g: *f32, m: *f32, v: *f32, n: i32, lr: f32, beta1: f32, beta2: f32, bc1: f32, bc2: f32) -> void {
+  @entry:
+    %i = let i32
+    %one_m_b1 = sub f32 1.0, %beta1
+    %one_m_b2 = sub f32 1.0, %beta2
+    store i32 0, *%i
+    jmp @cond
+
+  @cond:
+    %iv = load i32, *%i
+    %lt = slt i32 %iv, %n
+    br %lt, @body, @done
+
+  @body:
+    %gp = gep f32, *%g, %iv
+    %gv = load f32, *%gp
+    %mp = gep f32, *%m, %iv
+    %mv = load f32, *%mp
+    %vp = gep f32, *%v, %iv
+    %vv = load f32, *%vp
+    %m1 = mul f32 %mv, %beta1
+    %g1 = mul f32 %gv, %one_m_b1
+    %mn = add f32 %m1, %g1
+    %v1 = mul f32 %vv, %beta2
+    %gg = mul f32 %gv, %gv
+    %g2 = mul f32 %gg, %one_m_b2
+    %vn = add f32 %v1, %g2
+    store f32 %mn, *%mp
+    store f32 %vn, *%vp
+    %mh = div f32 %mn, %bc1
+    %vh = div f32 %vn, %bc2
+    %sq = call @llmone_sqrtf(%vh)
+    %eps = add f32 %sq, 0.00000001
+    %step = div f32 %lr, %eps
+    %delta = mul f32 %mh, %step
+    %pp = gep f32, *%p, %iv
+    %pv = load f32, *%pp
+    %pn = sub f32 %pv, %delta
+    store f32 %pn, *%pp
+    %next = add i32 %iv, 1
+    store i32 %next, *%i
+    jmp @cond
+
+  @done:
+    ret void
+}
+
+// g[i] = 0
+fun @llmone_zero(g: *f32, n: i32) -> void {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @cond
+
+  @cond:
+    %iv = load i32, *%i
+    %lt = slt i32 %iv, %n
+    br %lt, @body, @done
+
+  @body:
+    %gp = gep f32, *%g, %iv
+    store f32 0.0, *%gp
+    %next = add i32 %iv, 1
+    store i32 %next, *%i
+    jmp @cond
+
+  @done:
+    ret void
+}
+
+fun @llmone_absf(x: f32) -> f32 {
+  @entry:
+    %neg = slt f32 %x, 0.0
+    br %neg, @flip, @keep
+
+  @flip:
+    %z = sub f32 0.0, %x
+    ret f32 %z
+
+  @keep:
+    ret f32 %x
+}
+
+fun @llmone_zero_i32(p: *i32, n: i32) -> void {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @cond
+
+  @cond:
+    %iv = load i32, *%i
+    %lt = slt i32 %iv, %n
+    br %lt, @body, @done
+
+  @body:
+    %pp = gep i32, *%p, %iv
+    store i32 0, *%pp
+    %next = add i32 %iv, 1
+    store i32 %next, *%i
+    jmp @cond
+
+  @done:
+    ret void
+}
+
+// x[i] = x[i+1] for i in 0..n-2
+fun @llmone_shift_left(x: *i32, n: i32) -> void {
+  @entry:
+    %i = let i32
+    %lm1 = sub i32 %n, 1
+    store i32 0, *%i
+    jmp @cond
+
+  @cond:
+    %iv = load i32, *%i
+    %lt = slt i32 %iv, %lm1
+    br %lt, @body, @done
+
+  @body:
+    %iv2 = load i32, *%i
+    %n1 = add i32 %iv2, 1
+    %sp = gep i32, *%x, %n1
+    %v = load i32, *%sp
+    %dp = gep i32, *%x, %iv2
+    store i32 %v, *%dp
+    %next = add i32 %iv2, 1
+    store i32 %next, *%i
+    jmp @cond
+
+  @done:
+    ret void
+}
+
+// Copy the NUL-terminated prompt bytes into x as tokens; the caller zeroes
+// the rest. Returns the number of tokens copied.
+fun @llmone_load_prompt(x: *i32, s: *i8, T: i32) -> i32 {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @cond
+
+  @cond:
+    %iv = load i32, *%i
+    %lt = slt i32 %iv, %T
+    br %lt, @body, @full
+
+  @body:
+    %sp = gep i8, *%s, %iv
+    %ch = load i8, *%sp
+    %nul = eq i8 %ch, 0
+    br %nul, @stop, @copy
+
+  @copy:
+    %cv = zext i8 %ch to i32
+    %xp = gep i32, *%x, %iv
+    store i32 %cv, *%xp
+    %inc = add i32 %iv, 1
+    store i32 %inc, *%i
+    jmp @cond
+
+  @stop:
+    ret i32 %iv
+
+  @full:
+    ret i32 %T
+}
+
+// Zero out attention to future positions before softmax.
+fun @llmone_causal_mask(p: *f32, rows: i32, cols: i32) -> void {
+  @entry:
+    %i = let i32
+    %j = let i32
+    store i32 0, *%i
+    jmp @i_cond
+
+  @i_cond:
+    %iv = load i32, *%i
+    %ilt = slt i32 %iv, %rows
+    br %ilt, @i_body, @done
+
+  @i_body:
+    store i32 0, *%j
+    jmp @j_cond
+
+  @j_cond:
+    %jv = load i32, *%j
+    %jlt = slt i32 %jv, %cols
+    br %jlt, @j_body, @i_next
+
+  @j_body:
+    %iv2 = load i32, *%i
+    %jv2 = load i32, *%j
+    %future = sgt i32 %jv2, %iv2
+    br %future, @mask, @j_next
+
+  @mask:
+    %iv3 = load i32, *%i
+    %jv3 = load i32, *%j
+    %row = mul i32 %iv3, %cols
+    %idx = add i32 %row, %jv3
+    %pp = gep f32, *%p, %idx
+    store f32 -1000000.0, *%pp
+    jmp @j_next
+
+  @j_next:
+    %jv4 = load i32, *%j
+    %jn = add i32 %jv4, 1
+    store i32 %jn, *%j
+    jmp @j_cond
+
+  @i_next:
+    %iv4 = load i32, *%i
+    %in = add i32 %iv4, 1
+    store i32 %in, *%i
+    jmp @i_cond
+
+  @done:
+    ret void
+}

@@ -1,0 +1,123 @@
+// numone array/linalg — transpose and the scalar matmul reference.
+
+// dst is [cols, rows]: dst[c * rows + r] = src[r * cols + c]
+fun @numone_transpose(dst: *f32, src: *f32, rows: i32, cols: i32) -> void {
+  @entry:
+    %r = let i32
+    %c = let i32
+    store i32 0, *%r
+    jmp @row_loop
+
+  @row_loop:
+    %rv = load i32, *%r
+    %rlt = slt i32 %rv, %rows
+    br %rlt, @row_body, @done
+
+  @row_body:
+    store i32 0, *%c
+    jmp @col_loop
+
+  @col_loop:
+    %cv = load i32, *%c
+    %clt = slt i32 %cv, %cols
+    br %clt, @col_body, @row_next
+
+  @col_body:
+    %rv2 = load i32, *%r
+    %cv2 = load i32, *%c
+    %si = mul i32 %rv2, %cols
+    %sid = add i32 %si, %cv2
+    %sp = gep f32, *%src, %sid
+    %v = load f32, *%sp
+    %di = mul i32 %cv2, %rows
+    %did = add i32 %di, %rv2
+    %dp = gep f32, *%dst, %did
+    store f32 %v, *%dp
+    %cnext = add i32 %cv2, 1
+    store i32 %cnext, *%c
+    jmp @col_loop
+
+  @row_next:
+    %rv3 = load i32, *%r
+    %rnext = add i32 %rv3, 1
+    store i32 %rnext, *%r
+    jmp @row_loop
+
+  @done:
+    ret void
+}
+
+// dst is [m, n], a is [m, k], b is [k, n].
+fun @numone_matmul_scalar(dst: *f32, a: *f32, b: *f32, m: i32, k: i32, n: i32) -> void {
+  @entry:
+    %r = let i32
+    %c = let i32
+    %i = let i32
+    %acc = let f32
+    store i32 0, *%r
+    jmp @row_loop
+
+  @row_loop:
+    %rv = load i32, *%r
+    %rlt = slt i32 %rv, %m
+    br %rlt, @row_body, @done
+
+  @row_body:
+    store i32 0, *%c
+    jmp @col_loop
+
+  @col_loop:
+    %cv = load i32, *%c
+    %clt = slt i32 %cv, %n
+    br %clt, @col_body, @row_next
+
+  @col_body:
+    store f32 0.0, *%acc
+    store i32 0, *%i
+    jmp @k_loop
+
+  @k_loop:
+    %iv = load i32, *%i
+    %klt = slt i32 %iv, %k
+    br %klt, @k_body, @store_cell
+
+  @k_body:
+    %rv2 = load i32, *%r
+    %cv2 = load i32, *%c
+    %aoff = mul i32 %rv2, %k
+    %aidx = add i32 %aoff, %iv
+    %ap = gep f32, *%a, %aidx
+    %av = load f32, *%ap
+    %boff = mul i32 %iv, %n
+    %bidx = add i32 %boff, %cv2
+    %bp = gep f32, *%b, %bidx
+    %bv = load f32, *%bp
+    %prod = mul f32 %av, %bv
+    %sumv = load f32, *%acc
+    %sum = add f32 %sumv, %prod
+    store f32 %sum, *%acc
+    %inext = add i32 %iv, 1
+    store i32 %inext, *%i
+    jmp @k_loop
+
+  @store_cell:
+    %rv3 = load i32, *%r
+    %cv3 = load i32, *%c
+    %doff = mul i32 %rv3, %n
+    %didx = add i32 %doff, %cv3
+    %dp = gep f32, *%dst, %didx
+    %accv = load f32, *%acc
+    store f32 %accv, *%dp
+    %cnext = add i32 %cv3, 1
+    store i32 %cnext, *%c
+    jmp @col_loop
+
+  @row_next:
+    %rv4 = load i32, *%r
+    %rnext = add i32 %rv4, 1
+    store i32 %rnext, *%r
+    jmp @row_loop
+
+  @done:
+    ret void
+}

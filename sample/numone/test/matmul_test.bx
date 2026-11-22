@@ -1,0 +1,89 @@
+// numone test/matmul — tensor matmul vs the scalar reference.
+
+extern @numone_matmul_2x2(dst: *f32, a: *f32, b: *f32) -> void
+extern @numone_matmul_2x3x2(dst: *f32, a: *f32, b: *f32) -> void
+extern @numone_matmul_scalar(dst: *f32, a: *f32, b: *f32, m: i32, k: i32, n: i32) -> void
+extern @numone_transpose(dst: *f32, src: *f32, rows: i32, cols: i32) -> void
+extern @numone_equal(a: *f32, b: *f32, n: i32) -> i32
+
+extern @numone_report(name: *i8, ok: i32) -> i32
+extern @numone_seq(a: *f32, start: f32, step: f32, n: i32) -> void
+extern @numone_put4(a: *f32, v0: f32, v1: f32, v2: f32, v3: f32) -> void
+extern @numone_put6(a: *f32, v0: f32, v1: f32, v2: f32, v3: f32, v4: f32, v5: f32) -> void
+
+// [[1, 2], [3, 4]] x [[5, 6], [7, 8]] = [[19, 22], [43, 50]]
+fun @numone_test_matmul_2x2() -> i32 {
+  @entry:
+    %a = let [f32, 4]
+    %b = let [f32, 4]
+    %c = let [f32, 4]
+    %e = let [f32, 4]
+    %ap = gep f32, *%a, 0
+    %bp = gep f32, *%b, 0
+    %cp = gep f32, *%c, 0
+    %ep = gep f32, *%e, 0
+    call @numone_seq(%ap, 1.0, 1.0, 4)
+    call @numone_seq(%bp, 5.0, 1.0, 4)
+    call @numone_put4(%ep, 19.0, 22.0, 43.0, 50.0)
+    call @numone_matmul_2x2(%cp, %ap, %bp)
+    %ok = call @numone_equal(%cp, %ep, 4)
+    %r0 = call @numone_report("tensor matmul 2x2", %ok)
+    ret i32 %r0
+}
+
+// 2x3 times 3x2: [[1..6]] x [[7..12]] = [[58, 64], [139, 154]]
+fun @numone_test_matmul_2x3x2() -> i32 {
+  @entry:
+    %a = let [f32, 6]
+    %b = let [f32, 6]
+    %c = let [f32, 4]
+    %e = let [f32, 4]
+    %ap = gep f32, *%a, 0
+    %bp = gep f32, *%b, 0
+    %cp = gep f32, *%c, 0
+    %ep = gep f32, *%e, 0
+    call @numone_seq(%ap, 1.0, 1.0, 6)
+    call @numone_seq(%bp, 7.0, 1.0, 6)
+    call @numone_put4(%ep, 58.0, 64.0, 139.0, 154.0)
+    call @numone_matmul_2x3x2(%cp, %ap, %bp)
+    %ok = call @numone_equal(%cp, %ep, 4)
+    %r1 = call @numone_report("tensor matmul 2x3x2", %ok)
+    ret i32 %r1
+}
+
+// The kernel and the scalar loop must agree bit for bit.
+fun @numone_test_matmul_scalar_cross() -> i32 {
+  @entry:
+    %a = let [f32, 6]
+    %b = let [f32, 6]
+    %c = let [f32, 4]
+    %s = let [f32, 4]
+    %ap = gep f32, *%a, 0
+    %bp = gep f32, *%b, 0
+    %cp = gep f32, *%c, 0
+    %sp = gep f32, *%s, 0
+    call @numone_seq(%ap, 1.0, 1.0, 6)
+    call @numone_seq(%bp, 7.0, 1.0, 6)
+    call @numone_matmul_2x3x2(%cp, %ap, %bp)
+    call @numone_matmul_scalar(%sp, %ap, %bp, 2, 3, 2)
+    %ok = call @numone_equal(%cp, %sp, 4)
+    %r2 = call @numone_report("tensor matmul == scalar matmul", %ok)
+    ret i32 %r2
+}
+
+// 2x3 transposed is 3x2: [[1, 2, 3], [4, 5, 6]] -> [[1, 4], [2, 5], [3, 6]]
+fun @numone_test_transpose() -> i32 {
+  @entry:
+    %src = let [f32, 6]
+    %dst = let [f32, 6]
+    %e = let [f32, 6]
+    %sp = gep f32, *%src, 0
+    %dp = gep f32, *%dst, 0
+    %ep = gep f32, *%e, 0
+    call @numone_seq(%sp, 1.0, 1.0, 6)
+    call @numone_put6(%ep, 1.0, 4.0, 2.0, 5.0, 3.0, 6.0)
+    call @numone_transpose(%dp, %sp, 2, 3)
+    %ok = call @numone_equal(%dp, %ep, 6)
+    %r3 = call @numone_report("transpose 2x3 -> 3x2", %ok)
+    ret i32 %r3
+}

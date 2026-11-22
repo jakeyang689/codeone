@@ -1,0 +1,111 @@
+// Cross-check: the `tensor` matmul that llmone's model uses, against
+// numone's scalar reference loop (sample/numone/array/linalg.bx).
+
+extern @printf(fmt: *i8, ...) -> i32
+extern @numone_matmul_scalar(dst: *f32, a: *f32, b: *f32, m: i32, k: i32, n: i32) -> void
+
+
+fun @llmone_test_matmul_8(dst: *f32, a: *f32, b: *f32) -> void {
+  @entry:
+    tensor matmul, f32, [8, 8, 8], *%dst, *%a, *%b
+    ret void
+}
+
+fun @near(a: f32, b: f32, eps: f32) -> i32 {
+  @entry:
+    %d = sub f32 %a, %b
+    %neg = slt f32 %d, 0.0
+    br %neg, @flip, @cmp
+
+  @flip:
+    %z = sub f32 0.0, %d
+    %ok0 = slt f32 %z, %eps
+    br %ok0, @yes, @no
+
+  @cmp:
+    %ok1 = slt f32 %d, %eps
+    br %ok1, @yes, @no
+
+  @yes:
+    ret i32 1
+
+  @no:
+    ret i32 0
+}
+
+fun @main() -> i32 {
+  @entry:
+    %d1 = let [f32, 64]
+    %d2 = let [f32, 64]
+    %a = let [f32, 64]
+    %b = let [f32, 64]
+    %i = let i32
+    %bad = let i32
+    %av = let f32
+    %bv = let f32
+    %ap = gep f32, *%a, 0
+    %bp = gep f32, *%b, 0
+    store i32 0, *%i
+    store f32 0.0, *%av
+    store f32 3.9375, *%bv
+    jmp @fill_cond
+
+  @fill_cond:
+    %fiv = load i32, *%i
+    %flt = slt i32 %fiv, 64
+    br %flt, @fill_body, @mm
+
+  @fill_body:
+    %fav = load f32, *%av
+    %fap = gep f32, *%a, %fiv
+    store f32 %fav, *%fap
+    %anv = add f32 %fav, 0.125
+    store f32 %anv, *%av
+    %fbv = load f32, *%bv
+    %fbp = gep f32, *%b, %fiv
+    store f32 %fbv, *%fbp
+    %bnv = sub f32 %fbv, 0.0625
+    store f32 %bnv, *%bv
+    %fnx = add i32 %fiv, 1
+    store i32 %fnx, *%i
+    jmp @fill_cond
+
+  @mm:
+    call @llmone_test_matmul_8(%d1, %ap, %bp)
+    call @numone_matmul_scalar(%d2, %ap, %bp, 8, 8, 8)
+    store i32 0, *%bad
+    store i32 0, *%i
+    jmp @cond
+
+  @cond:
+    %iv = load i32, *%i
+    %lt = slt i32 %iv, 64
+    br %lt, @body, @done
+
+  @body:
+    %p1 = gep f32, *%d1, %iv
+    %p2 = gep f32, *%d2, %iv
+    %v1 = load f32, *%p1
+    %v2 = load f32, *%p2
+    %ok = call @near(%v1, %v2, 0.0001)
+    %inv = sub i32 1, %ok
+    %bcur = load i32, *%bad
+    %nb = add i32 %bcur, %inv
+    store i32 %nb, *%bad
+    %nxt = add i32 %iv, 1
+    store i32 %nxt, *%i
+    jmp @cond
+
+  @done:
+    %badn = load i32, *%bad
+    %zero = eq i32 %badn, 0
+    br %zero, @pass, @fail
+
+  @pass:
+    call @printf("PASS tensor_matmul_vs_numone\n")
+    ret i32 0
+
+  @fail:
+    call @printf("FAIL tensor_matmul_vs_numone: %d mismatched cells\n", %badn)
+    ret i32 1
+}

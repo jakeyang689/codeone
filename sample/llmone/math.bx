@@ -1,0 +1,242 @@
+// llmone math — floating-point kernels built without a math library.
+//
+// SSA has no math intrinsics and no int<->float conversion, so everything here
+// is built from f32 add/sub/mul/div, f32 compares and integer loops:
+//   exp   x/64 range reduction + degree-10 Taylor + six squarings
+//   log   exponent loop (scale into [1,2)) + atanh series
+//   sqrt  Newton iteration starting from x (x >= 1) or 1
+//   gelu  tanh approximation, tanh from exp
+// Reciprocal counts are passed in as f32 where a division by an i32 size is
+// needed (layernorm).
+
+fun @llmone_expf(x: f32) -> f32 {
+  @entry:
+    %low = slt f32 %x, -60.0
+    br %low, @under, @poly
+
+  @under:
+    ret f32 0.0
+
+  @poly:
+    %t = mul f32 %x, 0.015625
+    %p1 = mul f32 0.00000027557319, %t
+    %p2 = add f32 %p1, 0.00000275573192
+    %p3 = mul f32 %p2, %t
+    %p4 = add f32 %p3, 0.0000248015873
+    %p5 = mul f32 %p4, %t
+    %p6 = add f32 %p5, 0.000198412698
+    %p7 = mul f32 %p6, %t
+    %p8 = add f32 %p7, 0.00138888889
+    %p9 = mul f32 %p8, %t
+    %p10 = add f32 %p9, 0.008333333333
+    %p11 = mul f32 %p10, %t
+    %p12 = add f32 %p11, 0.041666666667
+    %p13 = mul f32 %p12, %t
+    %p14 = add f32 %p13, 0.166666666667
+    %p15 = mul f32 %p14, %t
+    %p16 = add f32 %p15, 0.5
+    %p17 = mul f32 %p16, %t
+    %p18 = add f32 %p17, 1.0
+    %p19 = mul f32 %p18, %t
+    %p20 = add f32 %p19, 1.0
+    %s2 = mul f32 %p20, %p20
+    %s4 = mul f32 %s2, %s2
+    %s8 = mul f32 %s4, %s4
+    %s16 = mul f32 %s8, %s8
+    %s32 = mul f32 %s16, %s16
+    %s64 = mul f32 %s32, %s32
+    ret f32 %s64
+}
+
+fun @llmone_logf(x: f32) -> f32 {
+  @entry:
+    %m = let f32
+    %k = let f32
+    store f32 %x, *%m
+    store f32 0.0, *%k
+    %nonpos = sle f32 %x, 0.0
+    br %nonpos, @zero, @hi_cond
+
+  @zero:
+    ret f32 -100.0
+
+  @hi_cond:
+    %mv = load f32, *%m
+    %hige = sge f32 %mv, 2.0
+    br %hige, @hi_body, @lo_cond
+
+  @hi_body:
+    %mv2 = load f32, *%m
+    %mh = mul f32 %mv2, 0.5
+    store f32 %mh, *%m
+    %kv = load f32, *%k
+    %k1 = add f32 %kv, 1.0
+    store f32 %k1, *%k
+    jmp @hi_cond
+
+  @lo_cond:
+    %mv3 = load f32, *%m
+    %lolt = slt f32 %mv3, 1.0
+    br %lolt, @lo_body, @series
+
+  @lo_body:
+    %mv4 = load f32, *%m
+    %m2 = mul f32 %mv4, 2.0
+    store f32 %m2, *%m
+    %kv2 = load f32, *%k
+    %k2 = sub f32 %kv2, 1.0
+    store f32 %k2, *%k
+    jmp @lo_cond
+
+  @series:
+    // log(m) = 2 * atanh((m-1)/(m+1)), |u| <= 1/3
+    %mv5 = load f32, *%m
+    %num = sub f32 %mv5, 1.0
+    %den = add f32 %mv5, 1.0
+    %u = div f32 %num, %den
+    %u2 = mul f32 %u, %u
+    %t3 = mul f32 %u, %u2
+    %d3 = div f32 %t3, 3.0
+    %s3 = add f32 %u, %d3
+    %t5 = mul f32 %t3, %u2
+    %d5 = div f32 %t5, 5.0
+    %s5 = add f32 %s3, %d5
+    %t7 = mul f32 %t5, %u2
+    %d7 = div f32 %t7, 7.0
+    %s7 = add f32 %s5, %d7
+    %t9 = mul f32 %t7, %u2
+    %d9 = div f32 %t9, 9.0
+    %s9 = add f32 %s7, %d9
+    %t11 = mul f32 %t9, %u2
+    %d11 = div f32 %t11, 11.0
+    %s11 = add f32 %s9, %d11
+    %t13 = mul f32 %t11, %u2
+    %d13 = div f32 %t13, 13.0
+    %s13 = add f32 %s11, %d13
+    %two = mul f32 %s13, 2.0
+    %kk = load f32, *%k
+    %kl = mul f32 %kk, 0.693147181
+    %res = add f32 %two, %kl
+    ret f32 %res
+}
+
+fun @llmone_sqrtf(x: f32) -> f32 {
+  @entry:
+    %y = let f32
+    %i = let i32
+    %nonpos = sle f32 %x, 0.0
+    br %nonpos, @zero, @init
+
+  @zero:
+    ret f32 0.0
+
+  @init:
+    %big = sgt f32 %x, 1.0
+    br %big, @from_x, @from_one
+
+  @from_x:
+    store f32 %x, *%y
+    jmp @iter_init
+
+  @from_one:
+    store f32 1.0, *%y
+    jmp @iter_init
+
+  @iter_init:
+    store i32 0, *%i
+    jmp @iter_cond
+
+  @iter_cond:
+    %iv = load i32, *%i
+    %lt = slt i32 %iv, 40
+    br %lt, @iter_body, @done
+
+  @iter_body:
+    %yv = load f32, *%y
+    %q = div f32 %x, %yv
+    %sum = add f32 %yv, %q
+    %nh = mul f32 %sum, 0.5
+    store f32 %nh, *%y
+    %next = add i32 %iv, 1
+    store i32 %next, *%i
+    jmp @iter_cond
+
+  @done:
+    %r = load f32, *%y
+    ret f32 %r
+}
+
+fun @llmone_rsqrtf(x: f32) -> f32 {
+  @entry:
+    %s = call @llmone_sqrtf(%x)
+    %one = sgt f32 %s, 0.0
+    br %one, @div, @zero
+
+  @div:
+    %r = div f32 1.0, %s
+    ret f32 %r
+
+  @zero:
+    ret f32 0.0
+}
+
+fun @llmone_tanhf(x: f32) -> f32 {
+  @entry:
+    %lo = sgt f32 %x, -15.0
+    br %lo, @clamp_hi, @neg
+
+  @clamp_hi:
+    %hi = slt f32 %x, 15.0
+    br %hi, @calc, @pos
+
+  @pos:
+    ret f32 1.0
+
+  @neg:
+    ret f32 -1.0
+
+  @calc:
+    %x2 = mul f32 %x, -2.0
+    %e = call @llmone_expf(%x2)
+    %num = sub f32 1.0, %e
+    %den = add f32 1.0, %e
+    %r = div f32 %num, %den
+    ret f32 %r
+}
+
+fun @llmone_gelu(x: f32) -> f32 {
+  @entry:
+    %x2 = mul f32 %x, %x
+    %x3 = mul f32 %x2, %x
+    %c = mul f32 %x3, 0.044715
+    %s = add f32 %x, %c
+    %k = mul f32 %s, 0.7978845608
+    %t = call @llmone_tanhf(%k)
+    %t1 = add f32 %t, 1.0
+    %half = mul f32 %x, 0.5
+    %r = mul f32 %half, %t1
+    ret f32 %r
+}
+
+fun @llmone_gelu_bwd(x: f32) -> f32 {
+  @entry:
+    %x2 = mul f32 %x, %x
+    %x3 = mul f32 %x2, %x
+    %c = mul f32 %x3, 0.044715
+    %s = add f32 %x, %c
+    %k = mul f32 %s, 0.7978845608
+    %t = call @llmone_tanhf(%k)
+    %t2 = mul f32 %t, %t
+    %one = sub f32 1.0, %t2
+    %tp = add f32 %t, 1.0
+    %half = mul f32 %tp, 0.5
+    %x2c = mul f32 %x2, 0.044715
+    %threec = mul f32 %x2c, 3.0
+    %inner = add f32 %threec, 1.0
+    %kk = mul f32 %inner, 0.7978845608
+    %sech = mul f32 %one, %kk
+    %xs = mul f32 %x, 0.5
+    %second = mul f32 %xs, %sech
+    %r = add f32 %half, %second
+    ret f32 %r
+}

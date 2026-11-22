@@ -1,0 +1,612 @@
+// llmone CLI: train / gen / gradcheck.
+//
+//   llmone train    [corpus] [steps]
+//   llmone gen      [prompt] [tokens]
+//   llmone gradcheck [corpus]
+//
+// Corpus and checkpoints are byte files; tokens are bytes of the file, so the
+// vocabulary is 256 for every config.
+
+extern @printf(fmt: *i8, ...) -> i32
+extern @putchar(c: i32) -> i32
+extern @fflush(f: *i8) -> i32
+extern @strcmp(a: *i8, b: *i8) -> i32
+extern @strtol(s: *i8, end: *i8, base: i32) -> i64
+extern @malloc(size: i64) -> *f32
+extern @c1_time_monotonic_ms() -> i64
+
+extern @llmone_read_file(path: *i8, out_len: *i32) -> *i8
+extern @llmone_save(path: *i8, params: *f32, n: i32, step: i32) -> i32
+extern @llmone_load(path: *i8, params: *f32, n: i32, step: *i32) -> i32
+extern @llmone_batch_offsets(off: *i32, batch: i32, data_len: i32, T: i32, s: *i32) -> void
+extern @llmone_gather(x: *i32, y: *i32, data: *i8, off: *i32, batch: i32, T: i32) -> void
+
+extern @llmone_init(p: *f32, seed: i32) -> void
+extern @llmone_forward(p: *f32, acts: *f32, ws: *f32, x: *i32, logits: *f32) -> void
+extern @llmone_backward(p: *f32, g: *f32, acts: *f32, ws: *f32, dlogits: *f32, x: *i32) -> void
+
+extern @llmone_zero(p: *f32, n: i32) -> void
+extern @llmone_zero_i32(p: *i32, n: i32) -> void
+extern @llmone_shift_left(x: *i32, n: i32) -> void
+extern @llmone_load_prompt(x: *i32, s: *i8, T: i32) -> i32
+extern @llmone_scale(x: *f32, k: f32, n: i32) -> void
+extern @llmone_adam(p: *f32, g: *f32, m: *f32, v: *f32, n: i32, lr: f32, beta1: f32, beta2: f32, bc1: f32, bc2: f32) -> void
+extern @llmone_ce(logits: *f32, tgt: *i32, rows: i32, cols: i32, dlogits: *f32, loss: *f32) -> void
+extern @llmone_argmax(p: *f32, n: i32) -> i32
+extern @llmone_absf(x: f32) -> f32
+
+const @def_corpus: [i8, 27] = "corpus/tinyshakespeare.txt"
+const @ckpt_path: [i8, 16] = "llmone-ckpt.bin"
+const @def_prompt: [i8, 5] = "The "
+// Offline fallback for gradcheck: two 64-byte sentences.
+const @sample_text: [i8, 130] = "the quick brown fox jumps over the lazy dog. the fox jumps over. a lazy dog sleeps; a quick brown fox jumps over the sleeping dog"
+
+fun @llmone_argi(argc: i32, argv: **i8, idx: i32, dflt: i32) -> i32 {
+  @entry:
+    %has = sgt i32 %argc, %idx
+    br %has, @parse, @def
+
+  @parse:
+    %pp = gep *i8, *%argv, %idx
+    %sp = load *i8, *%pp
+    %v = call @strtol(%sp, null, 10)
+    %v32 = trunc i64 %v to i32
+    ret i32 %v32
+
+  @def:
+    ret i32 %dflt
+}
+
+// Eight parameter indices to finite-difference check: the largest analytic
+// gradient, the final layernorm gains/biases, and the first MLP bias.
+fun @llmone_mkchecks(chk: *i32, mi: i32) -> void {
+  @entry:
+    %c0 = gep i32, *%chk, 0
+    store i32 %mi, *%c0
+
+    %g0 = add i32 __LN_BASE__, 0
+    %c1 = gep i32, *%chk, 1
+    store i32 %g0, *%c1
+    %g1 = add i32 __LN_BASE__, 1
+    %c2 = gep i32, *%chk, 2
+    store i32 %g1, *%c2
+    %g2 = add i32 __LN_BASE__, 2
+    %c3 = gep i32, *%chk, 3
+    store i32 %g2, *%c3
+
+    %bb = add i32 __LN_BASE__, __D__
+    %b0 = add i32 %bb, 0
+    %c4 = gep i32, *%chk, 4
+    store i32 %b0, *%c4
+    %b1 = add i32 %bb, 1
+    %c5 = gep i32, *%chk, 5
+    store i32 %b1, *%c5
+    %b2 = add i32 %bb, 2
+    %c6 = gep i32, *%chk, 6
+    store i32 %b2, *%c6
+
+    %m0 = add i32 __N_EMB__, __OFF_B1__
+    %c7 = gep i32, *%chk, 7
+    store i32 %m0, *%c7
+    ret void
+}
+
+// Train a tiny/big model from a byte corpus.
+fun @llmone_train(argc: i32, argv: **i8) -> i32 {
+  @entry:
+    %steps = let i32
+    %step = let i32
+    %dlen = let i32
+    %rng = let i32
+    %loss = let f32
+    %bc1 = let f32
+    %bc2 = let f32
+    %b = let i32
+    %stp = let i32
+    %path = let *i8
+    %data = let *i8
+    %params = let *f32
+    %grads = let *f32
+    %m = let *f32
+    %v = let *f32
+    %acts = let *f32
+    %ws = let *f32
+    %tokens = let [i32, __N_BT__]
+    %tgts = let [i32, __N_BT__]
+    %offs = let [i32, __B__]
+
+    %steps_v = call @llmone_argi(%argc, %argv, 3, __STEPS__)
+    store i32 %steps_v, *%steps
+    %has_path = sgt i32 %argc, 2
+    br %has_path, @path_argv, @path_def
+
+  @path_argv:
+    %pp = gep *i8, *%argv, 2
+    %spv = load *i8, *%pp
+    store *i8 %spv, *%path
+    jmp @load_data
+
+  @path_def:
+    %dp = gep i8, *@def_corpus, 0
+    store *i8 %dp, *%path
+    jmp @load_data
+
+  @load_data:
+    %pv = load *i8, *%path
+    %dv = call @llmone_read_file(%pv, %dlen)
+    store *i8 %dv, *%data
+    %ok = ne *i8 %dv, null
+    br %ok, @check_len, @nodata
+
+  @nodata:
+    call @printf("llmone: cannot read corpus %s\n", %pv)
+    ret i32 1
+
+  @check_len:
+    %dlv0 = load i32, *%dlen
+    %need = add i32 __T__, 1
+    %long = sgt i32 %dlv0, %need
+    br %long, @alloc, @short
+
+  @short:
+    call @printf("llmone: corpus too short (%d bytes, need > %d)\n", %dlv0, %need)
+    ret i32 1
+
+  @alloc:
+    %pb = call @malloc(__N_PARAMS_BYTES__)
+    store *f32 %pb, *%params
+    %gb = call @malloc(__N_PARAMS_BYTES__)
+    store *f32 %gb, *%grads
+    %mb = call @malloc(__N_PARAMS_BYTES__)
+    store *f32 %mb, *%m
+    %vb = call @malloc(__N_PARAMS_BYTES__)
+    store *f32 %vb, *%v
+    %ab = call @malloc(__N_ACTS_BYTES__)
+    store *f32 %ab, *%acts
+    %wb = call @malloc(__N_WS_BYTES__)
+    store *f32 %wb, *%ws
+    %st = call @llmone_load("llmone-ckpt.bin", %pb, __N_PARAMS__, %stp)
+    %loaded = eq i32 %st, 0
+    br %loaded, @resume, @fresh
+
+  @fresh:
+    %seed = call @c1_time_monotonic_ms()
+    %seed32 = trunc i64 %seed to i32
+    store i32 %seed32, *%rng
+    call @llmone_init(%pb, %seed32)
+    call @llmone_zero(%mb, __N_PARAMS__)
+    call @llmone_zero(%vb, __N_PARAMS__)
+    store i32 0, *%stp
+    call @printf("llmone: fresh init, %d parameters, corpus %s\n", __N_PARAMS__, %pv)
+    jmp @setup
+
+  @resume:
+    call @llmone_zero(%mb, __N_PARAMS__)
+    call @llmone_zero(%vb, __N_PARAMS__)
+    %sv0 = load i32, *%stp
+    store i32 %sv0, *%rng
+    call @printf("llmone: resumed at step %d, %d parameters\n", %sv0, __N_PARAMS__)
+    jmp @setup
+
+  @setup:
+    store f32 0.0, *%bc1
+    store f32 0.0, *%bc2
+    %sv1 = load i32, *%stp
+    %ns = add i32 %sv1, 1
+    store i32 %ns, *%step
+    jmp @cond
+
+  @cond:
+    %sv = load i32, *%step
+    %lim = load i32, *%steps
+    %lt = sle i32 %sv, %lim
+    br %lt, @body, @finish
+
+  @body:
+    %t0 = call @c1_time_monotonic_ms()
+    %dlv = load i32, *%dlen
+    call @llmone_batch_offsets(%offs, __B__, %dlv, __T__, %rng)
+    %datav = load *i8, *%data
+    call @llmone_gather(%tokens, %tgts, %datav, %offs, __B__, __T__)
+    %gv0 = load *f32, *%grads
+    call @llmone_zero(%gv0, __N_PARAMS__)
+    store f32 0.0, *%loss
+    store i32 0, *%b
+    jmp @bcond
+
+  @bcond:
+    %bv = load i32, *%b
+    %blt = slt i32 %bv, __B__
+    br %blt, @bbody, @opt
+
+  @bbody:
+    %boff = mul i32 %bv, __T__
+    %xr = gep i32, *%tokens, %boff
+    %yr = gep i32, *%tgts, %boff
+    %wv = load *f32, *%ws
+    %pbv = load *f32, *%params
+    %av = load *f32, *%acts
+    %gv1 = load *f32, *%grads
+    %lg = gep f32, *%wv, __W_LOGITS__
+    %dlg = gep f32, *%wv, __W_DLOGITS__
+    call @llmone_forward(%pbv, %av, %wv, %xr, %lg)
+    call @llmone_ce(%lg, %yr, __T__, __V__, %dlg, %loss)
+    call @llmone_backward(%pbv, %gv1, %av, %wv, %dlg, %xr)
+    %bn = add i32 %bv, 1
+    store i32 %bn, *%b
+    jmp @bcond
+
+  @opt:
+    %gv2 = load *f32, *%grads
+    call @llmone_scale(%gv2, __INVBT__, __N_PARAMS__)
+    %c1 = load f32, *%bc1
+    %c1a = mul f32 %c1, 0.9
+    %c1b = add f32 %c1a, 0.1
+    store f32 %c1b, *%bc1
+    %c2 = load f32, *%bc2
+    %c2a = mul f32 %c2, 0.999
+    %c2b = add f32 %c2a, 0.001
+    store f32 %c2b, *%bc2
+    %pv2 = load *f32, *%params
+    %mv2 = load *f32, *%m
+    %vv2 = load *f32, *%v
+    %gv3 = load *f32, *%grads
+    %c1v = load f32, *%bc1
+    %c2v = load f32, *%bc2
+    call @llmone_adam(%pv2, %gv3, %mv2, %vv2, __N_PARAMS__, __LR__, 0.9, 0.999, %c1v, %c2v)
+    %t1 = call @c1_time_monotonic_ms()
+    %dt = sub i64 %t1, %t0
+    %lv = load f32, *%loss
+    %avg = mul f32 %lv, __INVBT__
+    %sv2 = load i32, *%step
+    call @printf("step %d  loss %.5f  %lld ms\n", %sv2, %avg, %dt)
+    %mod = urem i32 %sv2, 250
+    %isz = eq i32 %mod, 0
+    br %isz, @save, @next
+
+  @save:
+    %pv3 = load *f32, *%params
+    %sv3 = load i32, *%step
+    %rc = call @llmone_save("llmone-ckpt.bin", %pv3, __N_PARAMS__, %sv3)
+    call @printf("saved checkpoint at step %d\n", %sv3)
+    jmp @next
+
+  @next:
+    %sv4 = load i32, *%step
+    %sinc = add i32 %sv4, 1
+    store i32 %sinc, *%step
+    jmp @cond
+
+  @finish:
+    %svf = load i32, *%step
+    %last = sub i32 %svf, 1
+    %pvf = load *f32, *%params
+    %rcf = call @llmone_save("llmone-ckpt.bin", %pvf, __N_PARAMS__, %last)
+    call @printf("done: %d steps, checkpoint written\n", %last)
+    ret i32 0
+}
+
+// Sample tokens from a checkpoint.
+fun @llmone_gen(argc: i32, argv: **i8) -> i32 {
+  @entry:
+    %params = let *f32
+    %acts = let *f32
+    %ws = let *f32
+    %x = let [i32, __T__]
+    %stp = let i32
+    %pos = let i32
+    %done = let i32
+    %np = let i32
+    %pb = call @malloc(__N_PARAMS_BYTES__)
+    store *f32 %pb, *%params
+    %ab = call @malloc(__N_ACTS_BYTES__)
+    store *f32 %ab, *%acts
+    %wb = call @malloc(__N_WS_BYTES__)
+    store *f32 %wb, *%ws
+    %st = call @llmone_load("llmone-ckpt.bin", %pb, __N_PARAMS__, %stp)
+    %ok = eq i32 %st, 0
+    br %ok, @ready, @fresh
+
+  @fresh:
+    call @printf("llmone: no checkpoint, sampling from random weights\n")
+    %seed = call @c1_time_monotonic_ms()
+    %seed32 = trunc i64 %seed to i32
+    call @llmone_init(%pb, %seed32)
+    jmp @ready
+
+  @ready:
+    call @llmone_zero_i32(%x, __T__)
+    %hasp = sgt i32 %argc, 2
+    br %hasp, @prompt_argv, @prompt_def
+
+  @prompt_argv:
+    %pp = gep *i8, *%argv, 2
+    %spv = load *i8, *%pp
+    %pl = call @llmone_load_prompt(%x, %spv, __T__)
+    store i32 %pl, *%pos
+    call @printf("%s\n", %spv)
+    jmp @gen_init
+
+  @prompt_def:
+    %dp = gep i8, *@def_prompt, 0
+    %pl2 = call @llmone_load_prompt(%x, %dp, __T__)
+    store i32 %pl2, *%pos
+    call @printf("%s\n", %dp)
+    jmp @gen_init
+
+  @gen_init:
+    %ng = call @llmone_argi(%argc, %argv, 3, 200)
+    store i32 %ng, *%np
+    store i32 0, *%done
+    %posv = load i32, *%pos
+    %ze = eq i32 %posv, 0
+    br %ze, @fix_empty, @gcond
+
+  @fix_empty:
+    store i32 1, *%pos
+    jmp @gcond
+
+  @gcond:
+    %dv = load i32, *%done
+    %ngv = load i32, *%np
+    %lt = slt i32 %dv, %ngv
+    br %lt, @gbody, @gdone
+
+  @gbody:
+    %pv = load *f32, *%params
+    %av = load *f32, *%acts
+    %wv = load *f32, *%ws
+    %lgp = gep f32, *%wv, __W_LOGITS__
+    call @llmone_forward(%pv, %av, %wv, %x, %lgp)
+    %posv2 = load i32, *%pos
+    %pm1 = sub i32 %posv2, 1
+    %rowoff = mul i32 %pm1, __V__
+    %rowp = gep f32, *%lgp, %rowoff
+    %tok = call @llmone_argmax(%rowp, __V__)
+    %pr = call @putchar(%tok)
+    %xp = gep i32, *%x, %posv2
+    store i32 %tok, *%xp
+    %posn = add i32 %posv2, 1
+    store i32 %posn, *%pos
+    %full = sge i32 %posn, __T__
+    br %full, @shift, @gnext
+
+  @shift:
+    call @llmone_shift_left(%x, __T__)
+    %tm1 = sub i32 __T__, 1
+    store i32 %tm1, *%pos
+    jmp @gnext
+
+  @gnext:
+    %dvn = load i32, *%done
+    %dinc = add i32 %dvn, 1
+    store i32 %dinc, *%done
+    jmp @gcond
+
+  @gdone:
+    %fl = call @fflush(null)
+    call @printf("\n")
+    ret i32 0
+}
+
+// One-sample finite-difference gradient check.
+fun @llmone_gc(argc: i32, argv: **i8) -> i32 {
+  @entry:
+    %dlen = let i32
+    %stp = let i32
+    %i = let i32
+    %k = let i32
+    %maxi = let i32
+    %maxv = let f32
+    %l1 = let f32
+    %l2 = let f32
+    %fails = let i32
+    %path = let *i8
+    %data = let *i8
+    %params = let *f32
+    %grads = let *f32
+    %acts = let *f32
+    %ws = let *f32
+    %tokens = let [i32, __T__]
+    %tgts = let [i32, __T__]
+    %offs = let [i32, 1]
+    %chk = let [i32, 8]
+
+    %hasp = sgt i32 %argc, 2
+    br %hasp, @path_argv, @path_def
+
+  @path_argv:
+    %pp = gep *i8, *%argv, 2
+    %spv = load *i8, *%pp
+    store *i8 %spv, *%path
+    jmp @load_data
+
+  @path_def:
+    %dp = gep i8, *@def_corpus, 0
+    store *i8 %dp, *%path
+    jmp @load_data
+
+  @load_data:
+    %pv = load *i8, *%path
+    %dv = call @llmone_read_file(%pv, %dlen)
+    %ok = ne *i8 %dv, null
+    br %ok, @have, @fallback
+
+  @have:
+    store *i8 %dv, *%data
+    %gl = load i32, *%dlen
+    %gneed = add i32 __T__, 1
+    %glong = sgt i32 %gl, %gneed
+    br %glong, @setup, @gshort
+
+  @gshort:
+    call @printf("llmone: corpus too short (%d bytes, need > %d)\n", %gl, %gneed)
+    ret i32 1
+
+  @fallback:
+    %st = gep i8, *@sample_text, 0
+    store *i8 %st, *%data
+    store i32 129, *%dlen
+    call @printf("llmone: corpus missing, using built-in sample\n")
+    jmp @setup
+
+  @setup:
+    %pb = call @malloc(__N_PARAMS_BYTES__)
+    store *f32 %pb, *%params
+    %gb = call @malloc(__N_PARAMS_BYTES__)
+    store *f32 %gb, *%grads
+    %ab = call @malloc(__N_ACTS_BYTES__)
+    store *f32 %ab, *%acts
+    %wb = call @malloc(__N_WS_BYTES__)
+    store *f32 %wb, *%ws
+    call @llmone_init(%pb, 7)
+    store i32 0, *%offs
+    %datav = load *i8, *%data
+    call @llmone_gather(%tokens, %tgts, %datav, %offs, 1, __T__)
+    call @llmone_zero(%gb, __N_PARAMS__)
+    %lg = gep f32, *%wb, __W_LOGITS__
+    %dlg = gep f32, *%wb, __W_DLOGITS__
+    store f32 0.0, *%l1
+    call @llmone_forward(%pb, %ab, %wb, %tokens, %lg)
+    call @llmone_ce(%lg, %tgts, __T__, __V__, %dlg, %l1)
+    call @llmone_backward(%pb, %gb, %ab, %wb, %dlg, %tokens)
+    %loss0 = load f32, *%l1
+    call @printf("gradcheck: loss %.5f over %d tokens\n", %loss0, __T__)
+
+    store f32 0.0, *%maxv
+    store i32 0, *%maxi
+    store i32 0, *%i
+    jmp @scan_cond
+
+  @scan_cond:
+    %iv = load i32, *%i
+    %lt = slt i32 %iv, __N_PARAMS__
+    br %lt, @scan_body, @build
+
+  @scan_body:
+    %gv = load *f32, *%grads
+    %gp = gep f32, *%gv, %iv
+    %w = load f32, *%gp
+    %a = call @llmone_absf(%w)
+    %cur = load f32, *%maxv
+    %gt = sgt f32 %a, %cur
+    br %gt, @take, @skip
+
+  @take:
+    store f32 %a, *%maxv
+    store i32 %iv, *%maxi
+    jmp @adv
+
+  @skip:
+    jmp @adv
+
+  @adv:
+    %nxt = add i32 %iv, 1
+    store i32 %nxt, *%i
+    jmp @scan_cond
+
+  @build:
+    %mi = load i32, *%maxi
+    %mxv = load f32, *%maxv
+    call @printf("gradcheck: max |g| = %.6f at index %d of %d\n", %mxv, %mi, __N_PARAMS__)
+    call @llmone_mkchecks(%chk, %mi)
+    store i32 0, *%k
+    store i32 0, *%fails
+    jmp @chk_cond
+
+  @chk_cond:
+    %kv = load i32, *%k
+    %klt = slt i32 %kv, 8
+    br %klt, @chk_body, @chk_done
+
+  @chk_body:
+    %cp = gep i32, *%chk, %kv
+    %idx = load i32, *%cp
+    %pv3 = load *f32, *%params
+    %pp2 = gep f32, *%pv3, %idx
+    %orig = load f32, *%pp2
+    %up = add f32 %orig, 0.02
+    store f32 %up, *%pp2
+    store f32 0.0, *%l1
+    %av = load *f32, *%acts
+    %wv = load *f32, *%ws
+    %lg2 = gep f32, *%wv, __W_LOGITS__
+    %dlg2 = gep f32, *%wv, __W_DLOGITS__
+    call @llmone_forward(%pv3, %av, %wv, %tokens, %lg2)
+    call @llmone_ce(%lg2, %tgts, __T__, __V__, %dlg2, %l1)
+    %lp = load f32, *%l1
+    %dn = sub f32 %orig, 0.02
+    store f32 %dn, *%pp2
+    store f32 0.0, *%l2
+    call @llmone_forward(%pv3, %av, %wv, %tokens, %lg2)
+    call @llmone_ce(%lg2, %tgts, __T__, __V__, %dlg2, %l2)
+    %lm = load f32, *%l2
+    store f32 %orig, *%pp2
+    %df = sub f32 %lp, %lm
+    %num = div f32 %df, 0.04
+    %gv3 = load *f32, *%grads
+    %gp3 = gep f32, *%gv3, %idx
+    %ana = load f32, *%gp3
+    %dd = sub f32 %num, %ana
+    %ad = call @llmone_absf(%dd)
+    %aa = call @llmone_absf(%ana)
+    %den = add f32 %aa, 0.002
+    %rel = div f32 %ad, %den
+    call @printf("gradcheck[%d] num=%.6f ana=%.6f rel=%.4f\n", %idx, %num, %ana, %rel)
+    %bad = sgt f32 %rel, 0.2
+    %bi = zext i1 %bad to i32
+    %fv = load i32, *%fails
+    %fn = add i32 %fv, %bi
+    store i32 %fn, *%fails
+    %kn = add i32 %kv, 1
+    store i32 %kn, *%k
+    jmp @chk_cond
+
+  @chk_done:
+    %f = load i32, *%fails
+    call @printf("gradcheck: %d failure(s)\n", %f)
+    ret i32 %f
+}
+
+fun @main(argc: i32, argv: **i8) -> i32 {
+  @entry:
+    %argc1 = sgt i32 %argc, 1
+    br %argc1, @dispatch, @default
+
+  @dispatch:
+    %pp = gep *i8, *%argv, 1
+    %mode = load *i8, *%pp
+    %c1 = call @strcmp(%mode, "train")
+    %is1 = eq i32 %c1, 0
+    br %is1, @do_train, @try_gen
+
+  @try_gen:
+    %c2 = call @strcmp(%mode, "gen")
+    %is2 = eq i32 %c2, 0
+    br %is2, @do_gen, @try_gc
+
+  @try_gc:
+    %c3 = call @strcmp(%mode, "gradcheck")
+    %is3 = eq i32 %c3, 0
+    br %is3, @do_gc, @usage
+
+  @default:
+    %r0 = call @llmone_train(%argc, %argv)
+    ret i32 %r0
+
+  @do_train:
+    %r1 = call @llmone_train(%argc, %argv)
+    ret i32 %r1
+
+  @do_gen:
+    %r2 = call @llmone_gen(%argc, %argv)
+    ret i32 %r2
+
+  @do_gc:
+    %r3 = call @llmone_gc(%argc, %argv)
+    ret i32 %r3
+
+  @usage:
+    call @printf("usage: llmone [train [corpus] [steps] | gen [prompt] [n] | gradcheck [corpus]]\n")
+    ret i32 2
+}

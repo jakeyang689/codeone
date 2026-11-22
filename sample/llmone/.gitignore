@@ -1,0 +1,4 @@
+build/
+corpus/
+*.o
+llmone-ckpt.bin

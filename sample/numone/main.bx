@@ -1,0 +1,16 @@
+// numone — entry point.
+// Runs the check suite: the `tensor` (MLIR) kernels in tensor/ are compared
+// bit for bit against the scalar loops in array/.
+
+extern @printf(fmt: *i8, ...) -> i32
+extern @numone_run_tests() -> i32
+
+const @numone_banner = "numone: tensor (MLIR) kernels vs scalar reference\n"
+
+fun @main() -> i32 {
+  @entry:
+    %bp = gep i8, *@numone_banner, 0
+    call @printf(%bp)
+    %fails = call @numone_run_tests()
+    ret i32 %fails
+}

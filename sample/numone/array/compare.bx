@@ -1,0 +1,36 @@
+// numone array/compare — bitwise buffer equality.
+// f32 comparisons are integer-only in SSA, so results are compared through
+// their raw IEEE-754 bit patterns.
+
+fun @numone_equal(a: *f32, b: *f32, n: i32) -> i32 {
+  @entry:
+    %i = let i32
+    store i32 0, *%i
+    jmp @loop
+
+  @loop:
+    %iv = load i32, *%i
+    %lt = slt i32 %iv, %n
+    br %lt, @body, @same
+
+  @body:
+    %off = mul i32 %iv, 4
+    %ap = gep i8, *%a, %off
+    %bp = gep i8, *%b, %off
+    %av = load i32, *%ap
+    %bv = load i32, *%bp
+    %same_bit = eq i32 %av, %bv
+    br %same_bit, @step, @diff
+
+  @step:
+    %iv2 = load i32, *%i
+    %next = add i32 %iv2, 1
+    store i32 %next, *%i
+    jmp @loop
+
+  @diff:
+    ret i32 0
+
+  @same:
+    ret i32 1
+}
