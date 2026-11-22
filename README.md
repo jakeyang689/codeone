@@ -1,4 +1,4 @@
-# <img src="assets/logo.svg" width="40" alt="codeone logo"> <span style="vertical-align: 0.36em">codeone</span>
+# <img src="assets/logo.svg" width="40" align="absmiddle" alt="codeone logo"> codeone
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
