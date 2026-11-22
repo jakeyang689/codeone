@@ -601,6 +601,29 @@ TEST(lower_unsigned_ops) {
     lower_free_ir(ir);
 }
 
+TEST(lower_float_ops) {
+    char err[256] = "";
+    char *ir = lower_str(
+        "fun @f(a: f32, b: f32) -> i32 {\n"
+        "  @entry:\n"
+        "    %s = sub f32 %a, %b\n"
+        "    %p = mul f32 %s, %a\n"
+        "    %q = div f32 %p, %b\n"
+        "    %r = add f32 %q, %a\n"
+        "    %c = slt f32 %r, %b\n"
+        "    %z = zext i1 %c to i32\n"
+        "    ret i32 %z\n"
+        "}",
+        err, sizeof(err));
+    ASSERT_NOT_NULL(ir);
+    ASSERT(ir_contains(ir, "fsub float"));
+    ASSERT(ir_contains(ir, "fmul float"));
+    ASSERT(ir_contains(ir, "fdiv float"));
+    ASSERT(ir_contains(ir, "fadd float"));
+    ASSERT(ir_contains(ir, "fcmp olt float"));
+    lower_free_ir(ir);
+}
+
 TEST(lower_forward_call) {
     char err[256] = "";
     char *ir = lower_str(
@@ -760,6 +783,7 @@ void run_lowering_tests(void) {
     RUN_TEST(lower_insn_sext);
     RUN_TEST(lower_insn_trunc);
     RUN_TEST(lower_unsigned_ops);
+    RUN_TEST(lower_float_ops);
     RUN_TEST(lower_forward_call);
     RUN_TEST(lower_pointer_type);
     RUN_TEST(lower_complete_gcd);

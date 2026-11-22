@@ -368,6 +368,23 @@ static LLVMIntPredicate cmp_kind_to_llvm(InsnKind k) {
     }
 }
 
+static bool is_float_type(LLVMTypeRef t) {
+    LLVMTypeKind k = LLVMGetTypeKind(t);
+    return k == LLVMFloatTypeKind || k == LLVMDoubleTypeKind;
+}
+
+static LLVMRealPredicate cmp_kind_to_real(InsnKind kind) {
+    switch (kind) {
+        case INSN_EQ:  return LLVMRealOEQ;
+        case INSN_NE:  return LLVMRealONE;
+        case INSN_SLT: return LLVMRealOLT;
+        case INSN_SLE: return LLVMRealOLE;
+        case INSN_SGT: return LLVMRealOGT;
+        case INSN_SGE: return LLVMRealOGE;
+        default: return LLVMRealOEQ;
+    }
+}
+
 /* ==================================================================
  * AES instructions
  * SSA semantics follow the standard AES round (SubBytes, ShiftRows,
@@ -465,7 +482,9 @@ static bool lower_insn(LLVMContextRef ctx, LLVMModuleRef mod,
             LLVMValueRef l = lower_op(ctx, mod, vm, &insn->data.binary.lhs, t, err, err_sz);
             LLVMValueRef r = lower_op(ctx, mod, vm, &insn->data.binary.rhs, t, err, err_sz);
             if (!l || !r) return false;
-            result = LLVMBuildAdd(builder, l, r, insn->result ? insn->result : "");
+            result = is_float_type(t)
+                ? LLVMBuildFAdd(builder, l, r, insn->result ? insn->result : "")
+                : LLVMBuildAdd(builder, l, r, insn->result ? insn->result : "");
             break;
         }
         case INSN_SUB: {
@@ -474,7 +493,9 @@ static bool lower_insn(LLVMContextRef ctx, LLVMModuleRef mod,
             LLVMValueRef l = lower_op(ctx, mod, vm, &insn->data.binary.lhs, t, err, err_sz);
             LLVMValueRef r = lower_op(ctx, mod, vm, &insn->data.binary.rhs, t, err, err_sz);
             if (!l || !r) return false;
-            result = LLVMBuildSub(builder, l, r, insn->result ? insn->result : "");
+            result = is_float_type(t)
+                ? LLVMBuildFSub(builder, l, r, insn->result ? insn->result : "")
+                : LLVMBuildSub(builder, l, r, insn->result ? insn->result : "");
             break;
         }
         case INSN_MUL: {
@@ -483,7 +504,9 @@ static bool lower_insn(LLVMContextRef ctx, LLVMModuleRef mod,
             LLVMValueRef l = lower_op(ctx, mod, vm, &insn->data.binary.lhs, t, err, err_sz);
             LLVMValueRef r = lower_op(ctx, mod, vm, &insn->data.binary.rhs, t, err, err_sz);
             if (!l || !r) return false;
-            result = LLVMBuildMul(builder, l, r, insn->result ? insn->result : "");
+            result = is_float_type(t)
+                ? LLVMBuildFMul(builder, l, r, insn->result ? insn->result : "")
+                : LLVMBuildMul(builder, l, r, insn->result ? insn->result : "");
             break;
         }
         case INSN_DIV: {
@@ -492,7 +515,9 @@ static bool lower_insn(LLVMContextRef ctx, LLVMModuleRef mod,
             LLVMValueRef l = lower_op(ctx, mod, vm, &insn->data.binary.lhs, t, err, err_sz);
             LLVMValueRef r = lower_op(ctx, mod, vm, &insn->data.binary.rhs, t, err, err_sz);
             if (!l || !r) return false;
-            result = LLVMBuildSDiv(builder, l, r, insn->result ? insn->result : "");
+            result = is_float_type(t)
+                ? LLVMBuildFDiv(builder, l, r, insn->result ? insn->result : "")
+                : LLVMBuildSDiv(builder, l, r, insn->result ? insn->result : "");
             break;
         }
         case INSN_REM: {
@@ -501,7 +526,9 @@ static bool lower_insn(LLVMContextRef ctx, LLVMModuleRef mod,
             LLVMValueRef l = lower_op(ctx, mod, vm, &insn->data.binary.lhs, t, err, err_sz);
             LLVMValueRef r = lower_op(ctx, mod, vm, &insn->data.binary.rhs, t, err, err_sz);
             if (!l || !r) return false;
-            result = LLVMBuildSRem(builder, l, r, insn->result ? insn->result : "");
+            result = is_float_type(t)
+                ? LLVMBuildFRem(builder, l, r, insn->result ? insn->result : "")
+                : LLVMBuildSRem(builder, l, r, insn->result ? insn->result : "");
             break;
         }
         case INSN_AND: {
@@ -565,8 +592,11 @@ static bool lower_insn(LLVMContextRef ctx, LLVMModuleRef mod,
             LLVMValueRef l = lower_op(ctx, mod, vm, &insn->data.binary.lhs, t, err, err_sz);
             LLVMValueRef r = lower_op(ctx, mod, vm, &insn->data.binary.rhs, t, err, err_sz);
             if (!l || !r) return false;
-            result = LLVMBuildICmp(builder, cmp_kind_to_llvm(insn->kind),
-                                    l, r, insn->result ? insn->result : "");
+            result = is_float_type(t)
+                ? LLVMBuildFCmp(builder, cmp_kind_to_real(insn->kind),
+                                l, r, insn->result ? insn->result : "")
+                : LLVMBuildICmp(builder, cmp_kind_to_llvm(insn->kind),
+                                l, r, insn->result ? insn->result : "");
             break;
         }
         case INSN_LOAD: {
